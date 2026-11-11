@@ -30,6 +30,10 @@ jobs:
         run: cargo fmt --all --check
       - name: App icon
         run: python3 scripts/make-icon.py --check
+      - name: Logo
+        run: python3 scripts/make-logo.py --check
+      - name: Website
+        run: python3 site/build.py
       - name: Clippy
         run: cargo clippy -p loupe-github -p loupe-linear -p loupe-t3 -p loupe-update --all-targets -- -D warnings
       - name: Test

@@ -10,7 +10,7 @@
 		Referrer-Policy strict-origin-when-cross-origin
 		Content-Security-Policy "default-src 'self'; img-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 	}
-	@static path /img/* /icon.svg /style.css
+	@static path /img/* /favicon.svg /hero.js /style.css
 	header @static Cache-Control "public, max-age=86400"
 	file_server
 	handle_errors {

@@ -1,4 +1,7 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-wordmark-dark.svg">
+  <img src="assets/logo-wordmark-light.svg" height="56" alt="Loupe">
+</picture>
 
 # Loupe
 
