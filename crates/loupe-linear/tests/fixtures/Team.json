@@ -1,0 +1,210 @@
+{
+  "data": {
+    "team": {
+      "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+      "key": "ENG",
+      "name": "Engineering",
+      "issueEstimationType": "fibonacci",
+      "issueEstimationAllowZero": false,
+      "issueEstimationExtended": true,
+      "states": {
+        "nodes": [
+          {
+            "id": "7636a155-bede-5302-a5a7-356c93999dae",
+            "name": "Triage",
+            "type": "triage",
+            "position": 0.0,
+            "color": "#e2e2e2"
+          },
+          {
+            "id": "fc8ef667-f2fd-5635-94bc-2aadbd3f8211",
+            "name": "Backlog",
+            "type": "backlog",
+            "position": 1.0,
+            "color": "#bec2c8"
+          },
+          {
+            "id": "e6fedd25-ff44-5529-84b5-e1a5e158666d",
+            "name": "Todo",
+            "type": "unstarted",
+            "position": 2.0,
+            "color": "#e2e2e2"
+          },
+          {
+            "id": "14457ad8-6b5c-5393-ba07-6062251f97bd",
+            "name": "In Progress",
+            "type": "started",
+            "position": 3.0,
+            "color": "#f2c94c"
+          },
+          {
+            "id": "b01682c5-afc0-5095-b94a-fcdcfb5027a0",
+            "name": "In Review",
+            "type": "started",
+            "position": 4.0,
+            "color": "#4cb782"
+          },
+          {
+            "id": "a2da5732-2483-5374-abc6-b7860b49625b",
+            "name": "Done",
+            "type": "completed",
+            "position": 5.0,
+            "color": "#5e6ad2"
+          },
+          {
+            "id": "51106e5e-6296-51f9-bc85-7c2771da7423",
+            "name": "Canceled",
+            "type": "canceled",
+            "position": 6.0,
+            "color": "#95a2b3"
+          },
+          {
+            "id": "a3be0177-56e3-595d-83df-2f91d984b8ae",
+            "name": "Duplicate",
+            "type": "duplicate",
+            "position": 7.0,
+            "color": "#95a2b3"
+          }
+        ]
+      },
+      "members": {
+        "nodes": [
+          {
+            "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+            "name": "Ada Okafor",
+            "displayName": "ada",
+            "avatarUrl": "https://avatars.example.test/ada.png",
+            "active": true
+          },
+          {
+            "id": "c40de612-aefd-556d-af82-9b7ec35e04c0",
+            "name": "Esme Hartley",
+            "displayName": "esme",
+            "avatarUrl": null,
+            "active": false
+          },
+          {
+            "id": "1bd93919-de71-5b4d-983f-f69c74716823",
+            "name": "Ben Lindqvist",
+            "displayName": "ben",
+            "avatarUrl": "https://avatars.example.test/ben.png",
+            "active": true
+          },
+          {
+            "id": "f149cdf3-5ed5-5c4a-b895-0af7f5a07d72",
+            "name": "Chloe Tanaka",
+            "displayName": "chloe",
+            "avatarUrl": "https://avatars.example.test/chloe.png",
+            "active": true
+          },
+          {
+            "id": "49ec13de-8cb6-55c0-a685-729f826fc158",
+            "name": "Dmitri Vasquez",
+            "displayName": "dmitri",
+            "avatarUrl": "https://avatars.example.test/dmitri.png",
+            "active": true
+          }
+        ]
+      },
+      "projects": {
+        "nodes": [
+          {
+            "id": "5efd5ba8-d18e-528e-baee-30f02656bb32",
+            "name": "Atlas",
+            "color": "#bb87fc"
+          },
+          {
+            "id": "3163630f-ddfc-5c0e-87de-8249cba97736",
+            "name": "Beacon",
+            "color": "#4cb782"
+          }
+        ]
+      },
+      "cycles": {
+        "nodes": [
+          {
+            "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+            "number": 41,
+            "name": null,
+            "startsAt": "2026-11-02T00:00:00.000Z",
+            "endsAt": "2026-11-16T00:00:00.000Z"
+          },
+          {
+            "id": "2179eb1f-aaad-55e6-bbe3-8399e87ce139",
+            "number": 42,
+            "name": "Polish sprint",
+            "startsAt": "2026-11-16T00:00:00.000Z",
+            "endsAt": "2026-11-30T00:00:00.000Z"
+          }
+        ]
+      }
+    },
+    "issueLabels": {
+      "nodes": [
+        {
+          "id": "8f50f439-a216-5087-adf6-dccbbb7710f4",
+          "name": "Bug",
+          "color": "#eb5757",
+          "parent": null
+        },
+        {
+          "id": "f8617d0d-ab27-507b-ab83-d87f63b708f2",
+          "name": "Feature",
+          "color": "#bb87fc",
+          "parent": null
+        },
+        {
+          "id": "18255c0a-8939-52fe-abd0-0e5e1f5e5118",
+          "name": "Improvement",
+          "color": "#4ea7fc",
+          "parent": null
+        },
+        {
+          "id": "722ee3d9-d4fc-5e9a-a870-7be0ea75e237",
+          "name": "Tech debt",
+          "color": "#f2994a",
+          "parent": null
+        },
+        {
+          "id": "4003d5a8-6648-5d06-ad65-de4618bb937d",
+          "name": "Needs design",
+          "color": "#26b5ce",
+          "parent": null
+        },
+        {
+          "id": "f31017bf-3590-56fc-8503-d9d9b324fd64",
+          "name": "Branding",
+          "color": "#f7c8c1",
+          "parent": null
+        },
+        {
+          "id": "1d3607b6-d339-5a0d-860a-6e52b9672c64",
+          "name": "Accessibility",
+          "color": "#4cb782",
+          "parent": null
+        },
+        {
+          "id": "2bedc668-6eb0-5a96-a66d-5200dfbde894",
+          "name": "Customer",
+          "color": "#5e6ad2",
+          "parent": null
+        },
+        {
+          "id": "647a5fa6-1ab2-59f8-826d-7c12719911e0",
+          "name": "Area",
+          "color": "#8a8f98",
+          "isGroup": true,
+          "parent": null
+        },
+        {
+          "id": "6633221c-9776-5acb-9da1-a383f525a2bf",
+          "name": "API",
+          "color": "#6b6f76",
+          "parent": {
+            "id": "647a5fa6-1ab2-59f8-826d-7c12719911e0"
+          }
+        }
+      ]
+    }
+  }
+}

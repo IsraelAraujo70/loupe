@@ -1,0 +1,81 @@
+{
+  "data": {
+    "organization": {
+      "projectStatuses": [
+        {
+          "id": "status-started",
+          "name": "In Progress",
+          "type": "started",
+          "color": "#f2c94c",
+          "position": 2
+        },
+        {
+          "id": "status-backlog",
+          "name": "Backlog",
+          "type": "backlog",
+          "color": "#bec2c8",
+          "position": 0
+        },
+        {
+          "id": "status-done",
+          "name": "Completed",
+          "type": "completed",
+          "color": "#5e6ad2",
+          "position": 3
+        }
+      ]
+    },
+    "projectLabels": {
+      "nodes": [
+        {
+          "id": "plabel-1",
+          "name": "vendor-a",
+          "color": "#5e6ad2",
+          "isGroup": false
+        },
+        {
+          "id": "plabel-group",
+          "name": "Vendors",
+          "color": "#bec2c8",
+          "isGroup": true
+        },
+        {
+          "id": "plabel-2",
+          "name": "identity-check",
+          "color": "#4cb782",
+          "isGroup": false
+        }
+      ]
+    },
+    "users": {
+      "nodes": [
+        {
+          "id": "user-2",
+          "name": "Maya Moreau",
+          "displayName": "maya",
+          "avatarUrl": null
+        },
+        {
+          "id": "user-1",
+          "name": "Israel Araujo",
+          "displayName": "israel",
+          "avatarUrl": null
+        }
+      ]
+    },
+    "teams": {
+      "nodes": [
+        {
+          "id": "team-2",
+          "key": "WEB",
+          "name": "Front-end"
+        },
+        {
+          "id": "team-1",
+          "key": "API",
+          "name": "Back-end"
+        }
+      ]
+    }
+  }
+}

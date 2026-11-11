@@ -1,0 +1,489 @@
+{
+  "data": {
+    "viewer": {
+      "assignedIssues": {
+        "nodes": [
+          {
+            "id": "5dc66de0-9866-5e89-a450-41a72269148f",
+            "identifier": "ENG-101",
+            "title": "Crash when the sync worker restarts mid-batch",
+            "priority": 1,
+            "sortOrder": -10.5,
+            "estimate": 5,
+            "dueDate": "2026-11-14",
+            "url": "https://linear.app/acme/issue/ENG-101/crash-when-the-sync-worker-restarts-mid-",
+            "branchName": "ada/eng-101-crash-when-the-sync-worker-restarts",
+            "createdAt": "2026-10-21T09:12:44.318Z",
+            "updatedAt": "2026-11-09T17:45:10.902Z",
+            "state": {
+              "id": "14457ad8-6b5c-5393-ba07-6062251f97bd",
+              "name": "In Progress",
+              "type": "started",
+              "color": "#f2c94c"
+            },
+            "team": {
+              "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+              "key": "ENG",
+              "name": "Engineering"
+            },
+            "assignee": {
+              "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+              "name": "Ada Okafor",
+              "displayName": "ada",
+              "avatarUrl": "https://avatars.example.test/ada.png"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "id": "8f50f439-a216-5087-adf6-dccbbb7710f4",
+                  "name": "Bug",
+                  "color": "#eb5757",
+                  "parent": null
+                }
+              ]
+            },
+            "project": {
+              "id": "5efd5ba8-d18e-528e-baee-30f02656bb32",
+              "name": "Atlas",
+              "color": "#bb87fc"
+            },
+            "cycle": {
+              "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+              "number": 41,
+              "name": null
+            },
+            "creator": {
+              "id": "c40de612-aefd-556d-af82-9b7ec35e04c0"
+            },
+            "parent": null,
+            "children": {
+              "nodes": [
+                {
+                  "id": "x"
+                }
+              ]
+            },
+            "projectMilestone": null,
+            "completedAt": null,
+            "canceledAt": null,
+            "pullRequests": {
+              "nodes": [
+                {
+                  "url": "https://github.com/acme/sync-worker/pull/412",
+                  "metadata": {
+                    "status": "merged",
+                    "mergedAt": "2026-11-08T10:00:00.000Z"
+                  }
+                },
+                {
+                  "url": "https://github.com/acme/web/pull/1187/",
+                  "metadata": {
+                    "status": "open",
+                    "draft": false
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "id": "3effda00-6e30-5c6a-accb-1f26d53081fd",
+            "identifier": "DES-21",
+            "title": "Redesign the empty state for the board",
+            "priority": 2,
+            "sortOrder": -21.0,
+            "estimate": 3,
+            "dueDate": null,
+            "url": "https://linear.app/acme/issue/DES-21/redesign-the-empty-state-for-the-board",
+            "createdAt": "2026-10-30T10:00:00.000Z",
+            "updatedAt": "2026-11-09T16:12:12.512Z",
+            "state": {
+              "id": "0ea85422-5100-5ebd-b33a-868744fa532f",
+              "name": "In Progress",
+              "type": "started",
+              "color": "#f2c94c"
+            },
+            "team": {
+              "id": "d7d32559-2c30-5752-af1d-d1c6ccf15a2e",
+              "key": "DES",
+              "name": "Design"
+            },
+            "assignee": {
+              "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+              "name": "Ada Okafor",
+              "displayName": "ada",
+              "avatarUrl": "https://avatars.example.test/ada.png"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "id": "f31017bf-3590-56fc-8503-d9d9b324fd64",
+                  "name": "Branding",
+                  "color": "#f7c8c1",
+                  "parent": null
+                }
+              ]
+            },
+            "project": {
+              "id": "3163630f-ddfc-5c0e-87de-8249cba97736",
+              "name": "Beacon",
+              "color": "#4cb782"
+            },
+            "cycle": {
+              "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+              "number": 41,
+              "name": null
+            },
+            "creator": {
+              "id": "c40de612-aefd-556d-af82-9b7ec35e04c0"
+            },
+            "parent": null,
+            "children": {
+              "nodes": []
+            },
+            "projectMilestone": null,
+            "completedAt": null,
+            "canceledAt": null,
+            "pullRequests": {
+              "nodes": []
+            }
+          },
+          {
+            "id": "e1848065-d691-5b55-9af2-296ed88808ee",
+            "identifier": "ENG-113",
+            "title": "Surface queue depth on the status page",
+            "priority": 3,
+            "sortOrder": -31.5,
+            "estimate": 3,
+            "dueDate": "2026-11-27",
+            "url": "https://linear.app/acme/issue/ENG-113/surface-queue-depth-on-the-status-page",
+            "createdAt": "2026-11-01T10:00:00.000Z",
+            "updatedAt": "2026-11-08T14:00:00.000Z",
+            "state": {
+              "id": "e6fedd25-ff44-5529-84b5-e1a5e158666d",
+              "name": "Todo",
+              "type": "unstarted",
+              "color": "#e2e2e2"
+            },
+            "team": {
+              "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+              "key": "ENG",
+              "name": "Engineering"
+            },
+            "assignee": {
+              "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+              "name": "Ada Okafor",
+              "displayName": "ada",
+              "avatarUrl": "https://avatars.example.test/ada.png"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "id": "f8617d0d-ab27-507b-ab83-d87f63b708f2",
+                  "name": "Feature",
+                  "color": "#bb87fc",
+                  "parent": null
+                },
+                {
+                  "id": "2bedc668-6eb0-5a96-a66d-5200dfbde894",
+                  "name": "Customer",
+                  "color": "#5e6ad2",
+                  "parent": null
+                }
+              ]
+            },
+            "project": {
+              "id": "3163630f-ddfc-5c0e-87de-8249cba97736",
+              "name": "Beacon",
+              "color": "#4cb782"
+            },
+            "cycle": {
+              "id": "2179eb1f-aaad-55e6-bbe3-8399e87ce139",
+              "number": 42,
+              "name": "Polish sprint"
+            },
+            "creator": {
+              "id": "f149cdf3-5ed5-5c4a-b895-0af7f5a07d72"
+            },
+            "parent": null,
+            "children": {
+              "nodes": []
+            },
+            "projectMilestone": null,
+            "completedAt": null,
+            "canceledAt": null,
+            "pullRequests": {
+              "nodes": []
+            }
+          },
+          {
+            "id": "3353912c-f8bf-5cf5-82ad-ed107fad2a6e",
+            "identifier": "DES-22",
+            "title": "Audit color contrast on the settings screen",
+            "priority": 1,
+            "sortOrder": -42.0,
+            "estimate": null,
+            "dueDate": "2026-11-12",
+            "url": "https://linear.app/acme/issue/DES-22/audit-color-contrast-on-the-settings-scr",
+            "createdAt": "2026-11-02T09:00:00.000Z",
+            "updatedAt": "2026-11-08T08:30:00.000Z",
+            "state": {
+              "id": "b23a7d2f-89f4-5502-a61f-362948ef955d",
+              "name": "Todo",
+              "type": "unstarted",
+              "color": "#e2e2e2"
+            },
+            "team": {
+              "id": "d7d32559-2c30-5752-af1d-d1c6ccf15a2e",
+              "key": "DES",
+              "name": "Design"
+            },
+            "assignee": {
+              "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+              "name": "Ada Okafor",
+              "displayName": "ada",
+              "avatarUrl": "https://avatars.example.test/ada.png"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "id": "1d3607b6-d339-5a0d-860a-6e52b9672c64",
+                  "name": "Accessibility",
+                  "color": "#4cb782",
+                  "parent": null
+                }
+              ]
+            },
+            "project": null,
+            "cycle": null,
+            "creator": {
+              "id": "1bd93919-de71-5b4d-983f-f69c74716823"
+            },
+            "parent": null,
+            "children": {
+              "nodes": []
+            },
+            "projectMilestone": null,
+            "completedAt": null,
+            "canceledAt": null,
+            "pullRequests": {
+              "nodes": []
+            }
+          },
+          {
+            "id": "3b5c0246-c5ed-512a-bfa0-73c51f8435c5",
+            "identifier": "DES-24",
+            "title": "Prototype the keyboard shortcut overlay",
+            "priority": 2,
+            "sortOrder": -52.5,
+            "estimate": null,
+            "dueDate": null,
+            "url": "https://linear.app/acme/issue/DES-24/prototype-the-keyboard-shortcut-overlay",
+            "createdAt": "2026-11-04T09:00:00.000Z",
+            "updatedAt": "2026-11-07T13:00:00.000Z",
+            "state": {
+              "id": "b7e041cf-8498-5a3e-902b-a9da6b475bd5",
+              "name": "In Review",
+              "type": "started",
+              "color": "#4cb782"
+            },
+            "team": {
+              "id": "d7d32559-2c30-5752-af1d-d1c6ccf15a2e",
+              "key": "DES",
+              "name": "Design"
+            },
+            "assignee": {
+              "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+              "name": "Ada Okafor",
+              "displayName": "ada",
+              "avatarUrl": "https://avatars.example.test/ada.png"
+            },
+            "labels": {
+              "nodes": []
+            },
+            "project": {
+              "id": "5efd5ba8-d18e-528e-baee-30f02656bb32",
+              "name": "Atlas",
+              "color": "#bb87fc"
+            },
+            "cycle": null,
+            "creator": {
+              "id": "49ec13de-8cb6-55c0-a685-729f826fc158"
+            },
+            "parent": null,
+            "children": {
+              "nodes": []
+            },
+            "projectMilestone": {
+              "id": "6b1f1d8e-3c47-5a51-9e0b-6f2a4b1d7c10",
+              "name": "Beta launch"
+            },
+            "completedAt": null,
+            "canceledAt": null,
+            "pullRequests": {
+              "nodes": []
+            }
+          },
+          {
+            "id": "73f3da53-be6b-5f3b-9ef2-379633c75a7d",
+            "identifier": "ENG-116",
+            "title": "Review the on-call handoff checklist",
+            "priority": 3,
+            "sortOrder": -63.0,
+            "estimate": null,
+            "dueDate": null,
+            "url": "https://linear.app/acme/issue/ENG-116/review-the-on-call-handoff-checklist",
+            "createdAt": "2026-11-05T09:00:00.000Z",
+            "updatedAt": "2026-11-06T09:00:00.000Z",
+            "state": {
+              "id": "e6fedd25-ff44-5529-84b5-e1a5e158666d",
+              "name": "Todo",
+              "type": "unstarted",
+              "color": "#e2e2e2"
+            },
+            "team": {
+              "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+              "key": "ENG",
+              "name": "Engineering"
+            },
+            "assignee": {
+              "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+              "name": "Ada Okafor",
+              "displayName": "ada",
+              "avatarUrl": "https://avatars.example.test/ada.png"
+            },
+            "labels": {
+              "nodes": []
+            },
+            "project": null,
+            "cycle": null,
+            "creator": {
+              "id": "c40de612-aefd-556d-af82-9b7ec35e04c0"
+            },
+            "parent": null,
+            "children": {
+              "nodes": []
+            },
+            "projectMilestone": null,
+            "completedAt": null,
+            "canceledAt": null,
+            "pullRequests": {
+              "nodes": []
+            }
+          },
+          {
+            "id": "9f6a3a6e-a752-5d30-8400-bedbac0644a7",
+            "identifier": "DES-23",
+            "title": "Icon set refresh for the sidebar",
+            "priority": 4,
+            "sortOrder": -73.5,
+            "estimate": null,
+            "dueDate": null,
+            "url": "https://linear.app/acme/issue/DES-23/icon-set-refresh-for-the-sidebar",
+            "createdAt": "2026-10-12T09:00:00.000Z",
+            "updatedAt": "2026-10-29T09:00:00.000Z",
+            "state": {
+              "id": "532e8521-3561-586b-9a95-b432825e57bd",
+              "name": "Backlog",
+              "type": "backlog",
+              "color": "#bec2c8"
+            },
+            "team": {
+              "id": "d7d32559-2c30-5752-af1d-d1c6ccf15a2e",
+              "key": "DES",
+              "name": "Design"
+            },
+            "assignee": {
+              "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+              "name": "Ada Okafor",
+              "displayName": "ada",
+              "avatarUrl": "https://avatars.example.test/ada.png"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "id": "f31017bf-3590-56fc-8503-d9d9b324fd64",
+                  "name": "Branding",
+                  "color": "#f7c8c1",
+                  "parent": null
+                }
+              ]
+            },
+            "project": null,
+            "cycle": null,
+            "creator": {
+              "id": "f149cdf3-5ed5-5c4a-b895-0af7f5a07d72"
+            },
+            "parent": null,
+            "children": {
+              "nodes": []
+            },
+            "projectMilestone": null,
+            "completedAt": null,
+            "canceledAt": null,
+            "pullRequests": {
+              "nodes": []
+            }
+          },
+          {
+            "id": "bba99bc1-4b42-52c5-b120-34bd4dae8ece",
+            "identifier": "ENG-117",
+            "title": "Pairing notes for the schema migration",
+            "priority": 0,
+            "sortOrder": -84.0,
+            "estimate": null,
+            "dueDate": null,
+            "url": "https://linear.app/acme/issue/ENG-117/pairing-notes-for-the-schema-migration",
+            "createdAt": "2026-10-08T09:00:00.000Z",
+            "updatedAt": "2026-10-27T09:00:00.000Z",
+            "state": {
+              "id": "fc8ef667-f2fd-5635-94bc-2aadbd3f8211",
+              "name": "Backlog",
+              "type": "backlog",
+              "color": "#bec2c8"
+            },
+            "team": {
+              "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+              "key": "ENG",
+              "name": "Engineering"
+            },
+            "assignee": {
+              "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+              "name": "Ada Okafor",
+              "displayName": "ada",
+              "avatarUrl": "https://avatars.example.test/ada.png"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "id": "722ee3d9-d4fc-5e9a-a870-7be0ea75e237",
+                  "name": "Tech debt",
+                  "color": "#f2994a",
+                  "parent": null
+                }
+              ]
+            },
+            "project": null,
+            "cycle": null,
+            "creator": {
+              "id": "1bd93919-de71-5b4d-983f-f69c74716823"
+            },
+            "parent": null,
+            "children": {
+              "nodes": []
+            },
+            "projectMilestone": null,
+            "completedAt": null,
+            "canceledAt": null,
+            "pullRequests": {
+              "nodes": []
+            }
+          }
+        ],
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": "bba99bc1-4b42-52c5-b120-34bd4dae8ece"
+        }
+      }
+    }
+  }
+}

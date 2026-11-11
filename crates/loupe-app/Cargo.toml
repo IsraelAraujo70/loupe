@@ -1,0 +1,33 @@
+[package]
+name = "loupe-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "loupe"
+
+[[bin]]
+name = "loupe"
+path = "src/main.rs"
+
+[dependencies]
+loupe-update = { path = "../loupe-update" }
+loupe-github.workspace = true
+loupe-linear.workspace = true
+loupe-t3.workspace = true
+gpui-kit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+futures.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+
+[dev-dependencies]
+# GPUI's test platform (`TestAppContext`, `debug_bounds`) for UI tests. Taken
+# from `gpui-pre` itself: gpui-kit's own `test-support` drags `gpui-fast` into
+# the lockfile, whose exact pins conflict with the locked dependencies.
+gpui-pre = { version = "=0.3.11", features = ["test-support"] }

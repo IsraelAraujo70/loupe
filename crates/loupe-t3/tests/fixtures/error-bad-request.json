@@ -1,0 +1,6 @@
+{
+    "_tag": "EnvironmentRequestInvalidError",
+    "code": "invalid_request",
+    "reason": "invalid_history_cursor",
+    "traceId": "15096081d5790b5f4e92fd2326375de7"
+}

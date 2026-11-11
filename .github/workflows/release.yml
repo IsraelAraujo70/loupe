@@ -1,0 +1,134 @@
+name: Release
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Test version (0.x.y-rc.N)'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('loupe-validate-{0}', github.event.pull_request.number) || (github.ref != 'refs/heads/main' && format('loupe-test-{0}', github.ref)) || 'loupe-release' }}
+  cancel-in-progress: false
+  queue: max
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        env:
+          RELEASE_VERSION: ${{ inputs.version || (github.ref != 'refs/heads/main' && format('0.1.1-rc.{0}', github.run_number)) || '' }}
+        run: echo "version=$(python3 scripts/release-version.py)" >> "$GITHUB_OUTPUT"
+  linux:
+    needs: version
+    # Boat VM (8 vCPU, 16 GB): the GitHub-hosted runner took ~22 min and kept failing on the Azure apt mirror.
+    runs-on: boat-large
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies
+        run: |
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends pkg-config cmake build-essential curl libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libfreetype-dev libvulkan-dev libssl-dev libzstd-dev libasound2-dev
+      - name: Install toolchain
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Set artifact version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: python3 -c 'import os,pathlib,re; p=pathlib.Path("Cargo.toml"); p.write_text(re.sub(r"(?m)^version = .*", "version = \""+os.environ["VERSION"]+"\"", p.read_text(), count=1))'
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test -p loupe-github -p loupe-linear -p loupe-t3 -p loupe-update
+      - run: cargo build --release --bin loupe
+      - run: mkdir -p dist && cp target/release/loupe dist/loupe-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/loupe-linux-x86_64
+  macos:
+    needs: version
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require Xcode Metal compiler
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          sudo xcodebuild -license accept
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+          test "$(uname -m)" = arm64
+      - name: Import Loupe release signing identity
+        env:
+          LOUPE_SIGNING_P12_BASE64: ${{ secrets.LOUPE_SIGNING_P12_BASE64 }}
+          LOUPE_SIGNING_P12_PASSWORD: ${{ secrets.LOUPE_SIGNING_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${LOUPE_SIGNING_P12_BASE64:?Loupe signing certificate secret is required}"
+          : "${LOUPE_SIGNING_P12_PASSWORD:?Loupe signing password secret is required}"
+          certificate="$RUNNER_TEMP/loupe-signing.p12"
+          keychain="$RUNNER_TEMP/loupe-signing.keychain-db"
+          trap 'rm -f "$certificate"' EXIT
+          umask 077
+          printf '%s' "$LOUPE_SIGNING_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$LOUPE_SIGNING_P12_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$LOUPE_SIGNING_P12_PASSWORD" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$LOUPE_SIGNING_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$LOUPE_SIGNING_P12_PASSWORD" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Set artifact version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: python3 -c 'import os,pathlib,re; p=pathlib.Path("Cargo.toml"); p.write_text(re.sub(r"(?m)^version = .*", "version = \""+os.environ["VERSION"]+"\"", p.read_text(), count=1))'
+      - name: Bundle with Loupe release identity
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          LOUPE_CI_SIGNING_KEYCHAIN: ${{ runner.temp }}/loupe-signing.keychain-db
+        run: bash scripts/bundle-ci.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/loupe-macos-aarch64.zip
+      - name: Remove release signing keychain
+        if: always()
+        run: |
+          keychain="$RUNNER_TEMP/loupe-signing.keychain-db"
+          if [[ -f "$keychain" ]]; then security delete-keychain "$keychain"; fi
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: [version, linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish complete release with generated changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          args=()
+          if [[ "$VERSION" == *-rc.* ]]; then args+=(--prerelease); fi
+          gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" --title "Loupe $VERSION" --generate-notes "${args[@]}"
