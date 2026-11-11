@@ -391,6 +391,8 @@ def ascii_scene() -> list[list[tuple[str, str]]]:
         char = RAMP[min(len(RAMP) - 1, int(level * len(RAMP)))]
         return char, f"{color} p{int(travelled / 2.4) % PHASES}"
 
+    # No stars above the apex: those rows sit behind the hero's text, and a glyph under a letter hurts its contrast.
+    sky_top = int(apex[1] / CELL_H)
     grid = []
     for row in range(ART_ROWS):
         line = []
@@ -416,7 +418,7 @@ def ascii_scene() -> list[list[tuple[str, str]]]:
                         i = int(band)
                         level = 1 - abs(band - i - 0.5) * 1.5
                         cell = light(level, f"c{i}", beam_len + math.dist(hit, origin) + math.dist(p, origin))
-                    elif _star(col, row) < 0.022:
+                    elif row >= sky_top and _star(col, row) < 0.022:
                         r = _star(row, col)
                         cell = (STARS[int(r * len(STARS))], f"s s{int(r * 3)}")
             line.append(cell)
