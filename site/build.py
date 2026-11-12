@@ -32,7 +32,10 @@ EN = {
     "nav_faq": "FAQ",
     "switch_label": "Português",
     "switch_href": "/pt/",
-    "badge": "Open source · AGPL",
+    "diff_file": "your-week.md",
+    "diff_label": "One line removed, one added",
+    "hero_del": "twelve browser tabs for one review",
+    "fine": "Free and open source under the {agpl}, for macOS and Linux.",
     "hero": "GitHub reviews and Linear issues, in one fast desktop app.",
     "lede": "Loupe shows the pull requests waiting on you, the issues they close, and the CI behind them in one native window. Tabs, a command palette, and the keyboard first.",
     "cta_mac": "Download for macOS",
@@ -50,11 +53,14 @@ EN = {
     "week_title": "What changes in your week.",
     "week_lede": "The four things you do between commits, without a dozen browser tabs.",
     "week": [
-        ("Triage the inbox", "GitHub notifications filtered by organization, repository, or kind, and cleared in bulk."),
-        ("Review a pull request", "Conversation, files with a highlighted diff, and checks in one tab. Comment, approve, or request changes."),
-        ("Move a ticket", "Your Linear board next to the pull request that closes it. Change the status, assignee, or labels in place."),
-        ("See the CI", "Every check of a pull request, the workflow run behind it as a graph, the log of the step that failed, and Re-run."),
+        ("Triage the inbox", "Open each notification in a tab to see whether it needs you", "Notifications by organization, repository, or kind, cleared in bulk"),
+        ("Review a pull request", "Hop between the conversation, the files, and the checks", "Conversation, a highlighted diff, and checks in one tab"),
+        ("Move a ticket", "Find the Linear issue the pull request closes, in another app", "The Linear board beside the pull request: status, assignee, and labels in place"),
+        ("See the CI", "Dig through the Actions logs in the browser", "Every check, the run as a graph, the failing step's log, and Re-run"),
     ],
+    "checks_head": "4 checks passed",
+    "required": "Required",
+    "keys_label": "Shortcut",
     "features_title": "Everything a review needs, a keystroke away.",
     "features": [
         ("pull-request", "Pull requests", "Files with a syntax-highlighted diff, unified or split, with a tree you can filter and mark as viewed. Review threads, suggestions, and the merge box live in the same tab.", "A pull request's Files tab with the file tree and a unified diff"),
@@ -108,7 +114,10 @@ PT = {
     "nav_faq": "Perguntas",
     "switch_label": "English",
     "switch_href": "/",
-    "badge": "Open source · AGPL",
+    "diff_file": "sua-semana.md",
+    "diff_label": "Uma linha removida, uma adicionada",
+    "hero_del": "doze abas no navegador para uma revisão",
+    "fine": "Gratuito e open source sob a {agpl}, para macOS e Linux.",
     "hero": "Revisões do GitHub e issues do Linear, num app de desktop rápido.",
     "lede": "O Loupe mostra os pull requests que esperam por você, as issues que eles fecham e o CI por trás, numa janela nativa. Abas, paleta de comandos e teclado em primeiro lugar.",
     "cta_mac": "Baixar para macOS",
@@ -126,11 +135,14 @@ PT = {
     "week_title": "O que muda na sua semana.",
     "week_lede": "As quatro coisas que você faz entre um commit e outro, sem uma dúzia de abas no navegador.",
     "week": [
-        ("Triar o inbox", "Notificações do GitHub filtradas por organização, repositório ou tipo, e marcadas como lidas em lote."),
-        ("Revisar um PR", "Conversa, arquivos com diff colorido e checks na mesma aba. Comente, aprove ou peça mudanças."),
-        ("Mover um ticket", "O board do Linear ao lado do PR que fecha a issue. Mude status, responsável ou labels ali mesmo."),
-        ("Ver o CI", "Todos os checks do PR, o workflow por trás como um grafo, o log do passo que falhou e o Re-run."),
+        ("Triar o inbox", "Abrir cada notificação numa aba para ver se é com você", "Notificações por organização, repositório ou tipo, marcadas como lidas em lote"),
+        ("Revisar um PR", "Pular entre a conversa, os arquivos e os checks", "Conversa, diff colorido e checks na mesma aba"),
+        ("Mover um ticket", "Achar em outro app a issue do Linear que o PR fecha", "O board do Linear ao lado do PR: status, responsável e labels ali mesmo"),
+        ("Ver o CI", "Cavar os logs do Actions no navegador", "Todos os checks, o workflow como grafo, o log do passo que falhou e o Re-run"),
     ],
+    "checks_head": "4 verificações passaram",
+    "required": "Obrigatório",
+    "keys_label": "Atalho",
     "features_title": "Tudo o que uma revisão pede, a um atalho de distância.",
     "features": [
         ("pull-request", "Pull requests", "Arquivos com diff colorido, unificado ou lado a lado, com uma árvore que você filtra e marca como vista. Threads de revisão, sugestões e o merge ficam na mesma aba.", "A aba Files de um PR com a árvore de arquivos e um diff unificado"),
@@ -183,11 +195,12 @@ ICONS = {
     "pr": '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="18" r="3"/><path d="M6 9v6"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/>',
     "board": '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M15 3v18"/>',
     "check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+    "tick": '<path d="M20 6 9 17l-5-5"/>',
     "github": '<path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65S8.93 17.38 9 18v4"/><path d="M9 18c-4.51 2-5-2-7-2"/>',
     "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
 }
-TRUST_ICONS = ["lock", "code", "monitor", "user"]
-WEEK_ICONS = ["inbox", "pr", "board", "check"]
+# The shortcut that opens or drives each feature in the app (README, Keyboard shortcuts).
+KEYS = {"linear-board": ["F"], "palette": ["⌘", "K"], "themes": ["⌘", ","], "pull-request": ["J", "K"]}
 
 
 def icon(name: str) -> str:
@@ -209,19 +222,47 @@ def shot(name: str, alt: str, eager: bool = False) -> str:
     )
 
 
+def term(lines: list[str]) -> str:
+    """Shell lines as a small terminal, each behind a $ prompt."""
+    body = "".join(f'<span class="cmd"><span class="ps" aria-hidden="true">$</span>{e(line)}</span>' for line in lines)
+    return f'<pre class="term"><code>{body}</code></pre>'
+
+
+def keys(name: str, label: str) -> str:
+    if name not in KEYS:
+        return ""
+    caps = "".join(f"<kbd>{e(k)}</kbd>" for k in KEYS[name])
+    return f'<p class="keys"><span>{e(label)}</span>{caps}</p>'
+
+
 def page(t: dict) -> str:
     other = PT if t is EN else EN
     trust = "\n".join(
-        f'<li>{icon(i)}<div><h3>{e(a)}</h3><p>{e(b)}</p></div></li>' for i, (a, b) in zip(TRUST_ICONS, t["trust"])
+        f'<li><span class="ok">{icon("tick")}</span><div><h3>{e(a)}</h3><p>{e(b)}</p></div><span class="req">{e(t["required"])}</span></li>'
+        for a, b in t["trust"]
     )
     week = "\n".join(
-        f'<li><span class="chip">{icon(i)}</span><h3>{e(a)}</h3><p>{e(b)}</p></li>' for i, (a, b) in zip(WEEK_ICONS, t["week"])
+        f'<div class="hunk"><p class="at">@@ {e(title)} @@</p>'
+        f'<p class="ln del"><span class="no" aria-hidden="true">{n}</span><span class="sg" aria-hidden="true">−</span><del>{e(old)}</del></p>'
+        f'<p class="ln add"><span class="no" aria-hidden="true">{n}</span><span class="sg" aria-hidden="true">+</span><ins>{e(new)}</ins></p></div>'
+        for n, (title, old, new) in enumerate(t["week"], start=1)
     )
-    features = "\n".join(
-        f'<article class="feature"><div class="copy"><h3>{e(title)}</h3><p>{e(body)}</p></div>'
-        f'<figure class="frame">{shot(name, alt)}</figure></article>'
+    # The features as a Loupe window: one tab each, switched by radio buttons (no JavaScript), and labelled
+    # with Cmd+N, the app's own shortcut for the tab at that position.
+    radios = "".join(
+        f'<input class="sr-only" type="radio" name="feature" id="tab-{name}" aria-label="{e(title)}"{" checked" if i == 0 else ""}>'
+        for i, (name, title, _, _) in enumerate(t["features"])
+    )
+    tabbar = "".join(
+        f'<label for="tab-{name}"><span>{e(title)}</span><kbd aria-hidden="true">\u2318{i}</kbd></label>'
+        for i, (name, title, _, _) in enumerate(t["features"], start=1)
+    )
+    panels = "".join(
+        f'<article class="panel" data-tab="{name}"><figure class="shot">{shot(name, alt)}</figure>'
+        f'<div class="copy"><h3>{e(title)}</h3><p>{e(body)}</p>{keys(name, t["keys_label"])}</div></article>'
         for name, title, body, alt in t["features"]
     )
+    features = f'<div class="window">{radios}<div class="tabbar" aria-hidden="true"><span class="lights"><i></i><i></i><i></i></span>{tabbar}</div><div class="panels">{panels}</div></div>'
     steps = "".join(f"<li>{e(step)}</li>" for step in t["t3_steps"])
     faq = "\n".join(f"<details><summary>{e(q)}</summary><p>{e(a)}</p></details>" for q, a in t["faq"])
     return f"""<!doctype html>
@@ -244,6 +285,7 @@ def page(t: dict) -> str:
 <meta property="og:url" content="{URL}{t['path']}">
 <meta property="og:image" content="{URL}/img/reviews.webp">
 <meta name="twitter:card" content="summary_large_image">
+<link rel="preload" href="/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/style.css">
 <script src="/hero.js" defer></script>
 </head>
@@ -264,14 +306,17 @@ def page(t: dict) -> str:
 <main id="main">
 <section class="stage">
   <div class="wrap hero">
-    <p class="badge"><span class="dot"></span>{e(t['badge'])}</p>
-    <h1>{e(t['hero'])}</h1>
+    <div class="diff">
+      <p class="diff-head" aria-label="{e(t['diff_label'])}"><span class="file">{e(t['diff_file'])}</span><span class="add">+1</span><span class="del">−1</span><span class="blocks" aria-hidden="true"><i class="a"></i><i class="a"></i><i></i><i></i><i class="n"></i></span></p>
+      <h1><span class="ln del"><span class="sg" aria-hidden="true">−</span><del>{e(t['hero_del'])}</del></span><span class="ln add"><span class="sg" aria-hidden="true">+</span><ins>{e(t['hero'])}</ins></span></h1>
+    </div>
     <p class="lede">{e(t['lede'])}</p>
     <div class="ctas">
       <a class="btn primary" href="{MAC}">{icon('download')}{e(t['cta_mac'])}</a>
       <a class="btn" href="{LINUX}">{icon('download')}{e(t['cta_linux'])}</a>
-      <a class="btn ghost" href="{REPO}">{icon('github')}{e(t['cta_source'])}</a>
+      <a class="source" href="{REPO}">{icon('github')}{e(t['cta_source'])}</a>
     </div>
+    <p class="fine">{e(t['fine']).replace('{agpl}', f'<a href="{REPO}/blob/main/LICENSE">AGPL</a>')}</p>
   </div>
   <div class="art" aria-hidden="true">{ART}</div>
 </section>
@@ -281,25 +326,28 @@ def page(t: dict) -> str:
 
 <section class="wrap block" aria-labelledby="trust">
   <h2 id="trust">{e(t['trust_title'])}</h2>
-  <ul class="trust">
+  <div class="checks">
+    <p class="checks-head"><span class="ok">{icon('tick')}</span>{e(t['checks_head'])}</p>
+    <ul class="trust">
 {trust}
-  </ul>
+    </ul>
+  </div>
 </section>
 
 <section class="wrap block" aria-labelledby="week">
   <h2 id="week">{e(t['week_title'])}</h2>
   <p class="sub">{e(t['week_lede'])}</p>
-  <ul class="week">
+  <div class="pr">
 {week}
-  </ul>
+  </div>
 </section>
 
 <section class="wrap block" id="features" aria-labelledby="features-title">
   <h2 id="features-title">{e(t['features_title'])}</h2>
-  <div class="features">
 {features}
+  <div class="features">
     <article class="feature t3"><div class="copy"><h3>{e(t['t3_title'])}</h3><p>{e(t['t3_body'])}</p></div>
-    <div class="request" role="group" aria-label="{e(t['t3_request_label'])}"><p class="request-head">{icon('pr')}{e(t['t3_request_label'])}</p><ol>{steps}</ol></div></article>
+    <div class="request" role="group" aria-label="{e(t['t3_request_label'])}"><p class="request-head">{icon('pr')}<span>{'review-request.md' if t is EN else 'pedido-de-revisao.md'}</span></p><ol>{steps}</ol></div></article>
   </div>
 </section>
 
@@ -308,8 +356,8 @@ def page(t: dict) -> str:
   <p class="sub">{e(t['download_lede'])}</p>
   <div class="cards">
     <div class="card"><h3>{e(t['mac_title'])}</h3><p>{e(t['mac_note'])}</p><a class="btn primary" href="{MAC}">{icon('download')}{e(t['download_mac'])}</a></div>
-    <div class="card"><h3>{e(t['linux_title'])}</h3><p>{e(t['linux_note'])}</p><a class="btn primary" href="{LINUX}">{icon('download')}{e(t['download_linux'])}</a></div>
-    <div class="card"><h3>{e(t['source_title'])}</h3><p>{e(t['source_note'])}</p><a class="btn" href="{REPO}#build-from-source">{icon('code')}{e(t['download_source'])}</a></div>
+    <div class="card"><h3>{e(t['linux_title'])}</h3><p>{e(t['linux_note'])}</p>{term(["chmod +x loupe-linux-x86_64", "./loupe-linux-x86_64"])}<a class="btn primary" href="{LINUX}">{icon('download')}{e(t['download_linux'])}</a></div>
+    <div class="card"><h3>{e(t['source_title'])}</h3><p>{e(t['source_note'])}</p>{term(["git clone " + REPO, "cd loupe && cargo run --release"])}<a class="btn" href="{REPO}#build-from-source">{icon('code')}{e(t['download_source'])}</a></div>
   </div>
 </section>
 
@@ -322,7 +370,7 @@ def page(t: dict) -> str:
 </main>
 <footer class="wrap foot">
   <a class="brand" href="{t['path']}" aria-label="{'Loupe home' if t is EN else 'Início do Loupe'}">{logo('foot')}</a>
-  <p>{e(t['footer_made'])} <a href="{REPO}/blob/main/LICENSE">{e(t['footer_license'])}</a> · <a href="{REPO}">GitHub</a> · <a href="{t['switch_href']}" lang="{other['lang']}">{e(t['switch_label'])}</a></p>
+  <p class="foot-links"><span>{e(t['footer_made'])}</span><a href="{REPO}/blob/main/LICENSE">{e(t['footer_license'])}</a><a href="{REPO}">GitHub</a><a href="{t['switch_href']}" lang="{other['lang']}">{e(t['switch_label'])}</a></p>
 </footer>
 </body>
 </html>
@@ -341,17 +389,32 @@ def logo(where: str) -> str:
 ART = (SITE / "hero-frame.html").read_text().rstrip("\n")
 
 
+def tab_css() -> bytes:
+    """The rules that show the checked tab's panel; the CSP allows no inline style, so they join style.css."""
+    names = [name for name, *_ in EN["features"]]
+    assert names == [name for name, *_ in PT["features"]], "both pages must list the same features"
+    rules = "".join(
+        f"#tab-{n}:checked~.panels [data-tab={n}]{{display:grid}}\n"
+        f"#tab-{n}:checked~.tabbar [for=tab-{n}]{{color:var(--text);background:var(--window);border-color:var(--border)}}\n"
+        f"#tab-{n}:focus-visible~.tabbar [for=tab-{n}]{{outline:2px solid var(--accent);outline-offset:-2px}}\n"
+        for n in names
+    )
+    return ("/* Written by site/build.py: the feature tabs. */\n" + rules).encode()
+
+
 def outputs() -> dict[Path, bytes]:
     files = {
         OUT / "index.html": page(EN).encode(),
         OUT / "pt" / "index.html": page(PT).encode(),
-        OUT / "style.css": (SITE / "style.css").read_bytes() + (SITE / "hero.css").read_bytes(),
+        OUT / "style.css": (SITE / "style.css").read_bytes() + (SITE / "hero.css").read_bytes() + tab_css(),
         OUT / "favicon.svg": (SITE / "favicon.svg").read_bytes(),
         OUT / "hero.js": (SITE / "hero.js").read_bytes(),
         OUT / "404.html": (SITE / "404.html").read_bytes(),
     }
     for image in sorted((SITE / "img").glob("*.webp")):
         files[OUT / "img" / image.name] = image.read_bytes()
+    for font in sorted((SITE / "fonts").iterdir()):
+        files[OUT / "fonts" / font.name] = font.read_bytes()
     return files
 
 
