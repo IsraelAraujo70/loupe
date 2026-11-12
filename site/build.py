@@ -9,7 +9,6 @@ Only the standard library is used.
 """
 
 import html
-import math
 import shutil
 import sys
 from pathlib import Path
@@ -251,7 +250,7 @@ def page(t: dict) -> str:
 <a class="skip" href="#main">{'Skip to content' if t is EN else 'Pular para o conteúdo'}</a>
 <header class="top">
   <div class="wrap bar">
-    <a class="brand" href="{t['path']}">{LOGO} Loupe</a>
+    <a class="brand" href="{t['path']}" aria-label="{'Loupe home' if t is EN else 'Início do Loupe'}">{logo('top')}</a>
     <nav aria-label="{'Main' if t is EN else 'Principal'}">
       <a href="#features">{e(t['nav_features'])}</a>
       <a href="#download">{e(t['nav_download'])}</a>
@@ -273,7 +272,7 @@ def page(t: dict) -> str:
       <a class="btn ghost" href="{REPO}">{icon('github')}{e(t['cta_source'])}</a>
     </div>
   </div>
-  <pre class="ascii" aria-hidden="true">{ART}</pre>
+  <div class="art" aria-hidden="true"><pre class="still">{ART}</pre></div>
 </section>
 <div class="wrap">
   <figure class="hero-shot"><div class="frame">{shot('reviews', t['hero_alt'], eager=True)}</div><figcaption>{e(t['hero_caption'])}</figcaption></figure>
@@ -321,7 +320,7 @@ def page(t: dict) -> str:
 </section>
 </main>
 <footer class="wrap foot">
-  <a class="brand" href="{t['path']}">{LOGO} Loupe</a>
+  <a class="brand" href="{t['path']}" aria-label="{'Loupe home' if t is EN else 'Início do Loupe'}">{logo('foot')}</a>
   <p>{e(t['footer_made'])} <a href="{REPO}/blob/main/LICENSE">{e(t['footer_license'])}</a> · <a href="{REPO}">GitHub</a> · <a href="{t['switch_href']}" lang="{other['lang']}">{e(t['switch_label'])}</a></p>
 </footer>
 </body>
@@ -329,128 +328,23 @@ def page(t: dict) -> str:
 """
 
 
-# The hero's ASCII scene: a beam of white light enters a prism and leaves as five bands.
-# Geometry is in em, on a grid of cells 0.6em wide and 1.2em tall (a monospace glyph at
-# line-height 1.2), so the shapes keep their proportions whatever the font size.
-ART_COLS, ART_ROWS = 120, 40
-CELL_W, CELL_H = 0.6, 1.2
-APEX_Y = 27.0  # em from the top: the CSS pulls the art up by this much so the text sits above the prism
-PHASES = 8  # the CSS animates one shimmer that runs along the light, phase by phase
-RAMP = ".:-=+*#"
-STARS = ".·'+*"
-
-Point = tuple[float, float]
+def logo(where: str) -> str:
+    """The wordmark, inlined so its ink takes the text colour; each copy gets its own gradient id."""
+    svg = (SITE / "logo.svg").read_text().strip()
+    return (svg.replace('<svg ', '<svg class="logo" aria-hidden="true" focusable="false" ', 1)
+            .replace(' role="img" aria-label="Loupe"', '')
+            .replace('id="diff"', f'id="diff-{where}"').replace('url(#diff)', f'url(#diff-{where})'))
 
 
-def _lerp(a: Point, b: Point, t: float) -> Point:
-    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
-
-
-def _along(p: Point, a: Point, b: Point) -> tuple[float, float]:
-    """Distance from p to segment ab, and how far along ab (0..1) the closest point is."""
-    dx, dy = b[0] - a[0], b[1] - a[1]
-    t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy)))
-    return math.dist(p, (a[0] + dx * t, a[1] + dy * t)), t
-
-
-def _star(col: int, row: int) -> float:
-    """A fixed pseudo-random number in [0, 1) per cell, so every build draws the same sky."""
-    n = (col * 374761393 + row * 668265263) & 0xFFFFFFFF
-    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
-    return (n ^ (n >> 16)) / 2**32
-
-
-def ascii_scene() -> list[list[tuple[str, str]]]:
-    """Every cell of the scene as (character, CSS classes); a space has no class."""
-    height = 14.5
-    half = height / math.sqrt(3)
-    apex = (ART_COLS * CELL_W / 2, APEX_Y)
-    left, right = (apex[0] - half, apex[1] + height), (apex[0] + half, apex[1] + height)
-    beam_start, hit = (-1.0, apex[1] + 10.5), _lerp(apex, left, 0.6)
-    beam_len = math.dist(beam_start, hit)
-    exits = [_lerp(apex, right, 0.36 + 0.06 * i) for i in range(5)]
-    origin, far = exits[2], ART_COLS * CELL_W
-    top = math.atan2(apex[1] + 3 - origin[1], far - origin[0])
-    bottom = math.atan2(apex[1] + 19 - origin[1], far - origin[0])
-
-    # The outline: one glyph per row on each face, and the base drawn with underscores.
-    outline: dict[tuple[int, int], str] = {}
-    base_row = round(left[1] / CELL_H - 0.5)
-    for row in range(int(apex[1] / CELL_H), base_row + 1):
-        y = max(apex[1], (row + 0.5) * CELL_H)
-        reach = half * (y - apex[1]) / height
-        l_col, r_col = int((apex[0] - reach) / CELL_W), int((apex[0] + reach) / CELL_W)
-        if row == base_row:
-            outline.update({(row, c): "_" for c in range(l_col + 1, r_col)})
-        outline[(row, l_col)], outline[(row, max(r_col, l_col + 1))] = "/", "\\"
-
-    def inside(p: Point) -> bool:
-        return left[1] > p[1] > apex[1] and abs(p[0] - apex[0]) < half * (p[1] - apex[1]) / height
-
-    def light(level: float, color: str, travelled: float) -> tuple[str, str]:
-        char = RAMP[min(len(RAMP) - 1, int(level * len(RAMP)))]
-        return char, f"{color} p{int(travelled / 2.4) % PHASES}"
-
-    # No stars above the apex: those rows sit behind the hero's text, and a glyph under a letter hurts its contrast.
-    sky_top = int(apex[1] / CELL_H)
-    grid = []
-    for row in range(ART_ROWS):
-        line = []
-        for col in range(ART_COLS):
-            p = ((col + 0.5) * CELL_W, (row + 0.5) * CELL_H)
-            cell = (" ", "")
-            if (row, col) in outline:
-                cell = (outline[(row, col)], "e")
-            elif inside(p):
-                # Inside the glass the light already splits: five faint threads.
-                d, t, i = min(_along(p, hit, x) + (i,) for i, x in enumerate(exits))
-                if d < 0.3:
-                    cell = light(0.3, f"c{i}", beam_len + t * math.dist(hit, exits[i]))
-            else:
-                d, t = _along(p, beam_start, hit)
-                if d < 0.8:
-                    cell = light(1 - d / 0.8, "w", t * beam_len)
-                else:
-                    # Out of the glass: a wedge of five bands, red on top, fanning from the right face.
-                    f = (math.atan2(p[1] - origin[1], p[0] - origin[0]) - top) / (bottom - top)
-                    if 0 <= f < 1 and p[0] > origin[0]:
-                        band = f * len(exits)
-                        i = int(band)
-                        level = 1 - abs(band - i - 0.5) * 1.5
-                        cell = light(level, f"c{i}", beam_len + math.dist(hit, origin) + math.dist(p, origin))
-                    elif row >= sky_top and _star(col, row) < 0.022:
-                        r = _star(row, col)
-                        cell = (STARS[int(r * len(STARS))], f"s s{int(r * 3)}")
-            line.append(cell)
-        grid.append(line)
-    return grid
-
-
-def ascii_hero() -> str:
-    """The scene as HTML: one span per run of cells with the same classes."""
-    rows = []
-    for line in ascii_scene():
-        out, run, cls = [], "", None
-        for char, c in line + [("", None)]:
-            if c != cls and run:
-                out.append(f'<span class="{cls}">{e(run)}</span>' if cls else run)
-                run = ""
-            run, cls = run + char, c
-        rows.append("".join(out).rstrip())
-    return "\n".join(rows)
-
-
-# The header's mark is inlined so its prism takes the text color; the scene is built once for both pages.
-LOGO = (SITE / "logo.svg").read_text().strip().replace(
-    '<svg ', '<svg class="logo" width="28" height="28" aria-hidden="true" ', 1).replace(' role="img" aria-label="Loupe"', '')
-ART = ascii_hero()
+# The hero's still frame (site/hero-frame.js writes it from hero.js); hero.js swaps in the live scene.
+ART = (SITE / "hero-frame.html").read_text().rstrip("\n")
 
 
 def outputs() -> dict[Path, bytes]:
     files = {
         OUT / "index.html": page(EN).encode(),
         OUT / "pt" / "index.html": page(PT).encode(),
-        OUT / "style.css": (SITE / "style.css").read_bytes(),
+        OUT / "style.css": (SITE / "style.css").read_bytes() + (SITE / "hero.css").read_bytes(),
         OUT / "favicon.svg": (SITE / "favicon.svg").read_bytes(),
         OUT / "hero.js": (SITE / "hero.js").read_bytes(),
         OUT / "404.html": (SITE / "404.html").read_bytes(),
