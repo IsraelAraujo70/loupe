@@ -12,6 +12,7 @@ Files written:
   assets/icon-dark.svg            the dark tile, drawn whole (a preview of the Dark appearance)
   assets/icon-small.svg           the light tile with the mark's small-size cut, for 16 and 32 px
   assets/Loupe.icns               icon.svg and icon-small.svg at every size, for macOS before 26
+  assets/icon.lock                the hash of the drawings and of each raster, read by --check
   assets/linux/dev.loupe.app.svg  the Linux icon (the light tile), installed by the app for its .desktop
   assets/linux/dev.loupe.app.png  the same at 256 px, for desktops that do not read SVG
 
@@ -19,11 +20,13 @@ The bundle scripts compile AppIcon.icon with actool (Xcode 26) into Assets.car a
 (CFBundleIconName); Loupe.icns stays as CFBundleIconFile, the icon older macOS shows.
 Rendering needs Playwright's Chromium (CHROME, or the newest one in ~/.cache/ms-playwright) and ImageMagick.
 
---check renders nothing: it fails unless the vector files are what this script writes and Loupe.icns holds a
-square RGBA PNG of the right size for every entry macOS uses.
+--check renders nothing: it fails unless the vector files are what this script writes, icon.lock matches
+both them and the rasters on disk, and Loupe.icns holds a square RGBA PNG of the right size for every entry
+macOS uses.
 """
 
 import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -117,19 +120,24 @@ def icon_json() -> str:
                 ],
                 **group,
             },
-            {"layers": [{"image-name": "back.svg", "name": "back"}], **group},
+            {"layers": [{"image-name": "back.png", "name": "back"}], **group},
         ],
         "supported-platforms": {"squares": ["macOS"]},
     }
     return json.dumps(doc, indent=2) + "\n"
 
 
+def back_layer() -> str:
+    """The back face alone, as SVG. It ships as back.png: Icon Composer's SVG import does not take gradients."""
+    back, _ = parts(logo.MARK, FULL_WIDTH, "diff")
+    return layer(back)
+
+
 def vectors() -> dict[Path, str]:
-    back, front = parts(logo.MARK, FULL_WIDTH, "diff")
+    _, front = parts(logo.MARK, FULL_WIDTH, "diff")
     return {
         ASSETS / "AppIcon.icon/icon.json": icon_json(),
         ASSETS / "AppIcon.icon/Assets/front.svg": layer(front.replace("INK", INK["light"])),
-        ASSETS / "AppIcon.icon/Assets/back.svg": layer(back),
         ASSETS / "icon.svg": tile("light", logo.MARK, FULL_WIDTH, "Loupe"),
         ASSETS / "icon-dark.svg": tile("dark", logo.MARK, FULL_WIDTH, "Loupe"),
         ASSETS / "icon-small.svg": tile("light", logo.FAVICON, SMALL_WIDTH, "Loupe (16 and 32 px)"),
@@ -223,6 +231,26 @@ def check(path: Path) -> None:
     print(f"{path}: {len(ICNS)} entries, all square RGBA PNGs of the right size")
 
 
+# The rasters, and icon.lock: the hash of everything they are drawn from and the hash of each raster, so
+# --check catches a raster that is stale (drawn from other vectors) or replaced, without rendering.
+RASTERS = [ASSETS / "Loupe.icns", ASSETS / "linux/dev.loupe.app.png", ASSETS / "AppIcon.icon/Assets/back.png"]
+LOCK = ASSETS / "icon.lock"
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def source_hash(files: dict[Path, str]) -> str:
+    text = "".join(f"{p.relative_to(ROOT)}\n{t}" for p, t in sorted(files.items())) + back_layer()
+    return sha(text.encode())
+
+
+def lock_text(files: dict[Path, str]) -> str:
+    rasters = {str(p.relative_to(ROOT)): sha(p.read_bytes()) for p in RASTERS}
+    return json.dumps({"source": source_hash(files), "rasters": rasters}, indent=2) + "\n"
+
+
 def main() -> None:
     target = ASSETS / "Loupe.icns"
     files = vectors()
@@ -230,16 +258,27 @@ def main() -> None:
         stale = [p for p, text in files.items() if not p.exists() or p.read_text() != text]
         if stale:
             sys.exit("out of date, run scripts/make-icon.py: " + ", ".join(str(p.relative_to(ROOT)) for p in stale))
+        lock = json.loads(LOCK.read_text()) if LOCK.exists() else {}
+        if lock.get("source") != source_hash(files):
+            sys.exit("the rasters were drawn from other vectors: run scripts/make-icon.py")
+        for path in RASTERS:
+            if lock.get("rasters", {}).get(str(path.relative_to(ROOT))) != sha(path.read_bytes()):
+                sys.exit(f"{path.relative_to(ROOT)} is not the file scripts/make-icon.py rendered: run it again")
         check(target)
         return
     for path, text in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    drawings = {"full": ASSETS / "icon.svg", "small": ASSETS / "icon-small.svg"}
     with tempfile.TemporaryDirectory() as tmp:
-        pngs = render(drawings, sorted({(px, name) for _, px, name in ICNS}), Path(tmp))
+        back = Path(tmp) / "back.svg"
+        back.write_text(back_layer())
+        drawings = {"full": ASSETS / "icon.svg", "small": ASSETS / "icon-small.svg", "back": back}
+        sizes = sorted({(px, name) for _, px, name in ICNS} | {(1024, "back")})
+        pngs = render(drawings, sizes, Path(tmp))
     target.write_bytes(icns([(kind, pngs[(px, name)]) for kind, px, name in ICNS]))
     (ASSETS / "linux/dev.loupe.app.png").write_bytes(pngs[(256, "full")])
+    (ASSETS / "AppIcon.icon/Assets/back.png").write_bytes(pngs[(1024, "back")])
+    LOCK.write_text(lock_text(files))
     check(target)
 
 

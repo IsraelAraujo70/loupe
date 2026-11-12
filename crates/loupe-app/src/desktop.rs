@@ -5,7 +5,9 @@
 //!
 //! Each file is written only when its contents differ, so a launch after an update in place (or from
 //! another path) refreshes `Exec`, and every other launch writes nothing. Failures are reported and
-//! ignored: the app works without the entry.
+//! ignored: the app works without the entry. It is skipped when `LOUPE_DESKTOP_ENTRY=0`, for a build
+//! under a Cargo `target/` directory (`cargo run` would fight the installed binary for `Exec`), and for
+//! a path an entry cannot hold (a control character, or a `%`, which desktops read as a field code).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,7 +20,9 @@ const ICON_PNG: &[u8] = include_bytes!("../../../assets/linux/dev.loupe.app.png"
 
 /// Register Loupe with the desktop, best effort. Does nothing outside Linux.
 pub fn install() {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(target_os = "linux")
+        || std::env::var_os("LOUPE_DESKTOP_ENTRY").is_some_and(|v| v == "0")
+    {
         return;
     }
     let Some(data_home) = data_home() else { return };
@@ -29,6 +33,9 @@ pub fn install() {
             return;
         }
     };
+    if !registrable(&exe) {
+        return;
+    }
     if let Err(error) = sync(&data_home, &exe) {
         eprintln!(
             "loupe: could not write the desktop entry under {}: {error}",
@@ -37,11 +44,22 @@ pub fn install() {
     }
 }
 
-/// `$XDG_DATA_HOME`, or `~/.local/share`.
+/// Whether an entry should start this binary: not a Cargo build, and a path an `Exec` line can hold.
+fn registrable(exe: &Path) -> bool {
+    let cargo_build = exe
+        .parent()
+        .and_then(|profile| profile.parent())
+        .and_then(|target| target.file_name())
+        .is_some_and(|name| name == "target");
+    let text = exe.to_string_lossy();
+    !cargo_build && !text.contains('%') && !text.chars().any(char::is_control)
+}
+
+/// `$XDG_DATA_HOME` if it is absolute (the XDG spec ignores a relative one), or `~/.local/share`.
 fn data_home() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
-        .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
 }
 
@@ -114,7 +132,7 @@ fn exec_arg(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{APP_ID, desktop_entry, exec_arg, sync};
+    use super::{APP_ID, desktop_entry, exec_arg, registrable, sync};
     use std::path::Path;
 
     #[test]
@@ -123,6 +141,17 @@ mod tests {
         assert_eq!(exec_arg("/opt/my apps/loupe"), r#""/opt/my apps/loupe""#);
         // `$` is escaped for the quoting layer, and that backslash is escaped again for the file.
         assert_eq!(exec_arg("/tmp/$x/100%/loupe"), r#""/tmp/\\$x/100%%/loupe""#);
+    }
+
+    #[test]
+    fn cargo_builds_and_unholdable_paths_are_not_registered() {
+        assert!(registrable(Path::new("/home/a/bin/loupe-linux-x86_64")));
+        assert!(!registrable(Path::new("/home/a/loupe/target/debug/loupe")));
+        assert!(!registrable(Path::new(
+            "/home/a/loupe/target/release/loupe"
+        )));
+        assert!(!registrable(Path::new("/home/a/100%/loupe")));
+        assert!(!registrable(Path::new("/home/a/two\nlines/loupe")));
     }
 
     #[test]
