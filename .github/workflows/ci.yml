@@ -32,6 +32,8 @@ jobs:
         run: python3 scripts/make-icon.py --check
       - name: Logo
         run: python3 scripts/make-logo.py --check
+      - name: Website hero frame
+        run: node site/hero-frame.js --check
       - name: Website
         run: python3 site/build.py
       - name: Clippy

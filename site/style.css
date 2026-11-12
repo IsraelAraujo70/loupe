@@ -57,10 +57,10 @@ p { margin: 0; }
   border-bottom: 1px solid var(--border-subtle);
 }
 .bar { display: flex; align-items: center; justify-content: space-between; height: 60px; gap: 16px; }
-.brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); font-weight: 650; font-size: 17px; }
+.brand { display: inline-flex; align-items: center; color: var(--text); }
 .brand:hover { text-decoration: none; }
-.logo { flex: none; }
-.foot .logo { width: 22px; height: 22px; }
+.logo { flex: none; display: block; height: 32px; width: auto; }
+.foot .logo { height: 24px; }
 nav { display: flex; align-items: center; gap: 4px; }
 nav a { color: var(--muted); font-size: 14px; padding: 8px 10px; border-radius: 8px; }
 nav a:hover { color: var(--text); background: #ffffff0a; text-decoration: none; }
@@ -95,45 +95,27 @@ nav .gh { display: inline-flex; padding: 8px; }
   border: 1px solid var(--border); background: var(--panel);
   box-shadow: 0 30px 80px -20px #000000b3, 0 0 0 1px #00000066;
 }
-/* The ASCII scene: behind the hero's text, pulled up so the prism sits under the buttons. */
+/* The hero's scene: a band under the buttons, the full width of the page. Without JavaScript it is the
+   still frame (160 x 32 cells scaled to the width); hero.js replaces it with a live canvas sized to the band. */
 .stage { position: relative; overflow: hidden; }
 .stage .hero { position: relative; z-index: 1; }
-.ascii {
-  position: relative; left: 50%; transform: translateX(-50%);
-  width: max-content; margin: calc(48px - 27em) 0 0;
-  font: clamp(7.5px, 1.389vw, 17px)/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
-  color: var(--faint); white-space: pre; pointer-events: none; user-select: none;
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 10% 90%, transparent), linear-gradient(transparent, #000 25%);
-  -webkit-mask-composite: source-in;
-  mask-image: linear-gradient(90deg, transparent, #000 10% 90%, transparent), linear-gradient(transparent, #000 25%);
-  mask-composite: intersect;
+.art {
+  --band: clamp(280px, 38vw, 540px);
+  position: relative; height: var(--band); margin-top: clamp(-120px, -7vw, -24px); overflow: hidden;
+  pointer-events: none; user-select: none;
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-image: linear-gradient(transparent, #000 22%, #000 82%, transparent);
+  mask-image: linear-gradient(transparent, #000 22%, #000 82%, transparent);
 }
-.ascii .e { color: var(--text); }
-.ascii .w { color: #ffffff; }
-.ascii .c0 { color: #ff3b30; }
-.ascii .c1 { color: #ffcc00; }
-.ascii .c2 { color: #30c84b; }
-.ascii .c3 { color: #438bff; }
-.ascii .c4 { color: #a855f7; }
-.ascii .s { color: #50545e; }
-.ascii .s2 { color: #747884; }
-/* hero.js adds .live only when motion is allowed and the scene is on screen. */
-@media (prefers-reduced-motion: no-preference) {
-  .ascii.live [class*=" p"] { animation: shine 2.4s steps(1, end) infinite; }
-  .ascii.live .p0 { animation-delay: -2.4s; }
-  .ascii.live .p1 { animation-delay: -2.1s; }
-  .ascii.live .p2 { animation-delay: -1.8s; }
-  .ascii.live .p3 { animation-delay: -1.5s; }
-  .ascii.live .p4 { animation-delay: -1.2s; }
-  .ascii.live .p5 { animation-delay: -0.9s; }
-  .ascii.live .p6 { animation-delay: -0.6s; }
-  .ascii.live .p7 { animation-delay: -0.3s; }
-  .ascii.live .s0 { animation: twinkle 3.3s steps(1, end) infinite; }
-  .ascii.live .s1 { animation: twinkle 4.7s steps(1, end) -1.6s infinite; }
-  .ascii.live .s2 { animation: twinkle 5.9s steps(1, end) -3.1s infinite; }
+.art .still {
+  position: absolute; left: 50%; bottom: 0; transform: translateX(-50%); margin: 0;
+  /* 160 columns fill the width; 32 rows of 1.2em never exceed the band. */
+  font: min(calc(100vw / 96), calc(var(--band) / 38.4))/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  color: var(--faint); white-space: pre;
 }
-@keyframes shine { 0% { opacity: 1; } 12.5% { opacity: 0.6; } }
-@keyframes twinkle { 0% { opacity: 1; } 50% { opacity: 0.3; } }
+.art canvas { position: absolute; left: 50%; top: 0; transform: translateX(-50%); }
+.art .glow { filter: blur(9px); opacity: 0.5; }
+.art.live .still { display: none; }
 
 .hero-shot { margin-top: 24px; position: relative; }
 .hero-shot::before {
@@ -184,7 +166,7 @@ nav .gh { display: inline-flex; padding: 8px; }
 
 .foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 112px; padding-top: 28px; padding-bottom: 40px; border-top: 1px solid var(--border-subtle); color: var(--faint); font-size: 14px; }
 .foot a { color: var(--muted); }
-.foot .brand { color: var(--text); font-size: 15px; }
+.foot .brand { color: var(--text); }
 
 /* Smaller screens */
 @media (max-width: 960px) {
