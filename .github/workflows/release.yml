@@ -63,7 +63,8 @@ jobs:
           path: dist/loupe-linux-x86_64
   macos:
     needs: version
-    runs-on: macos-15
+    # macOS 26: actool compiles the Icon Composer app icon only on a macOS 26 host (scripts/compile-app-icon.sh).
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Require Xcode Metal compiler

@@ -3,6 +3,7 @@ extern crate gpui_kit as gpui;
 
 mod assets;
 mod cache;
+mod desktop;
 mod github;
 mod linear;
 mod links;
@@ -25,6 +26,7 @@ use crate::shell::Workspace;
 use crate::store::Settings;
 
 fn main() {
+    desktop::install();
     let app = gpui_kit::application().with_assets(assets::LoupeAssets);
     // macOS hands over `loupe://` URLs and the links Finicky sends; the
     // platform callback has no `App`, so the URLs wait in a channel.
@@ -60,6 +62,8 @@ fn main() {
             app_owns_titlebar_drag: true,
             window_background: theme::window_background(),
             window_min_size: Some(size(px(900.), px(560.))),
+            // Linux docks match it to the desktop entry `desktop::install` writes, for the icon.
+            app_id: Some(desktop::APP_ID.into()),
             ..Default::default()
         };
         gpui_kit::open_window(options, cx, |window, cx| {

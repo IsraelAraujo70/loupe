@@ -49,8 +49,10 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 echo "==> icon"
-# Built by scripts/make-icon.py, with a simpler drawing at 16 and 32 px.
+# Built by scripts/make-icon.py: Loupe.icns for macOS before 26, and the Icon Composer file that
+# actool compiles into Assets.car for macOS 26's Light and Dark icons (skipped without Xcode 26).
 cp "$root/assets/Loupe.icns" "$app/Contents/Resources/Loupe.icns"
+"$root/scripts/compile-app-icon.sh" "$app/Contents/Resources" --optional
 
 echo "==> bundle"
 cp "$binary" "$app/Contents/MacOS/loupe"
@@ -66,6 +68,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Loupe</string>
   <key>CFBundleExecutable</key><string>loupe</string>
   <key>CFBundleIconFile</key><string>Loupe</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleShortVersionString</key><string>$version</string>

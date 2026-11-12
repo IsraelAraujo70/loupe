@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
-"""Write Loupe's app icon: assets/icon.svg, assets/icon-small.svg, and assets/Loupe.icns.
+"""Write Loupe's app icon from the brand mark (scripts/make-logo.py): the prism in depth, its back face lit
+like a diff, on a tile.
 
 Usage: scripts/make-icon.py [--check]
 
-The icon is a glass prism on a white tile: a white beam enters from the left and
-leaves to the right as red, yellow, green, and blue bands.
-icon.svg is the full drawing. icon-small.svg is the same idea with fewer details
-and thicker bands, for the 16 and 32 px images, where the full drawing blurs.
+Files written:
+  assets/AppIcon.icon/            the Icon Composer document macOS 26 builds the icon from, with its Light
+                                  and Dark appearances: a tile fill per appearance, the front face (ink on
+                                  light, paper on dark), and the back face in the diff gradient
+  assets/icon.svg                 the light tile, drawn whole (also the Linux icon's source)
+  assets/icon-dark.svg            the dark tile, drawn whole (a preview of the Dark appearance)
+  assets/icon-small.svg           the light tile with the mark's small-size cut, for 16 and 32 px
+  assets/Loupe.icns               icon.svg and icon-small.svg at every size, for macOS before 26
+  assets/icon.lock                the hash of the drawings and of each raster, read by --check
+  assets/linux/dev.loupe.app.svg  the Linux icon (the light tile), installed by the app for its .desktop
+  assets/linux/dev.loupe.app.png  the same at 256 px, for desktops that do not read SVG
 
-The .icns is built here, not with sips and iconutil on a Mac, so that it carries
-the small drawing at 16 and 32 px and the CI release bundle can use it as is.
-Rendering needs Playwright's Chromium (CHROME, or the newest one in
-~/.cache/ms-playwright) and ImageMagick (`magick`).
+The bundle scripts compile AppIcon.icon with actool (Xcode 26) into Assets.car and name it in Info.plist
+(CFBundleIconName); Loupe.icns stays as CFBundleIconFile, the icon older macOS shows.
+Rendering needs Playwright's Chromium (CHROME, or the newest one in ~/.cache/ms-playwright) and ImageMagick.
 
---check renders nothing: it reads assets/Loupe.icns and fails unless it holds a
-square PNG of the right size for every entry macOS uses.
+--check renders nothing: it fails unless the vector files are what this script writes, icon.lock matches
+both them and the rasters on disk, and Loupe.icns holds a square RGBA PNG of the right size for every entry
+macOS uses.
 """
 
 import glob
+import hashlib
+import importlib.util
+import json
 import os
 import struct
 import subprocess
@@ -28,173 +39,110 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
 
+_spec = importlib.util.spec_from_file_location("make_logo", Path(__file__).with_name("make-logo.py"))
+logo = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(logo)
+
+# The macOS tile (Big Sur grid: 824 of 1024, continuous corners).
 TILE = (
     "M280 100H744C868 100 924 156 924 280V744C924 868 868 924 744 924"
     "H280C156 924 100 868 100 744V280C100 156 156 100 280 100Z"
 )
+PAPER = {"light": ("#ffffff", "#eceff3"), "dark": ("#2c2f36", "#101114")}
+INK = {"light": logo.INK["light"], "dark": logo.INK["dark"]}
 
-# Prism, seen from the front: an outer triangle and the inner face, joined by three bevels.
-APEX, LEFT, RIGHT = (512, 262), (300, 660), (724, 660)
-IN_APEX, IN_LEFT, IN_RIGHT = (512, 300), (424, 582), (600, 582)
-
-BANDS = ["#ff3b30", "#ffd60a", "#30c84b", "#438bff"]  # the blue is the app's accent
-
-# The beam meets the prism's left edge here.
-ENTRY = (408, 457)
+# The mark's width on the tile, centred, a little above the middle (the optical centre).
+FULL_WIDTH, SMALL_WIDTH, LIFT = 560, 660, 14
 
 
-def on_right_edge(y: float) -> tuple[float, float]:
-    """The point of the prism's outer right edge at height y."""
-    (x0, y0), (x1, y1) = APEX, RIGHT
-    return (x0 + (y - y0) * (x1 - x0) / (y1 - y0), y)
+def placed(mark, width: float) -> tuple[tuple[float, float], float]:
+    """Origin and scale that centre the mark's ink, `width` wide, on the 1024 canvas."""
+    w, h = mark.size
+    scale = width / w
+    return ((1024 - w * scale) / 2, (1024 - h * scale) / 2 - LIFT), scale
 
 
-def pt(p: tuple[float, float]) -> str:
-    return f"{p[0]:.1f} {p[1]:.1f}"
+def parts(mark, width: float, gradient_id: str) -> tuple[str, str]:
+    """The back face (with its gradient) and the front face, as SVG elements on the 1024 canvas."""
+    origin, scale = placed(mark, width)
+    drawn = mark.draw("INK", origin, scale, gradient_id=gradient_id)
+    back_end = drawn.index('<path d="', drawn.index("</defs>") + 7)
+    back_end = drawn.index("/>", back_end) + 2
+    return drawn[:back_end], drawn[back_end:]
 
 
-def poly(*points: tuple[float, float]) -> str:
-    return "M" + "L".join(pt(p) for p in points) + "Z"
-
-
-def band_paths(face_top: float, face_step: float, edge_top: float, edge_step: float) -> list[str]:
-    """Four bands from the prism's right edge to past the tile's right edge (the tile clips them)."""
-    out = []
-    for k in range(4):
-        a = on_right_edge(face_top + face_step * k)
-        b = on_right_edge(face_top + face_step * (k + 1))
-        far = 960
-        out.append(poly(a, (far, edge_top + edge_step * k), (far, edge_top + edge_step * (k + 1)), b))
-    return out
-
-
-def svg(title: str, defs: str, body: str) -> str:
+def tile(scheme: str, mark, width: float, title: str) -> str:
+    top, bottom = PAPER[scheme]
+    back, front = parts(mark, width, "diff")
     return (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">\n'
-        "  <!-- Generated by scripts/make-icon.py, which also builds assets/Loupe.icns: edit it there. -->\n"
-        f"  <title>{title}</title>\n"
-        f"  <defs>\n{defs}\n  </defs>\n"
-        f"{body}\n"
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" '
+        f'aria-label="{title}">'
+        "<!-- Generated by scripts/make-icon.py from the mark in scripts/make-logo.py: edit them there. -->"
+        f'<defs><linearGradient id="tile" x1="0" y1="0" x2="0" y2="1"><stop stop-color="{top}"/>'
+        f'<stop offset="1" stop-color="{bottom}"/></linearGradient></defs>'
+        f'<path d="{TILE}" fill="url(#tile)"/>{back}{front.replace("INK", INK[scheme])}'
+        f'<path d="{TILE}" fill="none" stroke="#000" stroke-opacity="{".12" if scheme == "light" else ".5"}" stroke-width="4"/>'
         "</svg>\n"
     )
 
 
-TILE_DEFS = """    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
-      <stop stop-color="#ffffff"/>
-      <stop offset="1" stop-color="#eceff3"/>
-    </linearGradient>
-    <clipPath id="tile-clip"><path d="{tile}"/></clipPath>""".format(tile=TILE)
-
-TILE_BODY = f'  <path d="{TILE}" fill="url(#tile)"/>'
-TILE_RIM = f'  <path d="{TILE}" fill="none" stroke="#000" stroke-opacity=".12" stroke-width="4"/>'
-
-
-def full() -> str:
-    outer = poly(APEX, LEFT, RIGHT)
-    exits = band_paths(face_top=398, face_step=26, edge_top=416, edge_step=58)
-    exit_points = [on_right_edge(398 + 26 * k) for k in range(5)]
-    band_grads = "\n".join(
-        f'    <linearGradient id="b{k}" x1="{ENTRY[0]}" y1="0" x2="924" y2="0" gradientUnits="userSpaceOnUse">\n'
-        f'      <stop stop-color="{c}" stop-opacity="0"/>\n'
-        f'      <stop offset=".3" stop-color="{c}" stop-opacity=".8"/>\n'
-        f'      <stop offset=".45" stop-color="{c}"/>\n'
-        f'      <stop offset="1" stop-color="{c}" stop-opacity=".8"/>\n'
-        "    </linearGradient>"
-        for k, c in enumerate(BANDS)
+def layer(body: str) -> str:
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">'
+        f"{body}</svg>\n"
     )
-    # Inside the glass the bands start white at the entry point and gain color toward the exit.
-    inner_grads = "\n".join(
-        f'    <linearGradient id="i{k}" x1="{ENTRY[0]}" y1="0" x2="{exit_points[k][0]:.0f}" y2="0" gradientUnits="userSpaceOnUse">\n'
-        '      <stop stop-color="#fff" stop-opacity=".7"/>\n'
-        f'      <stop offset=".4" stop-color="{c}" stop-opacity=".6"/>\n'
-        f'      <stop offset="1" stop-color="{c}"/>\n'
-        "    </linearGradient>"
-        for k, c in enumerate(BANDS)
-    )
-    defs = "\n".join(
-        [
-            TILE_DEFS,
-            band_grads,
-            inner_grads,
-            f'    <clipPath id="prism"><path d="{outer}"/></clipPath>',
-            '    <radialGradient id="shadow" cx=".5" cy=".5" r=".5">\n'
-            '      <stop stop-color="#5a6478" stop-opacity=".28"/>\n'
-            '      <stop offset="1" stop-color="#5a6478" stop-opacity="0"/>\n'
-            "    </radialGradient>",
-            '    <linearGradient id="face-left" x1="0" y1="0" x2="1" y2="1">\n'
-            '      <stop stop-color="#e2e8f1"/>\n'
-            '      <stop offset="1" stop-color="#a7b3c7"/>\n'
-            "    </linearGradient>",
-            '    <linearGradient id="face-right" x1="1" y1="0" x2="0" y2="1">\n'
-            '      <stop stop-color="#f6f8fb"/>\n'
-            '      <stop offset="1" stop-color="#c4cede"/>\n'
-            "    </linearGradient>",
-            '    <linearGradient id="face-bottom" x1="0" y1="0" x2="0" y2="1">\n'
-            '      <stop stop-color="#cbd4e2"/>\n'
-            '      <stop offset="1" stop-color="#e8ecf3"/>\n'
-            "    </linearGradient>",
-            '    <linearGradient id="face-front" x1="0" y1="0" x2="0" y2="1">\n'
-            '      <stop stop-color="#ffffff" stop-opacity=".5"/>\n'
-            '      <stop offset="1" stop-color="#dde4ee" stop-opacity=".4"/>\n'
-            "    </linearGradient>",
-        ]
-    )
-    body = "\n".join(
-        [
-            TILE_BODY,
-            '  <g clip-path="url(#tile-clip)">',
-            *(f'    <path d="{d}" fill="url(#b{k})"/>' for k, d in enumerate(exits)),
-            # The incoming beam: white, with a grey edge so it shows on the white tile.
-            f'    <path d="M60 600L{pt(ENTRY)}" stroke="#c9d1dd" stroke-width="40" stroke-linecap="round"/>',
-            f'    <path d="M60 600L{pt(ENTRY)}" stroke="#ffffff" stroke-width="28" stroke-linecap="round"/>',
-            "  </g>",
-            '  <ellipse cx="512" cy="668" rx="250" ry="26" fill="url(#shadow)"/>',
-            f'  <path d="{poly(APEX, LEFT, IN_LEFT, IN_APEX)}" fill="url(#face-left)" fill-opacity=".92"/>',
-            f'  <path d="{poly(APEX, IN_APEX, IN_RIGHT, RIGHT)}" fill="url(#face-right)" fill-opacity=".82"/>',
-            f'  <path d="{poly(IN_LEFT, LEFT, RIGHT, IN_RIGHT)}" fill="url(#face-bottom)" fill-opacity=".95"/>',
-            f'  <path d="{poly(IN_APEX, IN_LEFT, IN_RIGHT)}" fill="url(#face-front)"/>',
-            # The spectrum inside the glass, fanning out from the entry point.
-            '  <g clip-path="url(#prism)" opacity=".9">',
-            *(
-                f'    <path d="{poly(ENTRY, exit_points[k], exit_points[k + 1])}" fill="url(#i{k})"/>'
-                for k in range(4)
-            ),
-            "  </g>",
-            # Light on the edges of the glass.
-            f'  <path d="{poly(IN_APEX, IN_LEFT, IN_RIGHT)}" fill="none" stroke="#fff" stroke-opacity=".9" stroke-width="5" stroke-linejoin="round"/>',
-            f'  <path d="M{pt(APEX)}L{pt(IN_APEX)}M{pt(LEFT)}L{pt(IN_LEFT)}M{pt(RIGHT)}L{pt(IN_RIGHT)}" stroke="#fff" stroke-opacity=".8" stroke-width="4"/>',
-            f'  <path d="{outer}" fill="none" stroke="#8f9bb0" stroke-opacity=".55" stroke-width="5" stroke-linejoin="round"/>',
-            f'  <path d="M{pt((APEX[0] - 6, APEX[1] + 30))}L{pt((LEFT[0] + 44, LEFT[1] - 22))}" stroke="#fff" stroke-opacity=".85" stroke-width="7" stroke-linecap="round"/>',
-            TILE_RIM,
-        ]
-    )
-    return svg("Loupe", defs, body)
 
 
-def small() -> str:
-    # Fewer, heavier parts: no bevels or highlights, a darker edge, a grey beam, wide bands.
-    apex, left, right = (470, 250), (240, 690), (700, 690)
+def srgb(hex_: str) -> str:
+    r, g, b = (int(hex_[i : i + 2], 16) / 255 for i in (1, 3, 5))
+    return f"srgb:{r:.5f},{g:.5f},{b:.5f},1.00000"
 
-    def edge(y: float) -> tuple[float, float]:
-        return (apex[0] + (y - apex[1]) * (right[0] - apex[0]) / (right[1] - apex[1]), y)
 
-    bands = []
-    for k in range(4):
-        a, b = edge(400 + 50 * k), edge(400 + 50 * (k + 1))
-        bands.append(poly(a, (960, 404 + 92 * k), (960, 404 + 92 * (k + 1)), b))
-    entry = (apex[0] - (470 - 240) * (470 - 250) / (690 - 250), 470)
-    body = "\n".join(
-        [
-            TILE_BODY,
-            '  <g clip-path="url(#tile-clip)">',
-            *(f'    <path d="{d}" fill="{c}"/>' for d, c in zip(bands, BANDS)),
-            f'    <path d="M60 640L{pt(entry)}" stroke="#9aa5b8" stroke-width="56" stroke-linecap="round"/>',
-            "  </g>",
-            f'  <path d="{poly(apex, left, right)}" fill="#e3e9f2" stroke="#6f7c94" stroke-width="40" stroke-linejoin="round"/>',
-            TILE_RIM.replace('stroke-opacity=".12" stroke-width="4"', 'stroke-opacity=".22" stroke-width="16"'),
-        ]
-    )
-    return svg("Loupe (16 and 32 px)", TILE_DEFS, body)
+def icon_json() -> str:
+    """Two groups, front first: the front face takes a solid fill per appearance, the back keeps its gradient."""
+    group = {"shadow": {"kind": "neutral", "opacity": 0.5}, "translucency": {"enabled": False, "value": 0.5}}
+    doc = {
+        "fill-specializations": [
+            {"value": {"linear-gradient": [srgb(PAPER["light"][0]), srgb(PAPER["light"][1])]}},
+            {"appearance": "dark", "value": {"linear-gradient": [srgb(PAPER["dark"][0]), srgb(PAPER["dark"][1])]}},
+        ],
+        "groups": [
+            {
+                "layers": [
+                    {
+                        "fill-specializations": [
+                            {"value": {"solid": srgb(INK["light"])}},
+                            {"appearance": "dark", "value": {"solid": srgb(INK["dark"])}},
+                        ],
+                        "image-name": "front.svg",
+                        "name": "front",
+                    }
+                ],
+                **group,
+            },
+            {"layers": [{"image-name": "back.png", "name": "back"}], **group},
+        ],
+        "supported-platforms": {"squares": ["macOS"]},
+    }
+    return json.dumps(doc, indent=2) + "\n"
+
+
+def back_layer() -> str:
+    """The back face alone, as SVG. It ships as back.png: Icon Composer's SVG import does not take gradients."""
+    back, _ = parts(logo.MARK, FULL_WIDTH, "diff")
+    return layer(back)
+
+
+def vectors() -> dict[Path, str]:
+    _, front = parts(logo.MARK, FULL_WIDTH, "diff")
+    return {
+        ASSETS / "AppIcon.icon/icon.json": icon_json(),
+        ASSETS / "AppIcon.icon/Assets/front.svg": layer(front.replace("INK", INK["light"])),
+        ASSETS / "icon.svg": tile("light", logo.MARK, FULL_WIDTH, "Loupe"),
+        ASSETS / "icon-dark.svg": tile("dark", logo.MARK, FULL_WIDTH, "Loupe"),
+        ASSETS / "icon-small.svg": tile("light", logo.FAVICON, SMALL_WIDTH, "Loupe (16 and 32 px)"),
+        ASSETS / "linux/dev.loupe.app.svg": tile("light", logo.MARK, FULL_WIDTH, "Loupe"),
+    }
 
 
 # (icns type, pixel size, drawing). icp4 and icp5 are the PNG types for 16 and 32 px.
@@ -283,17 +231,54 @@ def check(path: Path) -> None:
     print(f"{path}: {len(ICNS)} entries, all square RGBA PNGs of the right size")
 
 
+# The rasters, and icon.lock: the hash of everything they are drawn from and the hash of each raster, so
+# --check catches a raster that is stale (drawn from other vectors) or replaced, without rendering.
+RASTERS = [ASSETS / "Loupe.icns", ASSETS / "linux/dev.loupe.app.png", ASSETS / "AppIcon.icon/Assets/back.png"]
+LOCK = ASSETS / "icon.lock"
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def source_hash(files: dict[Path, str]) -> str:
+    text = "".join(f"{p.relative_to(ROOT)}\n{t}" for p, t in sorted(files.items())) + back_layer()
+    return sha(text.encode())
+
+
+def lock_text(files: dict[Path, str]) -> str:
+    rasters = {str(p.relative_to(ROOT)): sha(p.read_bytes()) for p in RASTERS}
+    return json.dumps({"source": source_hash(files), "rasters": rasters}, indent=2) + "\n"
+
+
 def main() -> None:
     target = ASSETS / "Loupe.icns"
+    files = vectors()
     if sys.argv[1:] == ["--check"]:
+        stale = [p for p, text in files.items() if not p.exists() or p.read_text() != text]
+        if stale:
+            sys.exit("out of date, run scripts/make-icon.py: " + ", ".join(str(p.relative_to(ROOT)) for p in stale))
+        lock = json.loads(LOCK.read_text()) if LOCK.exists() else {}
+        if lock.get("source") != source_hash(files):
+            sys.exit("the rasters were drawn from other vectors: run scripts/make-icon.py")
+        for path in RASTERS:
+            if lock.get("rasters", {}).get(str(path.relative_to(ROOT))) != sha(path.read_bytes()):
+                sys.exit(f"{path.relative_to(ROOT)} is not the file scripts/make-icon.py rendered: run it again")
         check(target)
         return
-    drawings = {"full": ASSETS / "icon.svg", "small": ASSETS / "icon-small.svg"}
-    drawings["full"].write_text(full())
-    drawings["small"].write_text(small())
+    for path, text in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
     with tempfile.TemporaryDirectory() as tmp:
-        pngs = render(drawings, sorted({(px, name) for _, px, name in ICNS}), Path(tmp))
+        back = Path(tmp) / "back.svg"
+        back.write_text(back_layer())
+        drawings = {"full": ASSETS / "icon.svg", "small": ASSETS / "icon-small.svg", "back": back}
+        sizes = sorted({(px, name) for _, px, name in ICNS} | {(1024, "back")})
+        pngs = render(drawings, sizes, Path(tmp))
     target.write_bytes(icns([(kind, pngs[(px, name)]) for kind, px, name in ICNS]))
+    (ASSETS / "linux/dev.loupe.app.png").write_bytes(pngs[(256, "full")])
+    (ASSETS / "AppIcon.icon/Assets/back.png").write_bytes(pngs[(1024, "back")])
+    LOCK.write_text(lock_text(files))
     check(target)
 
 
