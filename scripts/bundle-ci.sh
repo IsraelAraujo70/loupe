@@ -12,6 +12,8 @@ cp assets/Loupe.icns "$app/Contents/Resources/Loupe.icns"
 iconset="$(mktemp -d)/Loupe.iconset"
 iconutil -c iconset "$app/Contents/Resources/Loupe.icns" -o "$iconset" \
   || { echo "iconutil cannot read Loupe.icns" >&2; exit 1; }
+# macOS 26 draws its Light and Dark icons from the Icon Composer file, compiled here (required in CI).
+bash scripts/compile-app-icon.sh "$app/Contents/Resources"
 for size in 16 32 128 256 512; do
   for suffix in "" "@2x"; do
     name="icon_${size}x${size}${suffix}.png"
@@ -33,6 +35,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>CFBundleName</key><string>Loupe</string>
 <key>CFBundleExecutable</key><string>loupe</string>
 <key>CFBundleIconFile</key><string>Loupe</string>
+<key>CFBundleIconName</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
 <key>CFBundleVersion</key><string>${version%%-*}</string>
