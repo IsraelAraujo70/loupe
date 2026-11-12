@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Writes the hero's still frame from hero.js, for pages without JavaScript:
-//   site/hero-frame.html  the scene at t = 0 on a 160 x 32 grid, as text in coloured spans
+//   site/hero-frame.html  the scene at t = 0 as text in coloured spans, twice: the wide stage (160 x 46)
+//                         and the narrow band for phones (80 x 34); the stylesheet shows one
 //   site/hero.css         the colours of those spans (build.py appends it to style.css)
 // Usage: node site/hero-frame.js [--check]   (--check writes nothing and fails if a file is stale)
 "use strict";
@@ -8,14 +9,16 @@ const fs = require("fs");
 const path = require("path");
 const hero = require("./hero.js");
 
-const COLS = 160;
-const ROWS = 32;
+const FRAMES = [
+  { shape: "wide", cols: 160, rows: 46 },
+  { shape: "narrow", cols: 80, rows: 34 },
+];
 const STEP = 25; // one colour class per 25 nm
 
 const nmClass = (nm) => `h${Math.round(nm / STEP) * STEP}`;
 
-function frameHtml() {
-  const sc = hero.scene(COLS, ROWS);
+function frameHtml({ shape, cols: COLS, rows: ROWS }) {
+  const sc = hero.scene(COLS, ROWS, shape);
   const buf = hero.buffers(sc);
   hero.frame(sc, 0, buf);
   const lines = [];
@@ -41,7 +44,7 @@ function frameHtml() {
     flush();
     lines.push(line.replace(/\s+$/, ""));
   }
-  return lines.join("\n") + "\n";
+  return `<pre class="still ${shape}">${lines.join("\n")}</pre>`;
 }
 
 function css() {
@@ -59,7 +62,7 @@ function css() {
 }
 
 const files = {
-  [path.join(__dirname, "hero-frame.html")]: frameHtml(),
+  [path.join(__dirname, "hero-frame.html")]: FRAMES.map(frameHtml).join("") + "\n",
   [path.join(__dirname, "hero.css")]: css(),
 };
 

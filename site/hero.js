@@ -81,19 +81,29 @@
     return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
   }
 
+  /**
+   * Where the prism sits. "wide" is the desktop hero, the scene behind the whole stage with the text on
+   * its left: the prism stands right of centre and low, so the beam comes in from the left edge under the
+   * buttons. "narrow" is the band under the text on phones: the prism near the middle, larger.
+   */
+  const SHAPES = {
+    wide: (W, H) => ({ side: Math.min((H * 0.5) / (SQ3 / 2), W * 0.24), cx: W * 0.76, base: H * 0.9 }),
+    narrow: (W, H) => ({ side: Math.min((H * 0.66) / (SQ3 / 2), W * (W < 120 ? 0.34 : 0.24)), cx: W * (W < 120 ? 0.44 : 0.5), base: H * 0.84 }),
+  };
+
   /** The scene for a grid of cols x rows cells: geometry and every cell's still layers. */
-  function scene(cols, rows) {
-    const steps = sceneSteps(cols, rows);
+  function scene(cols, rows, shape = "narrow") {
+    const steps = sceneSteps(cols, rows, shape);
     let step = steps.next();
     while (!step.done) step = steps.next();
     return step.value;
   }
 
   /** scene(), one row per step, so the browser can build it in slices between frames. */
-  function* sceneSteps(cols, rows) {
+  function* sceneSteps(cols, rows, shape = "narrow") {
     const W = cols, H = rows * 2;
-    const side = Math.min((H * 0.66) / (SQ3 / 2), W * (W < 120 ? 0.34 : 0.24));
-    const cx = W * (W < 120 ? 0.44 : 0.5), base = H * 0.84, h = (side * SQ3) / 2;
+    const { side, cx, base } = SHAPES[shape](W, H);
+    const h = (side * SQ3) / 2;
     const A = [cx, base - h], R = [cx + side / 2, base], L = [cx - side / 2, base];
     const front = [A, R, L];
     const depth = side * (40 / 170);
@@ -308,6 +318,8 @@
     const box = art.getBoundingClientRect();
     measured = [art.clientWidth, art.clientHeight];
     if (!box.width || !box.height) return;
+    // The stylesheet decides the composition: the scene fills the stage on wide screens, a band on phones.
+    const shape = getComputedStyle(art).position === "absolute" ? "wide" : "narrow";
     fs = box.width >= 900 ? 12 : box.width >= 600 ? 10 : 8;
     const font = `${fs}px ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace`;
     ctx.font = font;
@@ -328,7 +340,7 @@
     glow.style.height = canvas.style.height;
     img = gctx.createImageData(cols, rows);
     sc = null;
-    const steps = sceneSteps(cols, rows);
+    const steps = sceneSteps(cols, rows, shape);
     const job = ++building;
     // Build in slices of about 6 ms, so the page never waits on a long task.
     const slice = () => {
