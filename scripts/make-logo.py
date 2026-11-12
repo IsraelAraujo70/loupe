@@ -126,7 +126,7 @@ class Mark:
             return f"{num(origin[0] + (p[0] - self.box[0]) * scale)} {num(origin[1] + (p[1] - self.box[1]) * scale)}"
 
         def path(rings: list[list[Point]]) -> str:
-            return "".join("M" + "L".join(at(p) for p in r) + "Z" for r in rings)
+            return "".join("M" + "L".join(at(p) for p in r) + "Z" for r in rings if len(r) >= 3)
 
         y0, y1 = (num(origin[1] + (y - self.box[1]) * scale) for y in self.gradient)
         stops = "".join(f'<stop offset="{num(o)}" stop-color="{c}"/>' for o, c in DIFF)

@@ -290,9 +290,10 @@
   art.append(glow, canvas);
   const ctx = canvas.getContext("2d");
   const gctx = glow.getContext("2d");
+  const FRAME = 1000 / 30;
   const WHITE = [236, 237, 240], BACK = [150, 156, 170], STAR = [120, 126, 140];
   const palette = new Map();
-  let sc, buf, cw, ch, fs, img, raf = 0, last = 0, visible = false, building = 0, started = false, t0 = performance.now();
+  let sc, buf, cw, ch, fs, img, raf = 0, last = 0, visible = false, building = 0, started = false, measured = [0, 0], t0 = performance.now();
 
   function rgb(key) {
     if (key === 1) return WHITE;
@@ -305,6 +306,7 @@
 
   function layout() {
     const box = art.getBoundingClientRect();
+    measured = [art.clientWidth, art.clientHeight];
     if (!box.width || !box.height) return;
     fs = box.width >= 900 ? 12 : box.width >= 600 ? 10 : 8;
     const font = `${fs}px ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace`;
@@ -366,8 +368,11 @@
   function tick(now) {
     raf = 0;
     if (!sc || !visible || document.hidden || reduce.matches) return;
-    if (now - last >= 1000 / 30) {
-      last = now;
+    // At most 30 fps on average: 2 ms of slack lets a 60 Hz screen draw every other frame, and carrying
+    // the remainder (early or late) keeps the long-run rate at exactly 30, not 20 or 30.3.
+    const elapsed = now - last;
+    if (elapsed >= FRAME - 2) {
+      last = elapsed < 2 * FRAME ? now - (elapsed - FRAME) : now;
       draw((now - t0) / 1000);
     }
     raf = requestAnimationFrame(tick);
@@ -387,18 +392,17 @@
     new IntersectionObserver(([entry]) => { visible = entry.isIntersecting; run(); }).observe(art);
     document.addEventListener("visibilitychange", run);
     reduce.addEventListener("change", run);
-    let pending = 0;
-    let width = art.clientWidth, height = art.clientHeight;
-    new ResizeObserver(() => {
-      if (art.clientWidth === width && art.clientHeight === height) return;
-      width = art.clientWidth; height = art.clientHeight;
-      clearTimeout(pending);
-      pending = setTimeout(layout, 120);
-    }).observe(art);
   }
 
   function start() {
     layout();
+    // Rebuild when the band's size differs from the one the current (or pending) scene was built for.
+    let pending = 0;
+    new ResizeObserver(() => {
+      if (art.clientWidth === measured[0] && art.clientHeight === measured[1]) return;
+      clearTimeout(pending);
+      pending = setTimeout(layout, 120);
+    }).observe(art);
   }
 
   // Draw after the page has painted, so the scene never delays the text.

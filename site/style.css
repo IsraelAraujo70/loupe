@@ -100,14 +100,17 @@ nav .gh { display: inline-flex; padding: 8px; }
 .stage { position: relative; overflow: hidden; }
 .stage .hero { position: relative; z-index: 1; }
 .art {
-  position: relative; height: clamp(280px, 38vw, 540px); margin-top: clamp(-120px, -7vw, -24px);
+  --band: clamp(280px, 38vw, 540px);
+  position: relative; height: var(--band); margin-top: clamp(-120px, -7vw, -24px); overflow: hidden;
   pointer-events: none; user-select: none;
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
   -webkit-mask-image: linear-gradient(transparent, #000 22%, #000 82%, transparent);
   mask-image: linear-gradient(transparent, #000 22%, #000 82%, transparent);
 }
 .art .still {
   position: absolute; left: 50%; bottom: 0; transform: translateX(-50%); margin: 0;
-  font: calc(100vw / 96)/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  /* 160 columns fill the width; 32 rows of 1.2em never exceed the band. */
+  font: min(calc(100vw / 96), calc(var(--band) / 38.4))/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
   color: var(--faint); white-space: pre;
 }
 .art canvas { position: absolute; left: 50%; top: 0; transform: translateX(-50%); }

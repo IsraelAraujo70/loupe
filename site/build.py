@@ -9,6 +9,7 @@ Only the standard library is used.
 """
 
 import html
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -354,8 +355,19 @@ def outputs() -> dict[Path, bytes]:
     return files
 
 
+def check_ids(name: str, text: str) -> None:
+    """Fail the build on a repeated id: an inlined SVG whose id was not renamed would share its gradient."""
+    ids = re.findall(r'\bid="([^"]+)"', text)
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        sys.exit(f"{name}: repeated ids {repeated}")
+
+
 def main() -> int:
     files = outputs()
+    for path, data in files.items():
+        if path.suffix == ".html":
+            check_ids(str(path.relative_to(SITE)), data.decode())
     shutil.rmtree(OUT, ignore_errors=True)
     for path, data in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
