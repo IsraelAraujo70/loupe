@@ -273,7 +273,7 @@ def page(t: dict) -> str:
       <a class="btn ghost" href="{REPO}">{icon('github')}{e(t['cta_source'])}</a>
     </div>
   </div>
-  <div class="art" aria-hidden="true"><pre class="still">{ART}</pre></div>
+  <div class="art" aria-hidden="true">{ART}</div>
 </section>
 <div class="wrap">
   <figure class="hero-shot"><div class="frame">{shot('reviews', t['hero_alt'], eager=True)}</div><figcaption>{e(t['hero_caption'])}</figcaption></figure>
