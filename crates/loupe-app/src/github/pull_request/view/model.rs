@@ -2,9 +2,11 @@
 //! to a loaded detail, labels, and review form validation.
 
 use loupe_github::{
-    CheckStatus, ChecksState, MergeMethod, MergeStateStatus, Mergeable, PrState, PullRequestDetail,
-    ReviewDecision, ReviewEvent, ReviewerState, TimelineItem,
+    CheckRun, CheckStatus, ChecksState, MergeMethod, MergeStateStatus, Mergeable, PrState,
+    PullRequestDetail, ReviewDecision, ReviewEvent, ReviewerState, TimelineItem,
 };
+
+use crate::github::pull_request::checks::format_duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PrTab {
@@ -346,6 +348,103 @@ pub(super) fn check_tally(detail: &PullRequestDetail) -> CheckTally {
     tally
 }
 
+/// The sections of the merge box's check list, in GitHub's order. Failing
+/// holds what the tally counts as failed, so a section's count matches the
+/// red run of the bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum CheckGroup {
+    Failing,
+    Pending,
+    Skipped,
+    Neutral,
+    Successful,
+}
+
+impl CheckGroup {
+    const ALL: [CheckGroup; 5] = [
+        CheckGroup::Failing,
+        CheckGroup::Pending,
+        CheckGroup::Skipped,
+        CheckGroup::Neutral,
+        CheckGroup::Successful,
+    ];
+
+    fn of(status: CheckStatus) -> Self {
+        match status {
+            CheckStatus::Failed | CheckStatus::Cancelled | CheckStatus::ActionRequired => {
+                CheckGroup::Failing
+            }
+            CheckStatus::Queued | CheckStatus::Running => CheckGroup::Pending,
+            CheckStatus::Skipped => CheckGroup::Skipped,
+            CheckStatus::Neutral => CheckGroup::Neutral,
+            CheckStatus::Passed => CheckGroup::Successful,
+        }
+    }
+
+    pub(super) fn key(self) -> &'static str {
+        match self {
+            CheckGroup::Failing => "failing",
+            CheckGroup::Pending => "pending",
+            CheckGroup::Skipped => "skipped",
+            CheckGroup::Neutral => "neutral",
+            CheckGroup::Successful => "successful",
+        }
+    }
+
+    /// `2 failing checks`, `1 successful check`.
+    pub(super) fn heading(self, count: usize) -> String {
+        let noun = if count == 1 { "check" } else { "checks" };
+        format!("{count} {} {noun}", self.key())
+    }
+}
+
+/// The indices of `runs` in each non-empty group, groups in GitHub's order
+/// and runs in the order GitHub lists them.
+pub(super) fn check_groups(runs: &[CheckRun]) -> Vec<(CheckGroup, Vec<usize>)> {
+    CheckGroup::ALL
+        .into_iter()
+        .filter_map(|group| {
+            let members: Vec<usize> = runs
+                .iter()
+                .enumerate()
+                .filter(|(_, run)| CheckGroup::of(run.status) == group)
+                .map(|(ix, _)| ix)
+                .collect();
+            (!members.is_empty()).then_some((group, members))
+        })
+        .collect()
+}
+
+/// What a check did, as GitHub words it beside the name: `Failing after
+/// 3m 5s`, `Successful in 45s`, `Queued`.
+pub(super) fn check_outcome(run: &CheckRun) -> String {
+    let took = match (run.started_at, run.completed_at) {
+        (Some(start), Some(end)) => Some(format_duration((end - start).num_seconds())),
+        _ => None,
+    };
+    let (word, link) = match run.status {
+        CheckStatus::Queued => return "Queued".into(),
+        CheckStatus::Running => return "In progress".into(),
+        CheckStatus::ActionRequired => return "Action required".into(),
+        CheckStatus::Skipped => return "Skipped".into(),
+        CheckStatus::Failed => ("Failing", "after"),
+        CheckStatus::Cancelled => ("Cancelled", "after"),
+        CheckStatus::Neutral => ("Neutral", "after"),
+        CheckStatus::Passed => ("Successful", "in"),
+    };
+    match took {
+        Some(took) => format!("{word} {link} {took}"),
+        None => word.into(),
+    }
+}
+
+/// The check list starts open while a check fails or runs, as on GitHub,
+/// and closed once every check has settled well.
+pub(super) fn checks_open_at_first(detail: &PullRequestDetail) -> bool {
+    let tally = check_tally(detail);
+    tally.failed + tally.pending > 0
+}
+
 /// `done` of `total`, for the merge box's progress bars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Progress {
@@ -483,10 +582,10 @@ mod tests {
     };
 
     use super::{
-        DraftAction, MergeAction, MergeTone, Panel, PrTab, Progress, StateAction, approvals,
-        available_actions, can_approve, check_tally, discard_confirm_text, head_label,
-        merge_button_label, merge_confirm_text, merge_status, pending_comments_label,
-        resolve_method, review_blocker,
+        CheckGroup, DraftAction, MergeAction, MergeTone, Panel, PrTab, Progress, StateAction,
+        approvals, available_actions, can_approve, check_groups, check_outcome, check_tally,
+        checks_open_at_first, discard_confirm_text, head_label, merge_button_label,
+        merge_confirm_text, merge_status, pending_comments_label, resolve_method, review_blocker,
     };
 
     fn actor(login: &str) -> Actor {
@@ -619,6 +718,84 @@ mod tests {
             (tally.passed, tally.failed, tally.pending, tally.total),
             (3, 2, 1, 6)
         );
+    }
+
+    #[test]
+    fn check_list_groups_runs_in_githubs_order_and_skips_empty_groups() {
+        let runs = [
+            CheckStatus::Passed,
+            CheckStatus::Failed,
+            CheckStatus::Skipped,
+            CheckStatus::Running,
+            CheckStatus::Cancelled,
+            CheckStatus::Passed,
+            CheckStatus::ActionRequired,
+            CheckStatus::Queued,
+        ]
+        .map(run);
+        let groups: Vec<(&str, Vec<usize>)> = check_groups(&runs)
+            .into_iter()
+            .map(|(group, members)| (group.key(), members))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                ("failing", vec![1, 4, 6]),
+                ("pending", vec![3, 7]),
+                ("skipped", vec![2]),
+                ("successful", vec![0, 5]),
+            ]
+        );
+        assert!(check_groups(&[]).is_empty());
+    }
+
+    #[test]
+    fn check_group_headings_count_like_github() {
+        assert_eq!(CheckGroup::Failing.heading(2), "2 failing checks");
+        assert_eq!(CheckGroup::Successful.heading(1), "1 successful check");
+        assert_eq!(CheckGroup::Neutral.heading(3), "3 neutral checks");
+    }
+
+    #[test]
+    fn check_outcome_says_what_happened_and_how_long_it_took() {
+        let timed = |status| CheckRun {
+            started_at: DateTime::<Utc>::from_timestamp(1_000, 0),
+            completed_at: DateTime::<Utc>::from_timestamp(1_185, 0),
+            ..run(status)
+        };
+        assert_eq!(
+            check_outcome(&timed(CheckStatus::Failed)),
+            "Failing after 3m 5s"
+        );
+        assert_eq!(
+            check_outcome(&timed(CheckStatus::Passed)),
+            "Successful in 3m 5s"
+        );
+        assert_eq!(
+            check_outcome(&timed(CheckStatus::Cancelled)),
+            "Cancelled after 3m 5s"
+        );
+        assert_eq!(check_outcome(&run(CheckStatus::Passed)), "Successful");
+        assert_eq!(check_outcome(&run(CheckStatus::Failed)), "Failing");
+        assert_eq!(check_outcome(&run(CheckStatus::Running)), "In progress");
+        assert_eq!(check_outcome(&run(CheckStatus::Queued)), "Queued");
+        assert_eq!(check_outcome(&timed(CheckStatus::Skipped)), "Skipped");
+        assert_eq!(
+            check_outcome(&run(CheckStatus::ActionRequired)),
+            "Action required"
+        );
+    }
+
+    #[test]
+    fn check_list_starts_open_only_while_a_check_fails_or_runs() {
+        let mut detail = detail();
+        assert!(!checks_open_at_first(&detail));
+        detail.checks.runs = vec![run(CheckStatus::Passed), run(CheckStatus::Skipped)];
+        assert!(!checks_open_at_first(&detail));
+        detail.checks.runs.push(run(CheckStatus::Running));
+        assert!(checks_open_at_first(&detail));
+        detail.checks.runs = vec![run(CheckStatus::Passed), run(CheckStatus::Cancelled)];
+        assert!(checks_open_at_first(&detail));
     }
 
     #[test]

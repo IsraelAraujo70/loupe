@@ -34,7 +34,7 @@ Website: [loupe.israeldeveloper.com.br](https://loupe.israeldeveloper.com.br)
 
 Get the latest build from [Releases](https://github.com/IsraelAraujo70/loupe/releases/latest):
 
-- macOS (Apple silicon): `loupe-macos-aarch64.zip`. Unzip it and move `Loupe.app` to Applications. The app is signed but not notarized, so the first time, right-click it and choose **Open**.
+- macOS (Apple silicon): `loupe-macos-aarch64.zip`. Unzip it and move `Loupe.app` to Applications. The app is signed but not notarized, so the first time, right-click it and choose **Open**. Intel Macs are not supported: there is no Intel build, and the app does not run or update on them.
 - Linux (x86_64): `loupe-linux-x86_64`. Make it executable (`chmod +x loupe-linux-x86_64`) and run it. It needs X11 or Wayland and a Vulkan driver. On launch, Loupe adds itself to your desktop's app list, with its icon: it writes `~/.local/share/applications/dev.loupe.app.desktop` and `dev.loupe.app` icons under `~/.local/share/icons/hicolor`, and updates the entry when the binary moves. To keep it out of the app list, start Loupe with `LOUPE_DESKTOP_ENTRY=0` and delete those files.
 
 Once installed, Loupe checks for a new release every hour and offers to update and restart.
