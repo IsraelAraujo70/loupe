@@ -168,6 +168,7 @@ impl LinkedThreads {
         };
         let github = services.github.clone();
         let context = self.context.clone();
+        let settings = crate::store::Settings::get(cx).t3_review.clone();
         self.review = Some(Readiness::Checking);
         let work = services::background(cx, move || {
             let check = || -> Result<Readiness, Error> {
@@ -184,7 +185,9 @@ impl LinkedThreads {
                     .into_iter()
                     .map(|file| file.path)
                     .collect();
-                Ok(review::assess(&context, session, &projects, &facts, &files))
+                Ok(review::assess(
+                    &context, session, &projects, &facts, &files, &settings,
+                ))
             };
             check().unwrap_or_else(|error| {
                 Readiness::Unavailable(match error {
