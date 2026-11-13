@@ -364,7 +364,7 @@ pub fn entries() -> Vec<Entry> {
         entry(
             ReviewPrompt,
             S::T3,
-            "",
+            "Review",
             "Review request",
             "What a review thread starts with. The dialog shows it before Send, and an edit \
              there is for that one review.",
@@ -655,6 +655,22 @@ mod tests {
             search("ree").is_empty(),
             "a word matches from its start, not inside \"tree\""
         );
+    }
+
+    #[test]
+    fn a_block_is_alone_in_its_group() {
+        // The page wraps a run of settings of one group in a card, so a
+        // block that shares its run would be a card inside a card.
+        let entries = entries();
+        for pair in entries.windows(2) {
+            let same_run = pair[0].section == pair[1].section && pair[0].group == pair[1].group;
+            assert!(
+                !(same_run && (pair[0].item.is_block() || pair[1].item.is_block())),
+                "{:?} and {:?} share a card",
+                pair[0].item,
+                pair[1].item
+            );
+        }
     }
 
     #[test]
