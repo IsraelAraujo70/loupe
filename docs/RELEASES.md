@@ -10,7 +10,8 @@ from GitHub's generated changelog. Publication waits for both platform builds.
 GitHub-hosted Ubuntu 24.04 runs tests, clippy, the Linux build and publication.
 GitHub-hosted macOS 15 arm64 builds Loupe.app using Xcode 26.3, explicitly checks
 Metal, signs the app and uploads the ZIP. No personal Mac is used. Notarization
-is out of scope. Intel Mac releases are not currently built.
+is out of scope. Intel Macs are not supported: releases ship no x86_64 macOS
+build, and the updater offers no asset there.
 
 The local scripts/bundle-macos.sh and its local signing identity are untouched.
 CI has its own scripts/bundle-ci.sh and signs ad-hoc by default. To sign with a
