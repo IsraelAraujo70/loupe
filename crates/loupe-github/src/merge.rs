@@ -57,22 +57,38 @@ impl GitHub {
         method: MergeMethod,
         expected_head_oid: &str,
     ) -> Result<MergeOutcome> {
-        let path = format!(
-            "/repos/{}/{}/pulls/{}/merge-async",
-            pr.repo.owner, pr.repo.name, pr.number
-        );
-        let body = request_body(method, expected_head_oid);
-        let (status, answer) = self.rest_with_status(RestMethod::Put(Some(&body)), &path)?;
-        let first = parse_request_answer(status, &answer)?;
-        settle(
-            first,
-            |uuid| {
-                let answer = self.rest(RestMethod::Get, &format!("{path}/{uuid}"))?;
-                parse_async_merge(answer.as_bytes())
-            },
+        run_merge(
+            pr,
+            method,
+            expected_head_oid,
+            |path, body| self.rest_with_status(RestMethod::Put(Some(body)), path),
+            |path| self.rest(RestMethod::Get, path).map(String::into_bytes),
             std::thread::sleep,
         )
     }
+}
+
+/// The whole merge with its HTTP calls passed in: `put` sends the merge
+/// request, `get` reads a result, and `wait` sleeps between reads.
+fn run_merge(
+    pr: &PrRef,
+    method: MergeMethod,
+    expected_head_oid: &str,
+    put: impl FnOnce(&str, &Value) -> Result<(u16, Vec<u8>)>,
+    mut get: impl FnMut(&str) -> Result<Vec<u8>>,
+    wait: impl FnMut(Duration),
+) -> Result<MergeOutcome> {
+    let path = format!(
+        "/repos/{}/{}/pulls/{}/merge-async",
+        pr.repo.owner, pr.repo.name, pr.number
+    );
+    let (status, answer) = put(&path, &request_body(method, expected_head_oid))?;
+    let first = parse_request_answer(status, &answer, method)?;
+    settle(
+        first,
+        |uuid| parse_async_merge(&get(&format!("{path}/{uuid}"))?),
+        wait,
+    )
 }
 
 /// The merge request: GitHub refuses it when the head is no longer
@@ -97,11 +113,31 @@ fn rest_method_name(method: MergeMethod) -> &'static str {
 
 /// Reads the answer to the merge request. 200 (already merged or queued) and
 /// 202 (accepted) carry the request's state, 400 (cannot be merged) a failed
-/// one, and 409 the merge request already pending for this pull request,
-/// which Loupe then waits for.
-fn parse_request_answer(status: u16, body: &[u8]) -> Result<AsyncMerge> {
+/// one, and 409 the merge request already pending for this pull request.
+/// Loupe waits for that one only when it uses the `method` the user picked;
+/// otherwise it would report someone else's merge as this one.
+fn parse_request_answer(status: u16, body: &[u8], method: MergeMethod) -> Result<AsyncMerge> {
     match status {
-        200 | 202 | 409 => parse_async_merge(body),
+        200 | 202 => parse_async_merge(body),
+        409 => {
+            let pending = parse_async_merge(body)?;
+            let theirs = serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|answer| {
+                    answer["details"]["merge_method"]
+                        .as_str()
+                        .map(str::to_owned)
+                });
+            match theirs {
+                Some(theirs) if theirs != rest_method_name(method) => Ok(AsyncMerge::Failed {
+                    message: format!(
+                        "a merge of this pull request with method {theirs} is already running. \
+                         Wait for it to finish."
+                    ),
+                }),
+                _ => Ok(pending),
+            }
+        }
         400 => parse_async_merge(body).map_err(|_| http_error(status, body)),
         _ => Err(http_error(status, body)),
     }
@@ -182,16 +218,15 @@ fn settle(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::time::Duration;
 
     use serde_json::json;
 
     use super::{
-        AsyncMerge, MAX_POLLS, MergeOutcome, parse_async_merge, parse_request_answer, request_body,
-        rest_method_name, settle,
+        AsyncMerge, MAX_POLLS, MergeOutcome, POLL_INTERVAL, parse_async_merge,
+        parse_request_answer, request_body, rest_method_name, run_merge, settle,
     };
-    use crate::{Error, MergeMethod};
+    use crate::{Error, MergeMethod, PrRef, RepoRef};
 
     // Answers recorded from api.github.com on this repository's pull
     // requests, except ENQUEUED and BACKGROUND_FAILURE, which follow the
@@ -206,6 +241,83 @@ mod tests {
     const NOT_FOUND: &str = r#"{"message":"Not Found","documentation_url":"https://docs.github.com/rest/pulls/pulls#merge-a-pull-request-asynchronously","status":"404"}"#;
     const ENQUEUED: &str = r#"{"status":"enqueued","details":{"message":"Pull request was added to the merge queue."}}"#;
     const BACKGROUND_FAILURE: &str = r#"{"status":"failed","details":{"message":"Required status check \"check\" is expected."}}"#;
+
+    const PATH: &str = "/repos/IsraelAraujo70/loupe/pulls/43/merge-async";
+    const HEAD: &str = "6b468bc965fc953b423d4c8519e6f88266f8c82a";
+
+    /// Runs a squash merge of #43 against `put_answer` and then `results`,
+    /// returning the outcome, the paths read, and how often it waited.
+    fn merge_against(
+        put_answer: (u16, &str),
+        results: &[&str],
+    ) -> (crate::Result<MergeOutcome>, Vec<String>, u32) {
+        let pr = PrRef::new(RepoRef::new("IsraelAraujo70", "loupe"), 43);
+        let mut results = results.iter().rev().copied().collect::<Vec<_>>();
+        let mut read = Vec::new();
+        let mut waits = 0;
+        let outcome = run_merge(
+            &pr,
+            MergeMethod::Squash,
+            HEAD,
+            |path, body| {
+                assert_eq!(path, PATH);
+                assert_eq!(body, &request_body(MergeMethod::Squash, HEAD));
+                Ok((put_answer.0, put_answer.1.as_bytes().to_vec()))
+            },
+            |path| {
+                read.push(path.to_owned());
+                let answer = results.pop().expect("an answer per read");
+                Ok(answer.as_bytes().to_vec())
+            },
+            |delay| {
+                assert_eq!(delay, POLL_INTERVAL);
+                waits += 1;
+            },
+        );
+        (outcome, read, waits)
+    }
+
+    #[test]
+    fn an_accepted_merge_is_read_by_its_uuid_until_merged() {
+        let (outcome, read, waits) =
+            merge_against((202, ACCEPTED), &[IN_PROGRESS, IN_PROGRESS, MERGED]);
+        assert_eq!(outcome.ok(), Some(MergeOutcome::Merged));
+        assert_eq!(
+            read,
+            vec![format!("{PATH}/11bee280-61dd-46b9-9b18-c9f9576bc67b"); 3]
+        );
+        assert_eq!(waits, 3);
+    }
+
+    #[test]
+    fn a_merge_already_running_with_the_same_method_is_followed() {
+        let (outcome, read, _) = merge_against((409, ACCEPTED), &[MERGED]);
+        assert_eq!(outcome.ok(), Some(MergeOutcome::Merged));
+        assert_eq!(read.len(), 1);
+    }
+
+    #[test]
+    fn a_merge_already_running_with_another_method_is_not_reported_as_this_one() {
+        let rebase = ACCEPTED.replace(r#""merge_method":"squash""#, r#""merge_method":"rebase""#);
+        let (outcome, read, waits) = merge_against((409, &rebase), &[]);
+        assert!(matches!(
+            outcome,
+            Err(Error::MergeFailed(message)) if message.contains("rebase")
+        ));
+        assert!(read.is_empty());
+        assert_eq!(waits, 0);
+    }
+
+    #[test]
+    fn a_refused_merge_is_an_error_without_polling() {
+        let (outcome, read, waits) = merge_against((400, HEAD_MOVED), &[]);
+        assert!(matches!(
+            outcome,
+            Err(Error::MergeFailed(message)) if message == "Pull request head branch was modified."
+        ));
+        assert!(read.is_empty());
+        assert_eq!(waits, 0);
+    }
 
     fn pending() -> AsyncMerge {
         AsyncMerge::Pending {
@@ -238,37 +350,37 @@ mod tests {
     #[test]
     fn reads_each_answer_to_the_merge_request() {
         assert_eq!(
-            parse_request_answer(200, ALREADY_MERGED.as_bytes()).ok(),
+            parse_request_answer(200, ALREADY_MERGED.as_bytes(), MergeMethod::Squash).ok(),
             Some(AsyncMerge::Merged)
         );
         assert_eq!(
-            parse_request_answer(202, ACCEPTED.as_bytes()).ok(),
+            parse_request_answer(202, ACCEPTED.as_bytes(), MergeMethod::Squash).ok(),
             Some(pending())
         );
         // A merge already pending for the pull request is followed, not an
         // error.
         assert_eq!(
-            parse_request_answer(409, ACCEPTED.as_bytes()).ok(),
+            parse_request_answer(409, ACCEPTED.as_bytes(), MergeMethod::Squash).ok(),
             Some(pending())
         );
         assert_eq!(
-            parse_request_answer(400, CLOSED.as_bytes()).ok(),
+            parse_request_answer(400, CLOSED.as_bytes(), MergeMethod::Squash).ok(),
             Some(AsyncMerge::Failed {
                 message: "Pull request is closed.".into()
             })
         );
         assert_eq!(
-            parse_request_answer(400, HEAD_MOVED.as_bytes()).ok(),
+            parse_request_answer(400, HEAD_MOVED.as_bytes(), MergeMethod::Squash).ok(),
             Some(AsyncMerge::Failed {
                 message: "Pull request head branch was modified.".into()
             })
         );
         assert!(matches!(
-            parse_request_answer(404, NOT_FOUND.as_bytes()),
+            parse_request_answer(404, NOT_FOUND.as_bytes(), MergeMethod::Squash),
             Err(Error::Http { status: 404, message }) if message == "Not Found"
         ));
         assert!(matches!(
-            parse_request_answer(400, b"{\"message\":\"Problems parsing JSON\"}"),
+            parse_request_answer(400, b"{\"message\":\"Problems parsing JSON\"}", MergeMethod::Squash),
             Err(Error::Http { status: 400, message }) if message == "Problems parsing JSON"
         ));
     }
@@ -284,28 +396,6 @@ mod tests {
             parse_async_merge(br#"{"status":"pending","details":{"message":"x"}}"#),
             Err(Error::Decode(_))
         ));
-    }
-
-    #[test]
-    fn waits_until_the_merge_is_no_longer_pending() {
-        let answers = RefCell::new(vec![MERGED, IN_PROGRESS, IN_PROGRESS]);
-        let asked = RefCell::new(Vec::new());
-        let mut waits = 0;
-        let outcome = settle(
-            pending(),
-            |uuid| {
-                asked.borrow_mut().push(uuid.to_owned());
-                let answer = answers.borrow_mut().pop().expect("an answer per poll");
-                parse_async_merge(answer.as_bytes())
-            },
-            |_| waits += 1,
-        );
-        assert_eq!(outcome.ok(), Some(MergeOutcome::Merged));
-        assert_eq!(waits, 3);
-        assert_eq!(
-            asked.into_inner(),
-            vec!["11bee280-61dd-46b9-9b18-c9f9576bc67b"; 3]
-        );
     }
 
     #[test]

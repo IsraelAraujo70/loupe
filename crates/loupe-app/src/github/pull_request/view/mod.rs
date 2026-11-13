@@ -124,6 +124,9 @@ pub struct PullRequestView {
     panel: Panel,
     merge_method: Option<MergeMethod>,
     write: Submit,
+    /// What a write that succeeded left to say, such as a merge GitHub was
+    /// still running when Loupe stopped waiting.
+    write_note: Option<&'static str>,
     /// The title being edited, while the edit row is open.
     title_edit: Option<Entity<InputState>>,
     /// The repository's labels while the label editor is open.
@@ -214,6 +217,7 @@ impl PullRequestView {
             panel: Panel::Closed,
             merge_method: None,
             write: Submit::Idle,
+            write_note: None,
             title_edit: None,
             labels_picker: None,
             labels_task: None,
@@ -547,19 +551,29 @@ impl PullRequestView {
             return;
         };
         let clears_review_body = matches!(write, Write::Review { .. });
+        let is_merge = matches!(write, Write::Merge(_));
         self.write = Submit::Busy;
+        self.write_note = None;
         self.write_task = Some(common::run(
             cx,
             move |gh| write.perform(gh, &detail),
             move |view, result, cx| match result {
                 Ok(note) => {
-                    view.write = note.map_or(Submit::Idle, |note| Submit::Failed(note.into()));
+                    view.write = Submit::Idle;
+                    view.write_note = note;
                     view.panel = Panel::Closed;
                     view.title_edit = None;
                     view.clear_review_body |= clears_review_body;
                     view.reload(cx);
                 }
-                Err(error) => view.write = Submit::Failed(error.detail()),
+                Err(error) => {
+                    view.write = Submit::Failed(error.detail());
+                    // GitHub may still be merging after a network error while
+                    // Loupe was reading the result; the reload shows the state.
+                    if is_merge {
+                        view.reload(cx);
+                    }
+                }
             },
         ));
         cx.notify();
