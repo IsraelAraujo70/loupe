@@ -211,6 +211,7 @@ impl<V> Node<V> {
             Node::Pane(pane) => PaneLayout::Pane {
                 tabs: pane.tabs.routes(),
                 active: pane.tabs.active_index(),
+                groups: pane.tabs.saved_groups(),
             },
             Node::Split(split) => PaneLayout::Split {
                 axis: split.axis,
@@ -275,7 +276,11 @@ impl<V> Panes<V> {
         build: &mut impl FnMut(&Route) -> V,
     ) -> Option<Node<V>> {
         match layout {
-            PaneLayout::Pane { tabs, active } => {
+            PaneLayout::Pane {
+                tabs,
+                active,
+                groups,
+            } => {
                 if tabs.is_empty() {
                     return None;
                 }
@@ -289,9 +294,11 @@ impl<V> Panes<V> {
                         self.tab(page)
                     })
                     .collect();
+                let mut tabs = Tabs::new(tabs, *active);
+                tabs.restore_groups(groups);
                 Some(Node::Pane(Pane {
                     id: self.node_id(),
-                    tabs: Tabs::new(tabs, *active),
+                    tabs,
                 }))
             }
             PaneLayout::Split {
@@ -485,10 +492,46 @@ impl<V> Panes<V> {
 
     /// Moves tab `tab` of pane `from` to `index` of pane `to` (its end when
     /// `None`), where it becomes the active tab of the now active pane. In its
-    /// own pane it takes the place of the tab at `index`. False when nothing
-    /// moved.
+    /// own pane it takes the place of the tab at `index`. It joins the group
+    /// of the tab it is dropped on and leaves its own, so a tab dropped after
+    /// the last one is in no group. False when nothing moved.
     pub fn move_tab(&mut self, from: PaneId, tab: u64, to: PaneId, index: Option<usize>) -> bool {
-        if self.pane(to).is_none() {
+        let Some(target) = self.pane(to) else {
+            return false;
+        };
+        let group = index.and_then(|index| target.tabs.group_at(index));
+        if from == to {
+            let Some(tabs) = self.tabs_mut(to) else {
+                return false;
+            };
+            let Some(at) = tabs.index_of(tab) else {
+                return false;
+            };
+            let target = index.unwrap_or(tabs.len() - 1).min(tabs.len() - 1);
+            let regrouped = tabs.group_at(at) != group;
+            let moved = tabs.remove(at).expect("the tab is in the pane");
+            tabs.insert(target, moved, group);
+            self.active = to;
+            return at != target || regrouped;
+        }
+        let Some(moved) = self.take(from, tab) else {
+            return false;
+        };
+        let tabs = self
+            .tabs_mut(to)
+            .expect("the target pane is a different one");
+        tabs.insert(index.unwrap_or(usize::MAX), moved, group);
+        self.active = to;
+        true
+    }
+
+    /// Moves tab `tab` of pane `from` to the end of group `group` of pane
+    /// `to`, as a tab dropped on the group's name. False when nothing moved.
+    pub fn move_into_group(&mut self, from: PaneId, tab: u64, to: PaneId, group: u64) -> bool {
+        let Some(target) = self.pane(to) else {
+            return false;
+        };
+        if target.tabs.group(group).is_none() {
             return false;
         }
         if from == to {
@@ -498,11 +541,12 @@ impl<V> Panes<V> {
             let Some(at) = tabs.index_of(tab) else {
                 return false;
             };
-            let target = index.unwrap_or(tabs.len() - 1).min(tabs.len() - 1);
-            let moved = tabs.remove(at).expect("the tab is in the pane");
-            tabs.insert(target, moved);
+            let moved = tabs.add_to_group(at, group);
+            if let Some(at) = tabs.index_of(tab) {
+                tabs.select(at);
+            }
             self.active = to;
-            return at != target;
+            return moved;
         }
         let Some(moved) = self.take(from, tab) else {
             return false;
@@ -510,7 +554,14 @@ impl<V> Panes<V> {
         let tabs = self
             .tabs_mut(to)
             .expect("the target pane is a different one");
-        tabs.insert(index.unwrap_or(usize::MAX), moved);
+        let after = tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.group == Some(group))
+            .map(|(index, _)| index + 1)
+            .last()
+            .unwrap_or(usize::MAX);
+        tabs.insert(after, moved, Some(group));
         self.active = to;
         true
     }
@@ -538,7 +589,7 @@ impl<V> Panes<V> {
     pub fn split(&mut self, target: PaneId, zone: Zone, tab: Tab<V>) {
         if zone == Zone::Center {
             if let Some(tabs) = self.tabs_mut(target) {
-                tabs.insert(usize::MAX, tab);
+                tabs.insert(usize::MAX, tab, None);
                 self.active = target;
             }
             return;
@@ -592,7 +643,7 @@ fn clamp_ratio(ratio: f32) -> f32 {
 mod tests {
     use super::{MIN_RATIO, Node, Panes, Zone};
     use crate::route::Route;
-    use crate::store::{PaneLayout, SplitAxis};
+    use crate::store::{PaneLayout, SavedTabGroup, SplitAxis, TabGroupColor};
 
     fn issue(id: &str) -> Route {
         Route::LinearIssue {
@@ -604,6 +655,7 @@ mod tests {
         PaneLayout::Pane {
             tabs: tabs.to_vec(),
             active,
+            groups: Vec::new(),
         }
     }
 
@@ -798,5 +850,126 @@ mod tests {
         assert_eq!(Zone::at(0.5, 0.05), Zone::Up);
         assert_eq!(Zone::at(0.9, 0.95), Zone::Down, "the nearer edge wins");
         assert_eq!(Zone::at(0.3, 0.5), Zone::Center);
+    }
+
+    #[test]
+    fn a_tab_dragged_onto_a_grouped_tab_joins_its_group_and_leaves_it_when_dropped_outside() {
+        let mut panes = restore(
+            &PaneLayout::Pane {
+                tabs: vec![issue("A"), issue("B"), issue("C"), issue("D")],
+                active: 0,
+                groups: vec![SavedTabGroup {
+                    name: "Review".into(),
+                    color: TabGroupColor::Red,
+                    collapsed: false,
+                    first: 1,
+                    len: 2,
+                }],
+            },
+            0,
+        );
+        let pane_id = panes.active_pane();
+        let id = |panes: &Panes<()>, name: &str| {
+            let (_, index) = panes.find(&issue(name)).unwrap();
+            panes.active().iter().nth(index).unwrap().id
+        };
+        let grouped = |panes: &Panes<()>| -> Vec<Route> {
+            let tabs = panes.active();
+            tabs.routes()
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| tabs.group_at(*index).is_some())
+                .map(|(_, route)| route)
+                .collect()
+        };
+
+        let d = id(&panes, "D");
+        assert!(panes.move_tab(pane_id, d, pane_id, Some(1)));
+        assert_eq!(
+            grouped(&panes),
+            [issue("D"), issue("B"), issue("C")],
+            "dropped on B, D takes its place in the group"
+        );
+
+        let c = id(&panes, "C");
+        assert!(panes.move_tab(pane_id, c, pane_id, None));
+        assert_eq!(
+            panes.active().routes(),
+            [issue("A"), issue("D"), issue("B"), issue("C")]
+        );
+        assert_eq!(
+            grouped(&panes),
+            [issue("D"), issue("B")],
+            "dropped after the last tab, C leaves the group even without moving"
+        );
+
+        let group = panes.active().groups()[0].id;
+        let a = id(&panes, "A");
+        assert!(panes.move_into_group(pane_id, a, pane_id, group));
+        assert_eq!(
+            grouped(&panes),
+            [issue("D"), issue("B"), issue("A")],
+            "dropped on the group's name, A joins it at its end"
+        );
+        assert!(!panes.move_into_group(pane_id, a, pane_id, group));
+
+        let saved = panes.layout();
+        let PaneLayout::Pane { groups, .. } = &saved.0 else {
+            panic!("one pane")
+        };
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            restore(&saved.0, saved.1).layout(),
+            saved,
+            "the groups come back after a restart"
+        );
+    }
+
+    #[test]
+    fn a_tab_moved_to_another_pane_leaves_its_group_unless_dropped_on_one() {
+        let grouped_pane = |tabs: &[Route]| PaneLayout::Pane {
+            tabs: tabs.to_vec(),
+            active: 0,
+            groups: vec![SavedTabGroup {
+                name: "Review".into(),
+                color: TabGroupColor::Blue,
+                collapsed: false,
+                first: 0,
+                len: tabs.len(),
+            }],
+        };
+        let mut panes = restore(
+            &PaneLayout::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(grouped_pane(&[issue("A"), issue("B")])),
+                second: Box::new(grouped_pane(&[issue("C"), issue("D")])),
+            },
+            0,
+        );
+        let (left, right) = (panes.panes()[0].id, panes.panes()[1].id);
+        let tab_id = |panes: &Panes<()>, name: &str| {
+            let (pane, index) = panes.find(&issue(name)).unwrap();
+            panes.pane(pane).unwrap().tabs.iter().nth(index).unwrap().id
+        };
+        let group_of = |panes: &Panes<()>, name: &str| {
+            let (pane, index) = panes.find(&issue(name)).unwrap();
+            let tabs = &panes.pane(pane).unwrap().tabs;
+            tabs.group_at(index)
+                .and_then(|id| tabs.group(id))
+                .map(|group| group.name.clone())
+        };
+
+        let a = tab_id(&panes, "A");
+        assert!(panes.move_tab(left, a, right, None));
+        assert_eq!(group_of(&panes, "A"), None);
+        let b = tab_id(&panes, "B");
+        assert!(panes.move_tab(left, b, right, Some(1)));
+        assert_eq!(
+            group_of(&panes, "B").as_deref(),
+            Some("Review"),
+            "dropped on D, B joins the other pane's group"
+        );
+        assert_eq!(panes.pane_count(), 1, "the emptied pane closes");
     }
 }
