@@ -64,6 +64,17 @@ pub(super) struct Pane<V> {
     pub tabs: Tabs<V>,
 }
 
+/// One open tab, as the command palette lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct OpenTab {
+    pub id: u64,
+    pub route: Route,
+    /// Its pane's place in reading order, from 0.
+    pub pane: usize,
+    /// The open tab of the active pane: the one the keys act on.
+    pub current: bool,
+}
+
 pub(super) struct Split<V> {
     pub id: u64,
     pub axis: SplitAxis,
@@ -410,6 +421,24 @@ impl<V> Panes<V> {
         all.into_iter().flat_map(|pane| pane.tabs.iter_mut())
     }
 
+    /// Every tab of every pane: the panes in reading order, each pane's
+    /// tabs in the order of its row.
+    pub fn open_tabs(&self) -> Vec<OpenTab> {
+        self.panes()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(place, pane)| {
+                let current = (pane.id == self.active).then(|| pane.tabs.active().id);
+                pane.tabs.iter().map(move |tab| OpenTab {
+                    id: tab.id,
+                    route: tab.current().route.clone(),
+                    pane: place,
+                    current: current == Some(tab.id),
+                })
+            })
+            .collect()
+    }
+
     /// The pane and the index of the first tab showing `route`.
     pub fn find(&self, route: &Route) -> Option<(PaneId, usize)> {
         self.panes().into_iter().find_map(|pane| {
@@ -590,7 +619,7 @@ fn clamp_ratio(ratio: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_RATIO, Node, Panes, Zone};
+    use super::{MIN_RATIO, Node, OpenTab, Panes, Zone};
     use crate::route::Route;
     use crate::store::{PaneLayout, SplitAxis};
 
@@ -620,6 +649,43 @@ mod tests {
         let (pane, index) = panes.find(&issue("ENG-1")).expect("the ticket is open");
         let tab = panes.pane(pane).unwrap().tabs.iter().nth(index).unwrap().id;
         (pane, tab)
+    }
+
+    #[test]
+    fn open_tabs_lists_every_pane_in_reading_order() {
+        let layout = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(pane(&[Route::Inbox, issue("ENG-1")], 1)),
+            second: Box::new(pane(&[Route::Settings, issue("ENG-2")], 0)),
+        };
+        let panes = restore(&layout, 1);
+        let listed: Vec<(Route, usize, bool)> = panes
+            .open_tabs()
+            .into_iter()
+            .map(
+                |OpenTab {
+                     route,
+                     pane,
+                     current,
+                     ..
+                 }| (route, pane, current),
+            )
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (Route::Inbox, 0, false),
+                (issue("ENG-1"), 0, false),
+                (Route::Settings, 1, true),
+                (issue("ENG-2"), 1, false),
+            ],
+            "only the active pane's open tab is the current one"
+        );
+        let ids: Vec<u64> = panes.open_tabs().iter().map(|tab| tab.id).collect();
+        let mut unique = ids.clone();
+        unique.dedup();
+        assert_eq!(ids, unique, "each tab is listed once, under its own id");
     }
 
     #[test]
