@@ -280,10 +280,11 @@ mod install_tests {
                 .status()
                 .unwrap();
             assert_eq!(status.success(), !fail);
-            // The helper starts the restored version in the background and exits, so on a
-            // busy machine it can take a while to run; the deadline only bounds a real failure.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !marker.exists() && std::time::Instant::now() < deadline {
+            // The restored version is started asynchronously by the helper.
+            for _ in 0..50 {
+                if marker.exists() {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert_eq!(
