@@ -1040,5 +1040,24 @@ mod golden {
             default_request(&odd, Reviewer::General, &[]),
             include_str!("golden/general-odd.txt"),
         );
+        // Every value that can hold braces holds a variable's name, so a
+        // value filled in early can never be filled again by a later one.
+        let braces = PrLinkContext {
+            url: "https://example.test/{repository}/pull/{number}".into(),
+            title: "{head_branch} and {security}".into(),
+            head_ref: "fix/{number}-{title}".into(),
+            head_oid: "{url}".into(),
+            author: Some("{short_sha}".into()),
+            ..context()
+        };
+        let risk = vec!["label {url}".to_owned(), "src/{title}/auth.ts".to_owned()];
+        same(
+            default_request(&braces, Reviewer::GeneralAndSecurity, &risk),
+            include_str!("golden/security-braces.txt"),
+        );
+        same(
+            default_request(&braces, Reviewer::General, &risk),
+            include_str!("golden/general-braces.txt"),
+        );
     }
 }

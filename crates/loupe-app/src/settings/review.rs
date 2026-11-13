@@ -100,6 +100,7 @@ impl SettingsView {
         let review = &Settings::get(cx).t3_review;
         let edited = review.prompt.is_some();
         let unknown = unknown_variables(review.prompt());
+        let no_security = !review.prompt().contains("{security}");
         let mono = cx.theme().mono_font_family.clone();
         let variables = h_flex()
             .flex_wrap()
@@ -163,6 +164,12 @@ impl SettingsView {
                 message(
                     format!("Not a variable, so sent as typed: {names}.").into(),
                     colors.danger,
+                )
+            }))
+            .children(no_security.then(|| {
+                message(
+                    "Without {security}, the security reviewer changes only the model.".into(),
+                    colors.muted,
                 )
             }))
     }
