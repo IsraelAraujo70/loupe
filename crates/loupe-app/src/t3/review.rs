@@ -599,3 +599,79 @@ mod tests {
         );
     }
 }
+
+/// The requests Loupe sent before the prompt and the risk rules became
+/// settings, captured from that build. With the default settings the request
+/// must stay byte for byte the same.
+#[cfg(test)]
+mod golden {
+    use loupe_github::{PrRef, RepoRef};
+
+    use super::{Reviewer, request};
+    use crate::links::PrLinkContext;
+
+    fn context() -> PrLinkContext {
+        PrLinkContext {
+            pr: PrRef::new(RepoRef::new("hooli-inc", "hooli-api"), 374),
+            url: "https://github.com/hooli-inc/hooli-api/pull/374".into(),
+            title: "feat: trusted CA roots".into(),
+            body: String::new(),
+            head_ref: "feature/eng-261-p1".into(),
+            head_oid: "4914142cdeadbeef".into(),
+            head_fork: None,
+            author: Some("octocat".into()),
+            viewer_login: "IsraelAraujo70".into(),
+            labels: Vec::new(),
+        }
+    }
+
+    /// The request the dialog writes with the default settings.
+    fn default_request(context: &PrLinkContext, reviewer: Reviewer, risk: &[String]) -> String {
+        request(context, reviewer, risk)
+    }
+
+    #[track_caller]
+    fn same(actual: String, expected: &str) {
+        if actual != expected {
+            let at = actual
+                .bytes()
+                .zip(expected.bytes())
+                .position(|(a, b)| a != b)
+                .unwrap_or(actual.len().min(expected.len()));
+            panic!(
+                "the default request changed at byte {at}\n--- expected\n{expected}\n--- actual\n{actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_request_is_byte_for_byte_the_one_loupe_sent_before() {
+        let two = vec!["label revisao:risco".to_owned(), "src/auth.ts".to_owned()];
+        let seven: Vec<String> = (1..=7).map(|k| format!("src/auth/file{k}.ts")).collect();
+        let general = include_str!("golden/general.txt");
+        same(default_request(&context(), Reviewer::General, &[]), general);
+        same(
+            default_request(&context(), Reviewer::General, &two),
+            general,
+        );
+        same(
+            default_request(&context(), Reviewer::GeneralAndSecurity, &[]),
+            include_str!("golden/security-asked.txt"),
+        );
+        same(
+            default_request(&context(), Reviewer::GeneralAndSecurity, &two),
+            include_str!("golden/security-risky.txt"),
+        );
+        same(
+            default_request(&context(), Reviewer::GeneralAndSecurity, &seven),
+            include_str!("golden/security-many.txt"),
+        );
+        let mut odd = context();
+        odd.title = "fix: keep {url} and {number} and \"quotes\" as typed".into();
+        odd.author = None;
+        same(
+            default_request(&odd, Reviewer::General, &[]),
+            include_str!("golden/general-odd.txt"),
+        );
+    }
+}
