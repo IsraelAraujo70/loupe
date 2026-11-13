@@ -1,0 +1,15 @@
+Revisar o PR #374 de hooli-inc/hooli-api, de `{short_sha}`: "{head_branch} and {security}".
+https://example.test/{repository}/pull/{number}
+
+Esta worktree parte do head atual de `origin/fix/{number}-{title}` (era `{url}` quando o pedido foi escrito).
+
+1. Leia o AGENTS.md e o CLAUDE.md do repo, a descrição do PR (`gh pr view 374 -R hooli-inc/hooli-api`), os comentários e as revisões já feitas (`gh api repos/hooli-inc/hooli-api/pulls/374/comments`, `gh api repos/hooli-inc/hooli-api/issues/374/comments`, `gh api repos/hooli-inc/hooli-api/pulls/374/reviews`).
+2. Use os revisores versionados do repo (`.claude/agents/`) e as skills `verify*` do repo como checklist, quando existirem.
+3. **Resolve o que diz resolver?** Confira contra o ticket ligado no Linear, quando houver.
+4. **Achados**, cada um com arquivo:linha, gravidade (🔴 bloqueia / 🟡 recomendação) e uma prova: um teste, uma reprodução ou o caminho no código.
+5. **Testes**: rode os specs que o PR toca (os pesados onde o AGENTS.md do repo mandar) e mostre que uma mutação relevante faz um teste falhar.
+6. **Escopo**: diga o que vazou para fora do que o PR pede.
+
+Este PR é de risco (`label {url}`, `src/{title}/auth.ts`): além da revisão geral, faça a revisão de segurança seguindo a skill `revisar-seguranca`, quando o ambiente tiver essa skill.
+
+Não comente no PR, não aprove, não faça push nem merge. Termine com um texto pronto para o usuário postar como revisão, o veredito (aprovar, aprovar com ressalvas ou pedir mudanças) e um bloco json: {"veredito":"...","vermelhos":<n>,"amarelos":<n>,"nao_verificado":"..."}.

@@ -211,7 +211,32 @@ impl GitHub {
         }
     }
 
+    /// Sends one JSON REST call and returns the status with the body, for
+    /// endpoints whose non-2xx answers carry a result: only 401 is an error
+    /// here.
+    pub(crate) fn rest_with_status(
+        &self,
+        method: RestMethod<'_>,
+        path: &str,
+    ) -> Result<(u16, Vec<u8>)> {
+        if std::env::var_os("LOUPE_OFFLINE").is_some() {
+            return Err(Error::Transport("Offline mode".into()));
+        }
+        let response = self.send_request(method, path, "application/vnd.github+json")?;
+        self.read_response(response)
+    }
+
     fn send_rest(&self, method: RestMethod<'_>, path: &str, accept: &str) -> Result<Vec<u8>> {
+        let response = self.send_request(method, path, accept)?;
+        self.read_success(response)
+    }
+
+    fn send_request(
+        &self,
+        method: RestMethod<'_>,
+        path: &str,
+        accept: &str,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!("{REST_URL}{path}");
         let sent = match method {
             RestMethod::Get => self.authorize(self.agent.get(&url), accept).call(),
@@ -222,8 +247,7 @@ impl GitHub {
             }
             RestMethod::Put(None) => self.authorize(self.agent.put(&url), accept).send_empty(),
         };
-        let response = sent.map_err(|error| Error::Transport(error.to_string()))?;
-        self.read_success(response)
+        sent.map_err(|error| Error::Transport(error.to_string()))
     }
 
     /// A GET that sends `etag` as `If-None-Match`. GitHub answers 304 when
@@ -257,7 +281,20 @@ impl GitHub {
 
     /// Records the rate limit, then returns the body of a 2xx response or
     /// the error the status stands for.
-    fn read_success(&self, mut response: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
+    fn read_success(&self, response: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
+        let (status, body) = self.read_response(response)?;
+        if !(200..300).contains(&status) {
+            return Err(http_error(status, &body));
+        }
+        Ok(body)
+    }
+
+    /// Records the rate limit and reads the status and body. A 401 is the
+    /// only status it turns into an error.
+    fn read_response(
+        &self,
+        mut response: ureq::http::Response<ureq::Body>,
+    ) -> Result<(u16, Vec<u8>)> {
         self.record_rate(response.headers());
         let status = response.status().as_u16();
         let body = response
@@ -269,14 +306,7 @@ impl GitHub {
         if status == 401 {
             return Err(Error::Unauthorized);
         }
-        if !(200..300).contains(&status) {
-            let message = serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|value| value["message"].as_str().map(str::to_owned))
-                .unwrap_or_default();
-            return Err(Error::Http { status, message });
-        }
-        Ok(body)
+        Ok((status, body))
     }
 
     /// Whether the check runs or the commit statuses of commit `sha`
@@ -367,6 +397,15 @@ impl ChecksPoll {
             }),
         }
     }
+}
+
+/// The error a non-2xx REST response stands for, with GitHub's `message`.
+pub(crate) fn http_error(status: u16, body: &[u8]) -> Error {
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    Error::Http { status, message }
 }
 
 /// Whether a failed request goes out again: a read that met a gateway error

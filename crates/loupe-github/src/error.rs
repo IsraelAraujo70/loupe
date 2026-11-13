@@ -10,6 +10,10 @@ pub enum Error {
     /// The GraphQL response carried `errors`.
     #[error("GitHub GraphQL error: {}", .0.join("; "))]
     GraphQl(Vec<String>),
+    /// GitHub refused a merge or it failed in the background; the reason is
+    /// GitHub's.
+    #[error("GitHub did not merge the pull request: {0}")]
+    MergeFailed(String),
     /// DNS, TLS, timeout, or connection failure.
     #[error("network error: {0}")]
     Transport(String),

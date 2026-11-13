@@ -1,11 +1,12 @@
-//! Every write the app makes. Each returns once GitHub accepted it; the app
+//! Every GraphQL write the app makes (merging goes through REST, in
+//! `merge.rs`). Each returns once GitHub accepted it; the app
 //! reloads the pull request afterwards.
 
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use serde_json::{Value, json};
 
-use crate::{Error, GitHub, MergeMethod, NewThread, Result, ReviewEvent, Side};
+use crate::{Error, GitHub, NewThread, Result, ReviewEvent, Side};
 
 const ADD_COMMENT: &str = "mutation AddComment($subjectId: ID!, $body: String!) { \
     addComment(input: {subjectId: $subjectId, body: $body}) { clientMutationId } }";
@@ -51,11 +52,6 @@ const MARK_FILE_VIEWED: &str = "mutation MarkFileViewed($pullRequestId: ID!, $pa
 const UNMARK_FILE_VIEWED: &str = "mutation UnmarkFileViewed($pullRequestId: ID!, $path: String!) { \
     unmarkFileAsViewed(input: {pullRequestId: $pullRequestId, path: $path}) { clientMutationId } }";
 
-const MERGE: &str = "mutation Merge($pullRequestId: ID!, $method: PullRequestMergeMethod!, \
-    $expectedHeadOid: GitObjectID!) { \
-    mergePullRequest(input: {pullRequestId: $pullRequestId, mergeMethod: $method, \
-    expectedHeadOid: $expectedHeadOid}) { clientMutationId } }";
-
 const MARK_READY: &str = "mutation MarkReady($pullRequestId: ID!) { \
     markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) { clientMutationId } }";
 
@@ -99,7 +95,6 @@ pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("discard_review", DISCARD_REVIEW),
     ("mark_file_viewed", MARK_FILE_VIEWED),
     ("unmark_file_viewed", UNMARK_FILE_VIEWED),
-    ("merge", MERGE),
     ("mark_ready_for_review", MARK_READY),
     ("convert_to_draft", CONVERT_TO_DRAFT),
     ("close_pull_request", CLOSE_PULL_REQUEST),
@@ -122,14 +117,6 @@ fn review_event_name(event: ReviewEvent) -> &'static str {
         ReviewEvent::Comment => "COMMENT",
         ReviewEvent::Approve => "APPROVE",
         ReviewEvent::RequestChanges => "REQUEST_CHANGES",
-    }
-}
-
-fn merge_method_name(method: MergeMethod) -> &'static str {
-    match method {
-        MergeMethod::Merge => "MERGE",
-        MergeMethod::Squash => "SQUASH",
-        MergeMethod::Rebase => "REBASE",
     }
 }
 
@@ -257,23 +244,6 @@ impl GitHub {
         )
     }
 
-    /// Merges only if the head is still `expected_head_oid`.
-    pub fn merge(
-        &self,
-        pull_request_id: &str,
-        method: MergeMethod,
-        expected_head_oid: &str,
-    ) -> Result<()> {
-        self.mutate(
-            MERGE,
-            json!({
-                "pullRequestId": pull_request_id,
-                "method": merge_method_name(method),
-                "expectedHeadOid": expected_head_oid,
-            }),
-        )
-    }
-
     pub fn mark_ready_for_review(&self, pull_request_id: &str) -> Result<()> {
         self.mutate(MARK_READY, json!({ "pullRequestId": pull_request_id }))
     }
@@ -341,8 +311,8 @@ impl GitHub {
 mod tests {
     use serde_json::json;
 
-    use super::{merge_method_name, review_event_name, review_thread_variables, side_name};
-    use crate::{LineAnchor, MergeMethod, NewThread, ReviewEvent, Side};
+    use super::{review_event_name, review_thread_variables, side_name};
+    use crate::{LineAnchor, NewThread, ReviewEvent, Side};
 
     fn thread(anchor: LineAnchor) -> NewThread {
         NewThread {
@@ -367,13 +337,6 @@ mod tests {
             review_event_name(ReviewEvent::RequestChanges),
             "REQUEST_CHANGES"
         );
-    }
-
-    #[test]
-    fn maps_merge_methods() {
-        assert_eq!(merge_method_name(MergeMethod::Merge), "MERGE");
-        assert_eq!(merge_method_name(MergeMethod::Squash), "SQUASH");
-        assert_eq!(merge_method_name(MergeMethod::Rebase), "REBASE");
     }
 
     #[test]

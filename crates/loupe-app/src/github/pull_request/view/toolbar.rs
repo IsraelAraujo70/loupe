@@ -32,7 +32,8 @@ enum Commit {
 }
 
 impl PullRequestView {
-    /// The band under the meta line: the open panel and the last write error.
+    /// The band under the meta line: the open panel, the last write error,
+    /// and what the last write left to say.
     pub(super) fn render_panel_band(
         &self,
         detail: &PullRequestDetail,
@@ -71,6 +72,25 @@ impl PullRequestView {
                             ui::icon_button("pr-write-error-dismiss", IconName::Close, "Dismiss")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.write = crate::github::common::Submit::Idle;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when_some(self.write_note, |column, note| {
+                column.child(
+                    h_flex()
+                        .px(scale::content_inset())
+                        .py_2()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(Alert::info("pr-write-note", note).flex_1())
+                        .child(
+                            ui::icon_button("pr-write-note-dismiss", IconName::Close, "Dismiss")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.write_note = None;
                                     cx.notify();
                                 })),
                         ),
