@@ -6,6 +6,8 @@
 //! `org:`, and `issue:` (or `issues:`) narrow what it lists; a team key such
 //! as `ENG-` narrows the Linear issues to that team; the other words are the
 //! text to search for. The field draws each prefix as a highlighted token.
+//! `tab:` (or `tabs:`) lists the window's open tabs, in every pane, and
+//! Enter switches to one; Cmd+Shift+A opens the palette on that list.
 //! Typed text also finds the pane commands (Split right, left, up, down),
 //! listed first under Commands: text that names one is asking for it.
 //!
@@ -40,16 +42,21 @@ use crate::linear::issue_menu::{self, Field, FieldChoice};
 use crate::route::Route;
 use crate::services::Services;
 use crate::shell::actions::PaletteOpenInNewTab;
+use crate::shell::actions::SearchTabs;
 use crate::shell::item_menu::{self, Command as ItemCommand, Item, Place};
-use crate::shell::panes::Zone;
-use crate::shell::{OpenOnClick as _, PaletteItem, navigate, open_in_new_tab, split_active_tab};
+use crate::shell::panes::{OpenTab, Zone};
+use crate::shell::{
+    OpenOnClick as _, PaletteItem, activate_tab, navigate, open_in_new_tab, split_active_tab,
+};
 use crate::store::{Favorite, Settings};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const PLACEHOLDER: &str =
-    "Search, or narrow with pr:, repo:, org:, issue:, or a team key like ENG-";
+    "Search, or narrow with pr:, repo:, org:, issue:, tab:, or a team key like ENG-";
+/// What the field holds when the palette opens on the open tabs.
+const TABS_QUERY: &str = "tab: ";
 /// Rows of the Repositories section.
 const MAX_REPOS: usize = 8;
 /// Repositories a `repo:` filter searches, one section each.
@@ -81,13 +88,30 @@ fn is_open(window: &mut Window, cx: &mut App) -> bool {
 }
 
 /// Opens the palette over `window`, or closes it when already open.
-/// `target` is the item whose commands it lists first.
-pub fn toggle(target: Option<(Item, Place)>, window: &mut Window, cx: &mut App) {
+/// `target` is the item whose commands it lists first; `tabs` are the
+/// window's open tabs, which `tab:` lists.
+pub(super) fn toggle(
+    target: Option<(Item, Place)>,
+    tabs: Vec<OpenTab>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if is_open(window, cx) {
         window.close_dialog(cx);
         return;
     }
-    open_palette(Mode::Search(target), window, cx);
+    open_palette(Mode::Search(target, tabs), window, cx);
+}
+
+/// Opens the palette on the open tabs `tabs`, as if `tab: ` were typed, or
+/// closes it when already open.
+pub(super) fn toggle_tabs(tabs: Vec<OpenTab>, window: &mut Window, cx: &mut App) {
+    if is_open(window, cx) {
+        window.close_dialog(cx);
+        return;
+    }
+    let view = open_palette(Mode::Search(None, tabs), window, cx);
+    view.update(cx, |view, cx| view.narrow_to_tabs(window, cx));
 }
 
 /// Opens the palette on `field`'s list for `issue`, in place of whatever
@@ -101,22 +125,24 @@ pub fn open_picker(issue: IssueSummary, field: Field, window: &mut Window, cx: &
 
 /// What the palette was opened for.
 enum Mode {
-    /// Search and go to, after the commands of the item, if any.
-    Search(Option<(Item, Place)>),
+    /// Search and go to, after the commands of the item, if any, with the
+    /// window's open tabs for `tab:`.
+    Search(Option<(Item, Place)>, Vec<OpenTab>),
     /// One property's list for an issue.
     Pick(Box<IssueSummary>, Field),
 }
 
-fn open_palette(mode: Mode, window: &mut Window, cx: &mut App) {
+fn open_palette(mode: Mode, window: &mut Window, cx: &mut App) -> Entity<PaletteView> {
     let command = cx.new(|cx| CommandState::new(window, cx));
     let placeholder = match &mode {
-        Mode::Search(_) => PLACEHOLDER.to_owned(),
+        Mode::Search(..) => PLACEHOLDER.to_owned(),
         Mode::Pick(issue, field) => field.placeholder(&issue.identifier),
     };
     let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
     let view = cx.new(|cx| PaletteView::new(command, input.clone(), mode, window, cx));
     cx.set_global(PaletteSlot(Some(view.downgrade())));
 
+    let shown = view.clone();
     let focus_pending = std::cell::Cell::new(true);
     window.open_dialog(cx, move |dialog, window, cx| {
         if focus_pending.replace(false) {
@@ -128,8 +154,9 @@ fn open_palette(mode: Mode, window: &mut Window, cx: &mut App) {
             .w(dp(620.))
             .margin_top(dp(96.))
             .on_close(|_, _, cx| cx.set_global(PaletteSlot(None)))
-            .child(view.clone())
+            .child(shown.clone())
     });
+    view
 }
 
 /// Items a query names directly, without a network call: `owner/repo#123`
@@ -213,10 +240,11 @@ enum Prefix {
     Repo,
     Org,
     Issue,
+    Tab,
 }
 
 /// Longer spellings first, so `prs:` is not read as `pr:` and an `s`.
-const PREFIXES: [(&str, Prefix); 7] = [
+const PREFIXES: [(&str, Prefix); 9] = [
     ("prs:", Prefix::PullRequest),
     ("pr:", Prefix::PullRequest),
     ("repos:", Prefix::Repo),
@@ -224,6 +252,8 @@ const PREFIXES: [(&str, Prefix); 7] = [
     ("org:", Prefix::Org),
     ("issues:", Prefix::Issue),
     ("issue:", Prefix::Issue),
+    ("tabs:", Prefix::Tab),
+    ("tab:", Prefix::Tab),
 ];
 
 /// The prefix `word` starts with, in any case, and its length in bytes.
@@ -266,7 +296,7 @@ struct ParsedQuery {
     orgs: Vec<String>,
     /// The key of an `ENG-` word, uppercased.
     team_key: Option<String>,
-    /// The free words, and what follows `pr:` and `issue:`.
+    /// The free words, and what follows `pr:`, `issue:`, and `tab:`.
     words: Vec<String>,
 }
 
@@ -285,7 +315,9 @@ impl ParsedQuery {
                 match prefix {
                     Prefix::Repo => parsed.repos.push(value.to_owned()),
                     Prefix::Org => parsed.orgs.push(value.to_owned()),
-                    Prefix::PullRequest | Prefix::Issue => parsed.words.push(value.to_owned()),
+                    Prefix::PullRequest | Prefix::Issue | Prefix::Tab => {
+                        parsed.words.push(value.to_owned())
+                    }
                 }
             } else if let Some(key) = team_key_word(word) {
                 parsed.team_key = Some(key);
@@ -314,16 +346,26 @@ impl ParsedQuery {
         self.has(Prefix::Issue) || self.team_key.is_some()
     }
 
+    /// `tab:`: the query asks for the open tabs.
+    fn narrows_to_tabs(&self) -> bool {
+        self.has(Prefix::Tab)
+    }
+
     fn is_narrowed(&self) -> bool {
-        self.narrows_to_github() || self.narrows_to_linear()
+        self.narrows_to_github() || self.narrows_to_linear() || self.narrows_to_tabs()
     }
 
     fn shows_github(&self) -> bool {
-        self.narrows_to_github() || !self.narrows_to_linear()
+        self.narrows_to_github() || !(self.narrows_to_linear() || self.narrows_to_tabs())
     }
 
     fn shows_linear(&self) -> bool {
-        self.narrows_to_linear() || !self.narrows_to_github()
+        self.narrows_to_linear() || !(self.narrows_to_github() || self.narrows_to_tabs())
+    }
+
+    /// Whether the query runs a search over the network.
+    fn searches_remotely(&self) -> bool {
+        self.shows_github() || self.shows_linear()
     }
 }
 
@@ -650,11 +692,16 @@ impl Group {
 /// 0 for a substring match, 1 for a subsequence match, `None` for no match.
 /// Case-insensitive, over the title and the subtitle.
 fn match_rank(query: &str, item: &PaletteItem) -> Option<u8> {
+    text_rank(query, &format!("{} {}", item.title, item.subtitle))
+}
+
+/// [`match_rank`] over any text.
+fn text_rank(query: &str, haystack: &str) -> Option<u8> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Some(0);
     }
-    let haystack = format!("{} {}", item.title, item.subtitle).to_lowercase();
+    let haystack = haystack.to_lowercase();
     if haystack.contains(&query) {
         return Some(0);
     }
@@ -761,11 +808,40 @@ fn pane_commands(parsed: &ParsedQuery) -> Vec<(&'static str, Zone, Option<&'stat
         .collect()
 }
 
-/// A row listed before the pages: a command on the panes or on the item.
+/// A row listed before the pages: a command on the panes or on the item,
+/// or an open tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leading {
     Pane(Zone),
     Item(ItemCommand),
+    Tab(u64),
+}
+
+/// The open tabs `tab:` lists: those whose title holds the text, or holds
+/// its letters in order, the closer matches first; otherwise in the order
+/// of their panes and rows.
+fn tab_rows(parsed: &ParsedQuery, tabs: &[OpenTab]) -> Vec<OpenTab> {
+    if !parsed.narrows_to_tabs() {
+        return Vec::new();
+    }
+    let text = parsed.text();
+    let mut ranked: Vec<(u8, &OpenTab)> = tabs
+        .iter()
+        .filter_map(|tab| text_rank(&text, &tab.route.label()).map(|rank| (rank, tab)))
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, tab)| tab.clone()).collect()
+}
+
+/// What a tab's row says after its title: its pane, once the window is
+/// split, and whether it is the tab on screen in the active pane.
+fn tab_subtitle(tab: &OpenTab, panes: usize) -> String {
+    let pane = (panes > 1).then(|| format!("Pane {}", tab.pane + 1));
+    let current = tab.current.then(|| "Current tab".to_owned());
+    pane.into_iter()
+        .chain(current)
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// The commands of `target` a query asks for: all of them while it is
@@ -881,6 +957,8 @@ struct PaletteView {
     command: Entity<CommandState>,
     input: Entity<InputState>,
     local: Vec<PaletteItem>,
+    /// The window's open tabs, as they were when the palette opened.
+    tabs: Vec<OpenTab>,
     catalog: RepoCatalog,
     /// False until the reachable repositories arrive. GitHub searches wait
     /// for them, because they decide what every search covers.
@@ -951,6 +1029,7 @@ impl PaletteView {
             command,
             input,
             local: local_items(cx),
+            tabs: Vec::new(),
             catalog: RepoCatalog {
                 watched: Settings::get(cx).watched_repos.clone(),
                 reachable: Vec::new(),
@@ -973,7 +1052,8 @@ impl PaletteView {
             _input_events: input_events,
         };
         match mode {
-            Mode::Search(target) => {
+            Mode::Search(target, tabs) => {
+                view.tabs = tabs;
                 view.set_target(target, cx);
                 view.load_catalog(window, cx);
             }
@@ -1094,11 +1174,11 @@ impl PaletteView {
         self.direct = direct_items(&self.query);
         self.pending.clear();
         self.github_waiting = None;
-        self.debouncing = !self.query.is_empty();
+        self.debouncing = !self.query.is_empty() && self.parsed.searches_remotely();
         let generation = self.remote.reset();
         self.sync_loading(window, cx);
         cx.notify();
-        if self.query.is_empty() {
+        if !self.debouncing {
             return;
         }
 
@@ -1181,6 +1261,14 @@ impl PaletteView {
         let loading = self.is_searching();
         self.input
             .update(cx, |input, cx| input.set_loading(loading, window, cx));
+    }
+
+    /// Puts `tab: ` in the field, in place of what it held, so the palette
+    /// lists the open tabs.
+    fn narrow_to_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_value(TABS_QUERY, window, cx));
+        self.on_input_changed(window, cx);
     }
 
     fn route_at(&self, section: usize, row: usize) -> Option<Route> {
@@ -1308,6 +1396,48 @@ fn row(item: PaletteItem) -> CommandItem {
                                 .text_color(muted),
                         )
                         .child(comments.to_string()),
+                )
+            })
+    })
+}
+
+/// An open tab: the icon and title its tab shows, then where it is.
+fn tab_row(tab: OpenTab, panes: usize) -> CommandItem {
+    let title = SharedString::from(tab.route.label());
+    let subtitle = SharedString::from(tab_subtitle(&tab, panes));
+    let icon = super::tab_bar::route_icon(&tab.route);
+    let id = SharedString::from(format!("palette-tab-{}", tab.id));
+    CommandItem::new().label(title.clone()).child(move |_, cx| {
+        let muted = cx.theme().muted_foreground;
+        let selector = id.to_string();
+        h_flex()
+            .id(id.clone())
+            .debug_selector(|| selector)
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .child(
+                svg()
+                    .path(icon.path())
+                    .flex_none()
+                    .size_4()
+                    .text_color(muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(scale::body())
+                    .child(title.clone()),
+            )
+            .when(!subtitle.is_empty(), |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .child(subtitle.clone()),
                 )
             })
     })
@@ -1570,6 +1700,11 @@ impl Render for PaletteView {
             self.render_search(cx)
         };
         div()
+            .on_action(cx.listener(|this, _: &SearchTabs, window, cx| {
+                if this.picker.is_none() {
+                    this.narrow_to_tabs(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &PaletteOpenInNewTab, window, cx| {
                 this.new_tab = true;
                 window.dispatch_action(Box::new(Confirm { secondary: false }), cx);
@@ -1604,6 +1739,7 @@ impl PaletteView {
             .collect();
         let item_commands = item_commands(self.target.as_ref(), self.target_t3, &self.parsed);
         let pane_commands = pane_commands(&self.parsed);
+        let tab_rows = tab_rows(&self.parsed, &self.tabs);
         self.leading = [
             item_commands
                 .iter()
@@ -1613,6 +1749,7 @@ impl PaletteView {
                 .iter()
                 .map(|(_, zone, _)| Leading::Pane(*zone))
                 .collect(),
+            tab_rows.iter().map(|tab| Leading::Tab(tab.id)).collect(),
         ]
         .into_iter()
         .filter(|section| !section.is_empty())
@@ -1659,6 +1796,11 @@ impl PaletteView {
                         item_menu::run(command, &item, window, cx);
                         return;
                     }
+                    Some((Leading::Tab(tab), _)) => {
+                        window.close_dialog(cx);
+                        activate_tab(tab, cx);
+                        return;
+                    }
                     _ => {}
                 }
                 let picked = view
@@ -1696,6 +1838,14 @@ impl PaletteView {
                 ),
             );
         }
+        if !tab_rows.is_empty() {
+            let panes = self.tabs.iter().map(|tab| tab.pane + 1).max().unwrap_or(1);
+            command = command.group(
+                CommandGroup::new()
+                    .label("Tabs")
+                    .items(tab_rows.into_iter().map(|tab| tab_row(tab, panes))),
+            );
+        }
         for (group, items) in sections {
             command = command.group(
                 CommandGroup::new()
@@ -1712,10 +1862,11 @@ mod tests {
     use super::{
         Group, ParsedQuery, PrSearch, PrTarget, Prefix, RemoteResults, RepoCatalog, Source,
         build_sections, direct_items, linear_search, match_rank, pane_commands, pr_searches,
-        prefix_ranges, repo_rows, searching_label,
+        prefix_ranges, repo_rows, searching_label, tab_rows, tab_subtitle,
     };
     use crate::route::Route;
     use crate::shell::PaletteItem;
+    use crate::shell::panes::OpenTab;
     use loupe_github::{PrRef, RepoRef};
 
     fn item(title: &str, subtitle: &str, route: Route) -> PaletteItem {
@@ -1847,6 +1998,83 @@ mod tests {
                 "{short:?} looks for a page, not a split"
             );
         }
+    }
+
+    fn open_tab(id: u64, route: Route, pane: usize, current: bool) -> OpenTab {
+        OpenTab {
+            id,
+            route,
+            pane,
+            current,
+        }
+    }
+
+    #[test]
+    fn tab_prefix_lists_only_the_open_tabs_and_searches_nothing() {
+        for query in ["tab:", "Tabs:", "tab: web"] {
+            let parsed = ParsedQuery::parse(query);
+            assert!(parsed.has(Prefix::Tab), "{query:?}");
+            assert!(parsed.is_narrowed());
+            assert!(
+                !parsed.searches_remotely(),
+                "{query:?} leaves the network alone"
+            );
+            assert!(pr_searches(&parsed, &catalog()).is_empty());
+            assert_eq!(linear_search(&parsed), None);
+            let remote = RemoteResults::default();
+            let sections = build_sections(&parsed, &[], &[], &catalog(), &remote);
+            assert!(sections.is_empty(), "{query:?} lists no page: {sections:?}");
+        }
+        assert_eq!(ParsedQuery::parse("tab: web").text(), "web");
+        assert!(
+            !ParsedQuery::parse("table").has(Prefix::Tab),
+            "a word that only starts with tab is text"
+        );
+    }
+
+    #[test]
+    fn tab_rows_list_every_pane_and_typing_filters_by_title() {
+        let pr = Route::PullRequest(PrRef::new(RepoRef::new("acme", "web"), 7));
+        let tabs = [
+            open_tab(0, Route::Inbox, 0, false),
+            open_tab(3, pr.clone(), 0, false),
+            open_tab(1, Route::Settings, 1, true),
+            open_tab(2, Route::Notifications, 1, false),
+        ];
+        let ids = |query: &str| -> Vec<u64> {
+            tab_rows(&ParsedQuery::parse(query), &tabs)
+                .iter()
+                .map(|tab| tab.id)
+                .collect()
+        };
+        assert_eq!(
+            ids("tab:"),
+            [0, 3, 1, 2],
+            "every tab of every pane, in order"
+        );
+        assert_eq!(
+            ids("tab: web#"),
+            [3],
+            "the pull request's tab, by its title"
+        );
+        assert_eq!(ids("tab: SETT"), [1], "in any case");
+        assert_eq!(
+            ids("tab: inb"),
+            [2],
+            "Inbox, not Reviews (which shows the inbox route)"
+        );
+        assert_eq!(ids("tab: stg"), [1], "letters in order match too");
+        assert_eq!(
+            ids("tab: pane"),
+            Vec::<u64>::new(),
+            "the pane is not the title"
+        );
+        assert!(ids("settings").is_empty(), "no tab rows without tab:");
+
+        assert_eq!(tab_subtitle(&tabs[2], 2), "Pane 2 · Current tab");
+        assert_eq!(tab_subtitle(&tabs[1], 2), "Pane 1");
+        assert_eq!(tab_subtitle(&tabs[2], 1), "Current tab");
+        assert_eq!(tab_subtitle(&tabs[1], 1), "");
     }
 
     #[test]
@@ -2265,7 +2493,7 @@ mod tests {
             });
             let mut cx = VisualTestContext::from_window(handle, cx);
             cx.update(|window, cx| {
-                toggle(None, window, cx);
+                toggle(None, Vec::new(), window, cx);
                 window.refresh();
                 window.draw(cx).clear(cx);
             });

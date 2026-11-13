@@ -20,7 +20,7 @@ Website: [loupe.israeldeveloper.com.br](https://loupe.israeldeveloper.com.br)
 - **Pull requests.** Conversation, review threads, files with a syntax-highlighted diff, and checks, in a tab. Comment, reply, approve, or request changes without leaving the app.
 - **Actions.** Workflow runs with the graph of their jobs, the log of a failed step, and re-runs.
 - **Linear.** Your issues, team boards, projects, and saved views, with several workspaces. Move an issue, change its assignee or labels, and see the pull requests linked to it.
-- **Command palette.** Cmd+K opens any pull request, repository, issue, or command.
+- **Command palette.** Cmd+K opens any pull request, repository, issue, or command. Cmd+Shift+A (or `tab:`) jumps to any open tab.
 - **Themes.** Six built-in themes, each with a light and a dark palette, switched live.
 - **Review with T3 Code.** Hand a pull request to a [T3 Code](https://github.com/pingdotgg/t3code) server, which starts a review thread in a worktree of its head.
 
@@ -94,6 +94,7 @@ On Linux, Cmd is the Super key.
 | Shortcut | Action |
 |---|---|
 | Cmd+K | Command palette (Cmd+Enter opens the result in a new tab) |
+| Cmd+Shift+A | Search the open tabs, in every pane |
 | Cmd+T | New tab |
 | Cmd+W | Close the tab |
 | Cmd+1 … Cmd+8, Cmd+9 | The tab at that position, the last tab |
