@@ -46,6 +46,10 @@ gpui_kit::actions!(
         ToggleSidebar,
         /// Cmd+K: open the command palette. Handled by `Workspace`.
         OpenPalette,
+        /// Cmd+Shift+A, Chrome's key for its tab search: open the command
+        /// palette on the open tabs (`tab:`). Handled by `Workspace`, and by
+        /// the palette while it is open.
+        SearchTabs,
         /// O then W, as in Linear: open the Linear workspace switcher.
         /// Handled by `Workspace`.
         SwitchWorkspace,

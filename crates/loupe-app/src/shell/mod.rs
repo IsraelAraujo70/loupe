@@ -50,8 +50,8 @@ use crate::shell::actions::{
     ActivateLastTab, ActivateTab1, ActivateTab2, ActivateTab3, ActivateTab4, ActivateTab5,
     ActivateTab6, ActivateTab7, ActivateTab8, CloseTab, ComposeIssue, CopyItemBranch, CopyItemId,
     CopyItemLink, GoBack, GoForward, NewTab, NextTab, OpenItemInNewTab, OpenItemSideBySide,
-    OpenPalette, PreviousTab, ScrollPageDown, ScrollPageUp, SplitDown, SplitLeft, SplitRight,
-    SplitUp, SwitchWorkspace, ToggleSidebar,
+    OpenPalette, PreviousTab, ScrollPageDown, ScrollPageUp, SearchTabs, SplitDown, SplitLeft,
+    SplitRight, SplitUp, SwitchWorkspace, ToggleSidebar,
 };
 use crate::shell::item_menu::Command;
 use crate::shell::panes::{Node, Pane, PaneId, Panes, Zone};
@@ -106,6 +106,9 @@ pub struct Workspace {
     /// row under the pointer may have gone without a word, so it is
     /// forgotten.
     shown_pages: Vec<EntityId>,
+    /// Each pane's row of tabs: its sideways scroll and the open tab it
+    /// follows.
+    tab_rows: HashMap<PaneId, tab_bar::TabRow>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -245,6 +248,12 @@ fn split_active_tab(zone: Zone, window: &mut Window, cx: &mut App) {
     with_workspace(cx, |workspace, cx| workspace.split_active(zone, window, cx));
 }
 
+/// Shows tab `tab` and makes its pane the active one. For the command
+/// palette.
+fn activate_tab(tab: u64, cx: &mut App) {
+    with_workspace(cx, |workspace, cx| workspace.select_tab_id(tab, cx));
+}
+
 /// Opens `route` in a new pane on the right of the active pane, as "Open
 /// to the side" in VS Code.
 pub fn open_side_by_side(route: Route, window: &mut Window, cx: &mut App) {
@@ -296,6 +305,7 @@ impl Workspace {
             link_menu: None,
             workspace_menu: None,
             shown_pages: Vec::new(),
+            tab_rows: HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -396,6 +406,19 @@ impl Workspace {
         window.defer(cx, move |window, cx| {
             item_menu::run(command, &item, window, cx)
         });
+    }
+
+    /// Keeps one row of tabs per pane, for the panes there are now.
+    fn track_tab_rows(&mut self) {
+        let panes: Vec<PaneId> = self.panes.panes().iter().map(|pane| pane.id).collect();
+        self.tab_rows.retain(|pane, _| panes.contains(pane));
+        for pane in panes {
+            self.tab_rows.entry(pane).or_default();
+        }
+    }
+
+    fn tab_row(&self, pane: PaneId) -> tab_bar::TabRow {
+        self.tab_rows.get(&pane).cloned().unwrap_or_default()
     }
 
     /// Forgets the row under the pointer when a pane shows another page.
@@ -847,7 +870,10 @@ impl Workspace {
         let split = self.panes.pane_count() > 1;
         let active = pane_id == self.panes.active_pane();
         let view = pane.tabs.active().current().view.clone();
-        let strip = split.then(|| tab_bar::pane_strip(pane, number, active, lifted, cx));
+        let strip = split.then(|| {
+            let row = self.tab_row(pane_id);
+            tab_bar::pane_strip(pane, &row, number, active, lifted, cx)
+        });
         let bounds = self.pane_bounds.clone();
         let record_bounds = canvas(
             move |drawn, _, _| {
@@ -993,6 +1019,7 @@ fn splash(cx: &App) -> impl IntoElement {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.track_shown_pages(cx);
+        self.track_tab_rows();
         let github = Accounts::get(cx).github.clone();
         let body = match &github {
             Connection::Connected(viewer) => {
@@ -1083,7 +1110,10 @@ impl Render for Workspace {
                     }))
                     .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                         let target = item_menu::target(this.active_page(), cx);
-                        palette::toggle(target, window, cx)
+                        palette::toggle(target, this.panes.open_tabs(), window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &SearchTabs, window, cx| {
+                        palette::toggle_tabs(this.panes.open_tabs(), window, cx)
                     }))
                     .on_action(cx.listener(|this, _: &OpenItemInNewTab, window, cx| {
                         this.run_on_target(Command::OpenInNewTab, window, cx)
@@ -1152,14 +1182,14 @@ impl Render for Workspace {
 mod tests {
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Bounds, Entity, InputEvent as _, Modifiers, MouseButton,
-        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, TestAppContext,
-        VisualTestContext, WindowBounds, WindowOptions, point, px, size,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent,
+        TestAppContext, VisualTestContext, WindowBounds, WindowOptions, point, px, size,
     };
 
     use super::Workspace;
     use crate::route::Route;
     use crate::services::{Accounts, Connection, Services};
-    use crate::shell::actions::{CloseTab, SplitDown, SplitRight};
+    use crate::shell::actions::{ActivateTab1, CloseTab, NewTab, SplitDown, SplitRight};
     use crate::store::{PaneLayout, Settings, SplitAxis};
 
     /// The real window: GitHub signed in with no client, so nothing loads
@@ -1442,6 +1472,104 @@ mod tests {
         );
     }
 
+    /// Where tab `id` was drawn, after two frames: the row of tabs follows
+    /// its open tab on the frame after it was laid out.
+    fn tab_bounds(cx: &mut VisualTestContext, id: u64) -> Bounds<Pixels> {
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        }
+        let selector: &'static str = format!("tab-{id}").leak();
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"))
+    }
+
+    fn in_view(row: Bounds<Pixels>, tab: Bounds<Pixels>) -> bool {
+        row.left() <= tab.left() && tab.right() <= row.right()
+    }
+
+    #[gpui_kit::test]
+    fn a_full_row_of_tabs_scrolls_and_keeps_the_open_tab_and_new_tab_in_view(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        for _ in 0..15 {
+            cx.dispatch_action(NewTab);
+            cx.run_until_parked();
+        }
+        assert_eq!(tabs(&workspace, cx).1, 15, "each new tab is the open one");
+
+        let last = tab_bounds(cx, 15);
+        let row = cx
+            .debug_bounds("tabs-0")
+            .expect("the row of tabs is on screen");
+        for id in 0..16 {
+            assert!(
+                tab_bounds(cx, id).size.width >= px(128.),
+                "tab {id} keeps a readable width instead of shrinking away"
+            );
+        }
+        assert!(in_view(row, last), "the open tab, the last one, is in view");
+        let plus = cx.debug_bounds("new-tab").expect("+ is on screen");
+        assert!(
+            plus.left() >= row.right() && plus.right() <= px(1280.),
+            "+ stays after the tabs, inside the window"
+        );
+
+        cx.simulate_resize(size(px(1000.), px(820.)));
+        cx.run_until_parked();
+        let last = tab_bounds(cx, 15);
+        let row = cx
+            .debug_bounds("tabs-0")
+            .expect("the row of tabs is on screen");
+        assert!(
+            in_view(row, last),
+            "a narrower window keeps the open tab in view"
+        );
+
+        cx.dispatch_action(ActivateTab1);
+        cx.run_until_parked();
+        let first = tab_bounds(cx, 0);
+        assert!(in_view(row, first), "Cmd+1 scrolls the first tab into view");
+
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        assert_eq!(tabs(&workspace, cx).0.len(), 17);
+        assert_eq!(
+            tab_bounds(cx, 0),
+            first,
+            "a tab opened in the background leaves the row where it is"
+        );
+
+        let none = Modifiers::none();
+        dispatch(
+            cx,
+            MouseMoveEvent {
+                position: row.center(),
+                pressed_button: None,
+                modifiers: none,
+            }
+            .to_platform_input(),
+        );
+        dispatch(
+            cx,
+            ScrollEvent {
+                position: row.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-200.))),
+                modifiers: none,
+                ..ScrollEvent::default()
+            }
+            .to_platform_input(),
+        );
+        assert_eq!(
+            tab_bounds(cx, 0).left(),
+            first.left() - px(200.),
+            "the wheel scrolls the row sideways"
+        );
+    }
+
     #[gpui_kit::test]
     fn middle_click_on_a_tab_closes_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open_workspace(cx);
@@ -1638,6 +1766,107 @@ mod tests {
             "each pane shows its page"
         );
     }
+    /// Cmd+Shift+A opens the palette on the open tabs of every pane; typing
+    /// narrows them by title and Enter shows the tab, in its own pane.
+    #[gpui_kit::test]
+    fn the_tab_search_lists_every_pane_s_tabs_and_switches(cx: &mut TestAppContext) {
+        use gpui_kit::base::actions::Confirm;
+        use gpui_kit::component::WindowExt as _;
+
+        use crate::shell::actions::{OpenPalette, SearchTabs};
+
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        // Reviews (0) and, in the background, Inbox (1); Reviews moves to
+        // a pane of its own on the right, which then shows Settings and
+        // opens Reviews in the background (2).
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        cx.dispatch_action(SplitRight);
+        cx.run_until_parked();
+        cx.update(|window, cx| super::navigate(Route::Settings, window, cx));
+        cx.update(|window, cx| super::open_in_new_tab(Route::Inbox, window, cx));
+        // Left pane: Inbox (1). Right pane, active: Settings (0), Reviews (2).
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let active = workspace.panes.active_pane();
+                let tab = workspace.panes.active().active();
+                (active, tab.id, tab.current().route.clone())
+            })
+        };
+        let before = shown(cx);
+        assert_eq!(before.2, Route::Settings);
+
+        // Cmd+K opens the palette from the window, which hands it the tabs.
+        cx.dispatch_action(OpenPalette);
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| window.close_dialog(cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(SearchTabs);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        let tab_rows = |cx: &mut VisualTestContext| {
+            [
+                (0, "palette-tab-0"),
+                (1, "palette-tab-1"),
+                (2, "palette-tab-2"),
+                (3, "palette-tab-3"),
+            ]
+            .into_iter()
+            .filter(|(_, selector)| cx.debug_bounds(selector).is_some())
+            .map(|(id, _)| id)
+            .collect::<Vec<u64>>()
+        };
+        // Rows are drawn top to bottom; their ids say which tab each is.
+        let order = |cx: &mut VisualTestContext, ids: &[u64]| {
+            let mut ids = ids.to_vec();
+            ids.sort_by(|a, b| {
+                let y = |cx: &mut VisualTestContext, id: u64| {
+                    let selector = [
+                        "palette-tab-0",
+                        "palette-tab-1",
+                        "palette-tab-2",
+                        "palette-tab-3",
+                    ][id as usize];
+                    cx.debug_bounds(selector).expect("a drawn row").origin.y
+                };
+                y(cx, *a).partial_cmp(&y(cx, *b)).expect("finite")
+            });
+            ids
+        };
+        let rows = tab_rows(cx);
+        assert_eq!(
+            order(cx, &rows),
+            [1, 0, 2],
+            "both panes' tabs, the left pane's first"
+        );
+
+        cx.simulate_input("inb");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(tab_rows(cx), [1], "typing narrows the tabs by title");
+
+        cx.dispatch_action(Confirm { secondary: false });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "choosing a tab closes the palette"
+        );
+        let after = shown(cx);
+        assert_eq!(after.1, 1, "Enter shows the first match, in the left pane");
+        assert_eq!(after.2, Route::Notifications);
+        assert_ne!(after.0, before.0, "its pane becomes the active one");
+    }
+
     /// With the pointer on no row, the item keys act on the page on screen:
     /// a pull request's link and branch are copied, an issue's ID is not
     /// one of its commands, and side by side opens it in a pane on the
