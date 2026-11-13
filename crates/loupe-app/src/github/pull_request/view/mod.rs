@@ -19,8 +19,8 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{
-    ActionsJob, ChecksEtag, ChecksPoll, GitHub, Label, MergeMethod, PrRef, PullRequestDetail,
-    ReviewEvent,
+    ActionsJob, ChecksEtag, ChecksPoll, GitHub, Label, MergeMethod, MergeOutcome, PrRef,
+    PullRequestDetail, ReviewEvent,
 };
 
 use super::checks::{ChecksTab, Freshness};
@@ -70,17 +70,34 @@ enum Write {
     RemoveLabel(String),
 }
 
+/// Shown after a merge that GitHub had not finished when Loupe stopped
+/// waiting for it.
+const MERGE_STILL_RUNNING: &str =
+    "GitHub is still merging this pull request. Refresh in a moment to see the result.";
+
 impl Write {
-    fn perform(self, gh: &GitHub, detail: &PullRequestDetail) -> loupe_github::Result<()> {
+    /// Sends the write. `Ok(Some(note))` succeeded with something to tell the
+    /// user once the pull request reloads.
+    fn perform(
+        self,
+        gh: &GitHub,
+        detail: &PullRequestDetail,
+    ) -> loupe_github::Result<Option<&'static str>> {
         let id = detail.id.as_str();
-        match self {
+        let done = match self {
+            Write::Merge(method) => {
+                return gh
+                    .merge(&detail.pr, method, &detail.head_oid)
+                    .map(|outcome| {
+                        (outcome == MergeOutcome::Pending).then_some(MERGE_STILL_RUNNING)
+                    });
+            }
             Write::Review {
                 event,
                 body,
                 review_id,
             } => gh.submit_review(id, review_id.as_deref(), event, &body),
             Write::DiscardReview { review_id } => gh.discard_review(&review_id),
-            Write::Merge(method) => gh.merge(id, method, &detail.head_oid),
             Write::MarkReady => gh.mark_ready_for_review(id),
             Write::ConvertToDraft => gh.convert_to_draft(id),
             Write::Close => gh.close_pull_request(id),
@@ -88,7 +105,8 @@ impl Write {
             Write::EditTitle(title) => gh.update_pull_request(id, Some(&title), None),
             Write::AddLabel(label_id) => gh.add_labels(id, &[label_id]),
             Write::RemoveLabel(label_id) => gh.remove_labels(id, &[label_id]),
-        }
+        };
+        done.map(|()| None)
     }
 }
 
@@ -526,8 +544,8 @@ impl PullRequestView {
             cx,
             move |gh| write.perform(gh, &detail),
             move |view, result, cx| match result {
-                Ok(()) => {
-                    view.write = Submit::Idle;
+                Ok(note) => {
+                    view.write = note.map_or(Submit::Idle, |note| Submit::Failed(note.into()));
                     view.panel = Panel::Closed;
                     view.title_edit = None;
                     view.clear_review_body |= clears_review_body;
