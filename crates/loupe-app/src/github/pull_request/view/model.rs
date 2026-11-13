@@ -562,7 +562,13 @@ mod tests {
     #[test]
     fn merge_box_names_the_most_pressing_blocker_first() {
         let mut detail = detail();
-        assert_eq!(headline(&detail), (MergeTone::Ready, "Ready to merge"));
+        assert_eq!(
+            headline(&detail),
+            (
+                MergeTone::Ready,
+                "Ready to merge (scratch: deliberately wrong)"
+            )
+        );
 
         detail.review_decision = Some(ReviewDecision::ReviewRequired);
         assert_eq!(headline(&detail), (MergeTone::Warning, "Review required"));
