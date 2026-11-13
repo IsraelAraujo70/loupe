@@ -11,9 +11,9 @@ use crate::shell::actions::{
     ActivateTab6, ActivateTab7, ActivateTab8, CloseTab, CloseWindow, ComposeIssue, CopyItemBranch,
     CopyItemId, CopyItemLink, FocusSettingsSearch, GoBack, GoForward, Minimize, NewTab, NextTab,
     OpenItemInNewTab, OpenItemSideBySide, OpenPalette, OpenSelected, OpenSettings,
-    PaletteOpenInNewTab, PreviousTab, Quit, ResetZoom, ScrollPageDown, ScrollPageUp, SelectNext,
-    SelectPrevious, SplitDown, SplitLeft, SplitRight, SplitUp, SwitchWorkspace, ToggleSidebar,
-    ZoomIn, ZoomOut,
+    PaletteOpenInNewTab, PreviousTab, Quit, ResetZoom, ScrollPageDown, ScrollPageUp, SearchTabs,
+    SelectNext, SelectPrevious, SplitDown, SplitLeft, SplitRight, SplitUp, SwitchWorkspace,
+    ToggleSidebar, ZoomIn, ZoomOut,
 };
 use crate::shell::navigate;
 use crate::store::{Settings, update_settings};
@@ -67,6 +67,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-k", OpenPalette, None),
+        KeyBinding::new("cmd-shift-a", SearchTabs, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("pagedown", ScrollPageDown, Some("Workspace")),
         KeyBinding::new("pageup", ScrollPageUp, Some("Workspace")),
@@ -182,6 +183,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Close Tab", CloseTab),
             MenuItem::action("Show Next Tab", NextTab),
             MenuItem::action("Show Previous Tab", PreviousTab),
+            MenuItem::action("Search Tabs…", SearchTabs),
             MenuItem::separator(),
             MenuItem::action("Split Right", SplitRight),
             MenuItem::action("Split Left", SplitLeft),

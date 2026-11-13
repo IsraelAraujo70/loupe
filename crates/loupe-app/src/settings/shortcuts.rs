@@ -8,8 +8,8 @@ use crate::shell::actions::{
     ActivateLastTab, ActivateTab1, CloseTab, CloseWindow, ComposeIssue, CopyItemBranch, CopyItemId,
     CopyItemLink, FocusSettingsSearch, GoBack, GoForward, Minimize, NewTab, NextTab,
     OpenItemInNewTab, OpenItemSideBySide, OpenPalette, OpenSelected, OpenSettings,
-    PaletteOpenInNewTab, PreviousTab, Quit, ResetZoom, ScrollPageDown, ScrollPageUp, SelectNext,
-    SelectPrevious, SwitchWorkspace, ToggleSidebar, ZoomIn, ZoomOut,
+    PaletteOpenInNewTab, PreviousTab, Quit, ResetZoom, ScrollPageDown, ScrollPageUp, SearchTabs,
+    SelectNext, SelectPrevious, SwitchWorkspace, ToggleSidebar, ZoomIn, ZoomOut,
 };
 
 /// One row of the section: its group (the card it is in), what it does,
@@ -50,6 +50,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
         Box::new(ActivateTab1)
     }),
     shortcut("Tabs", "Last tab", || Box::new(ActivateLastTab)),
+    shortcut("Tabs", "Search the open tabs", || Box::new(SearchTabs)),
     shortcut("Lists", "Next row", || Box::new(SelectNext)),
     shortcut("Lists", "Previous row", || Box::new(SelectPrevious)),
     shortcut("Lists", "Open the row", || Box::new(OpenSelected)),
