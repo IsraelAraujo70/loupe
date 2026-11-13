@@ -8,12 +8,19 @@
 //! bar keeps the navigation and +, which act on the active pane. A tab drags
 //! along its row to a new place, to another pane's row, or onto a page
 //! (`Workspace` draws the drop zones there); its right-click menu splits.
+//!
+//! A row with more tabs than fit scrolls sideways, with the trackpad or the
+//! wheel, once its tabs are down to [`TAB_MIN_WIDTH`]; + stays after it, in
+//! view. When a pane's open tab changes, its row scrolls just enough to show
+//! it whole; a tab opened in the background leaves the row where it is.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::cell::Cell;
+use std::rc::Rc;
 
 use super::Workspace;
 use super::actions::{GoBack, GoForward, NewTab, ToggleSidebar};
@@ -30,6 +37,9 @@ pub(crate) const TOP_BAR_HEIGHT: Pixels = px(40.);
 /// starts at the sidebar's own inset there.
 const LEADING_INSET: Pixels = px(if cfg!(target_os = "macos") { 78. } else { 8. });
 const TAB_MAX_WIDTH: f32 = 220.;
+/// Tabs shrink to this width and no further, so a title keeps about ten
+/// characters; past it the row scrolls.
+const TAB_MIN_WIDTH: f32 = 128.;
 /// A pane's own row of tabs, once the window is split.
 const STRIP_HEIGHT: f32 = 36.;
 
@@ -46,6 +56,48 @@ fn route_icon(route: &Route) -> IconName {
         Route::LinearViews { .. } => IconName::Layers,
         Route::LinearIssue { .. } => IconName::CircleDot,
         Route::Settings => IconName::Settings,
+    }
+}
+
+/// The sideways scroll of a pane's row of tabs, and the open tab and row
+/// width it last scrolled for.
+#[derive(Clone, Default)]
+pub(super) struct TabRow {
+    scroll: ScrollHandle,
+    shown: Rc<Cell<Option<u64>>>,
+    width: Rc<Cell<Pixels>>,
+}
+
+impl TabRow {
+    /// Scrolls the row to the open tab of `pane` when that tab changed, or
+    /// the row's width did (the window, the sidebar, or the update pill
+    /// beside it), since it last did. Nothing happens before the row's first
+    /// layout, when its width is unknown.
+    fn follow_open_tab(&self, pane: &Pane<AnyView>) {
+        let open = pane.tabs.active().id;
+        let bounds = self.scroll.bounds();
+        if bounds == Bounds::default()
+            || (self.shown.get() == Some(open) && self.width.get() == bounds.size.width)
+        {
+            return;
+        }
+        self.scroll.scroll_to_item(pane.tabs.active_index());
+        self.shown.set(Some(open));
+        self.width.set(bounds.size.width);
+    }
+
+    /// Asks for another frame once the row was laid out at a new width: the
+    /// scroll handle learns the width only after this frame's scroll ran.
+    fn watch_width(
+        &self,
+        workspace: EntityId,
+    ) -> impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static {
+        let row = self.clone();
+        move |_, window, _| {
+            if row.scroll.bounds().size.width != row.width.get() {
+                window.on_next_frame(move |_, cx| cx.notify(workspace));
+            }
+        }
     }
 }
 
@@ -166,6 +218,7 @@ fn tabs(
                 .aria_selected(selected)
                 .relative()
                 .h(px(28.))
+                .min_w(dp(TAB_MIN_WIDTH))
                 .max_w(dp(TAB_MAX_WIDTH))
                 .flex_shrink(1.)
                 // 12 px on both sides of every tab, so the space between two
@@ -269,22 +322,31 @@ fn tabs(
         .collect()
 }
 
-/// The row that holds `pane`'s tabs: a tab list that also takes a tab
-/// dropped after its last one.
+/// The row that holds `pane`'s tabs: a tab list that scrolls sideways and
+/// also takes a tab dropped after its last one.
 fn tab_list(
     pane: &Pane<AnyView>,
+    row: &TabRow,
     label: SharedString,
     emphasized: bool,
     lifted: Option<(PaneId, u64)>,
     cx: &mut Context<Workspace>,
 ) -> Stateful<Div> {
     let pane_id = pane.id;
+    row.follow_open_tab(pane);
     let items = tabs(pane, emphasized, lifted, cx);
     h_flex()
+        .on_children_prepainted(row.watch_width(cx.entity_id()))
         .id(("tabs", pane_id))
+        .debug_selector(move || format!("tabs-{pane_id}"))
         .role(Role::TabList)
         .aria_label(label)
         .min_w_0()
+        .overflow_x_scroll()
+        .track_scroll(&row.scroll)
+        // The row clips what it scrolls; the landing line before its first
+        // tab and after its last needs this much room inside it.
+        .px_1()
         .gap_1()
         .items_center()
         .children(items)
@@ -299,7 +361,10 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
     let (can_back, can_forward) = (active.can_go_back(), active.can_go_forward());
     let lifted = workspace.lifted_tab(cx);
     let single = (workspace.panes.pane_count() == 1).then(|| workspace.panes.panes()[0]);
-    let tab_list = single.map(|pane| tab_list(pane, "Tabs".into(), true, lifted, cx).ml_2());
+    let tab_list = single.map(|pane| {
+        let row = workspace.tab_row(pane.id);
+        tab_list(pane, &row, "Tabs".into(), true, lifted, cx).ml_1()
+    });
     let end_drop = single.map(|pane| pane.id);
     h_flex()
         .id("top-bar")
@@ -330,9 +395,11 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
         )
         .children(tab_list)
         .child(
-            ui::icon_button("new-tab", IconName::Plus, "New tab (⌘T)")
-                .small()
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
+            div().flex_none().debug_selector(|| "new-tab".into()).child(
+                ui::icon_button("new-tab", IconName::Plus, "New tab (⌘T)")
+                    .small()
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
+            ),
         )
         // Apart from the tabs, at the bar's trailing edge. A tab dropped
         // here goes after the last one.
@@ -355,6 +422,7 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
 /// `number` counts the panes in reading order, from 1, for its name.
 pub(super) fn pane_strip(
     pane: &Pane<AnyView>,
+    row: &TabRow,
     number: usize,
     active: bool,
     lifted: Option<(PaneId, u64)>,
@@ -363,6 +431,7 @@ pub(super) fn pane_strip(
     let pane_id = pane.id;
     let list = tab_list(
         pane,
+        row,
         format!("Pane {number} tabs").into(),
         active,
         lifted,
@@ -374,7 +443,6 @@ pub(super) fn pane_strip(
         .h(dp(STRIP_HEIGHT))
         .w_full()
         .flex_none()
-        .px_1()
         .items_center()
         .border_b_1()
         .border_color(tokens::border_subtle())
