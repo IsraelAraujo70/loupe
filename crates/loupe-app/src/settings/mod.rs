@@ -6,13 +6,15 @@
 //! - [`view`]: the `Route::Settings` screen; [`catalog`] lists its sections and
 //!   settings, [`accounts`] draws its account cards, [`workspace_map`] the
 //!   Linear workspace of each GitHub org or repository, [`appearance`] its
-//!   Appearance section (color scheme, themes, interface, typography), and
+//!   Appearance section (color scheme, themes, interface, typography),
+//!   [`review`] the review request and risk rules of its T3 Code section, and
 //!   [`shortcuts`] its Keyboard shortcuts section.
 
 mod accounts;
 mod appearance;
 pub mod auth;
 pub mod catalog;
+mod review;
 pub mod session;
 pub mod shortcuts;
 pub mod sign_in;

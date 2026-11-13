@@ -51,8 +51,8 @@ use crate::shell::actions::{
     ActivateLastTab, ActivateTab1, ActivateTab2, ActivateTab3, ActivateTab4, ActivateTab5,
     ActivateTab6, ActivateTab7, ActivateTab8, CloseTab, ComposeIssue, CopyItemBranch, CopyItemId,
     CopyItemLink, GoBack, GoForward, NewTab, NextTab, OpenItemInNewTab, OpenItemSideBySide,
-    OpenPalette, PreviousTab, ScrollPageDown, ScrollPageUp, SplitDown, SplitLeft, SplitRight,
-    SplitUp, SwitchWorkspace, ToggleSidebar,
+    OpenPalette, PreviousTab, ScrollPageDown, ScrollPageUp, SearchTabs, SplitDown, SplitLeft,
+    SplitRight, SplitUp, SwitchWorkspace, ToggleSidebar,
 };
 use crate::shell::item_menu::Command;
 use crate::shell::panes::{Node, Pane, PaneId, Panes, Zone};
@@ -248,6 +248,12 @@ impl<E: InteractiveElement> OpenOnClick for E {}
 /// actions do. For the command palette.
 fn split_active_tab(zone: Zone, window: &mut Window, cx: &mut App) {
     with_workspace(cx, |workspace, cx| workspace.split_active(zone, window, cx));
+}
+
+/// Shows tab `tab` and makes its pane the active one. For the command
+/// palette.
+fn activate_tab(tab: u64, cx: &mut App) {
+    with_workspace(cx, |workspace, cx| workspace.select_tab_id(tab, cx));
 }
 
 /// Opens `route` in a new pane on the right of the active pane, as "Open
@@ -1152,7 +1158,10 @@ impl Render for Workspace {
                     }))
                     .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                         let target = item_menu::target(this.active_page(), cx);
-                        palette::toggle(target, window, cx)
+                        palette::toggle(target, this.panes.open_tabs(), window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &SearchTabs, window, cx| {
+                        palette::toggle_tabs(this.panes.open_tabs(), window, cx)
                     }))
                     .on_action(cx.listener(|this, _: &OpenItemInNewTab, window, cx| {
                         this.run_on_target(Command::OpenInNewTab, window, cx)
@@ -1890,6 +1899,107 @@ mod tests {
             "each pane shows its page"
         );
     }
+    /// Cmd+Shift+A opens the palette on the open tabs of every pane; typing
+    /// narrows them by title and Enter shows the tab, in its own pane.
+    #[gpui_kit::test]
+    fn the_tab_search_lists_every_pane_s_tabs_and_switches(cx: &mut TestAppContext) {
+        use gpui_kit::base::actions::Confirm;
+        use gpui_kit::component::WindowExt as _;
+
+        use crate::shell::actions::{OpenPalette, SearchTabs};
+
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        // Reviews (0) and, in the background, Inbox (1); Reviews moves to
+        // a pane of its own on the right, which then shows Settings and
+        // opens Reviews in the background (2).
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        cx.dispatch_action(SplitRight);
+        cx.run_until_parked();
+        cx.update(|window, cx| super::navigate(Route::Settings, window, cx));
+        cx.update(|window, cx| super::open_in_new_tab(Route::Inbox, window, cx));
+        // Left pane: Inbox (1). Right pane, active: Settings (0), Reviews (2).
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let active = workspace.panes.active_pane();
+                let tab = workspace.panes.active().active();
+                (active, tab.id, tab.current().route.clone())
+            })
+        };
+        let before = shown(cx);
+        assert_eq!(before.2, Route::Settings);
+
+        // Cmd+K opens the palette from the window, which hands it the tabs.
+        cx.dispatch_action(OpenPalette);
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| window.close_dialog(cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(SearchTabs);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        let tab_rows = |cx: &mut VisualTestContext| {
+            [
+                (0, "palette-tab-0"),
+                (1, "palette-tab-1"),
+                (2, "palette-tab-2"),
+                (3, "palette-tab-3"),
+            ]
+            .into_iter()
+            .filter(|(_, selector)| cx.debug_bounds(selector).is_some())
+            .map(|(id, _)| id)
+            .collect::<Vec<u64>>()
+        };
+        // Rows are drawn top to bottom; their ids say which tab each is.
+        let order = |cx: &mut VisualTestContext, ids: &[u64]| {
+            let mut ids = ids.to_vec();
+            ids.sort_by(|a, b| {
+                let y = |cx: &mut VisualTestContext, id: u64| {
+                    let selector = [
+                        "palette-tab-0",
+                        "palette-tab-1",
+                        "palette-tab-2",
+                        "palette-tab-3",
+                    ][id as usize];
+                    cx.debug_bounds(selector).expect("a drawn row").origin.y
+                };
+                y(cx, *a).partial_cmp(&y(cx, *b)).expect("finite")
+            });
+            ids
+        };
+        let rows = tab_rows(cx);
+        assert_eq!(
+            order(cx, &rows),
+            [1, 0, 2],
+            "both panes' tabs, the left pane's first"
+        );
+
+        cx.simulate_input("inb");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(tab_rows(cx), [1], "typing narrows the tabs by title");
+
+        cx.dispatch_action(Confirm { secondary: false });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "choosing a tab closes the palette"
+        );
+        let after = shown(cx);
+        assert_eq!(after.1, 1, "Enter shows the first match, in the left pane");
+        assert_eq!(after.2, Route::Notifications);
+        assert_ne!(after.0, before.0, "its pane becomes the active one");
+    }
+
     /// With the pointer on no row, the item keys act on the page on screen:
     /// a pull request's link and branch are copied, an issue's ID is not
     /// one of its commands, and side by side opens it in a pane on the

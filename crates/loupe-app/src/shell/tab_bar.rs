@@ -52,7 +52,8 @@ const TAB_MIN_WIDTH: f32 = 128.;
 /// A pane's own row of tabs, once the window is split.
 const STRIP_HEIGHT: f32 = 36.;
 
-fn route_icon(route: &Route) -> IconName {
+/// The icon a tab showing `route` has.
+pub(super) fn route_icon(route: &Route) -> IconName {
     match route {
         Route::Inbox => IconName::GitPullRequest,
         Route::Notifications => IconName::Inbox,

@@ -249,15 +249,20 @@ mod install_tests {
             let target = root.join("loupe");
             let source = stage.join("download");
             let marker = root.join("started");
-            let old = format!("#!/bin/sh\necho old > '{}'\n", marker.display());
+            // `echo > file` creates the file before it writes, so a reader polling for the
+            // file can see it empty. Rename into place so the marker appears complete.
+            let mark = |text: &str| {
+                format!(
+                    "echo {text} > '{0}.tmp' && mv '{0}.tmp' '{0}'",
+                    marker.display()
+                )
+            };
+            let old = format!("#!/bin/sh\n{}\n", mark("old"));
             fs::write(&target, &old).unwrap();
             let new = if fail {
                 "#!/bin/sh\nexit 1\n".into()
             } else {
-                format!(
-                    "#!/bin/sh\necho new > '{}'\nexec sleep 5\n",
-                    marker.display()
-                )
+                format!("#!/bin/sh\n{}\nexec sleep 5\n", mark("new"))
             };
             fs::write(&source, &new).unwrap();
             for path in [&source, &target] {

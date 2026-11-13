@@ -7,7 +7,10 @@ mod dialog;
 mod panel;
 mod review;
 
-pub use review::OPERATE_HINT;
+pub use review::{
+    DEFAULT_PROMPT, OPERATE_HINT, ReviewSettings, RiskList, VARIABLES, format_list,
+    unknown_variables,
+};
 
 use gpui_kit::{AnyView, App, Task, Window};
 
