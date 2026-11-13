@@ -163,13 +163,17 @@ impl<V> Tabs<V> {
     /// they were opened, right after it.
     pub fn open_in_background(&mut self, tab: Tab<V>) {
         let from = self.active().id;
+        // The last one counts only while it still follows the active tab in
+        // the same group; once moved elsewhere, a new run starts.
+        let group = self.active().group;
         let after = match self.last_background {
-            Some((active, last)) if active == from => self.index_of(last),
+            Some((active, last)) if active == from => self
+                .index_of(last)
+                .filter(|&ix| ix > self.active && self.tabs[ix].group == group),
             _ => None,
         };
         let at = after.unwrap_or(self.active) + 1;
         self.last_background = Some((from, tab.id));
-        let group = self.active().group;
         let active = self.active().id;
         self.place(at, tab, group);
         self.active = self.index_of(active).unwrap_or(0);
@@ -183,6 +187,27 @@ impl<V> Tabs<V> {
         self.place(at, tab, group);
         self.active = at;
         self.tidy();
+    }
+
+    /// Moves the tab at `from` to `to` (clamped), in `group` as [`Self::insert`]
+    /// decides, and opens it. Nothing else changes on the way: a group that
+    /// loses the tab only for the move, or a collapsed group next to it,
+    /// stays as it is. False when the tab stays where it was, in its group.
+    pub fn move_within(&mut self, from: usize, to: usize, group: Option<u64>) -> bool {
+        if from >= self.tabs.len() {
+            return false;
+        }
+        let to = to.min(self.tabs.len() - 1);
+        let before = self.tabs[from].group;
+        if from == to && before == group {
+            self.select(from);
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        self.place(to, tab, group);
+        self.active = to;
+        self.tidy();
+        from != to || self.tabs[to].group != before
     }
 
     /// Inserts `tab` at `at` and gives it a group: the one it lands inside,
@@ -800,13 +825,56 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_dropped_on_itself_changes_nothing() {
+        let mut tabs = five_tabs();
+        let solo = tabs.new_group(1, "Solo").unwrap();
+        assert!(!tabs.move_within(1, 1, Some(solo)));
+        assert_eq!(
+            names(&tabs),
+            ["A", "B:Solo", "C", "D", "E"],
+            "a group of one tab keeps it"
+        );
+        assert_eq!(tabs.active_index(), 1);
+
+        let mut tabs = five_tabs();
+        let hidden = tabs.new_group(1, "Hidden").unwrap();
+        for _ in 0..3 {
+            tabs.add_to_group(2, hidden);
+        }
+        tabs.toggle_group(hidden);
+        tabs.select(0);
+        assert!(!tabs.move_within(0, 0, None));
+        assert!(
+            tabs.group(hidden).unwrap().collapsed,
+            "the only tab on show dropped on itself leaves the group collapsed"
+        );
+    }
+
+    #[test]
+    fn a_background_tab_never_lands_in_a_group_it_was_not_opened_from() {
+        let mut tabs = Tabs::new(vec![tab(issue("A")), tab(issue("B"))], 0);
+        tabs.open_in_background(tab(issue("X")));
+        let other = tabs.new_group(1, "Other").unwrap();
+        tabs.add_to_group(2, other);
+        tabs.toggle_group(other);
+        tabs.open_in_background(tab(issue("Y")));
+        assert_eq!(
+            names(&tabs),
+            ["A", "Y", "X:Other", "B:Other"],
+            "once X moved to another group, Y starts a new run after A"
+        );
+        assert!(!tabs.is_hidden(1));
+    }
+
+    #[test]
     fn groups_come_back_as_saved() {
         let mut tabs = five_tabs();
+        // Made right to left, saved left to right.
+        let later = tabs.new_group(4, "Later").unwrap();
+        tabs.toggle_group(later);
         let review = tabs.new_group(1, "Review").unwrap();
         tabs.add_to_group(2, review);
         tabs.set_group_color(review, TabGroupColor::Purple);
-        let later = tabs.new_group(4, "Later").unwrap();
-        tabs.toggle_group(later);
         let saved = tabs.saved_groups();
         assert_eq!(
             saved,

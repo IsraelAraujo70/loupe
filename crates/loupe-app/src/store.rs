@@ -195,8 +195,9 @@ pub enum SplitAxis {
 /// The colors a group of tabs can take, as Chrome offers them. Each one is
 /// a color the theme already has (see `tab_bar::group_fill`), so a theme
 /// file needs no new slots.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabGroupColor {
+    #[default]
     Grey,
     Blue,
     Red,
@@ -231,11 +232,36 @@ impl TabGroupColor {
 /// its pane's list, since a group's tabs always sit next to each other.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedTabGroup {
+    #[serde(default)]
     pub name: String,
+    /// A color this build does not know, from a newer one, reads as grey.
+    #[serde(default, deserialize_with = "color_or_grey")]
     pub color: TabGroupColor,
+    #[serde(default)]
     pub collapsed: bool,
     pub first: usize,
     pub len: usize,
+}
+
+fn color_or_grey<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<TabGroupColor, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// The saved groups that can be read; an entry that cannot is dropped,
+/// so it never costs the tabs and the rest of the settings.
+fn readable_groups<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<SavedTabGroup>, D::Error> {
+    let serde_json::Value::Array(values) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
 }
 
 /// The window's panes as saved: a pane's tabs, or a split of two layouts.
@@ -246,7 +272,11 @@ pub enum PaneLayout {
     Pane {
         tabs: Vec<crate::route::Route>,
         active: usize,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "readable_groups"
+        )]
         groups: Vec<SavedTabGroup>,
     },
     /// Two layouts along `axis`; `ratio` is the first one's share, 0 to 1.
@@ -843,6 +873,29 @@ mod tests {
         let loaded: Settings = serde_json::from_str(&saved).expect("saved settings load");
         assert_eq!(loaded.pane_layout(), split);
         assert_eq!(loaded.active_pane, 1);
+
+        let newer = Settings::parse(
+            br#"{"sidebar_collapsed": true, "panes": {"Pane": {"tabs": ["Inbox", "Settings"], "active": 0,
+                "groups": [{"name": "A", "color": "Orange", "first": 0, "len": 1},
+                           {"name": "B", "first": "one", "len": 1}]}}}"#,
+        )
+        .expect("groups from a newer build or a hand edit never cost the settings");
+        assert!(newer.sidebar_collapsed);
+        assert_eq!(
+            newer.pane_layout(),
+            PaneLayout::Pane {
+                tabs: vec![Route::Inbox, Route::Settings],
+                active: 0,
+                groups: vec![SavedTabGroup {
+                    name: "A".into(),
+                    color: TabGroupColor::Grey,
+                    collapsed: false,
+                    first: 0,
+                    len: 1,
+                }],
+            },
+            "an unknown color reads as grey, and an unreadable group is dropped"
+        );
 
         let before_groups =
             Settings::parse(br#"{"panes": {"Pane": {"tabs": ["Inbox"], "active": 0}}}"#)

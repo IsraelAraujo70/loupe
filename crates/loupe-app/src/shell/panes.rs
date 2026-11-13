@@ -536,12 +536,10 @@ impl<V> Panes<V> {
             let Some(at) = tabs.index_of(tab) else {
                 return false;
             };
-            let target = index.unwrap_or(tabs.len() - 1).min(tabs.len() - 1);
-            let regrouped = tabs.group_at(at) != group;
-            let moved = tabs.remove(at).expect("the tab is in the pane");
-            tabs.insert(target, moved, group);
+            let target = index.unwrap_or(tabs.len() - 1);
+            let moved = tabs.move_within(at, target, group);
             self.active = to;
-            return at != target || regrouped;
+            return moved;
         }
         let Some(moved) = self.take(from, tab) else {
             return false;
