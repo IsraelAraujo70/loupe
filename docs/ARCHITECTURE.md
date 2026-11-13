@@ -47,4 +47,5 @@ macOS is the main target; Linux builds too. Build and run with `cargo run`, test
 - Every GraphQL document validates against the checked-in SDL in `schemas/` (offline test in each API crate).
 - Read queries run live against the real API in an `#[ignore]` smoke test that reads the token from the environment.
 - Mutations are validated live without side effects: GitHub with a bogus node id (the API reports "Could not resolve to a node" only after the document validates), Linear unauthenticated (the API reports `AUTHENTICATION_ERROR` only after the document validates).
+- The merge goes through GitHub's asynchronous merge REST endpoint, the only one that merges stacked pull requests. It is checked live without side effects on an already merged and a closed pull request (`tests/live_merge.rs`).
 - The GUI is checked by running the app and reading its accessibility tree and screenshots.
