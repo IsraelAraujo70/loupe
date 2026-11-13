@@ -106,6 +106,9 @@ pub struct Workspace {
     /// row under the pointer may have gone without a word, so it is
     /// forgotten.
     shown_pages: Vec<EntityId>,
+    /// Each pane's row of tabs: its sideways scroll and the open tab it
+    /// follows.
+    tab_rows: HashMap<PaneId, tab_bar::TabRow>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -296,6 +299,7 @@ impl Workspace {
             link_menu: None,
             workspace_menu: None,
             shown_pages: Vec::new(),
+            tab_rows: HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -396,6 +400,19 @@ impl Workspace {
         window.defer(cx, move |window, cx| {
             item_menu::run(command, &item, window, cx)
         });
+    }
+
+    /// Keeps one row of tabs per pane, for the panes there are now.
+    fn track_tab_rows(&mut self) {
+        let panes: Vec<PaneId> = self.panes.panes().iter().map(|pane| pane.id).collect();
+        self.tab_rows.retain(|pane, _| panes.contains(pane));
+        for pane in panes {
+            self.tab_rows.entry(pane).or_default();
+        }
+    }
+
+    fn tab_row(&self, pane: PaneId) -> tab_bar::TabRow {
+        self.tab_rows.get(&pane).cloned().unwrap_or_default()
     }
 
     /// Forgets the row under the pointer when a pane shows another page.
@@ -847,7 +864,10 @@ impl Workspace {
         let split = self.panes.pane_count() > 1;
         let active = pane_id == self.panes.active_pane();
         let view = pane.tabs.active().current().view.clone();
-        let strip = split.then(|| tab_bar::pane_strip(pane, number, active, lifted, cx));
+        let strip = split.then(|| {
+            let row = self.tab_row(pane_id);
+            tab_bar::pane_strip(pane, &row, number, active, lifted, cx)
+        });
         let bounds = self.pane_bounds.clone();
         let record_bounds = canvas(
             move |drawn, _, _| {
@@ -993,6 +1013,7 @@ fn splash(cx: &App) -> impl IntoElement {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.track_shown_pages(cx);
+        self.track_tab_rows();
         let github = Accounts::get(cx).github.clone();
         let body = match &github {
             Connection::Connected(viewer) => {
@@ -1152,14 +1173,14 @@ impl Render for Workspace {
 mod tests {
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Bounds, Entity, InputEvent as _, Modifiers, MouseButton,
-        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, TestAppContext,
-        VisualTestContext, WindowBounds, WindowOptions, point, px, size,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent,
+        TestAppContext, VisualTestContext, WindowBounds, WindowOptions, point, px, size,
     };
 
     use super::Workspace;
     use crate::route::Route;
     use crate::services::{Accounts, Connection, Services};
-    use crate::shell::actions::{CloseTab, SplitDown, SplitRight};
+    use crate::shell::actions::{ActivateTab1, CloseTab, NewTab, SplitDown, SplitRight};
     use crate::store::{PaneLayout, Settings, SplitAxis};
 
     /// The real window: GitHub signed in with no client, so nothing loads
@@ -1439,6 +1460,104 @@ mod tests {
                 0
             ),
             "a plain click still navigates the current tab"
+        );
+    }
+
+    /// Where tab `id` was drawn, after two frames: the row of tabs follows
+    /// its open tab on the frame after it was laid out.
+    fn tab_bounds(cx: &mut VisualTestContext, id: u64) -> Bounds<Pixels> {
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        }
+        let selector: &'static str = format!("tab-{id}").leak();
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"))
+    }
+
+    fn in_view(row: Bounds<Pixels>, tab: Bounds<Pixels>) -> bool {
+        row.left() <= tab.left() && tab.right() <= row.right()
+    }
+
+    #[gpui_kit::test]
+    fn a_full_row_of_tabs_scrolls_and_keeps_the_open_tab_and_new_tab_in_view(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        for _ in 0..15 {
+            cx.dispatch_action(NewTab);
+            cx.run_until_parked();
+        }
+        assert_eq!(tabs(&workspace, cx).1, 15, "each new tab is the open one");
+
+        let last = tab_bounds(cx, 15);
+        let row = cx
+            .debug_bounds("tabs-0")
+            .expect("the row of tabs is on screen");
+        for id in 0..16 {
+            assert!(
+                tab_bounds(cx, id).size.width >= px(128.),
+                "tab {id} keeps a readable width instead of shrinking away"
+            );
+        }
+        assert!(in_view(row, last), "the open tab, the last one, is in view");
+        let plus = cx.debug_bounds("new-tab").expect("+ is on screen");
+        assert!(
+            plus.left() >= row.right() && plus.right() <= px(1280.),
+            "+ stays after the tabs, inside the window"
+        );
+
+        cx.simulate_resize(size(px(1000.), px(820.)));
+        cx.run_until_parked();
+        let last = tab_bounds(cx, 15);
+        let row = cx
+            .debug_bounds("tabs-0")
+            .expect("the row of tabs is on screen");
+        assert!(
+            in_view(row, last),
+            "a narrower window keeps the open tab in view"
+        );
+
+        cx.dispatch_action(ActivateTab1);
+        cx.run_until_parked();
+        let first = tab_bounds(cx, 0);
+        assert!(in_view(row, first), "Cmd+1 scrolls the first tab into view");
+
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        assert_eq!(tabs(&workspace, cx).0.len(), 17);
+        assert_eq!(
+            tab_bounds(cx, 0),
+            first,
+            "a tab opened in the background leaves the row where it is"
+        );
+
+        let none = Modifiers::none();
+        dispatch(
+            cx,
+            MouseMoveEvent {
+                position: row.center(),
+                pressed_button: None,
+                modifiers: none,
+            }
+            .to_platform_input(),
+        );
+        dispatch(
+            cx,
+            ScrollEvent {
+                position: row.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-200.))),
+                modifiers: none,
+                ..ScrollEvent::default()
+            }
+            .to_platform_input(),
+        );
+        assert_eq!(
+            tab_bounds(cx, 0).left(),
+            first.left() - px(200.),
+            "the wheel scrolls the row sideways"
         );
     }
 
