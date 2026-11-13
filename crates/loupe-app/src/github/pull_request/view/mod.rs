@@ -8,6 +8,7 @@ mod poll;
 mod side;
 mod toolbar;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -158,6 +159,11 @@ pub struct PullRequestView {
     rerun: Option<(Instant, Vec<ActionsJob>)>,
     /// Polling waits for a low rate limit to reset.
     paused_until: Option<DateTime<Utc>>,
+    /// Whether the merge box's check list is open, once the user opened or
+    /// closed it; until then it follows `model::checks_open_at_first`.
+    checks_open: Option<bool>,
+    /// The sections of the merge box's check list the user folded.
+    folded_check_groups: HashSet<model::CheckGroup>,
     /// Whether the last tick found the pull request on screen.
     on_screen: bool,
     poll_task: Option<Task<()>>,
@@ -228,6 +234,8 @@ impl PullRequestView {
             retried_same_checks: false,
             rerun: None,
             paused_until: None,
+            checks_open: None,
+            folded_check_groups: HashSet::new(),
             on_screen: true,
             poll_task: None,
             _ticker: ticker,
