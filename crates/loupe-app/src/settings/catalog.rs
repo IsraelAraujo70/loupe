@@ -80,11 +80,12 @@ impl Section {
 
     /// Whether the section has preferences Restore defaults can put back.
     /// Accounts and the watched repositories are not preferences: they are
-    /// the user's data, and only their own actions change them.
+    /// the user's data, and only their own actions change them. T3 Code's
+    /// are its review request and risk rules, not its server.
     pub fn has_defaults(self) -> bool {
         matches!(
             self,
-            Section::General | Section::Appearance | Section::GitHub
+            Section::General | Section::Appearance | Section::GitHub | Section::T3
         )
     }
 
@@ -109,7 +110,8 @@ impl Section {
                 settings.comment_order = defaults.comment_order;
                 settings.comment_box = defaults.comment_box;
             }
-            Section::Linear | Section::T3 | Section::Shortcuts | Section::About => {}
+            Section::T3 => settings.t3_review = defaults.t3_review,
+            Section::Linear | Section::Shortcuts | Section::About => {}
         }
     }
 
@@ -145,6 +147,9 @@ pub enum Item {
     LinearAccount,
     WorkspaceMappings,
     T3Server,
+    ReviewPrompt,
+    RiskCheck,
+    RiskList(crate::t3::RiskList),
     /// The shortcut at this index of [`SHORTCUTS`].
     Shortcut(usize),
     Version,
@@ -356,6 +361,48 @@ pub fn entries() -> Vec<Entry> {
             "The server Loupe reads threads from and starts reviews on.",
             "url token operate threads review",
         ),
+        entry(
+            ReviewPrompt,
+            S::T3,
+            "Review",
+            "Review request",
+            "What a review thread starts with. The dialog shows it before Send, and an edit \
+             there is for that one review.",
+            "prompt template variables restore default",
+        ),
+        entry(
+            RiskCheck,
+            S::T3,
+            "Risky pull requests",
+            "Detect risky pull requests",
+            "A risky pull request starts on the security review.",
+            "risk security reviewer",
+        ),
+        entry(
+            RiskList(crate::t3::RiskList::Labels),
+            S::T3,
+            "Risky pull requests",
+            "Risk labels",
+            "A label that contains one of these marks the pull request. Separate them with \
+             commas.",
+            "risk labels",
+        ),
+        entry(
+            RiskList(crate::t3::RiskList::Words),
+            S::T3,
+            "Risky pull requests",
+            "Risky path words",
+            "A changed file with a path word that starts with one of these.",
+            "risk paths files words",
+        ),
+        entry(
+            RiskList(crate::t3::RiskList::Exceptions),
+            S::T3,
+            "Risky pull requests",
+            "Not risky",
+            "Path words that start like a risky one and are not, such as author.",
+            "risk exceptions ignore",
+        ),
     ];
     entries.extend(SHORTCUTS.iter().enumerate().map(|(index, shortcut)| {
         entry(
@@ -397,6 +444,7 @@ impl Item {
             Item::GitHubAccount
                 | Item::LinearAccount
                 | Item::T3Server
+                | Item::ReviewPrompt
                 | Item::ColorScheme
                 | Item::Themes
         )
@@ -488,6 +536,11 @@ mod tests {
             comment_box: Some(CommentBoxPlace::Bottom),
             watched_repos: vec![RepoRef::new("acme", "app")],
             t3_server_url: Some("https://t3.example".into()),
+            t3_review: crate::t3::ReviewSettings {
+                prompt: Some("Review #{number}".into()),
+                risk_check: false,
+                ..crate::t3::ReviewSettings::default()
+            },
             ..Settings::default()
         }
     }
@@ -523,6 +576,15 @@ mod tests {
         assert!(!settings.sidebar_collapsed);
         assert!(settings.notification_filter.is_empty());
         assert_eq!(settings.watched_repos.len(), 1);
+        assert!(!settings.t3_review.risk_check, "T3 Code is untouched");
+
+        Section::T3.restore_defaults(&mut settings);
+        assert_eq!(settings.t3_review, crate::t3::ReviewSettings::default());
+        assert_eq!(
+            settings.t3_server_url.as_deref(),
+            Some("https://t3.example"),
+            "the server is an account, not a default"
+        );
     }
 
     #[test]
@@ -593,6 +655,22 @@ mod tests {
             search("ree").is_empty(),
             "a word matches from its start, not inside \"tree\""
         );
+    }
+
+    #[test]
+    fn a_block_is_alone_in_its_group() {
+        // The page wraps a run of settings of one group in a card, so a
+        // block that shares its run would be a card inside a card.
+        let entries = entries();
+        for pair in entries.windows(2) {
+            let same_run = pair[0].section == pair[1].section && pair[0].group == pair[1].group;
+            assert!(
+                !(same_run && (pair[0].item.is_block() || pair[1].item.is_block())),
+                "{:?} and {:?} share a card",
+                pair[0].item,
+                pair[1].item
+            );
+        }
     }
 
     #[test]

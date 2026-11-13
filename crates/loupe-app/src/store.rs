@@ -147,6 +147,8 @@ pub struct Settings {
     pub comment_box: Option<CommentBoxPlace>,
     /// Base URL of the T3 Code server, such as `https://t3.example.com:3774`.
     pub t3_server_url: Option<String>,
+    /// The request template and the risk rules of "Review with T3 Code".
+    pub t3_review: crate::t3::ReviewSettings,
     /// Whether the sidebar shows as an icon rail (Cmd+B).
     pub sidebar_collapsed: bool,
     /// The expanded sidebar's width in points, set by dragging its edge.

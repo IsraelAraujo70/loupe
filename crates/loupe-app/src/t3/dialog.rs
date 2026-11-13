@@ -17,6 +17,7 @@ use loupe_t3::{Error, PullRequestKey, ReviewLaunch, T3};
 use super::review::{self, OPERATE_HINT, Plan, Reviewer};
 use crate::links::PrLinkContext;
 use crate::services;
+use crate::store::Settings;
 use crate::theme::scale::{self, dp};
 use crate::ui;
 
@@ -61,6 +62,8 @@ struct ReviewForm {
     t3: Arc<T3>,
     on_launched: OnLaunched,
     reviewer: Reviewer,
+    /// The template of Settings > T3 Code when the dialog opened.
+    template: String,
     text: Entity<TextareaState>,
     /// Kept for the life of the dialog: sending again after a lost answer
     /// does not start a second thread.
@@ -78,7 +81,8 @@ impl ReviewForm {
         cx: &mut Context<Self>,
     ) -> Self {
         let reviewer = plan.default_reviewer();
-        let initial = review::request(&context, reviewer, &plan.risk);
+        let template = Settings::get(cx).t3_review.prompt().to_owned();
+        let initial = review::request(&context, reviewer, &plan.risk, &template);
         let text = cx.new(|cx| {
             let mut state = TextareaState::new(window, cx).auto_grow(12, 20);
             state.set_value(initial, window, cx);
@@ -97,6 +101,7 @@ impl ReviewForm {
             t3,
             on_launched,
             reviewer,
+            template,
             text,
             submit: Submit::Idle,
         }
@@ -111,9 +116,14 @@ impl ReviewForm {
         if reviewer == self.reviewer || self.sending() {
             return;
         }
-        let written = review::request(&self.context, self.reviewer, &self.plan.risk);
+        let written = review::request(
+            &self.context,
+            self.reviewer,
+            &self.plan.risk,
+            &self.template,
+        );
         if self.text.read(cx).value() == written {
-            let next = review::request(&self.context, reviewer, &self.plan.risk);
+            let next = review::request(&self.context, reviewer, &self.plan.risk, &self.template);
             self.text
                 .update(cx, |state, cx| state.set_value(next, window, cx));
         }

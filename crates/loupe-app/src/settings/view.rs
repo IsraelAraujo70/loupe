@@ -10,6 +10,7 @@ use gpui_kit::*;
 
 use crate::settings::appearance::AppearanceState;
 use crate::settings::catalog::{self, Entry, Item, Section};
+use crate::settings::review::ReviewFields;
 use crate::settings::shortcuts::SHORTCUTS;
 use crate::shell::actions::FocusSettingsSearch;
 use crate::store::{self, CommentBoxPlace, CommentOrder, DiffLayout, FileTreePosition, Settings};
@@ -62,6 +63,7 @@ pub struct SettingsView {
     pub(super) t3_notice: Notice,
     pub(super) github_error: Option<SharedString>,
     pub(super) appearance: AppearanceState,
+    pub(super) review: ReviewFields,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -87,7 +89,8 @@ impl SettingsView {
                 .masked(true)
                 .placeholder(super::accounts::token_placeholder())
         });
-        let subscriptions = vec![
+        let (review, review_subscriptions) = ReviewFields::new(window, cx);
+        let mut subscriptions = vec![
             cx.observe_global::<crate::services::Accounts>(|_, cx| cx.notify()),
             cx.observe_global::<crate::services::Services>(|_, cx| cx.notify()),
             cx.observe_global::<Settings>(|_, cx| cx.notify()),
@@ -117,6 +120,7 @@ impl SettingsView {
                 },
             ),
         ];
+        subscriptions.extend(review_subscriptions);
         Self {
             focus: cx.focus_handle(),
             search,
@@ -132,6 +136,7 @@ impl SettingsView {
             t3_notice: Notice::None,
             github_error: None,
             appearance,
+            review,
             _subscriptions: subscriptions,
         }
     }
@@ -176,6 +181,9 @@ impl SettingsView {
             theme::apply_zoom(Settings::get(cx).zoom, cx);
             theme::apply(cx);
             self.appearance.sync(window, cx);
+        }
+        if section == Section::T3 {
+            self.review.sync(window, cx);
         }
         cx.notify();
     }
@@ -439,6 +447,11 @@ impl SettingsView {
                 .workspace_mappings(entry, &settings, colors, cx)
                 .into_any_element(),
             Item::T3Server => self.t3_card(colors, cx).into_any_element(),
+            Item::ReviewPrompt => self
+                .review_prompt_card(entry, colors, cx)
+                .into_any_element(),
+            Item::RiskCheck => self.risk_check_row(entry, colors, cx),
+            Item::RiskList(list) => self.risk_list_row(entry, list, colors, cx),
             Item::Shortcut(index) => shortcut_row(index, colors, cx),
             Item::Version => row(message(
                 format!("Loupe {}", env!("CARGO_PKG_VERSION")).into(),
