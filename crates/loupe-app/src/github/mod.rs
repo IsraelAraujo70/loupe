@@ -20,7 +20,7 @@ use loupe_github::{PrRef, RepoRef};
 
 use crate::shell::PaletteItem;
 
-pub use self::inbox::{ClearReviewsSelection, OpenReviewsFilter, SelectSectionRows};
+pub use self::inbox::{ClearReviewsSelection, OpenReviewsFilter, SelectTabRows};
 
 pub fn inbox_view(window: &mut Window, cx: &mut App) -> AnyView {
     inbox::view(window, cx)

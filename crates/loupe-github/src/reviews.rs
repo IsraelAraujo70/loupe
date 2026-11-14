@@ -1,10 +1,11 @@
 //! The Reviews screen's filters and saved views. A view keeps the pull
 //! requests that match every clause; inside one clause, values are
 //! alternatives ("Review is Approved, Changes requested"). Filtering runs on
-//! the pull requests the inbox already loaded, so the three sections and
-//! their counts always agree with what the screen lists. A view that names
-//! repositories can also list every open pull request in them ("All open").
-//! Views live in a JSON file the app owns, never on GitHub.
+//! the pull requests the inbox already loaded, so the tabs and their counts
+//! always agree with what the screen lists. A view that names repositories
+//! can also list every open pull request in them (the All tab). Inside a
+//! tab, pull requests group by their next step ([`next_step`]). Views live
+//! in a JSON file the app owns, never on GitHub.
 
 use std::path::Path;
 
@@ -321,6 +322,101 @@ pub fn all_open_query(clauses: &[Clause]) -> Option<String> {
     ))
 }
 
+/// One tab of the Reviews screen, in the order the tab row shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewTab {
+    /// `review-requested:@me`.
+    ToReview,
+    /// `author:@me`.
+    Mine,
+    /// `involves:@me`, minus the two above.
+    Involved,
+    /// Every pull request the other tabs list, and on a view that names
+    /// repositories every other open one in them.
+    All,
+}
+
+impl ReviewTab {
+    pub const ALL: [ReviewTab; 4] = [
+        ReviewTab::ToReview,
+        ReviewTab::Mine,
+        ReviewTab::Involved,
+        ReviewTab::All,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewTab::ToReview => "To review",
+            ReviewTab::Mine => "Mine",
+            ReviewTab::Involved => "Involved",
+            ReviewTab::All => "All",
+        }
+    }
+}
+
+/// What a pull request waits on next: the groups inside a tab, in the order
+/// they are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NextStep {
+    ReadyToMerge,
+    ChecksFailing,
+    ChangesRequested,
+    WaitingForReview,
+    Draft,
+}
+
+impl NextStep {
+    pub const ALL: [NextStep; 5] = [
+        NextStep::ReadyToMerge,
+        NextStep::ChecksFailing,
+        NextStep::ChangesRequested,
+        NextStep::WaitingForReview,
+        NextStep::Draft,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NextStep::ReadyToMerge => "Ready to merge",
+            NextStep::ChecksFailing => "Checks failing",
+            NextStep::ChangesRequested => "Changes requested",
+            NextStep::WaitingForReview => "Waiting for review",
+            NextStep::Draft => "Draft",
+        }
+    }
+}
+
+/// The one group `pr` belongs to: the first of [`NextStep::ALL`] whose rule
+/// it meets.
+///
+/// 1. Ready to merge: not a draft, approved, no check failing or still
+///    running (a pull request without checks has none to wait for), and no
+///    conflict (`Unknown`, not computed yet, is not a conflict).
+/// 2. Checks failing.
+/// 3. Changes requested.
+/// 4. Waiting for review: every other pull request that is not a draft,
+///    including an approved one whose checks still run or that conflicts.
+/// 5. Draft.
+pub fn next_step(pr: &PrSummary) -> NextStep {
+    let checks_green = !matches!(pr.checks, Some(ChecksState::Failing | ChecksState::Pending));
+    if !pr.is_draft
+        && pr.review_decision == Some(ReviewDecision::Approved)
+        && checks_green
+        && pr.mergeable != Mergeable::Conflicting
+    {
+        NextStep::ReadyToMerge
+    } else if pr.checks == Some(ChecksState::Failing) {
+        NextStep::ChecksFailing
+    } else if pr.review_decision == Some(ReviewDecision::ChangesRequested) {
+        NextStep::ChangesRequested
+    } else if !pr.is_draft {
+        NextStep::WaitingForReview
+    } else {
+        NextStep::Draft
+    }
+}
+
 /// What a section's rows can be sorted by: the row's lanes, with its age
 /// read from either date.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -471,6 +567,13 @@ pub struct SavedView {
     /// The order of each section's rows; `None` is GitHub's order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<Sort>,
+    /// The tab the view opens on; `None` opens the first tab with pull
+    /// requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<ReviewTab>,
+    /// The groups folded in every tab.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed: Vec<NextStep>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -519,6 +622,8 @@ impl ViewsFile {
             filters,
             all_open: None,
             sort: None,
+            tab: None,
+            collapsed: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -542,6 +647,21 @@ impl ViewsFile {
     /// Sets the order of the view's rows; whether the view exists.
     pub fn set_sort(&mut self, id: &str, sort: Option<Sort>, now: DateTime<Utc>) -> bool {
         self.edit(id, now, |view| view.sort = sort)
+    }
+
+    /// Sets the tab the view opens on; whether the view exists.
+    pub fn set_tab(&mut self, id: &str, tab: Option<ReviewTab>, now: DateTime<Utc>) -> bool {
+        self.edit(id, now, |view| view.tab = tab)
+    }
+
+    /// Sets the groups the view keeps folded; whether the view exists.
+    pub fn set_collapsed(
+        &mut self,
+        id: &str,
+        collapsed: Vec<NextStep>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.edit(id, now, |view| view.collapsed = collapsed)
     }
 
     pub fn delete(&mut self, id: &str) -> bool {
@@ -617,8 +737,9 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        Clause, Field, Loaded, Op, Sort, SortDir, SortKey, ViewsFile, all_open_query, cycle_sort,
-        describe, load, matches, options, save, set_op, sort_rows, toggle_value,
+        Clause, Field, Loaded, NextStep, Op, ReviewTab, Sort, SortDir, SortKey, ViewsFile,
+        all_open_query, cycle_sort, describe, load, matches, next_step, options, save, set_op,
+        sort_rows, toggle_value,
     };
     use crate::{
         Actor, ChecksState, Label, Mergeable, PrRef, PrState, PrSummary, RepoRef, ReviewDecision,
@@ -966,6 +1087,8 @@ mod tests {
             dir: SortDir::Descending,
         });
         assert!(file.set_sort(&id, largest, now));
+        assert!(file.set_tab(&id, Some(ReviewTab::Mine), now));
+        assert!(file.set_collapsed(&id, vec![NextStep::Draft], now));
         save(&path, &file).unwrap();
 
         let Loaded::Read(read) = load(&path) else {
@@ -976,10 +1099,121 @@ mod tests {
         assert_eq!(read.views[0].filters, more);
         assert_eq!(read.views[0].all_open, Some(false));
         assert_eq!(read.views[0].sort, largest);
+        assert_eq!(read.views[0].tab, Some(ReviewTab::Mine));
+        assert_eq!(read.views[0].collapsed, [NextStep::Draft]);
 
         std::fs::write(&path, b"{ not json").unwrap();
         assert!(matches!(load(&path), Loaded::Recovered { .. }));
         assert!(path.with_extension("json.bak").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_view_saved_before_tabs_reads_with_none() {
+        let json = r#"{"version":1,"views":[{"id":"rv_1","name":"Old","filters":[],
+            "createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z"}]}"#;
+        let file: ViewsFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.views[0].tab, None);
+        assert!(file.views[0].collapsed.is_empty());
+    }
+
+    /// A pull request with these facts and nothing else.
+    fn in_state(
+        draft: bool,
+        review: Option<ReviewDecision>,
+        checks: Option<ChecksState>,
+        mergeable: Mergeable,
+    ) -> PrSummary {
+        PrSummary {
+            is_draft: draft,
+            review_decision: review,
+            checks,
+            mergeable,
+            ..pr("a", "b", 1)
+        }
+    }
+
+    #[test]
+    fn each_pull_request_lands_in_the_group_of_its_next_step() {
+        use ChecksState::{Failing, Passing, Pending};
+        use Mergeable::{Conflicting, Unknown};
+        use NextStep::*;
+        use ReviewDecision::{Approved, ChangesRequested as Asked, ReviewRequired};
+        let ready = Mergeable::Mergeable;
+        let cases = [
+            // Approved, green, no conflict.
+            ((false, Some(Approved), Some(Passing), ready), ReadyToMerge),
+            ((false, Some(Approved), None, ready), ReadyToMerge),
+            (
+                (false, Some(Approved), Some(Passing), Unknown),
+                ReadyToMerge,
+            ),
+            // Anything short of that waits on something else.
+            (
+                (false, Some(Approved), Some(Pending), ready),
+                WaitingForReview,
+            ),
+            (
+                (false, Some(Approved), Some(Passing), Conflicting),
+                WaitingForReview,
+            ),
+            ((true, Some(Approved), Some(Passing), ready), Draft),
+            // Failing checks come before every review.
+            ((false, Some(Approved), Some(Failing), ready), ChecksFailing),
+            ((false, Some(Asked), Some(Failing), ready), ChecksFailing),
+            ((true, None, Some(Failing), Unknown), ChecksFailing),
+            // Then changes asked for.
+            ((false, Some(Asked), Some(Passing), ready), ChangesRequested),
+            ((false, Some(Asked), None, Conflicting), ChangesRequested),
+            (
+                (true, Some(Asked), Some(Pending), Unknown),
+                ChangesRequested,
+            ),
+            // Then a review still to come.
+            (
+                (false, Some(ReviewRequired), Some(Passing), ready),
+                WaitingForReview,
+            ),
+            ((false, None, None, Unknown), WaitingForReview),
+            ((false, None, Some(Pending), Conflicting), WaitingForReview),
+            // A draft with nothing failing and nothing asked.
+            ((true, None, None, Unknown), Draft),
+            ((true, Some(ReviewRequired), Some(Passing), ready), Draft),
+            ((true, None, Some(Pending), Conflicting), Draft),
+        ];
+        for ((draft, review, checks, mergeable), group) in cases {
+            let pr = in_state(draft, review, checks, mergeable);
+            assert_eq!(
+                next_step(&pr),
+                group,
+                "draft {draft}, review {review:?}, checks {checks:?}, {mergeable:?}"
+            );
+        }
+
+        // Every combination: the group's own rule holds, and no earlier
+        // group's rule does.
+        let reviews = [None, Some(Approved), Some(Asked), Some(ReviewRequired)];
+        let checks = [None, Some(Passing), Some(Pending), Some(Failing)];
+        for draft in [false, true] {
+            for review in reviews {
+                for check in checks {
+                    for mergeable in [ready, Conflicting, Unknown] {
+                        let pr = in_state(draft, review, check, mergeable);
+                        let rules = [
+                            !draft
+                                && review == Some(Approved)
+                                && matches!(check, None | Some(Passing))
+                                && mergeable != Conflicting,
+                            check == Some(Failing),
+                            review == Some(Asked),
+                            !draft,
+                            true,
+                        ];
+                        let first = rules.iter().position(|holds| *holds).unwrap();
+                        assert_eq!(next_step(&pr), NextStep::ALL[first], "{pr:?}");
+                    }
+                }
+            }
+        }
     }
 }
