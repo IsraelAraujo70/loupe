@@ -261,6 +261,94 @@ pub trait OpenOnClick: InteractiveElement + Sized {
 
 impl<E: InteractiveElement> OpenOnClick for E {}
 
+/// A group of tabs in one pane, as [`active_pane_groups`] lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupRef {
+    pane: PaneId,
+    group: u64,
+}
+
+/// The group [`open_in_group`] puts pages in.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroupTarget {
+    /// A group that exists.
+    Existing(GroupRef),
+    /// A new group of the active pane named `name`, in `color`, or else in
+    /// the first color no other group of the pane has.
+    New {
+        name: String,
+        color: Option<store::TabGroupColor>,
+    },
+}
+
+/// A group of the active pane, for a menu outside the tab bar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneGroup {
+    pub group: GroupRef,
+    pub name: SharedString,
+    pub color: store::TabGroupColor,
+}
+
+/// The groups of the active pane, in the order their names show in its row
+/// of tabs.
+pub fn active_pane_groups(cx: &App) -> Vec<PaneGroup> {
+    let Some(workspace) = cx
+        .try_global::<WorkspaceHandle>()
+        .and_then(|handle| handle.0.upgrade())
+    else {
+        return Vec::new();
+    };
+    let panes = &workspace.read(cx).panes;
+    let pane = panes.active_pane();
+    let tabs = panes.active();
+    let mut seen: Vec<u64> = Vec::new();
+    tabs.iter()
+        .filter_map(|tab| tab.group)
+        .filter(|id| {
+            let first = !seen.contains(id);
+            seen.push(*id);
+            first
+        })
+        .filter_map(|id| tabs.group(id))
+        .map(|group| PaneGroup {
+            group: GroupRef {
+                pane,
+                group: group.id,
+            },
+            name: group.name.clone().into(),
+            color: group.color,
+        })
+        .collect()
+}
+
+/// The color a new group of the active pane takes unless told otherwise.
+pub fn free_group_color(cx: &App) -> store::TabGroupColor {
+    cx.try_global::<WorkspaceHandle>()
+        .and_then(|handle| handle.0.upgrade())
+        .map(|workspace| workspace.read(cx).panes.active().free_color())
+        .unwrap_or_default()
+}
+
+/// Opens a tab for each of `routes`, in order, at the end of `target`'s
+/// group, in the background: the open tab stays on screen. A page some tab
+/// already shows moves that tab into the group instead of opening it again.
+pub fn open_in_group(target: GroupTarget, routes: Vec<Route>, window: &mut Window, cx: &mut App) {
+    with_workspace(cx, |workspace, cx| {
+        workspace.open_in_group(target, &routes, window, cx)
+    });
+}
+
+/// Asks for a new group's name and color, as "Add to new group…" does, and
+/// hands them to `on_pick` once confirmed.
+pub fn ask_new_group(
+    on_pick: impl Fn(&str, store::TabGroupColor, &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let color = free_group_color(cx);
+    tab_groups::ask_name_and_color("New group", "Create", color, on_pick, window, cx);
+}
+
 /// Splits the active pane on `zone`'s side with its active tab, as the Split
 /// actions do. For the command palette.
 fn split_active_tab(zone: Zone, window: &mut Window, cx: &mut App) {
@@ -418,6 +506,23 @@ impl Workspace {
             pane.open(tab);
         } else {
             pane.open_in_background(tab);
+        }
+    }
+
+    fn open_in_group(
+        &mut self,
+        target: GroupTarget,
+        routes: &[Route],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let opened = self.panes.open_in_group(target, routes, |route| Page {
+            view: router::build(route, window, cx),
+            route: route.clone(),
+        });
+        if opened.is_some() {
+            self.save_tabs(cx);
+            cx.notify();
         }
     }
 

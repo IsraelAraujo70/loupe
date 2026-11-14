@@ -43,6 +43,7 @@ use super::pr_row::{
 };
 use crate::route::Route;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
+use crate::shell::{self, GroupTarget, PaneGroup};
 use crate::theme::scale;
 use crate::ui;
 use crate::ui::MenuTriggerExt as _;
@@ -459,12 +460,51 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
 }
 
 /// Where the selection bar opens the picked pull requests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Bulk {
     /// One background tab each, in Loupe.
     Tabs,
     /// One browser tab each, on GitHub.
     Browser,
+    /// One background tab each, in a group of the active pane.
+    Group(GroupPick),
+}
+
+/// The group "Open in group" opens the picked pull requests in.
+#[derive(Clone, Debug, PartialEq)]
+enum GroupPick {
+    /// A new group; a dialog asks for its name and color.
+    New,
+    /// A new group named after the saved view on screen.
+    View(String),
+    /// A group the pane has.
+    Existing(PaneGroup),
+}
+
+impl GroupPick {
+    /// Opens `routes` in the background, in order, in this group. A page a
+    /// tab already shows moves that tab into the group.
+    fn open(self, routes: Vec<Route>, window: &mut Window, cx: &mut App) {
+        match self {
+            GroupPick::New => shell::ask_new_group(
+                move |name, color, window, cx| {
+                    let target = GroupTarget::New {
+                        name: name.to_owned(),
+                        color: Some(color),
+                    };
+                    shell::open_in_group(target, routes.clone(), window, cx)
+                },
+                window,
+                cx,
+            ),
+            GroupPick::View(name) => {
+                shell::open_in_group(GroupTarget::New { name, color: None }, routes, window, cx)
+            }
+            GroupPick::Existing(group) => {
+                shell::open_in_group(GroupTarget::Existing(group.group), routes, window, cx)
+            }
+        }
+    }
 }
 
 type Edit = Rc<dyn Fn(&mut Vec<Clause>)>;
@@ -1158,15 +1198,103 @@ impl InboxView {
             return;
         }
         self.confirm = None;
-        for summary in picked {
-            match bulk {
-                Bulk::Tabs => {
-                    crate::shell::open_in_new_tab(Route::PullRequest(summary.pr), window, cx)
+        match bulk {
+            Bulk::Tabs => {
+                for summary in picked {
+                    shell::open_in_new_tab(Route::PullRequest(summary.pr), window, cx)
                 }
-                Bulk::Browser => cx.open_url(&summary.url),
+            }
+            Bulk::Browser => {
+                for summary in picked {
+                    cx.open_url(&summary.url)
+                }
+            }
+            Bulk::Group(pick) => {
+                let routes = picked
+                    .into_iter()
+                    .map(|summary| Route::PullRequest(summary.pr))
+                    .collect();
+                pick.open(routes, window, cx);
             }
         }
         cx.notify();
+    }
+
+    /// The name of the saved view on screen while every row on screen is
+    /// picked, for "Open as group <name>".
+    fn view_group_name(&self, cx: &mut App) -> Option<String> {
+        let id = self.page.view_id.as_deref()?;
+        let rows = self.rows_shown();
+        if rows.is_empty() || !rows.iter().all(|pr| self.selection.contains(pr)) {
+            return None;
+        }
+        views_store::snapshot(cx)
+            .get(id)
+            .map(|view| view.name.clone())
+    }
+
+    /// "Open in group": a new group, a group named after the saved view
+    /// when every row is picked, and the active pane's groups.
+    fn group_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        let view_name = self.view_group_name(cx);
+        Button::new("reviews-selection-group")
+            .debug_selector(|| "reviews-selection-group".into())
+            .outline()
+            .small()
+            .icon(IconName::Layers)
+            .label("Open in group")
+            .dropdown_caret(true)
+            .menu_trigger()
+            .dropdown_menu(move |menu: PopupMenu, _, cx| {
+                let item = |label: SharedString, pick: GroupPick| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let bulk = Bulk::Group(pick.clone());
+                        view.update(cx, |this, cx| this.open_picked(bulk, false, window, cx))
+                            .ok();
+                    })
+                };
+                let menu = menu
+                    .min_w(px(220.))
+                    .item(item("New group…".into(), GroupPick::New));
+                let menu = match &view_name {
+                    Some(name) => menu.item(item(
+                        format!("Open as group {name}").into(),
+                        GroupPick::View(name.clone()),
+                    )),
+                    None => menu,
+                };
+                let groups = shell::active_pane_groups(cx);
+                if groups.is_empty() {
+                    return menu;
+                }
+                groups.into_iter().fold(menu.separator(), |menu, group| {
+                    let (name, color) = (group.name.clone(), group.color);
+                    let view = view.clone();
+                    let pick = GroupPick::Existing(group);
+                    menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .size_3()
+                                        .rounded_full()
+                                        .bg(crate::theme::tokens::tab_group(color)),
+                                )
+                                .child(div().min_w_0().truncate().child(name.clone()))
+                        })
+                        .on_click(move |_, window, cx| {
+                            let bulk = Bulk::Group(pick.clone());
+                            view.update(cx, |this, cx| this.open_picked(bulk, false, window, cx))
+                                .ok();
+                        }),
+                    )
+                })
+            })
     }
 
     /// Copies the picked pull requests' links, one per line, in list order.
@@ -1632,11 +1760,20 @@ impl InboxView {
                 .label(label)
         };
         let controls = h_flex().gap_2().items_center();
-        let controls = match self.confirm {
+        let controls = match self.confirm.clone() {
             Some(bulk) => {
-                let question = match bulk {
+                let question = match &bulk {
                     Bulk::Tabs => format!("Open {count} pull requests in new tabs?"),
                     Bulk::Browser => format!("Open {count} pull requests on GitHub?"),
+                    Bulk::Group(GroupPick::New) => {
+                        format!("Open {count} pull requests in a new group?")
+                    }
+                    Bulk::Group(GroupPick::View(name)) => {
+                        format!("Open {count} pull requests as group {name}?")
+                    }
+                    Bulk::Group(GroupPick::Existing(group)) => {
+                        format!("Open {count} pull requests in group {}?", group.name)
+                    }
                 };
                 controls
                     .child(div().text_sm().text_color(muted).child(question))
@@ -1657,7 +1794,7 @@ impl InboxView {
                             .small()
                             .label(format!("Open {count}"))
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_picked(bulk, true, window, cx)
+                                this.open_picked(bulk.clone(), true, window, cx)
                             })),
                     )
             }
@@ -1672,6 +1809,7 @@ impl InboxView {
                         this.open_picked(Bulk::Tabs, false, window, cx)
                     })),
                 )
+                .child(self.group_menu(cx))
                 .child(
                     action(
                         "reviews-selection-github",
@@ -2973,7 +3111,7 @@ mod tests {
             assert_eq!(picked(view, cx).len(), count as usize);
         };
         let confirm = |view: &Entity<InboxView>, cx: &mut VisualTestContext| {
-            view.read_with(cx, |view, _| view.confirm)
+            view.read_with(cx, |view, _| view.confirm.clone())
         };
 
         // Ten open at once.
@@ -2992,6 +3130,38 @@ mod tests {
         assert_eq!(confirm(&view, cx), None, "confirmed and opened");
         click(cx, "reviews-selection-github");
         assert_eq!(confirm(&view, cx), Some(super::Bulk::Browser));
+        let group = super::Bulk::Group(super::GroupPick::New);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_picked(group.clone(), false, window, cx)
+            })
+        });
+        assert_eq!(confirm(&view, cx), Some(group), "a group asks as well");
+    }
+
+    #[gpui_kit::test]
+    fn open_as_group_needs_a_saved_view_and_every_row_on_screen_picked(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
+        load(&view, inbox(), cx);
+        let offered = |view: &Entity<InboxView>, cx: &mut VisualTestContext| {
+            view.update(cx, |view, cx| view.view_group_name(cx))
+        };
+        cx.simulate_keystrokes("cmd-a");
+        assert!(!picked(&view, cx).is_empty());
+        assert_eq!(offered(&view, cx), None, "no saved view is open");
+
+        view.update(cx, |view, cx| view.save_as_new("Ready to ship", cx));
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(offered(&view, cx).as_deref(), Some("Ready to ship"));
+
+        view.update(cx, |view, cx| {
+            let first = view.rows_shown()[0].clone();
+            view.selection.toggle(&first);
+            view.selection_changed(cx);
+        });
+        assert_eq!(offered(&view, cx), None, "one row is left out");
     }
 
     #[test]
