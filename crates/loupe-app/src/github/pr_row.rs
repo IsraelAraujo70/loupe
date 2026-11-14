@@ -1,5 +1,7 @@
 //! The pull request list row shared by the inbox and repository lists.
 
+use std::rc::Rc;
+
 use chrono::Utc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::tag::Tag;
@@ -7,6 +9,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use loupe_github::reviews::{self, Sort, SortDir, SortKey};
 use loupe_github::{PrSummary, ReviewDecision};
 
 use super::widgets;
@@ -49,10 +52,41 @@ fn lane(width: f32) -> Div {
     h_flex().flex_none().w(dp(width)).justify_end()
 }
 
+/// What a click on a column heading does: sort by that column.
+pub type OnSort = Rc<dyn Fn(SortKey, &mut Window, &mut App)>;
+
 /// The 24 px heading over a list of [`pr_row`]s: a 12 px label over each
-/// lane, starting on the rows' own leading edge.
-pub fn column_header(show_repo: bool, show_author: bool, cx: &App) -> Div {
+/// lane, starting on the rows' own leading edge. With `on_sort`, every lane
+/// but the title's sorts the list when clicked, and the column `sort` names
+/// shows its direction with an arrow. The age lane sorts by the date its
+/// rows show: created when `sort` is by creation, else updated.
+pub fn column_header(
+    show_repo: bool,
+    show_author: bool,
+    sort: Option<Sort>,
+    on_sort: Option<OnSort>,
+    cx: &App,
+) -> Div {
     let muted = cx.theme().muted_foreground;
+    let age_key = match sort {
+        Some(Sort {
+            key: SortKey::Created,
+            ..
+        }) => SortKey::Created,
+        _ => SortKey::Updated,
+    };
+    let heading = |key: SortKey, label: &'static str, width: f32, center: bool| {
+        sort_heading(key, label, sort, on_sort.clone(), cx)
+            .flex_none()
+            .w(dp(width))
+            .map(|lane| {
+                if center {
+                    lane.justify_center()
+                } else {
+                    lane.justify_end()
+                }
+            })
+    };
     h_flex()
         .w_full()
         .h_6()
@@ -63,15 +97,89 @@ pub fn column_header(show_repo: bool, show_author: bool, cx: &App) -> Div {
         .text_color(muted)
         .child(div().flex_1().min_w_0().child("Pull request"))
         .when(show_author, |row| {
-            row.child(lane(AUTHOR_LANE).justify_center().child("Author"))
+            row.child(heading(SortKey::Author, "Author", AUTHOR_LANE, true))
         })
         .when(show_repo, |row| {
-            row.child(div().flex_none().w(dp(REPO_LANE)).child("Repository"))
+            row.child(
+                sort_heading(SortKey::Repository, "Repository", sort, on_sort.clone(), cx)
+                    .flex_none()
+                    .w(dp(REPO_LANE)),
+            )
         })
-        .child(lane(CHANGES_LANE).child("Changes"))
-        .child(lane(COMMENTS_LANE).child("Comments"))
-        .child(lane(CHECKS_LANE).justify_center().child("Checks"))
-        .child(lane(AGE_LANE).child("Age"))
+        .child(heading(SortKey::Changes, "Changes", CHANGES_LANE, false))
+        .child(heading(SortKey::Comments, "Comments", COMMENTS_LANE, false))
+        .child(heading(SortKey::Checks, "Checks", CHECKS_LANE, true))
+        .child(heading(age_key, "Age", AGE_LANE, false))
+}
+
+/// One column's label in [`column_header`]: a button that sorts by `key`
+/// when `on_sort` is set, with an arrow while `sort` is by `key`.
+fn sort_heading(
+    key: SortKey,
+    label: &'static str,
+    sort: Option<Sort>,
+    on_sort: Option<OnSort>,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    let active = sort.filter(|sort| sort.key == key);
+    let id = SharedString::from(format!("reviews-sort-{}", key.label().to_lowercase()));
+    let arrow = active.map(|sort| match sort.dir {
+        SortDir::Ascending => IconName::ArrowUp,
+        SortDir::Descending => IconName::ArrowDown,
+    });
+    let cell = h_flex()
+        .id(id.clone())
+        .h_full()
+        .gap_0p5()
+        .items_center()
+        .when(active.is_some(), |cell| cell.text_color(theme.foreground))
+        .children(arrow.map(|arrow| Icon::new(arrow).with_size(dp(12.))))
+        .child(label);
+    let Some(on_sort) = on_sort else {
+        return cell;
+    };
+    // The name says what a click does next, so a screen reader hears the
+    // order the list is in and the one it will get.
+    let state = match active {
+        Some(sort) => format!("{label}, sorted {}", sort.describe().to_lowercase()),
+        None => label.to_owned(),
+    };
+    let tip = match reviews::cycle_sort(sort, key) {
+        Some(next) => format!(
+            "Sort by {}: {}",
+            key.label().to_lowercase(),
+            next.describe().to_lowercase()
+        ),
+        None => "Back to the default order".to_owned(),
+    };
+    let foreground = theme.foreground;
+    cell.debug_selector(move || id.to_string())
+        .role(Role::Button)
+        .aria_label(format!("{state}. {tip}"))
+        .hover(move |cell| cell.text_color(foreground))
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .on_click(move |_, window, cx| on_sort(key, window, cx))
+}
+
+/// Which date a row's age lane counts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgeFrom {
+    Updated,
+    Created,
+}
+
+impl AgeFrom {
+    /// The date the rows show under `sort`: created while it sorts by it.
+    pub fn for_sort(sort: Option<Sort>) -> Self {
+        match sort {
+            Some(Sort {
+                key: SortKey::Created,
+                ..
+            }) => AgeFrom::Created,
+            _ => AgeFrom::Updated,
+        }
+    }
 }
 
 /// What a lane shows when the row has no value for it: a faint dash, so an
@@ -98,14 +206,15 @@ fn review_chip(decision: ReviewDecision) -> Tag {
 /// One 36 px row: state icon, `#number`, the title with its review decision
 /// right after it, then fixed lanes on the right for the author (when
 /// `show_author`), the repository (when `show_repo`), diff size, comments,
-/// checks, and age. Fixed lanes keep every column on one spine down the
-/// list. `selected` marks the row under the keyboard cursor. Clicking it
-/// opens `Route::PullRequest`.
+/// checks, and age (counted from `age_from`). Fixed lanes keep every column
+/// on one spine down the list. `selected` marks the row under the keyboard
+/// cursor. Clicking it opens `Route::PullRequest`.
 pub fn pr_row(
     summary: &PrSummary,
     show_repo: bool,
     show_author: bool,
     selected: bool,
+    age_from: AgeFrom,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
@@ -115,7 +224,11 @@ pub fn pr_row(
     let reference: SharedString = summary.pr.to_string().into();
     let repo = summary.pr.repo.name.clone();
     let route = Route::PullRequest(summary.pr.clone());
-    let age = ui::relative_time(summary.updated_at, Utc::now());
+    let at = match age_from {
+        AgeFrom::Updated => summary.updated_at,
+        AgeFrom::Created => summary.created_at,
+    };
+    let age = ui::relative_time(at, Utc::now());
     let (login, avatar_url) = summary.author.as_ref().map_or_else(
         || ("ghost".to_owned(), String::new()),
         |author| (author.login.clone(), author.avatar_url.clone()),
