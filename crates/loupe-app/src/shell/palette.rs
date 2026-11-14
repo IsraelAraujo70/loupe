@@ -827,7 +827,7 @@ fn tab_rows(parsed: &ParsedQuery, tabs: &[OpenTab]) -> Vec<OpenTab> {
     let text = parsed.text();
     let mut ranked: Vec<(u8, &OpenTab)> = tabs
         .iter()
-        .filter_map(|tab| text_rank(&text, &tab.route.label()).map(|rank| (rank, tab)))
+        .filter_map(|tab| text_rank(&text, &tab.label).map(|rank| (rank, tab)))
         .collect();
     ranked.sort_by_key(|(rank, _)| *rank);
     ranked.into_iter().map(|(_, tab)| tab.clone()).collect()
@@ -1403,7 +1403,7 @@ fn row(item: PaletteItem) -> CommandItem {
 
 /// An open tab: the icon and title its tab shows, then where it is.
 fn tab_row(tab: OpenTab, panes: usize) -> CommandItem {
-    let title = SharedString::from(tab.route.label());
+    let title = SharedString::from(tab.label.clone());
     let subtitle = SharedString::from(tab_subtitle(&tab, panes));
     let icon = super::tab_bar::route_icon(&tab.route);
     let id = SharedString::from(format!("palette-tab-{}", tab.id));
@@ -2003,6 +2003,7 @@ mod tests {
     fn open_tab(id: u64, route: Route, pane: usize, current: bool) -> OpenTab {
         OpenTab {
             id,
+            label: route.label(),
             route,
             pane,
             current,

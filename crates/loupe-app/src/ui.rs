@@ -405,14 +405,16 @@ impl RenderOnce for PageHeader {
             .when_some(self.prefix, |row, prefix| {
                 row.child(div().flex_none().child(prefix))
             })
-            .child(
+            .child({
+                let title = self.title.clone();
                 div()
+                    .debug_selector(move || format!("page-title:{title}"))
                     .min_w_0()
                     .truncate()
                     .text_size(scale::title())
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.title),
-            )
+                    .child(self.title)
+            })
             .when_some(self.count, |row, count| row.child(count_badge(count, cx)))
             .children(self.after_title)
             .child(div().flex_1().min_w_4())

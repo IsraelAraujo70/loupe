@@ -37,7 +37,7 @@ use super::Workspace;
 use super::actions::{GoBack, GoForward, NewTab, ToggleSidebar};
 use super::panes::{Pane, PaneId, Zone};
 use super::tab_groups;
-use super::tabs::TabGroup;
+use super::tabs::{Page, TabGroup};
 use crate::route::Route;
 use crate::store::{ClosedTabGroup, TabGroupColor};
 use crate::theme::scale::dp;
@@ -59,6 +59,16 @@ const PINNED_TAB_MAX_WIDTH: f32 = 112.;
 /// A pane's own row of tabs, once the window is split.
 const STRIP_HEIGHT: f32 = 36.;
 
+/// What a tab calls its page: the page's own title where it has one (a
+/// Reviews page names its open saved view), otherwise its route's label.
+pub(super) fn page_label(page: &Page<AnyView>, cx: &App) -> SharedString {
+    match page.route {
+        Route::Inbox => crate::github::inbox_title(&page.view, cx),
+        _ => None,
+    }
+    .unwrap_or_else(|| page.route.label().into())
+}
+
 /// The icon a tab showing `route` has.
 pub(super) fn route_icon(route: &Route) -> IconName {
     match route {
@@ -77,11 +87,12 @@ pub(super) fn route_icon(route: &Route) -> IconName {
 }
 
 /// The short name a pinned tab shows: a repository by its name alone, since
-/// its owner is what a narrow tab would show otherwise.
-fn pinned_label(route: &Route) -> String {
+/// its owner is what a narrow tab would show otherwise; any other page by
+/// `label`, its tab's title.
+fn pinned_label(route: &Route, label: &SharedString) -> SharedString {
     match route {
-        Route::Repo(repo) => repo.name.clone(),
-        route => route.label(),
+        Route::Repo(repo) => repo.name.clone().into(),
+        _ => label.clone(),
     }
 }
 
@@ -461,12 +472,12 @@ fn tabs(
         let line_color = group.map(|group| tokens::tab_group(group.color));
         let element = {
             let route = &tab.current().route;
-            let label: SharedString = route.label().into();
+            let label = page_label(tab.current(), cx);
             let icon = route_icon(route);
             let selected = index == active;
             let pinned = tab.pinned;
-            let shown_label: SharedString = if pinned {
-                pinned_label(route).into()
+            let shown_label = if pinned {
+                pinned_label(route, &label)
             } else {
                 label.clone()
             };
@@ -583,7 +594,15 @@ fn tabs(
                         muted
                     },
                 ))
-                .child(div().flex_1().min_w_0().truncate().child(shown_label))
+                .child({
+                    let text = shown_label.clone();
+                    div()
+                        .debug_selector(move || format!("tab-{id}-label:{text}"))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(shown_label)
+                })
                 .when(!pinned, |tab| {
                     tab.child(
                         div()

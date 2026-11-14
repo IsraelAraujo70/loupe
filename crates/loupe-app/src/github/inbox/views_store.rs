@@ -44,6 +44,12 @@ pub fn snapshot(cx: &mut App) -> ViewsFile {
     saved(cx).file.clone()
 }
 
+/// The saved views, once loaded: a Reviews page loads them when it opens.
+/// For reads that have no `&mut App`, such as a tab's title.
+pub fn loaded(cx: &App) -> Option<&ViewsFile> {
+    cx.try_global::<SavedViews>().map(|saved| &saved.file)
+}
+
 /// The load warning, once.
 pub fn take_warning(cx: &mut App) -> Option<SharedString> {
     saved(cx).warning.take()
