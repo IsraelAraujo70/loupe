@@ -48,7 +48,8 @@ jobs:
     # name. GitHub-hosted runner since #100: the Boat runner (`boat-large`)
     # has a daily start limit, and when it ran out PRs lost this required
     # check. To go back to Boat, set `runs-on: boat-large` here and on the
-    # Release `linux` job.
+    # Release `linux` job. Measured on ubuntu-24.04 with no Rust cache (#101):
+    # 8-11 min, so 45 min leaves room for a slow runner or apt retries.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:

@@ -33,7 +33,9 @@ jobs:
     # GitHub-hosted runner since #100: the Boat runner (`boat-large`, 8 vCPU,
     # 16 GB) has a daily start limit, and when it ran out the Release stopped.
     # apt retries cover the flaky Azure mirror. To go back to Boat, set
-    # `runs-on: boat-large` here and on the CI `app-tests` job.
+    # `runs-on: boat-large` here and on the CI `app-tests` job. Measured on
+    # ubuntu-24.04 with no Rust cache (#101): 11.5 min, so 45 min leaves room
+    # for a slow runner or apt retries.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
