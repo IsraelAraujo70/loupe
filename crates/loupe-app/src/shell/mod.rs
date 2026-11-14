@@ -347,6 +347,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Every open tab, titled as its tab shows it, for the palette.
+    fn open_tabs(&self, cx: &App) -> Vec<panes::OpenTab> {
+        self.panes
+            .open_tabs(|page| tab_bar::page_label(page, cx).into())
+    }
+
     fn page(&self, route: Route, window: &mut Window, cx: &mut Context<Self>) -> Page<AnyView> {
         Page {
             view: router::build(&route, window, cx),
@@ -1158,10 +1164,10 @@ impl Render for Workspace {
                     }))
                     .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                         let target = item_menu::target(this.active_page(), cx);
-                        palette::toggle(target, this.panes.open_tabs(), window, cx)
+                        palette::toggle(target, this.open_tabs(cx), window, cx)
                     }))
                     .on_action(cx.listener(|this, _: &SearchTabs, window, cx| {
-                        palette::toggle_tabs(this.panes.open_tabs(), window, cx)
+                        palette::toggle_tabs(this.open_tabs(cx), window, cx)
                     }))
                     .on_action(cx.listener(|this, _: &OpenItemInNewTab, window, cx| {
                         this.run_on_target(Command::OpenInNewTab, window, cx)

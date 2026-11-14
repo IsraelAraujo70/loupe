@@ -69,6 +69,8 @@ pub(super) struct Pane<V> {
 pub(super) struct OpenTab {
     pub id: u64,
     pub route: Route,
+    /// The title its tab shows.
+    pub label: String,
     /// Its pane's place in reading order, from 0.
     pub pane: usize,
     /// The open tab of the active pane: the one the keys act on.
@@ -429,8 +431,9 @@ impl<V> Panes<V> {
     }
 
     /// Every tab of every pane: the panes in reading order, each pane's
-    /// tabs in the order of its row.
-    pub fn open_tabs(&self) -> Vec<OpenTab> {
+    /// tabs in the order of its row, each titled by `label`.
+    pub fn open_tabs(&self, label: impl Fn(&Page<V>) -> String) -> Vec<OpenTab> {
+        let label = &label;
         self.panes()
             .into_iter()
             .enumerate()
@@ -439,6 +442,7 @@ impl<V> Panes<V> {
                 pane.tabs.iter().map(move |tab| OpenTab {
                     id: tab.id,
                     route: tab.current().route.clone(),
+                    label: label(tab.current()),
                     pane: place,
                     current: current == Some(tab.id),
                 })
@@ -711,7 +715,7 @@ mod tests {
         };
         let panes = restore(&layout, 1);
         let listed: Vec<(Route, usize, bool)> = panes
-            .open_tabs()
+            .open_tabs(|page| page.route.label())
             .into_iter()
             .map(
                 |OpenTab {
@@ -732,7 +736,11 @@ mod tests {
             ],
             "only the active pane's open tab is the current one"
         );
-        let ids: Vec<u64> = panes.open_tabs().iter().map(|tab| tab.id).collect();
+        let ids: Vec<u64> = panes
+            .open_tabs(|page| page.route.label())
+            .iter()
+            .map(|tab| tab.id)
+            .collect();
         let mut unique = ids.clone();
         unique.dedup();
         assert_eq!(ids, unique, "each tab is listed once, under its own id");

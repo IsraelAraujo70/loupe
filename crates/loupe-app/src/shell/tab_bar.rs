@@ -30,7 +30,7 @@ use super::Workspace;
 use super::actions::{GoBack, GoForward, NewTab, ToggleSidebar};
 use super::panes::{Pane, PaneId, Zone};
 use super::tab_groups;
-use super::tabs::TabGroup;
+use super::tabs::{Page, TabGroup};
 use crate::route::Route;
 use crate::store::TabGroupColor;
 use crate::theme::scale::dp;
@@ -49,6 +49,16 @@ const TAB_MAX_WIDTH: f32 = 220.;
 const TAB_MIN_WIDTH: f32 = 128.;
 /// A pane's own row of tabs, once the window is split.
 const STRIP_HEIGHT: f32 = 36.;
+
+/// What a tab calls its page: the page's own title where it has one (a
+/// Reviews page names its open saved view), otherwise its route's label.
+pub(super) fn page_label(page: &Page<AnyView>, cx: &App) -> SharedString {
+    match page.route {
+        Route::Inbox => crate::github::inbox_title(&page.view, cx),
+        _ => None,
+    }
+    .unwrap_or_else(|| page.route.label().into())
+}
 
 /// The icon a tab showing `route` has.
 pub(super) fn route_icon(route: &Route) -> IconName {
@@ -270,7 +280,7 @@ fn tabs(
         let line_color = group.map(|group| tokens::tab_group(group.color));
         let element = {
             let route = &tab.current().route;
-            let label: SharedString = route.label().into();
+            let label = page_label(tab.current(), cx);
             let icon = route_icon(route);
             let selected = index == active;
             let id = tab.id;
