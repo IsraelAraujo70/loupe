@@ -263,6 +263,21 @@ pub struct SavedTabGroup {
     pub collapsed: bool,
     pub first: usize,
     pub len: usize,
+    /// The saved Reviews view the group keeps in sync with, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<ViewSync>,
+}
+
+/// What a tab group kept in sync with a saved Reviews view follows: the
+/// view, the tab of Reviews it was opened from, and the pull requests that
+/// tab listed when the group last synced. A pull request new to the list
+/// opens in the group; one that left it closes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSync {
+    pub view: String,
+    pub tab: loupe_github::reviews::ReviewTab,
+    #[serde(default)]
+    pub seen: Vec<loupe_github::PrRef>,
 }
 
 /// How many closed groups of tabs [`Settings::closed_tab_groups`] keeps.
@@ -941,6 +956,7 @@ mod tests {
                     collapsed: true,
                     first: 1,
                     len: 1,
+                    sync: None,
                 }],
                 pinned: 1,
             }),
@@ -977,6 +993,7 @@ mod tests {
                     collapsed: false,
                     first: 0,
                     len: 1,
+                    sync: None,
                 }],
                 pinned: 0,
             },
@@ -1080,6 +1097,7 @@ mod tests {
                         collapsed: false,
                         first: 0,
                         len: 1,
+                        sync: None,
                     }],
                     pinned: 0,
                 }),

@@ -5,8 +5,10 @@
 //! A pane is never empty: taking its last tab out removes it, and its
 //! sibling takes the space. The window always has one pane.
 
+use loupe_github::PrRef;
+
 use crate::route::Route;
-use crate::store::{ClosedTabGroup, PaneLayout, SplitAxis};
+use crate::store::{ClosedTabGroup, PaneLayout, SplitAxis, ViewSync};
 
 use super::tabs::{Page, Tab, Tabs};
 use super::{GroupRef, GroupTarget};
@@ -623,7 +625,9 @@ impl<V> Panes<V> {
                 self.pane(pane)?.tabs.group(group)?;
                 (pane, Some(group), None)
             }
-            GroupTarget::New { name, color } => (self.active, None, Some((name, color))),
+            GroupTarget::New { name, color, sync } => {
+                (self.active, None, Some((name, color, sync)))
+            }
         };
         for route in routes {
             let open = self.find(route);
@@ -637,7 +641,7 @@ impl<V> Panes<V> {
                             tabs.add_to_group(index, id);
                         }
                     }
-                    (None, Some((name, color))) => {
+                    (None, Some((name, color, _))) => {
                         group = tabs.new_group(index, name);
                         if let (Some(id), Some(color)) = (group, color) {
                             tabs.set_group_color(id, *color);
@@ -665,11 +669,91 @@ impl<V> Panes<V> {
                 (Some(id), _) => {
                     tabs.append_to_group(tab, id);
                 }
-                (None, Some((name, color))) => group = tabs.open_in_new_group(tab, name, *color),
+                (None, Some((name, color, _))) => group = tabs.open_in_new_group(tab, name, *color),
                 (None, None) => return None,
             }
         }
+        if let (Some(id), Some((_, _, sync @ Some(_)))) = (group, new) {
+            self.tabs_mut(pane)?.set_group_sync(id, sync);
+        }
         group.map(|group| GroupRef { pane, group })
+    }
+
+    /// Brings group `group`, kept in sync with a saved view, in line with
+    /// `list`, the pull requests the view lists now. One new to the list
+    /// since the last sync opens in the group in the background, as
+    /// [`Self::open_in_group`] does, unless it is the open tab of another
+    /// pane; the group's tab of one that left the list closes. No pane's
+    /// open tab is ever closed or switched. `list` is then what the group
+    /// has seen. Returns whether anything changed; false when the group is
+    /// gone or not kept in sync.
+    pub fn sync_group(
+        &mut self,
+        group: GroupRef,
+        list: &[PrRef],
+        page: impl FnMut(&Route) -> Page<V>,
+    ) -> bool {
+        let Some(sync) = self
+            .pane(group.pane)
+            .and_then(|pane| pane.tabs.group(group.group))
+            .and_then(|found| found.sync.clone())
+        else {
+            return false;
+        };
+        let shown: Vec<u64> = self
+            .panes()
+            .into_iter()
+            .filter(|pane| pane.id != group.pane)
+            .map(|pane| pane.tabs.active().id)
+            .collect();
+        let shown_elsewhere = |route: &Route| {
+            self.find(route).is_some_and(|(pane, index)| {
+                self.pane(pane)
+                    .and_then(|pane| pane.tabs.iter().nth(index))
+                    .is_some_and(|tab| shown.contains(&tab.id))
+            })
+        };
+        let added: Vec<Route> = list
+            .iter()
+            .filter(|pr| !sync.seen.contains(pr))
+            .map(|pr| Route::PullRequest(pr.clone()))
+            .filter(|route| !shown_elsewhere(route))
+            .collect();
+        let left: Vec<Route> = sync
+            .seen
+            .iter()
+            .filter(|pr| !list.contains(pr))
+            .map(|pr| Route::PullRequest(pr.clone()))
+            .collect();
+        let mut changed = !added.is_empty()
+            && self
+                .open_in_group(GroupTarget::Existing(group), &added, page)
+                .is_some();
+        let closing: Vec<u64> = self
+            .pane(group.pane)
+            .map(|pane| {
+                let open = pane.tabs.active().id;
+                pane.tabs
+                    .iter()
+                    .filter(|tab| tab.group == Some(group.group) && tab.id != open)
+                    .filter(|tab| left.contains(&tab.current().route))
+                    .map(|tab| tab.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in closing {
+            if let Some((pane, index)) = self.locate(id) {
+                changed |= self.close(pane, index);
+            }
+        }
+        let seen = ViewSync {
+            seen: list.to_vec(),
+            ..sync
+        };
+        if let Some(tabs) = self.tabs_mut(group.pane) {
+            changed |= tabs.set_group_sync(group.group, Some(seen));
+        }
+        changed
     }
 
     /// Closes every tab of group `group` of `pane` and returns the group as
@@ -768,7 +852,8 @@ mod tests {
     use crate::route::Route;
     use crate::shell::tabs::Page;
     use crate::shell::{GroupRef, GroupTarget};
-    use crate::store::{PaneLayout, SavedTabGroup, SplitAxis, TabGroupColor};
+    use crate::store::{PaneLayout, SavedTabGroup, SplitAxis, TabGroupColor, ViewSync};
+    use loupe_github::reviews::ReviewTab;
     use loupe_github::{PrRef, RepoRef};
 
     fn issue(id: &str) -> Route {
@@ -993,6 +1078,7 @@ mod tests {
                 collapsed: false,
                 first: 2,
                 len: 2,
+                sync: None,
             }],
             pinned: 2,
         };
@@ -1050,6 +1136,7 @@ mod tests {
             collapsed: false,
             first,
             len,
+            sync: None,
         }
     }
 
@@ -1136,11 +1223,13 @@ mod tests {
         let target = GroupTarget::New {
             name: "Ready".into(),
             color: Some(TabGroupColor::Pink),
+            sync: None,
         };
         assert!(panes.open_in_group(target, &[pr(1), pr(2)], page).is_some());
         let target = GroupTarget::New {
             name: "My view".into(),
             color: None,
+            sync: None,
         };
         assert!(panes.open_in_group(target, &[pr(3)], page).is_some());
         assert_eq!(
@@ -1173,6 +1262,113 @@ mod tests {
         );
     }
 
+    fn number(pr: u64) -> PrRef {
+        PrRef::new(RepoRef::new("acme", "web"), pr)
+    }
+
+    fn kept(seen: &[u64]) -> ViewSync {
+        ViewSync {
+            view: "ready".into(),
+            tab: ReviewTab::ToReview,
+            seen: seen.iter().copied().map(number).collect(),
+        }
+    }
+
+    #[test]
+    fn a_synced_group_opens_only_what_joined_the_view_and_closes_only_what_left_it() {
+        // Ready follows its view, which listed #1 to #4 and #8; the tab of
+        // #4 was closed by hand and #8 taken out of the group. #2 is open on
+        // screen. On the right, #5 is open on screen and #6 behind it.
+        let mut ready = group("Ready", TabGroupColor::Green, 1, 3);
+        ready.sync = Some(kept(&[1, 2, 3, 4, 8]));
+        let mut panes = restore(
+            &PaneLayout::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(PaneLayout::Pane {
+                    tabs: vec![Route::Inbox, pr(1), pr(2), pr(3), pr(8), issue("ENG-1")],
+                    active: 2,
+                    groups: vec![ready],
+                    pinned: 0,
+                }),
+                second: Box::new(pane(&[pr(5), pr(6)], 0)),
+            },
+            0,
+        );
+        let left = panes.active_pane();
+        let id = panes.active().groups()[0].id;
+        let target = GroupRef {
+            pane: left,
+            group: id,
+        };
+        // #2, #3, and #8 left the view; #5, #6, and #7 joined it.
+        let list: Vec<PrRef> = [1, 4, 5, 6, 7].into_iter().map(number).collect();
+        assert!(panes.sync_group(target, &list, page));
+        let mut synced = group("Ready", TabGroupColor::Green, 1, 4);
+        synced.sync = Some(kept(&[1, 4, 5, 6, 7]));
+        assert_eq!(
+            panes.layout(),
+            (
+                PaneLayout::Split {
+                    axis: SplitAxis::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(PaneLayout::Pane {
+                        tabs: vec![
+                            Route::Inbox,
+                            pr(1),
+                            pr(2),
+                            pr(6),
+                            pr(7),
+                            pr(8),
+                            issue("ENG-1"),
+                        ],
+                        active: 2,
+                        groups: vec![synced],
+                        pinned: 0,
+                    }),
+                    second: Box::new(pane(&[pr(5)], 0)),
+                },
+                0,
+            ),
+            "#3 closes; #2 stays open on screen and #8 outside the group; #4 \
+             stays closed; #6 moves in and #7 opens in the background; #5 \
+             stays the other pane's open tab"
+        );
+        assert!(
+            !panes.sync_group(target, &list, page),
+            "the same list changes nothing"
+        );
+    }
+
+    #[test]
+    fn only_a_group_kept_in_sync_follows_a_view_and_stopping_keeps_its_tabs() {
+        let mut panes = restore(&pane(&[Route::Inbox], 0), 0);
+        let target = GroupTarget::New {
+            name: "Ready".into(),
+            color: None,
+            sync: Some(kept(&[1])),
+        };
+        let synced = panes.open_in_group(target, &[pr(1)], page).unwrap();
+        let target = GroupTarget::New {
+            name: "Plain".into(),
+            color: None,
+            sync: None,
+        };
+        let plain = panes.open_in_group(target, &[pr(2)], page).unwrap();
+        let next: Vec<PrRef> = [3].into_iter().map(number).collect();
+        assert!(!panes.sync_group(plain, &next, page), "not kept in sync");
+        assert!(panes.find(&pr(3)).is_none());
+
+        let tabs = panes.active_mut();
+        assert!(tabs.set_group_sync(synced.group, None), "Stop syncing");
+        assert!(!panes.sync_group(synced, &next, page));
+        assert_eq!(
+            panes.active().routes(),
+            vec![Route::Inbox, pr(2), pr(1)],
+            "a group no longer in sync keeps its tabs"
+        );
+    }
+
     #[test]
     fn a_group_opened_from_a_pinned_tab_starts_after_the_pinned_ones() {
         // Reviews and #1 are pinned.
@@ -1188,6 +1384,7 @@ mod tests {
         let target = GroupTarget::New {
             name: "Ready".into(),
             color: None,
+            sync: None,
         };
         assert!(panes.open_in_group(target, &[pr(2), pr(1)], page).is_some());
         assert_eq!(
@@ -1215,6 +1412,7 @@ mod tests {
                     collapsed: false,
                     first: 1,
                     len: 2,
+                    sync: None,
                 }],
                 pinned: 0,
             },
@@ -1288,6 +1486,7 @@ mod tests {
                 collapsed: false,
                 first: 0,
                 len: tabs.len(),
+                sync: None,
             }],
             pinned: 0,
         };

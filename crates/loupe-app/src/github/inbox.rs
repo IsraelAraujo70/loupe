@@ -6,9 +6,12 @@
 
 mod dialogs;
 mod filter_menu;
+mod group_sync;
 mod selection;
 mod stacks;
 mod views_store;
+
+pub use self::group_sync::start as start_group_sync;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -16,6 +19,7 @@ use std::rc::Rc;
 use chrono::Utc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
@@ -44,6 +48,7 @@ use super::pr_row::{
 use crate::route::Route;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::shell::{self, GroupTarget, PaneGroup};
+use crate::store::ViewSync;
 use crate::theme::scale;
 use crate::ui;
 use crate::ui::MenuTriggerExt as _;
@@ -158,6 +163,28 @@ fn shown_all<'a>(
         note,
         items,
     }
+}
+
+/// The pull requests `tab` lists under `filters`, in GitHub's order, with
+/// `all_open` the view's "All open" results for All: what a tab group kept
+/// in sync with a saved view follows.
+fn view_rows(
+    inbox: &Inbox,
+    all_open: Option<&Page<PrSummary>>,
+    filters: &[Clause],
+    tab: ReviewTab,
+) -> Vec<PrRef> {
+    let rows = match tab_page(tab, inbox) {
+        Some(page) => shown(page, filters),
+        None => {
+            let tabs: Vec<Shown<'_>> = INBOX_TABS
+                .iter()
+                .filter_map(|&tab| Some(shown(tab_page(tab, inbox)?, filters)))
+                .collect();
+            shown_all(&tabs.iter().collect::<Vec<_>>(), all_open, filters)
+        }
+    };
+    rows.items.iter().map(|pr| pr.pr.clone()).collect()
 }
 
 /// What a Reviews page and its tab are called with view `view_id` open:
@@ -370,6 +397,9 @@ pub struct InboxView {
     confirm: Option<Bulk>,
     /// "Mark as read" in flight.
     marking: Option<Task<()>>,
+    /// "Keep in sync with the view" under "Open as group <view>"; off until
+    /// the user ticks it.
+    keep_in_sync: bool,
     /// Whether the last frame showed the selection bar.
     bar_shown: bool,
     /// What the last "Mark as read" did, or why it failed (`true`).
@@ -446,6 +476,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             selection: Selection::default(),
             confirm: None,
             marking: None,
+            keep_in_sync: false,
             bar_shown: false,
             mark_note: None,
             opened_on: None,
@@ -457,6 +488,38 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
         view.reload(cx);
         view
     })
+}
+
+/// "Keep in sync with the view", a box under "Open as group <view>" that
+/// leaves the menu open when clicked; Enter on it ticks it too.
+fn keep_in_sync_item(view: WeakEntity<InboxView>) -> PopupMenuItem {
+    let toggle = |view: &WeakEntity<InboxView>, cx: &mut App| {
+        view.update(cx, |this, cx| {
+            this.keep_in_sync = !this.keep_in_sync;
+            cx.notify();
+        })
+        .ok();
+    };
+    let on_enter = view.clone();
+    PopupMenuItem::element(move |_, cx| {
+        let on = view
+            .upgrade()
+            .is_some_and(|view| view.read(cx).keep_in_sync);
+        let view = view.clone();
+        div()
+            .id("reviews-keep-in-sync")
+            .debug_selector(|| "reviews-keep-in-sync".into())
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                toggle(&view, cx);
+            })
+            .child(
+                Checkbox::new("reviews-keep-in-sync-box")
+                    .checked(on)
+                    .label("Keep in sync with the view"),
+            )
+    })
+    .on_click(move |_, _, cx| toggle(&on_enter, cx))
 }
 
 /// Where the selection bar opens the picked pull requests.
@@ -475,8 +538,12 @@ enum Bulk {
 enum GroupPick {
     /// A new group; a dialog asks for its name and color.
     New,
-    /// A new group named after the saved view on screen.
-    View(String),
+    /// A new group named after the saved view on screen, kept in sync with
+    /// it when `sync` is set.
+    View {
+        name: String,
+        sync: Option<ViewSync>,
+    },
     /// A group the pane has.
     Existing(PaneGroup),
 }
@@ -491,15 +558,23 @@ impl GroupPick {
                     let target = GroupTarget::New {
                         name: name.to_owned(),
                         color: Some(color),
+                        sync: None,
                     };
                     shell::open_in_group(target, routes.clone(), window, cx)
                 },
                 window,
                 cx,
             ),
-            GroupPick::View(name) => {
-                shell::open_in_group(GroupTarget::New { name, color: None }, routes, window, cx)
-            }
+            GroupPick::View { name, sync } => shell::open_in_group(
+                GroupTarget::New {
+                    name,
+                    color: None,
+                    sync,
+                },
+                routes,
+                window,
+                cx,
+            ),
             GroupPick::Existing(group) => {
                 shell::open_in_group(GroupTarget::Existing(group.group), routes, window, cx)
             }
@@ -603,6 +678,9 @@ impl InboxView {
             move |view, result, cx| {
                 if let (Some(key), Ok(value)) = (&key, &result) {
                     crate::cache::put(key, value);
+                }
+                if let Ok(inbox) = &result {
+                    group_sync::now(Some(inbox.clone()), cx);
                 }
                 view.inbox.finish(result);
                 view.count_bases(cx);
@@ -1008,6 +1086,9 @@ impl InboxView {
             views.update_filters(&id, draft, now);
             views.set_sort(&id, sort, now);
         });
+        if result.is_ok() {
+            group_sync::now(None, cx);
+        }
         self.report(result.err(), cx);
     }
 
@@ -1233,6 +1314,37 @@ impl InboxView {
             .map(|view| view.name.clone())
     }
 
+    /// "Open as group <view>": the group named after the saved view on
+    /// screen, kept in sync with it when "Keep in sync with the view" is
+    /// ticked. The group then follows the open tab's pull requests under the
+    /// view's saved filters, and those listed now count as seen.
+    fn view_pick(&self, cx: &mut App) -> Option<GroupPick> {
+        let name = self.view_group_name(cx)?;
+        let sync = self.keep_in_sync.then(|| self.view_sync(cx)).flatten();
+        Some(GroupPick::View { name, sync })
+    }
+
+    /// What a group kept in sync with the saved view on screen starts from:
+    /// the view, the open tab, and what that tab lists under the view's
+    /// saved filters.
+    fn view_sync(&self, cx: &mut App) -> Option<ViewSync> {
+        let id = self.page.view_id.clone()?;
+        let inbox = self.inbox.value()?;
+        let tab = self.current_tab()?;
+        let views = views_store::snapshot(cx);
+        let view = views.get(&id)?;
+        let all_open = (tab == ReviewTab::All && view.all_open.unwrap_or(true))
+            .then(|| reviews::all_open_query(&view.filters))
+            .flatten()
+            .and_then(|query| self.all_open.get(&query))
+            .and_then(Loadable::value);
+        Some(ViewSync {
+            view: id,
+            tab,
+            seen: view_rows(inbox, all_open, &view.filters, tab),
+        })
+    }
+
     /// "Open in group": a new group, a group named after the saved view
     /// when every row is picked, and the active pane's groups.
     fn group_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1259,10 +1371,23 @@ impl InboxView {
                     .min_w(px(220.))
                     .item(item("New group…".into(), GroupPick::New));
                 let menu = match &view_name {
-                    Some(name) => menu.item(item(
-                        format!("Open as group {name}").into(),
-                        GroupPick::View(name.clone()),
-                    )),
+                    Some(name) => {
+                        let open = {
+                            let view = view.clone();
+                            PopupMenuItem::new(format!("Open as group {name}")).on_click(
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        let Some(pick) = this.view_pick(cx) else {
+                                            return;
+                                        };
+                                        this.open_picked(Bulk::Group(pick), false, window, cx)
+                                    })
+                                    .ok();
+                                },
+                            )
+                        };
+                        menu.item(open).item(keep_in_sync_item(view.clone()))
+                    }
                     None => menu,
                 };
                 let groups = shell::active_pane_groups(cx);
@@ -1768,7 +1893,7 @@ impl InboxView {
                     Bulk::Group(GroupPick::New) => {
                         format!("Open {count} pull requests in a new group?")
                     }
-                    Bulk::Group(GroupPick::View(name)) => {
+                    Bulk::Group(GroupPick::View { name, .. }) => {
                         format!("Open {count} pull requests as group {name}?")
                     }
                     Bulk::Group(GroupPick::Existing(group)) => {
@@ -3162,6 +3287,49 @@ mod tests {
             view.selection_changed(cx);
         });
         assert_eq!(offered(&view, cx), None, "one row is left out");
+    }
+
+    #[gpui_kit::test]
+    fn keep_in_sync_is_off_until_ticked_and_follows_the_whole_open_tab(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
+        load(&view, inbox(), cx);
+        view.update(cx, |view, cx| view.save_as_new("Ready to ship", cx));
+        cx.simulate_keystrokes("cmd-a");
+        let pick = |view: &Entity<InboxView>, cx: &mut VisualTestContext| {
+            view.update(cx, |view, cx| view.view_pick(cx))
+        };
+        assert_eq!(
+            pick(&view, cx),
+            Some(super::GroupPick::View {
+                name: "Ready to ship".into(),
+                sync: None,
+            }),
+            "off by default"
+        );
+
+        // A folded group's rows are off screen but still in the view.
+        view.update(cx, |view, cx| {
+            view.keep_in_sync = true;
+            view.toggle_group(NextStep::ReadyToMerge, cx);
+        });
+        cx.simulate_keystrokes("cmd-a");
+        let Some(super::GroupPick::View {
+            sync: Some(sync), ..
+        }) = pick(&view, cx)
+        else {
+            panic!("ticked, the group keeps in sync");
+        };
+        let id = view.read_with(cx, |view, _| view.page.view_id.clone());
+        assert_eq!(Some(sync.view), id);
+        assert_eq!(sync.tab, ReviewTab::ToReview);
+        let seen: Vec<u64> = sync.seen.iter().map(|pr| pr.number).collect();
+        assert_eq!(
+            seen,
+            vec![1, 2, 3, 6],
+            "every row of the tab, in GitHub's order"
+        );
     }
 
     #[test]
