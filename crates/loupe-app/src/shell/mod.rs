@@ -57,8 +57,7 @@ use crate::shell::actions::{
 use crate::shell::item_menu::Command;
 use crate::shell::panes::{Node, Pane, PaneId, Panes, Zone};
 use crate::shell::tab_bar::DraggedTab;
-use crate::shell::tabs::Page;
-use crate::shell::tabs::Tabs;
+use crate::shell::tabs::{Page, Tabs};
 use crate::store::{self, Settings, SplitAxis};
 use crate::theme::{scale, tokens};
 use crate::ui::WindowDragArea as _;
@@ -2001,6 +2000,45 @@ mod tests {
             groups.is_empty(),
             "no tab joined a group of its own: {groups:?}"
         );
+
+        // A group named after a repository, made by hand, takes no other
+        // tab of that repository, and opening to the side makes no group.
+        let first = workspace.read_with(cx, |this, _| {
+            this.panes
+                .active()
+                .iter()
+                .find(|tab| tab.current().route == pr("loupe", 1))
+                .expect("loupe#1 is open")
+                .id
+        });
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(
+                first,
+                |tabs, index| tabs.new_group(index, "loupe").is_some(),
+                cx,
+            )
+        });
+        cx.update(|window, cx| super::open_in_new_tab(pr("loupe", 4), window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| super::open_side_by_side(pr("loupe", 5), window, cx));
+        cx.run_until_parked();
+        let layout = saved_panes(cx).0;
+        let PaneLayout::Split { first, second, .. } = &layout else {
+            panic!("two panes, got {layout:?}");
+        };
+        let groups = |pane: &PaneLayout| match pane {
+            PaneLayout::Pane { groups, .. } => groups
+                .iter()
+                .map(|group| (group.name.clone(), group.len))
+                .collect::<Vec<_>>(),
+            split => panic!("expected a pane, got {split:?}"),
+        };
+        assert_eq!(
+            groups(first),
+            [("loupe".to_owned(), 1)],
+            "the hand-made group keeps only its own tab"
+        );
+        assert!(groups(second).is_empty(), "the new pane has no group");
     }
 
     #[gpui_kit::test]
