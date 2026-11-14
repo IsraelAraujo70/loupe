@@ -2006,6 +2006,43 @@ mod tests {
         assert_ne!(after.0, before.0, "its pane becomes the active one");
     }
 
+    /// Two Reviews tabs on different views are told apart: the tab whose
+    /// page opens a saved view takes its name, the other stays "Reviews".
+    #[gpui_kit::test]
+    fn a_reviews_tab_is_named_after_its_saved_view(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        cx.update(|window, cx| super::open_in_new_tab(Route::Inbox, window, cx));
+        cx.run_until_parked();
+        let labels = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .open_tabs(cx)
+                    .into_iter()
+                    .map(|tab| tab.label)
+                    .collect::<Vec<String>>()
+            })
+        };
+        assert_eq!(labels(cx), ["Reviews", "Reviews"]);
+
+        // Save the first tab's page as a new view, as the user does.
+        click(
+            cx,
+            "reviews-view-save-as",
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.simulate_input("Mine");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            labels(cx),
+            ["Mine", "Reviews"],
+            "the tab on the saved view takes its name; the one on All does not"
+        );
+    }
+
     /// With the pointer on no row, the item keys act on the page on screen:
     /// a pull request's link and branch are copied, an issue's ID is not
     /// one of its commands, and side by side opens it in a pane on the
