@@ -4,18 +4,19 @@ use std::rc::Rc;
 
 use chrono::Utc;
 use gpui_kit::assets::IconName;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::reviews::{self, Sort, SortDir, SortKey};
-use loupe_github::{PrSummary, ReviewDecision};
+use loupe_github::{PrRef, PrSummary, ReviewDecision};
 
 use super::widgets;
 use crate::route::Route;
-use crate::shell::OpenOnClick as _;
 use crate::shell::item_menu::{Item, with_item_menu};
+use crate::shell::{OpenOnClick as _, open};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
@@ -46,11 +47,65 @@ const COMMENTS_LANE: f32 = 72.;
 const CHECKS_LANE: f32 = 48.;
 const AUTHOR_LANE: f32 = 48.;
 const AGE_LANE: f32 = 40.;
+/// The checkbox lane at the leading edge of a list whose rows can be picked.
+const CHECKBOX_LANE: f32 = 16.;
+
+/// What picking a row asks for: its checkbox toggles it, a Shift+click
+/// extends the selection to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectGesture {
+    Toggle,
+    Range,
+}
+
+/// What picking a row does.
+pub type OnSelect = Rc<dyn Fn(&PrRef, SelectGesture, &mut Window, &mut App)>;
+
+/// A row that can be picked: whether it is, whether the list has anything
+/// picked (then every box shows, not only the hovered row's), and what a
+/// pick does.
+pub struct RowSelect {
+    pub checked: bool,
+    pub showing: bool,
+    pub on_select: OnSelect,
+}
+
+/// The 16 px checkbox lane of a row or a section heading inside the hover
+/// group `group`. The box is transparent until the group is hovered, unless
+/// `showing` or `checked`; it stays clickable and in the accessibility tree.
+pub fn select_box(
+    id: SharedString,
+    group: &'static str,
+    checked: bool,
+    showing: bool,
+    label: impl Into<SharedString>,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> Div {
+    let selector = id.clone();
+    h_flex()
+        .debug_selector(move || selector.to_string())
+        .flex_none()
+        .w(dp(CHECKBOX_LANE))
+        .justify_center()
+        .when(!showing && !checked, |lane| {
+            lane.opacity(0.)
+                .group_hover(group, |style| style.opacity(1.))
+        })
+        .child(
+            Checkbox::new(id)
+                .checked(checked)
+                .accessibility_label(label)
+                .on_click(move |_, window, cx| on_click(window, cx)),
+        )
+}
 
 /// A trailing lane `width` wide, its content at the trailing edge.
 fn lane(width: f32) -> Div {
     h_flex().flex_none().w(dp(width)).justify_end()
 }
+
+/// The hover group of a row, which shows its checkbox.
+const ROW_GROUP: &str = "pr-row";
 
 /// What a click on a column heading does: sort by that column.
 pub type OnSort = Rc<dyn Fn(SortKey, &mut Window, &mut App)>;
@@ -61,6 +116,7 @@ pub type OnSort = Rc<dyn Fn(SortKey, &mut Window, &mut App)>;
 /// shows its direction with an arrow. The age lane sorts by the date its
 /// rows show: created when `sort` is by creation, else updated.
 pub fn column_header(
+    checkbox_lane: bool,
     show_repo: bool,
     show_author: bool,
     sort: Option<Sort>,
@@ -95,6 +151,9 @@ pub fn column_header(
         .items_center()
         .text_size(scale::meta())
         .text_color(muted)
+        .when(checkbox_lane, |row| {
+            row.child(div().flex_none().w(dp(CHECKBOX_LANE)))
+        })
         .child(div().flex_1().min_w_0().child("Pull request"))
         .when(show_author, |row| {
             row.child(heading(SortKey::Author, "Author", AUTHOR_LANE, true))
@@ -208,12 +267,14 @@ fn review_chip(decision: ReviewDecision) -> Tag {
 /// `show_author`), the repository (when `show_repo`), diff size, comments,
 /// checks, and age (counted from `age_from`). Fixed lanes keep every column
 /// on one spine down the list. `selected` marks the row under the keyboard
-/// cursor. Clicking it opens `Route::PullRequest`.
+/// cursor. Clicking it opens `Route::PullRequest`. With `select`, a checkbox
+/// lane leads the row and a Shift+click picks instead of opening.
 pub fn pr_row(
     summary: &PrSummary,
     show_repo: bool,
     show_author: bool,
     selected: bool,
+    select: Option<RowSelect>,
     age_from: AgeFrom,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -238,8 +299,13 @@ pub fn pr_row(
     // agents can find a pull request by number, title, or repository.
     let name = format!("{reference} {}", summary.title);
     let item = Item::pull_request(summary);
+    let pr = summary.pr.clone();
     let row = h_flex()
         .id(SharedString::from(format!("pr-row-{id}")))
+        .debug_selector({
+            let id = id.clone();
+            move || format!("pr-row-{id}")
+        })
         .role(Role::Link)
         .aria_label(name)
         .w_full()
@@ -248,6 +314,7 @@ pub fn pr_row(
         .gap_3()
         .items_center()
         .relative()
+        .group(ROW_GROUP)
         .rounded(theme.radius)
         .hover(move |row| row.bg(hover))
         // The keyboard cursor: a fill and the accent on the leading edge.
@@ -275,7 +342,42 @@ pub fn pr_row(
                 .h(px(1.))
                 .bg(tokens::border_subtle()),
         )
-        .opens(route)
+        .map(|row| match &select {
+            Some(select) => {
+                let (on_select, pr) = (select.on_select.clone(), pr.clone());
+                row.on_open(move |event, window, cx| {
+                    if !event.is_middle_click() && event.modifiers().shift {
+                        on_select(&pr, SelectGesture::Range, window, cx);
+                    } else {
+                        open(route.clone(), event, window, cx);
+                    }
+                })
+            }
+            None => row.opens(route),
+        })
+        .when_some(select, |row, select| {
+            let RowSelect {
+                checked,
+                showing,
+                on_select,
+            } = select;
+            let label = format!("Select {}", summary.pr);
+            row.child(select_box(
+                SharedString::from(format!("pr-select-{id}")),
+                ROW_GROUP,
+                checked,
+                showing,
+                label,
+                move |window, cx| {
+                    let gesture = if window.modifiers().shift {
+                        SelectGesture::Range
+                    } else {
+                        SelectGesture::Toggle
+                    };
+                    on_select(&pr, gesture, window, cx)
+                },
+            ))
+        })
         .child(hint(
             SharedString::from(format!("pr-state-{id}")),
             widgets::state_label(summary.state, summary.is_draft),
