@@ -192,9 +192,9 @@ pub enum SplitAxis {
     Vertical,
 }
 
-/// The colors a group of tabs can take, as Chrome offers them. Each one is
-/// a color the theme already has (see `tab_bar::group_fill`), so a theme
-/// file needs no new slots.
+/// The colors a group of tabs can take, as Chrome offers them. Each theme
+/// gives every one a fill (`Palette::tab_group`). Saved by name, so a new
+/// color goes at the end of `ALL` and the saved ones keep theirs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabGroupColor {
     #[default]
@@ -204,16 +204,22 @@ pub enum TabGroupColor {
     Yellow,
     Green,
     Purple,
+    Pink,
+    Cyan,
+    Orange,
 }
 
 impl TabGroupColor {
-    pub const ALL: [TabGroupColor; 6] = [
+    pub const ALL: [TabGroupColor; 9] = [
         TabGroupColor::Grey,
         TabGroupColor::Blue,
         TabGroupColor::Red,
         TabGroupColor::Yellow,
         TabGroupColor::Green,
         TabGroupColor::Purple,
+        TabGroupColor::Pink,
+        TabGroupColor::Cyan,
+        TabGroupColor::Orange,
     ];
 
     pub fn label(self) -> &'static str {
@@ -224,6 +230,9 @@ impl TabGroupColor {
             TabGroupColor::Yellow => "Yellow",
             TabGroupColor::Green => "Green",
             TabGroupColor::Purple => "Purple",
+            TabGroupColor::Pink => "Pink",
+            TabGroupColor::Cyan => "Cyan",
+            TabGroupColor::Orange => "Orange",
         }
     }
 }
@@ -876,7 +885,7 @@ mod tests {
 
         let newer = Settings::parse(
             br#"{"sidebar_collapsed": true, "panes": {"Pane": {"tabs": ["Inbox", "Settings"], "active": 0,
-                "groups": [{"name": "A", "color": "Orange", "first": 0, "len": 1},
+                "groups": [{"name": "A", "color": "Teal", "first": 0, "len": 1},
                            {"name": "B", "first": "one", "len": 1}]}}}"#,
         )
         .expect("groups from a newer build or a hand edit never cost the settings");
@@ -908,6 +917,56 @@ mod tests {
                 groups: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn groups_keep_their_color_across_the_new_colors() {
+        // A pane saved before Pink, Cyan, and Orange existed, one group per
+        // color it could hold.
+        let before = Settings::parse(
+            br#"{"panes": {"Pane": {"tabs": ["Inbox", "Notifications", "Settings", "LinearMyIssues",
+                {"LinearProjects": {"team_id": null}}, {"LinearViews": {"team_id": null}}], "active": 0,
+                "groups": [{"name": "a", "color": "Grey", "first": 0, "len": 1},
+                           {"name": "b", "color": "Blue", "first": 1, "len": 1},
+                           {"name": "c", "color": "Red", "first": 2, "len": 1},
+                           {"name": "d", "color": "Yellow", "first": 3, "len": 1},
+                           {"name": "e", "color": "Green", "first": 4, "len": 1},
+                           {"name": "f", "color": "Purple", "first": 5, "len": 1}]}}}"#,
+        )
+        .expect("settings from before the new colors load");
+        let PaneLayout::Pane { groups, .. } = before.pane_layout() else {
+            panic!("one pane");
+        };
+        let colors: Vec<TabGroupColor> = groups.iter().map(|group| group.color).collect();
+        assert_eq!(colors, TabGroupColor::ALL[..6]);
+
+        for color in [
+            TabGroupColor::Pink,
+            TabGroupColor::Cyan,
+            TabGroupColor::Orange,
+        ] {
+            let settings = Settings {
+                panes: Some(PaneLayout::Pane {
+                    tabs: vec![Route::Inbox],
+                    active: 0,
+                    groups: vec![SavedTabGroup {
+                        name: "New".into(),
+                        color,
+                        collapsed: false,
+                        first: 0,
+                        len: 1,
+                    }],
+                }),
+                ..Settings::default()
+            };
+            let saved = serde_json::to_vec(&settings).expect("settings serialize");
+            let PaneLayout::Pane { groups, .. } =
+                Settings::parse(&saved).expect("loads").pane_layout()
+            else {
+                panic!("one pane");
+            };
+            assert_eq!(groups[0].color, color, "{} comes back", color.label());
+        }
     }
 
     #[test]
