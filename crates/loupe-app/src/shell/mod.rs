@@ -56,7 +56,7 @@ use crate::shell::actions::{
 };
 use crate::shell::item_menu::Command;
 use crate::shell::panes::{Node, Pane, PaneId, Panes, Zone};
-use crate::shell::tab_bar::DraggedTab;
+use crate::shell::tab_bar::{DraggedGroup, DraggedTab};
 use crate::shell::tabs::{Page, Tab, Tabs};
 use crate::store::{self, Settings, SplitAxis};
 use crate::theme::{scale, tokens};
@@ -83,6 +83,12 @@ pub struct Workspace {
     /// The tab being dragged, set when its drag starts. It counts only while
     /// GPUI still has a drag (`lifted_tab`), which ends at the mouse up.
     tab_drag: Option<DraggedTab>,
+    /// The group being dragged by its name, set when its drag starts; like
+    /// `tab_drag`, it counts only while GPUI still has a drag.
+    group_drag: Option<DraggedGroup>,
+    /// The tab under the pointer, as its pane and index, while a group is
+    /// dragged over its own row: where the group would land.
+    group_drop: Option<(PaneId, usize)>,
     /// Where each pane's page was drawn in the last frame, for the drop
     /// zones and for paging the active pane.
     pane_bounds: Rc<RefCell<HashMap<PaneId, Bounds<Pixels>>>>,
@@ -296,6 +302,8 @@ impl Workspace {
         Self {
             panes,
             tab_drag: None,
+            group_drag: None,
+            group_drop: None,
             pane_bounds: Rc::default(),
             resizing_panes: false,
             focus,
@@ -576,6 +584,117 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The group being dragged by its name and the tab of its row under the
+    /// pointer, while one is.
+    fn group_lift(&self, cx: &App) -> Option<tab_bar::GroupLift> {
+        let drag = self.group_drag.as_ref().filter(|_| cx.has_active_drag())?;
+        let onto = self
+            .group_drop
+            .filter(|(pane, _)| *pane == drag.pane)
+            .map(|(_, index)| index);
+        Some(tab_bar::GroupLift {
+            pane: drag.pane,
+            group: drag.group,
+            onto,
+        })
+    }
+
+    /// Follows the pointer while a group is dragged: `over` says whether it
+    /// is on the tab at `index` of `pane`, which then is where the group
+    /// would land.
+    fn hover_group_drop(&mut self, pane: PaneId, index: usize, over: bool, cx: &mut Context<Self>) {
+        let target = Some((pane, index));
+        if over && self.group_drop != target {
+            self.group_drop = target;
+            cx.notify();
+        } else if !over && self.group_drop == target {
+            self.group_drop = None;
+            cx.notify();
+        }
+    }
+
+    /// A group dropped on its own row: on the tab at `onto` (or the name of
+    /// the group that tab starts), or after the last tab for `None`. A group
+    /// dropped on another pane's row stays where it is.
+    fn drop_group(
+        &mut self,
+        dragged: &DraggedGroup,
+        pane: PaneId,
+        onto: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.group_drag = None;
+        self.group_drop = None;
+        if dragged.pane == pane {
+            self.panes.focus(pane);
+            self.edit_tabs(pane, |tabs| tabs.move_group(dragged.group, onto), cx);
+        }
+        cx.notify();
+    }
+
+    /// "Close group": closes every tab of group `group` of `pane` and keeps
+    /// the group for the new-tab button's menu. When those are the window's
+    /// only tabs, Reviews opens in a new tab first, as closing the last tab
+    /// does.
+    fn close_group(
+        &mut self,
+        pane: PaneId,
+        group: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tabs) = self.panes.pane(pane).map(|pane| &pane.tabs) else {
+            return;
+        };
+        let holds_every_tab = tabs.group_len(group) == tabs.len();
+        if holds_every_tab && self.panes.pane_count() == 1 {
+            let page = self.page(Route::Inbox, window, cx);
+            let tab = self.panes.tab(page);
+            if let Some(tabs) = self.panes.tabs_mut(pane) {
+                tabs.insert(usize::MAX, tab, None);
+            }
+        }
+        if let Some(closed) = self.panes.close_group(pane, group) {
+            store::update_settings(cx, |settings| settings.remember_closed_group(closed));
+        }
+        self.save_tabs(cx);
+        cx.notify();
+    }
+
+    /// Reopens closed group `closed` in the active pane, with its name,
+    /// color, and tabs, where it was (or at the end), and takes it off the
+    /// list of closed groups.
+    fn reopen_group(
+        &mut self,
+        closed: &store::ClosedTabGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(at) = Settings::get(cx)
+            .closed_tab_groups
+            .iter()
+            .position(|group| group == closed)
+        else {
+            return;
+        };
+        store::update_settings(cx, |settings| {
+            settings.closed_tab_groups.remove(at);
+        });
+        let tabs: Vec<Tab<AnyView>> = closed
+            .tabs
+            .iter()
+            .map(|route| {
+                let page = self.page(route.clone(), window, cx);
+                self.panes.tab(page)
+            })
+            .collect();
+        self.panes
+            .active_mut()
+            .insert_group(closed.position, &closed.name, closed.color, tabs);
+        self.save_tabs(cx);
+        cx.notify();
+    }
+
     /// Runs `edit` on the tabs of `pane`, and saves them when it says it
     /// changed something.
     fn edit_tabs(
@@ -698,7 +817,8 @@ impl Workspace {
         if std::mem::take(&mut self.resizing_panes) {
             self.save_tabs(cx);
         }
-        if self.tab_drag.take().is_some() {
+        self.group_drop = None;
+        if self.tab_drag.take().is_some() || self.group_drag.take().is_some() {
             cx.notify();
         }
     }
@@ -941,7 +1061,8 @@ impl Workspace {
         let view = pane.tabs.active().current().view.clone();
         let strip = split.then(|| {
             let row = self.tab_row(pane_id);
-            tab_bar::pane_strip(pane, &row, number, active, lifted, cx)
+            let group_lift = self.group_lift(cx);
+            tab_bar::pane_strip(pane, &row, number, active, lifted, group_lift, cx)
         });
         let bounds = self.pane_bounds.clone();
         let record_bounds = canvas(
@@ -1824,6 +1945,137 @@ mod tests {
                 }],
             },
             "a tab dropped on a tab outside the group leaves it"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn dragging_a_group_s_name_moves_the_whole_group(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        // Reviews, Inbox, My issues; then Inbox and My issues in a group.
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        click(
+            cx,
+            "sidebar-my-issues",
+            MouseButton::Middle,
+            Modifiers::none(),
+        );
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(
+                1,
+                |tabs, index| {
+                    let group = tabs.new_group(index, "Review");
+                    group.is_some_and(|group| tabs.add_to_group(index + 1, group))
+                },
+                cx,
+            )
+        });
+        assert_eq!(saved_group_names(cx), [("Review".into(), 1, 2)]);
+
+        let start = center(cx, "tab-group-0-0");
+        let end = center(cx, "tab-0");
+        drag(cx, start, end);
+        assert_eq!(
+            saved_panes(cx).0,
+            PaneLayout::Pane {
+                tabs: vec![Route::Notifications, Route::LinearMyIssues, Route::Inbox],
+                active: 2,
+                groups: vec![SavedTabGroup {
+                    name: "Review".into(),
+                    color: TabGroupColor::Grey,
+                    collapsed: false,
+                    first: 0,
+                    len: 2,
+                }],
+            },
+            "the name brings every tab of its group, in order, and the open tab stays open"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_closed_group_reopens_from_the_new_tab_button_as_it_was(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        click(
+            cx,
+            "sidebar-my-issues",
+            MouseButton::Middle,
+            Modifiers::none(),
+        );
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(
+                1,
+                |tabs, index| {
+                    let Some(group) = tabs.new_group(index, "Review") else {
+                        return false;
+                    };
+                    tabs.add_to_group(index + 1, group);
+                    tabs.set_group_color(group, TabGroupColor::Cyan)
+                },
+                cx,
+            )
+        });
+        let PaneLayout::Pane { tabs, groups, .. } = saved_panes(cx).0 else {
+            panic!("one pane")
+        };
+
+        // What the name's "Close group" does.
+        workspace.update_in(cx, |this, window, cx| {
+            let pane = this.panes.active_pane();
+            this.close_group(pane, 0, window, cx)
+        });
+        assert_eq!(saved_panes(cx).0, one_pane(&[Route::Inbox]));
+        let closed = cx.update(|_, cx| Settings::get(cx).closed_tab_groups.clone());
+        assert_eq!(
+            closed,
+            [store::ClosedTabGroup {
+                name: "Review".into(),
+                color: TabGroupColor::Cyan,
+                tabs: vec![Route::Notifications, Route::LinearMyIssues],
+                position: 1,
+            }],
+            "the closed group is kept with its name, color, tabs, and place"
+        );
+
+        click(cx, "new-tab", MouseButton::Right, Modifiers::none());
+        click(cx, "reopen-group-0", MouseButton::Left, Modifiers::none());
+        assert_eq!(
+            saved_panes(cx).0,
+            PaneLayout::Pane {
+                tabs,
+                active: 1,
+                groups,
+            },
+            "the same tabs come back in the same order, name, color, and place"
+        );
+        assert!(
+            cx.update(|_, cx| Settings::get(cx).closed_tab_groups.is_empty()),
+            "and the group leaves the list"
+        );
+
+        // A group holding every tab of the window leaves Reviews open.
+        workspace.update_in(cx, |this, window, cx| {
+            let pane = this.panes.active_pane();
+            this.edit_tabs(
+                pane,
+                |tabs| {
+                    let Some(all) = tabs.new_group(0, "All") else {
+                        return false;
+                    };
+                    tabs.add_to_group(1, all);
+                    tabs.add_to_group(2, all)
+                },
+                cx,
+            );
+            assert_eq!(this.panes.active().groups().len(), 1);
+            let all = this.panes.active().groups()[0].id;
+            this.close_group(pane, all, window, cx)
+        });
+        assert_eq!(saved_panes(cx).0, one_pane(&[Route::Inbox]));
+        assert_eq!(
+            cx.update(|_, cx| Settings::get(cx).closed_tab_groups.len()),
+            1
         );
     }
 

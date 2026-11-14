@@ -173,6 +173,14 @@ pub struct Settings {
     /// a repository opens outside every group. Off by default; turning it
     /// off keeps the groups there are.
     pub group_tabs_by_repo: bool,
+    /// The groups of tabs closed with "Close group", the latest first, at
+    /// most [`CLOSED_TAB_GROUPS_KEPT`]; the new-tab button's menu reopens
+    /// them.
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "readable_entries"
+    )]
+    pub closed_tab_groups: Vec<ClosedTabGroup>,
     /// The whole-window zoom (Cmd+=, Cmd+-, Cmd+0).
     pub zoom: crate::theme::Zoom,
     /// The theme, color scheme, contrast, density, and fonts.
@@ -257,6 +265,23 @@ pub struct SavedTabGroup {
     pub len: usize,
 }
 
+/// How many closed groups of tabs [`Settings::closed_tab_groups`] keeps.
+pub const CLOSED_TAB_GROUPS_KEPT: usize = 10;
+
+/// A group of tabs closed with "Close group": its name, its color, the page
+/// each of its tabs showed, in order, and where its first tab was in its
+/// pane.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClosedTabGroup {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, deserialize_with = "color_or_grey")]
+    pub color: TabGroupColor,
+    pub tabs: Vec<crate::route::Route>,
+    #[serde(default)]
+    pub position: usize,
+}
+
 fn color_or_grey<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<TabGroupColor, D::Error> {
@@ -264,11 +289,11 @@ fn color_or_grey<'de, D: serde::Deserializer<'de>>(
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
-/// The saved groups that can be read; an entry that cannot is dropped,
-/// so it never costs the tabs and the rest of the settings.
-fn readable_groups<'de, D: serde::Deserializer<'de>>(
+/// The entries of a saved list that can be read; an entry that cannot is
+/// dropped, so it never costs the tabs and the rest of the settings.
+fn readable_entries<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(
     deserializer: D,
-) -> Result<Vec<SavedTabGroup>, D::Error> {
+) -> Result<Vec<T>, D::Error> {
     let serde_json::Value::Array(values) = serde_json::Value::deserialize(deserializer)? else {
         return Ok(Vec::new());
     };
@@ -289,7 +314,7 @@ pub enum PaneLayout {
         #[serde(
             default,
             skip_serializing_if = "Vec::is_empty",
-            deserialize_with = "readable_groups"
+            deserialize_with = "readable_entries"
         )]
         groups: Vec<SavedTabGroup>,
     },
@@ -380,6 +405,13 @@ impl Settings {
             Some(known) => *known = mapping,
             None => self.workspace_mappings.push(mapping),
         }
+    }
+
+    /// Keeps `group` first among the closed groups, dropping the oldest
+    /// past [`CLOSED_TAB_GROUPS_KEPT`].
+    pub fn remember_closed_group(&mut self, group: ClosedTabGroup) {
+        self.closed_tab_groups.insert(0, group);
+        self.closed_tab_groups.truncate(CLOSED_TAB_GROUPS_KEPT);
     }
 
     pub fn is_collapsed(&self, section: &str) -> bool {
@@ -711,9 +743,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CommentBoxPlace, CommentOrder, Favorite, FileTreePosition, KEYCHAIN_SERVICE, PaneLayout,
-        SavedTabGroup, Secret, SecretStore, Settings, SplitAxis, TabGroupColor, WorkspaceMapping,
-        parse_github_target,
+        CLOSED_TAB_GROUPS_KEPT, ClosedTabGroup, CommentBoxPlace, CommentOrder, Favorite,
+        FileTreePosition, KEYCHAIN_SERVICE, PaneLayout, SavedTabGroup, Secret, SecretStore,
+        Settings, SplitAxis, TabGroupColor, WorkspaceMapping, parse_github_target,
     };
     use crate::route::Route;
 
@@ -921,6 +953,53 @@ mod tests {
                 active: 0,
                 groups: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn closed_groups_survive_a_restart_and_keep_the_latest_ten() {
+        let mut settings = Settings::default();
+        for number in 0..12 {
+            settings.remember_closed_group(ClosedTabGroup {
+                name: format!("Group {number}"),
+                color: TabGroupColor::Orange,
+                tabs: vec![Route::Inbox, Route::Settings],
+                position: number,
+            });
+        }
+        assert_eq!(settings.closed_tab_groups.len(), CLOSED_TAB_GROUPS_KEPT);
+        assert_eq!(
+            settings.closed_tab_groups[0].name, "Group 11",
+            "the latest comes first"
+        );
+        assert_eq!(settings.closed_tab_groups[9].name, "Group 2");
+
+        let saved = serde_json::to_vec(&settings).expect("settings serialize");
+        let loaded = Settings::parse(&saved).expect("loads");
+        assert_eq!(loaded.closed_tab_groups, settings.closed_tab_groups);
+
+        let newer = Settings::parse(
+            br#"{"sidebar_collapsed": true, "closed_tab_groups": [
+                {"name": "A", "color": "Teal", "tabs": ["Inbox"], "position": 2},
+                {"name": "B", "tabs": "not a list"}]}"#,
+        )
+        .expect("closed groups from a newer build never cost the settings");
+        assert!(newer.sidebar_collapsed);
+        assert_eq!(
+            newer.closed_tab_groups,
+            [ClosedTabGroup {
+                name: "A".into(),
+                color: TabGroupColor::Grey,
+                tabs: vec![Route::Inbox],
+                position: 2,
+            }],
+            "an unknown color reads as grey, and an unreadable group is dropped"
+        );
+        assert!(
+            !String::from_utf8(serde_json::to_vec(&Settings::default()).unwrap())
+                .unwrap()
+                .contains("closed_tab_groups"),
+            "no closed group writes nothing"
         );
     }
 
