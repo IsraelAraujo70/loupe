@@ -11,11 +11,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{MergeMethod, PullRequestDetail, ReviewEvent};
+use loupe_github::{MergeMethod, PullRequestDetail, ReviewEvent, StackEntry};
 
 use super::model::{
-    DraftAction, Panel, PrActions, StateAction, can_approve, discard_confirm_text,
+    DraftAction, Panel, PrActions, StackMerge, StateAction, can_approve, discard_confirm_text,
     merge_button_label, merge_confirm_text, pending_comments_label, resolve_method,
+    stack_entry_problems, stack_merge, stack_merge_confirm_text,
 };
 use super::{PullRequestView, Write};
 use crate::github::widgets;
@@ -368,37 +369,55 @@ impl PullRequestView {
                     "Discard review",
                     Commit::Destructive,
                     Write::DiscardReview { review_id },
+                    None,
                     cx,
                 )
                 .into_any_element()
             }
-            Panel::ConfirmMerge(method) => self
-                .render_confirm(
-                    merge_confirm_text(detail.pr.number, &detail.base_ref, method),
-                    "Merge",
-                    Commit::Merge,
-                    Write::Merge(method),
-                    cx,
-                )
-                .into_any_element(),
+            Panel::ConfirmMerge(method) => match stack_merge(detail) {
+                Some(stack) => self
+                    .render_confirm(
+                        stack_merge_confirm_text(stack.entries.len(), stack.base_ref, method),
+                        "Merge",
+                        Commit::Merge,
+                        Write::Merge(method),
+                        Some(render_stack_merge(&stack, cx)),
+                        cx,
+                    )
+                    .into_any_element(),
+                None => self
+                    .render_confirm(
+                        merge_confirm_text(detail.pr.number, &detail.base_ref, method),
+                        "Merge",
+                        Commit::Merge,
+                        Write::Merge(method),
+                        None,
+                        cx,
+                    )
+                    .into_any_element(),
+            },
             Panel::ConfirmClose => self
                 .render_confirm(
                     format!("Close #{} without merging?", detail.pr.number),
                     "Close pull request",
                     Commit::Destructive,
                     Write::Close,
+                    None,
                     cx,
                 )
                 .into_any_element(),
         }
     }
 
+    /// The confirmation row: the question with Cancel and the commit at its
+    /// trailing edge, and `details` under the question when it has any.
     fn render_confirm(
         &self,
         question: String,
         confirm_label: &'static str,
         commit: Commit,
         write: Write,
+        details: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let busy = self.write.is_busy();
@@ -418,10 +437,18 @@ impl PullRequestView {
             Commit::Merge => confirm.success(),
             Commit::Destructive => confirm.danger(),
         };
-        h_flex()
+        let row = h_flex()
             .gap_2()
             .items_center()
-            .child(Icon::new(icon).small().text_color(color))
+            .child(
+                // A 16 px slot, so the details under the question start on
+                // the question's edge.
+                h_flex()
+                    .flex_none()
+                    .size_4()
+                    .justify_center()
+                    .child(Icon::new(icon).small().text_color(color)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -440,7 +467,11 @@ impl PullRequestView {
                         cx.notify();
                     })),
             )
-            .child(confirm)
+            .child(confirm);
+        v_flex()
+            .gap_1()
+            .child(row)
+            .children(details.map(|details| div().pl_6().child(details)))
     }
 
     fn render_review_panel(
@@ -538,4 +569,88 @@ impl PullRequestView {
                     ),
             )
     }
+}
+
+/// The pull requests a stack merge lands, base first, one 28 px row each:
+/// state, number, title, then what would make the merge go wrong (conflicts,
+/// requested changes) as red chips, and the checks in a fixed lane at the
+/// trailing edge, red when they fail.
+fn render_stack_merge(stack: &StackMerge, cx: &App) -> AnyElement {
+    v_flex()
+        .id("pr-stack-merge")
+        .role(Role::List)
+        .aria_label(format!("{} pull requests to merge", stack.entries.len()))
+        .children(
+            stack
+                .entries
+                .iter()
+                .map(|entry| render_stack_entry(entry, cx)),
+        )
+        .into_any_element()
+}
+
+fn render_stack_entry(entry: &StackEntry, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let (muted, foreground) = (theme.muted_foreground, theme.foreground);
+    let problems = stack_entry_problems(entry);
+    let checks = entry.checks.map_or("No checks", widgets::checks_label);
+    let mut name = format!(
+        "#{} {}, {}",
+        entry.number,
+        entry.title,
+        checks.to_lowercase()
+    );
+    for problem in &problems {
+        name.push_str(", ");
+        name.push_str(&problem.to_lowercase());
+    }
+    h_flex()
+        .id(("pr-stack-entry", entry.number))
+        .role(Role::ListItem)
+        .aria_label(name)
+        .h_7()
+        .gap_2()
+        .items_center()
+        .child(widgets::state_icon(entry.state, entry.is_draft))
+        .child(
+            div()
+                .flex_none()
+                .text_size(scale::body())
+                .text_color(muted)
+                .child(format!("#{}", entry.number)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(scale::body())
+                .text_color(foreground)
+                .child(entry.title.clone()),
+        )
+        .children(
+            problems
+                .into_iter()
+                .map(|problem| ui::tinted_chip(tokens::closed()).child(problem)),
+        )
+        .child(
+            h_flex()
+                .flex_none()
+                .w_32()
+                .gap_1()
+                .items_center()
+                .text_size(scale::meta())
+                .map(|lane| match entry.checks {
+                    Some(state) => lane.child(widgets::checks_icon(state)).child(
+                        div()
+                            .text_color(if entry.checks_failing() {
+                                widgets::checks_color(state)
+                            } else {
+                                muted
+                            })
+                            .child(widgets::checks_label(state)),
+                    ),
+                    None => lane.text_color(muted).child("No checks"),
+                }),
+        )
 }
