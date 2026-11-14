@@ -78,7 +78,10 @@ pub fn update<R>(
     let result = change(&mut next);
     reviews::save(&path(), &next)
         .map_err(|error| SharedString::from(format!("Couldn’t save views: {error}")))?;
-    saved(cx).file = next;
+    let saved = saved(cx);
+    saved.file = next;
+    // The file on disk is the user's again.
+    saved.recovered = false;
     cx.refresh_windows();
     Ok(result)
 }

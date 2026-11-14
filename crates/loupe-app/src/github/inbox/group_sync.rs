@@ -208,12 +208,44 @@ mod tests {
         let all = list_for(&inbox, &whole, &view, ReviewTab::All).unwrap();
         assert_eq!((numbers(&all.rows), all.complete), (vec![1, 2], true));
 
-        let part = HashMap::from([(query, page(&[1, 2], 180, true))]);
+        let part = HashMap::from([(query.clone(), page(&[1, 2], 180, true))]);
         let all = list_for(&inbox, &part, &view, ReviewTab::All).unwrap();
         assert_eq!(
             (numbers(&all.rows), all.complete),
             (vec![1, 2], false),
             "GitHub sent part of the search"
+        );
+    }
+
+    #[test]
+    fn a_whole_all_open_search_is_the_whole_of_all_whatever_the_dashboard_misses() {
+        // Over 100 pull requests involve you across GitHub, so the
+        // dashboard's search is cut; the view's own search is whole.
+        let inbox = Inbox {
+            review_requested: page(&[], 0, false),
+            authored: page(&[1], 1, false),
+            involved: page(&[7], 300, true),
+            viewer_login: "me".into(),
+        };
+        let view = view();
+        let query = loupe_github::reviews::all_open_query(&view.filters).unwrap();
+        let whole = HashMap::from([(query, page(&[1, 2], 2, false))]);
+        let all = list_for(&inbox, &whole, &view, ReviewTab::All).unwrap();
+        assert!(all.complete);
+        let involved = list_for(&inbox, &whole, &view, ReviewTab::Involved).unwrap();
+        assert!(
+            !involved.complete,
+            "Involved is the dashboard's search alone"
+        );
+
+        let asked = Inbox {
+            review_requested: page(&[], 150, true),
+            ..inbox
+        };
+        let needs = list_for(&asked, &whole, &view, ReviewTab::NeedsReview).unwrap();
+        assert!(
+            !needs.complete,
+            "Needs review reads the review requests, which are cut"
         );
     }
 }

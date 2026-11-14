@@ -225,9 +225,9 @@ struct ViewList {
     complete: bool,
 }
 
-/// Whether `page` holds its whole search.
+/// Whether `page` holds its whole search: GitHub has no page after it.
 fn whole(page: &Page<PrSummary>) -> bool {
-    page.next_cursor.is_none() && page.items.len() >= page.total_count as usize
+    page.next_cursor.is_none()
 }
 
 /// What `tab` lists under `filters`, with `all_open` the view's "All open"
@@ -243,16 +243,18 @@ fn view_rows(
         .find(|(shown_tab, _)| *shown_tab == tab)
         .map(|(_, rows)| rows.items.iter().map(|pr| pr.pr.clone()).collect())
         .unwrap_or_default();
-    let mut sources = match tab {
-        ReviewTab::Mine => vec![&inbox.authored],
-        ReviewTab::Involved => vec![&inbox.involved],
-        ReviewTab::NeedsReview | ReviewTab::All => {
+    // "All open" holds every open pull request the view's repositories and
+    // organizations have, so whole, it is the whole of All; Needs review
+    // also reads the review requests to know which are asked of you.
+    let sources = match (tab, all_open.filter(|_| uses_all_open(tab))) {
+        (ReviewTab::Mine, _) => vec![&inbox.authored],
+        (ReviewTab::Involved, _) => vec![&inbox.involved],
+        (ReviewTab::All, Some(open)) => vec![open],
+        (ReviewTab::NeedsReview, Some(open)) => vec![open, &inbox.review_requested],
+        (ReviewTab::All | ReviewTab::NeedsReview, None) => {
             vec![&inbox.review_requested, &inbox.authored, &inbox.involved]
         }
     };
-    if uses_all_open(tab) {
-        sources.extend(all_open);
-    }
     ViewList {
         rows,
         complete: sources.into_iter().all(whole),
