@@ -21,12 +21,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::reviews::{self, Clause, Op, ViewsFile};
+use loupe_github::reviews::{self, Clause, Op, Sort, SortDir, SortKey, ViewsFile};
 use loupe_github::{Inbox, Page, PrRef, PrSummary};
 
 use self::filter_menu::{FilterMenu, FilterOptions};
 use super::common::{self, Loadable};
-use super::pr_row::pr_row;
+use super::pr_row::{AgeFrom, OnSort, pr_row};
 use crate::route::Route;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::theme::scale;
@@ -168,36 +168,33 @@ fn shown_all_open<'a>(
     }
 }
 
-/// The saved view on screen and the clauses edited on top of it. The draft
-/// is "unsaved" while it differs from the saved view; with no view, while it
-/// has any clause.
+/// The saved view on screen and the clauses and sort order edited on top of
+/// it. The draft is "unsaved" while either differs from the saved view; with
+/// no view, while it has any clause or a sort.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PageState {
     view_id: Option<String>,
     draft: Vec<Clause>,
+    /// The order of each section's rows; `None` is GitHub's order.
+    sort: Option<Sort>,
     /// The view's saved "All open" choice; `None` means the default (on).
     all_open: Option<bool>,
 }
 
 impl PageState {
-    fn saved<'a>(&self, views: &'a ViewsFile) -> Option<&'a [Clause]> {
-        views
-            .get(self.view_id.as_deref()?)
-            .map(|view| view.filters.as_slice())
-    }
-
     fn is_dirty(&self, views: &ViewsFile) -> bool {
-        match self.saved(views) {
-            Some(saved) => saved != self.draft.as_slice(),
-            None => !self.draft.is_empty(),
+        match self.view_id.as_deref().and_then(|id| views.get(id)) {
+            Some(saved) => saved.filters != self.draft || saved.sort != self.sort,
+            None => !self.draft.is_empty() || self.sort.is_some(),
         }
     }
 
-    /// Shows view `id` (or no view) with its saved clauses.
+    /// Shows view `id` (or no view) with its saved clauses and sort order.
     fn switch(&mut self, views: &ViewsFile, id: Option<&str>) {
         let view = id.and_then(|id| views.get(id));
         self.view_id = view.map(|view| view.id.clone());
         self.draft = view.map(|view| view.filters.clone()).unwrap_or_default();
+        self.sort = view.and_then(|view| view.sort);
         self.all_open = view.and_then(|view| view.all_open);
     }
 
@@ -436,7 +433,30 @@ impl InboxView {
             let all_open = shown_all_open(page, &self.page.draft, &above);
             sections.push((Section::AllOpen, all_open));
         }
+        // Each section sorts its own rows: a sort never moves a pull
+        // request into another section.
+        for (_, shown) in &mut sections {
+            reviews::sort_rows(&mut shown.items, self.page.sort);
+        }
         sections
+    }
+
+    /// Sorts every section by `sort` (`None`: GitHub's order). Like a
+    /// filter, it is part of the draft until the view is saved.
+    fn set_sort(&mut self, sort: Option<Sort>, cx: &mut Context<Self>) {
+        self.page.sort = sort;
+        cx.notify();
+    }
+
+    /// What a column heading does on a click: the next step of its cycle.
+    fn on_sort(&self, cx: &Context<Self>) -> OnSort {
+        let view = cx.weak_entity();
+        Rc::new(move |key, _, cx| {
+            view.update(cx, |this, cx| {
+                this.set_sort(reviews::cycle_sort(this.page.sort, key), cx)
+            })
+            .ok();
+        })
     }
 
     /// Turns "All open" on or off for the view on screen and saves it.
@@ -499,14 +519,22 @@ impl InboxView {
         let Some(id) = self.page.view_id.clone() else {
             return;
         };
-        let draft = self.page.draft.clone();
-        let result = views_store::update(cx, |views| views.update_filters(&id, draft, Utc::now()));
+        let (draft, sort) = (self.page.draft.clone(), self.page.sort);
+        let result = views_store::update(cx, |views| {
+            let now = Utc::now();
+            views.update_filters(&id, draft, now);
+            views.set_sort(&id, sort, now);
+        });
         self.report(result.err(), cx);
     }
 
     fn save_as_new(&mut self, name: &str, cx: &mut Context<Self>) {
-        let draft = self.page.draft.clone();
-        match views_store::update(cx, |views| views.create(name, draft, Utc::now())) {
+        let (draft, sort) = (self.page.draft.clone(), self.page.sort);
+        match views_store::update(cx, |views| {
+            let id = views.create(name, draft, Utc::now());
+            views.set_sort(&id, sort, Utc::now());
+            id
+        }) {
             Ok(id) => self.page.view_id = Some(id),
             Err(message) => self.notice = Some(message),
         }
@@ -743,6 +771,7 @@ impl InboxView {
             .children(view_menu)
             .child(div().w_2())
             .child(self.filter_button(cx))
+            .child(self.sort_button(cx))
             .when(dirty, |row| {
                 row.child(
                     div()
@@ -843,6 +872,73 @@ impl InboxView {
             .into_any_element()
     }
 
+    /// "Sort" and its menu: every field the column headings sort by (and
+    /// the creation date, which has no column of its own), the direction,
+    /// and the default order.
+    fn sort_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let sort = self.page.sort;
+        let view = cx.weak_entity();
+        // An icon alone: the arrow on the sorted column already says what
+        // the order is, and a label would push Save out of a narrow header.
+        let tip = match sort {
+            Some(sort) => format!(
+                "Sorted by {}, {}",
+                sort.key.label().to_lowercase(),
+                sort.describe().to_lowercase()
+            ),
+            None => "Sort the pull requests in each section".to_owned(),
+        };
+        ui::icon_button("reviews-sort-open", IconName::ArrowDownUp, tip)
+            .debug_selector(|| "reviews-sort-open".into())
+            .selected(sort.is_some())
+            .menu_trigger()
+            .dropdown_menu(move |menu: PopupMenu, _, _| {
+                let set = |label: &'static str, checked: bool, next: Option<Sort>| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label)
+                        .checked(checked)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.set_sort(next, cx)).ok();
+                        })
+                };
+                let menu = SortKey::ALL
+                    .iter()
+                    .fold(menu.min_w(px(200.)), |menu, &key| {
+                        // A new field keeps the direction already picked.
+                        let dir = sort.map_or(SortDir::Ascending, |sort| sort.dir);
+                        menu.item(set(
+                            key.label(),
+                            sort.is_some_and(|sort| sort.key == key),
+                            Some(Sort { key, dir }),
+                        ))
+                    });
+                let menu = match sort {
+                    Some(sort) => {
+                        let (ascending, descending) = sort.key.directions();
+                        let with = |dir| Some(Sort { dir, ..sort });
+                        menu.item(PopupMenuItem::separator())
+                            .item(set(
+                                ascending,
+                                sort.dir == SortDir::Ascending,
+                                with(SortDir::Ascending),
+                            ))
+                            .item(set(
+                                descending,
+                                sort.dir == SortDir::Descending,
+                                with(SortDir::Descending),
+                            ))
+                    }
+                    None => menu,
+                };
+                menu.item(PopupMenuItem::separator()).item(set(
+                    "Default order",
+                    sort.is_none(),
+                    None,
+                ))
+            })
+            .into_any_element()
+    }
+
     fn notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let text = self.notice.clone()?;
         Some(
@@ -867,8 +963,15 @@ impl InboxView {
         )
     }
 
-    fn section(&self, section: Section, shown: Shown<'_>, cx: &App) -> impl IntoElement {
+    fn section(
+        &self,
+        section: Section,
+        shown: Shown<'_>,
+        on_sort: OnSort,
+        cx: &App,
+    ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        let age_from = AgeFrom::for_sort(self.page.sort);
         let (empty_icon, empty_text) = if self.page.draft.is_empty() {
             section.empty()
         } else {
@@ -885,6 +988,7 @@ impl InboxView {
                 true,
                 section.shows_author(),
                 self.cursor.as_ref() == Some(&summary.pr),
+                age_from,
                 cx,
             )
         }));
@@ -899,6 +1003,9 @@ impl InboxView {
             )
             .children(empty);
         v_flex()
+            // Its own id scope: every section's column heading has the same
+            // ids, and a click must reach the one under the pointer.
+            .id(SharedString::from(section.title()))
             .w_full()
             .child(section_heading(section, heading, cx))
             // Each section heads its own columns: the viewer's own pull
@@ -907,6 +1014,8 @@ impl InboxView {
                 column.child(super::pr_row::column_header(
                     true,
                     section.shows_author(),
+                    self.page.sort,
+                    Some(on_sort),
                     cx,
                 ))
             })
@@ -955,10 +1064,14 @@ impl Render for InboxView {
             }
             Loadable::Loading => self.loading().into_any_element(),
             Loadable::Loaded(inbox) | Loadable::Refreshing(inbox) => {
+                let on_sort = self.on_sort(cx);
                 let sections: Vec<AnyElement> = self
                     .sections(inbox)
                     .into_iter()
-                    .map(|(section, shown)| self.section(section, shown, cx).into_any_element())
+                    .map(|(section, shown)| {
+                        self.section(section, shown, on_sort.clone(), cx)
+                            .into_any_element()
+                    })
                     .collect();
                 v_flex()
                     .gap_3()
@@ -1025,12 +1138,14 @@ fn section_heading(section: Section, detail: impl IntoElement, cx: &App) -> impl
 mod tests {
     use chrono::Utc;
     use gpui_kit::{
-        Bounds, Pixels, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px, size,
+        Bounds, Entity, Modifiers, Pixels, TestAppContext, VisualTestContext, WindowBounds,
+        WindowOptions, px, size,
     };
-    use loupe_github::reviews::{Clause, Field, Op, ViewsFile};
-    use loupe_github::{Page, PrRef, PrState, PrSummary, RepoRef};
+    use loupe_github::reviews::{Clause, Field, Op, Sort, SortDir, SortKey, ViewsFile};
+    use loupe_github::{Inbox, Page, PrRef, PrState, PrSummary, RepoRef};
 
-    use super::{PageState, build, shown, shown_all_open, step_cursor};
+    use super::{InboxView, PageState, build, shown, shown_all_open, step_cursor};
+    use crate::github::common::Loadable;
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
 
@@ -1128,8 +1243,8 @@ mod tests {
         cx.debug_bounds(selector)
     }
 
-    #[gpui_kit::test]
-    fn changing_a_filter_moves_neither_the_filter_button_nor_its_menu(cx: &mut TestAppContext) {
+    /// The Reviews screen in a 1280 × 820 window, with no account.
+    fn open(cx: &mut TestAppContext) -> (VisualTestContext, Entity<InboxView>) {
         let (handle, view) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::init(cx);
@@ -1149,7 +1264,19 @@ mod tests {
             )
             .expect("open the window")
         });
-        let cx = &mut VisualTestContext::from_window(handle, cx);
+        (VisualTestContext::from_window(handle, cx), view)
+    }
+
+    /// Clicks the element with `selector` where it was last painted.
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let at = bounds(cx, selector).unwrap_or_else(|| panic!("{selector} is on screen"));
+        cx.simulate_click(at.center(), Modifiers::none());
+    }
+
+    #[gpui_kit::test]
+    fn changing_a_filter_moves_neither_the_filter_button_nor_its_menu(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
 
         // A saved view with one filter, and "Add Filter…" open on it.
         view.update_in(cx, |view, window, cx| {
@@ -1181,6 +1308,83 @@ mod tests {
         let unsaved = bounds(cx, "reviews-filter-open").expect("the Filter button");
         view.update(cx, |view, cx| view.edit_draft(|draft| draft.clear(), cx));
         assert_eq!(bounds(cx, "reviews-filter-open"), Some(unsaved));
+    }
+
+    /// A pull request in `owner/repo` with `lines` changed.
+    fn sized(owner: &str, number: u64, lines: u32) -> PrSummary {
+        PrSummary {
+            additions: lines,
+            ..pr(owner, number)
+        }
+    }
+
+    fn numbers(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> Vec<Vec<u64>> {
+        view.read_with(cx, |view, _| {
+            view.sections_shown()
+                .iter()
+                .map(|section| section.iter().map(|pr| pr.number).collect())
+                .collect()
+        })
+    }
+
+    #[gpui_kit::test]
+    fn a_column_heading_sorts_each_section_on_its_own_and_a_view_keeps_it(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        let inbox = Inbox {
+            review_requested: page(
+                vec![sized("a", 1, 50), sized("a", 2, 5), sized("a", 3, 500)],
+                3,
+                false,
+            ),
+            authored: page(Vec::new(), 0, false),
+            involved: page(vec![sized("b", 4, 900), sized("b", 5, 1)], 2, false),
+        };
+        view.update(cx, |view, cx| {
+            view.inbox = Loadable::Loaded(inbox);
+            cx.notify();
+        });
+        let github = vec![vec![1, 2, 3], vec![], vec![4, 5]];
+        assert_eq!(numbers(&view, cx), github);
+
+        // Ascending, descending, then GitHub's order again; a row never
+        // leaves its section.
+        click(cx, "reviews-sort-changes");
+        assert_eq!(numbers(&view, cx), [vec![2, 1, 3], vec![], vec![5, 4]]);
+        click(cx, "reviews-sort-changes");
+        assert_eq!(numbers(&view, cx), [vec![3, 1, 2], vec![], vec![4, 5]]);
+        click(cx, "reviews-sort-changes");
+        assert_eq!(numbers(&view, cx), github);
+
+        // The keyboard cursor walks the rows in the order on screen.
+        click(cx, "reviews-sort-changes");
+        let walk: Vec<u64> = (0..5)
+            .map(|_| {
+                view.update_in(cx, |view, window, cx| {
+                    view.move_cursor(true, window, cx);
+                    view.cursor.as_ref().map(|pr| pr.number)
+                })
+                .expect("a row under the cursor")
+            })
+            .collect();
+        assert_eq!(walk, [2, 1, 3, 5, 4]);
+
+        // A sort is a change to the view: saved with it, and back with it.
+        let smallest = Some(Sort {
+            key: SortKey::Changes,
+            dir: SortDir::Ascending,
+        });
+        view.update(cx, |view, cx| {
+            assert!(view.page.is_dirty(&super::views_store::snapshot(cx)));
+            view.save_as_new("Small first", cx);
+            assert!(!view.page.is_dirty(&super::views_store::snapshot(cx)));
+        });
+        let id = view.read_with(cx, |view, _| view.page.view_id.clone());
+        view.update(cx, |view, cx| view.switch_view(None, cx));
+        assert_eq!(numbers(&view, cx), github, "All has its own order");
+        view.update(cx, |view, cx| view.switch_view(id.as_deref(), cx));
+        assert_eq!(view.read_with(cx, |view, _| view.page.sort), smallest);
+        assert_eq!(numbers(&view, cx), [vec![2, 1, 3], vec![], vec![5, 4]]);
     }
 
     #[test]
@@ -1265,5 +1469,19 @@ mod tests {
         assert!(page.is_dirty(&views));
         page.switch(&views, None);
         assert_eq!(page, PageState::default());
+
+        // The sort order is part of the draft, like the clauses.
+        page.switch(&views, Some(&id));
+        page.sort = Some(Sort {
+            key: SortKey::Checks,
+            dir: SortDir::Ascending,
+        });
+        assert!(page.is_dirty(&views), "a new sort is unsaved");
+        views.set_sort(&id, page.sort, Utc::now());
+        assert!(!page.is_dirty(&views));
+        page.switch(&views, None);
+        assert_eq!(page.sort, None);
+        page.switch(&views, Some(&id));
+        assert_eq!(page.sort.map(|sort| sort.key), Some(SortKey::Checks));
     }
 }

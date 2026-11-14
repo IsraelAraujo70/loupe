@@ -321,6 +321,142 @@ pub fn all_open_query(clauses: &[Clause]) -> Option<String> {
     ))
 }
 
+/// What a section's rows can be sorted by: the row's lanes, with its age
+/// read from either date.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SortKey {
+    Updated,
+    Created,
+    /// Lines added plus lines removed.
+    Changes,
+    Comments,
+    Checks,
+    Author,
+    Repository,
+}
+
+impl SortKey {
+    pub const ALL: [SortKey; 7] = [
+        SortKey::Updated,
+        SortKey::Created,
+        SortKey::Changes,
+        SortKey::Comments,
+        SortKey::Checks,
+        SortKey::Author,
+        SortKey::Repository,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Updated => "Updated",
+            SortKey::Created => "Created",
+            SortKey::Changes => "Changes",
+            SortKey::Comments => "Comments",
+            SortKey::Checks => "Checks",
+            SortKey::Author => "Author",
+            SortKey::Repository => "Repository",
+        }
+    }
+
+    /// How each direction reads for this key, ascending first.
+    pub fn directions(self) -> (&'static str, &'static str) {
+        match self {
+            SortKey::Updated | SortKey::Created => ("Oldest first", "Newest first"),
+            SortKey::Changes => ("Smallest first", "Largest first"),
+            SortKey::Comments => ("Fewest first", "Most first"),
+            SortKey::Checks => ("Failing first", "Passing first"),
+            SortKey::Author | SortKey::Repository => ("A to Z", "Z to A"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SortDir {
+    Ascending,
+    Descending,
+}
+
+/// A sort order for each section's rows. No sort (`None` wherever an
+/// `Option<Sort>` is kept) is GitHub's own order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Sort {
+    pub key: SortKey,
+    pub dir: SortDir,
+}
+
+impl Sort {
+    /// How this direction reads, such as "Largest first".
+    pub fn describe(self) -> &'static str {
+        let (ascending, descending) = self.key.directions();
+        match self.dir {
+            SortDir::Ascending => ascending,
+            SortDir::Descending => descending,
+        }
+    }
+}
+
+/// The sort after a click on `key`'s column heading: ascending, then
+/// descending, then back to the default order. A click on another column
+/// starts it at ascending.
+pub fn cycle_sort(current: Option<Sort>, key: SortKey) -> Option<Sort> {
+    let dir = match current {
+        Some(sort) if sort.key == key => match sort.dir {
+            SortDir::Ascending => SortDir::Descending,
+            SortDir::Descending => return None,
+        },
+        _ => SortDir::Ascending,
+    };
+    Some(Sort { key, dir })
+}
+
+/// The value `pr` sorts by, or `None` when it has none for `key`.
+fn sort_value(pr: &PrSummary, key: SortKey) -> Option<SortValue> {
+    Some(match key {
+        SortKey::Updated => SortValue::Number(pr.updated_at.timestamp_millis()),
+        SortKey::Created => SortValue::Number(pr.created_at.timestamp_millis()),
+        SortKey::Changes => SortValue::Number(i64::from(pr.additions) + i64::from(pr.deletions)),
+        SortKey::Comments => SortValue::Number(i64::from(pr.comment_count)),
+        // Failing ranks lowest, so ascending puts what needs attention first.
+        SortKey::Checks => SortValue::Number(match pr.checks? {
+            ChecksState::Failing => 0,
+            ChecksState::Pending => 1,
+            ChecksState::Passing => 2,
+        }),
+        SortKey::Author => SortValue::Text(pr.author.as_ref()?.login.to_lowercase()),
+        SortKey::Repository => SortValue::Text(pr.pr.repo.to_string().to_lowercase()),
+    })
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SortValue {
+    Number(i64),
+    Text(String),
+}
+
+/// Sorts `rows` in place. The sort is stable, so rows that tie keep the
+/// order they came in; rows with no value for the key (no checks, a deleted
+/// author) go last in either direction. `None` leaves the order as it is.
+pub fn sort_rows<T: std::borrow::Borrow<PrSummary>>(rows: &mut [T], sort: Option<Sort>) {
+    let Some(sort) = sort else {
+        return;
+    };
+    rows.sort_by(|a, b| {
+        let (a, b) = (
+            sort_value(a.borrow(), sort.key),
+            sort_value(b.borrow(), sort.key),
+        );
+        match (a, b) {
+            (Some(a), Some(b)) => match sort.dir {
+                SortDir::Ascending => a.cmp(&b),
+                SortDir::Descending => b.cmp(&a),
+            },
+            (a, b) => a.is_none().cmp(&b.is_none()),
+        }
+    });
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedView {
@@ -332,6 +468,9 @@ pub struct SavedView {
     /// organizations: see [`SavedView::shows_all_open`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub all_open: Option<bool>,
+    /// The order of each section's rows; `None` is GitHub's order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Sort>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -379,6 +518,7 @@ impl ViewsFile {
             name: clean_name(name),
             filters,
             all_open: None,
+            sort: None,
             created_at: now,
             updated_at: now,
         });
@@ -397,6 +537,11 @@ impl ViewsFile {
     /// Turns the view's "All open" section on or off; whether the view exists.
     pub fn set_all_open(&mut self, id: &str, on: bool, now: DateTime<Utc>) -> bool {
         self.edit(id, now, |view| view.all_open = Some(on))
+    }
+
+    /// Sets the order of the view's rows; whether the view exists.
+    pub fn set_sort(&mut self, id: &str, sort: Option<Sort>, now: DateTime<Utc>) -> bool {
+        self.edit(id, now, |view| view.sort = sort)
     }
 
     pub fn delete(&mut self, id: &str) -> bool {
@@ -472,8 +617,8 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        Clause, Field, Loaded, Op, ViewsFile, all_open_query, describe, load, matches, options,
-        save, set_op, toggle_value,
+        Clause, Field, Loaded, Op, Sort, SortDir, SortKey, ViewsFile, all_open_query, cycle_sort,
+        describe, load, matches, options, save, set_op, sort_rows, toggle_value,
     };
     use crate::{
         Actor, ChecksState, Label, Mergeable, PrRef, PrState, PrSummary, RepoRef, ReviewDecision,
@@ -696,7 +841,108 @@ mod tests {
             "createdAt":"2026-11-11T00:00:00Z","updatedAt":"2026-11-11T00:00:00Z"}]}"#;
         let old: ViewsFile = serde_json::from_str(old).unwrap();
         assert_eq!(old.views[0].all_open, None);
+        assert_eq!(
+            old.views[0].sort, None,
+            "a view saved before sorting keeps GitHub's order"
+        );
         assert!(old.views[0].shows_all_open());
+    }
+
+    fn sorted(prs: &[PrSummary], key: SortKey, dir: SortDir) -> Vec<u64> {
+        let mut rows: Vec<&PrSummary> = prs.iter().collect();
+        sort_rows(&mut rows, Some(Sort { key, dir }));
+        rows.iter().map(|pr| pr.pr.number).collect()
+    }
+
+    /// Five pull requests in GitHub's order (1 to 5), each field set so
+    /// that every key orders them differently.
+    fn sortable() -> Vec<PrSummary> {
+        let day = |n: i64| Utc::now() - chrono::Duration::days(n);
+        #[rustfmt::skip]
+        let rows = [
+            // number, repo, author, created, updated, changes, comments, checks
+            (1, "web", Some("dora"), 3, 1, (10, 5), 4, Some(ChecksState::Passing)),
+            (2, "api", Some("ana"), 9, 2, (300, 0), 0, Some(ChecksState::Failing)),
+            (3, "infra", None, 1, 5, (0, 2), 9, None),
+            (4, "api", Some("Cy"), 6, 3, (40, 40), 1, Some(ChecksState::Pending)),
+            (5, "zeta", Some("bo"), 4, 4, (1, 2), 4, Some(ChecksState::Failing)),
+        ];
+        rows.into_iter()
+            .map(
+                |(number, repo, author, created, updated, (add, del), comments, checks)| {
+                    let mut row = pr("hooli-inc", repo, number);
+                    row.author = author.map(actor);
+                    row.created_at = day(created);
+                    row.updated_at = day(updated);
+                    row.additions = add;
+                    row.deletions = del;
+                    row.comment_count = comments;
+                    row.checks = checks;
+                    row
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn every_key_sorts_both_ways_and_rows_without_a_value_go_last() {
+        use SortDir::{Ascending as Up, Descending as Down};
+        let prs = sortable();
+        let cases = [
+            (SortKey::Updated, Up, [3, 5, 4, 2, 1]),
+            (SortKey::Updated, Down, [1, 2, 4, 5, 3]),
+            (SortKey::Created, Up, [2, 4, 5, 1, 3]),
+            (SortKey::Created, Down, [3, 1, 5, 4, 2]),
+            (SortKey::Changes, Up, [3, 5, 1, 4, 2]),
+            (SortKey::Changes, Down, [2, 4, 1, 5, 3]),
+            // Ties (1 and 5 have four comments) keep GitHub's order.
+            (SortKey::Comments, Up, [2, 4, 1, 5, 3]),
+            (SortKey::Comments, Down, [3, 1, 5, 4, 2]),
+            (SortKey::Checks, Up, [2, 5, 4, 1, 3]),
+            (SortKey::Checks, Down, [1, 4, 2, 5, 3]),
+            // Logins compare without case; a deleted author goes last.
+            (SortKey::Author, Up, [2, 5, 4, 1, 3]),
+            (SortKey::Author, Down, [1, 4, 5, 2, 3]),
+            (SortKey::Repository, Up, [2, 4, 3, 1, 5]),
+            (SortKey::Repository, Down, [5, 1, 3, 2, 4]),
+        ];
+        for (key, dir, want) in cases {
+            assert_eq!(sorted(&prs, key, dir), want, "{key:?} {dir:?}");
+        }
+        let mut rows: Vec<&PrSummary> = prs.iter().collect();
+        sort_rows(&mut rows, None);
+        let numbers: Vec<u64> = rows.iter().map(|pr| pr.pr.number).collect();
+        assert_eq!(numbers, [1, 2, 3, 4, 5], "no sort is GitHub's order");
+    }
+
+    #[test]
+    fn a_column_click_goes_ascending_then_descending_then_back_to_default() {
+        let up = |key| {
+            Some(Sort {
+                key,
+                dir: SortDir::Ascending,
+            })
+        };
+        let down = |key| {
+            Some(Sort {
+                key,
+                dir: SortDir::Descending,
+            })
+        };
+        assert_eq!(cycle_sort(None, SortKey::Changes), up(SortKey::Changes));
+        assert_eq!(
+            cycle_sort(up(SortKey::Changes), SortKey::Changes),
+            down(SortKey::Changes)
+        );
+        assert_eq!(cycle_sort(down(SortKey::Changes), SortKey::Changes), None);
+        assert_eq!(
+            cycle_sort(down(SortKey::Changes), SortKey::Author),
+            up(SortKey::Author)
+        );
+        assert_eq!(
+            up(SortKey::Checks).map(Sort::describe),
+            Some("Failing first")
+        );
     }
 
     #[test]
@@ -715,6 +961,11 @@ mod tests {
         more.push(clause(Field::Review, Op::In, &["approved"]));
         assert!(file.update_filters(&id, more.clone(), now));
         assert!(file.set_all_open(&id, false, now));
+        let largest = Some(Sort {
+            key: SortKey::Changes,
+            dir: SortDir::Descending,
+        });
+        assert!(file.set_sort(&id, largest, now));
         save(&path, &file).unwrap();
 
         let Loaded::Read(read) = load(&path) else {
@@ -724,6 +975,7 @@ mod tests {
         assert_eq!(read.views[0].name, "Hooli approved");
         assert_eq!(read.views[0].filters, more);
         assert_eq!(read.views[0].all_open, Some(false));
+        assert_eq!(read.views[0].sort, largest);
 
         std::fs::write(&path, b"{ not json").unwrap();
         assert!(matches!(load(&path), Loaded::Recovered { .. }));
