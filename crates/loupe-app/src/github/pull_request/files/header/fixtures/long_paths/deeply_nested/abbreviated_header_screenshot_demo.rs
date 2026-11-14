@@ -1,0 +1,32 @@
+//! Throwaway file for the screenshots of issue #55: a deep path and long lines.
+
+pub const LINE_01: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 1";
+pub const LINE_02: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 2";
+pub const LINE_03: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 3";
+pub const LINE_04: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 4";
+pub const LINE_05: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 5";
+pub const LINE_06: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 6";
+pub const LINE_07: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 7";
+pub const LINE_08: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 8";
+pub const LINE_09: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 9";
+pub const LINE_10: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 10";
+pub const LINE_11: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 11";
+pub const LINE_12: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 12";
+pub const LINE_13: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 13";
+pub const LINE_14: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 14";
+pub const LINE_15: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 15";
+pub const LINE_16: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 16";
+pub const LINE_17: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 17";
+pub const LINE_18: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 18";
+pub const LINE_19: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 19";
+pub const LINE_20: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 20";
+pub const LINE_21: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 21";
+pub const LINE_22: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 22";
+pub const LINE_23: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 23";
+pub const LINE_24: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 24";
+pub const LINE_25: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 25";
+pub const LINE_26: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 26";
+pub const LINE_27: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 27";
+pub const LINE_28: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 28";
+pub const LINE_29: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 29";
+pub const LINE_30: &str = "This line is long on purpose, so the diff scrolls sideways when lines do not wrap: ------------------------------------------------------------ 30";
