@@ -3,6 +3,7 @@
 //! annotations.
 
 mod composer;
+mod header;
 mod model;
 mod tree;
 mod tree_view;
@@ -13,9 +14,9 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::diff::{
-    Diff, DiffAnnotation, DiffHoverHighlight, DiffLinePosition, DiffLineRange, DiffState,
+    Diff, DiffAnnotation, DiffFile, DiffFileStatus, DiffHoverHighlight, DiffLinePosition,
+    DiffLineRange, DiffState,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
@@ -59,6 +60,8 @@ const LONG_LINE: usize = 100;
 const LONG_LINES_HINT: &str = "These files have lines longer than the view. Scroll sideways with Shift + wheel or ← →, or choose Wrap.";
 const FILE_LIST_MIN: f32 = 220.;
 const FILE_LIST_MAX: f32 = 640.;
+/// How wide the diff's trailing edge fades while long lines run past it.
+const FADE_WIDTH: f32 = 32.;
 
 struct ThreadSlot {
     view: Entity<ThreadView>,
@@ -956,8 +959,7 @@ impl FilesTab {
             notes.push((id, reason.note().into()));
         }
 
-        // Each file's size, for its header: the diff component draws the
-        // path, and Loupe adds the size and Viewed after it.
+        // Each file's size, for its header, as GitHub counts it.
         let sizes: Rc<HashMap<String, (u32, u32)>> = Rc::new(
             self.files
                 .iter()
@@ -986,39 +988,40 @@ impl FilesTab {
         // keeps the scroll offset to itself (`DiffState::horizontal_scroll`
         // is crate-private), so a bar of Loupe's own could not be true.
         let runs_on = !wrap && self.long_files().next().is_some();
-        // What Loupe adds to a file's header: its size (where the component
-        // does not show it) and the Viewed checkbox, 12 px clear of what
-        // comes before.
-        let header_extra = {
+        let header = {
             let (viewed, sizes, weak) = (viewed.clone(), sizes.clone(), weak.clone());
-            Rc::new(move |path: String, with_size: bool| -> AnyElement {
-                let checked = viewed.contains(&path);
+            let fade = if runs_on { dp(FADE_WIDTH) } else { px(0.) };
+            move |file: &DiffFile, _: &mut Window, _: &mut App| {
+                let path = file.path().clone();
+                let title = match (file.original_path(), file.modified_path()) {
+                    (Some(old), Some(new)) if old != new => format!("{old} → {new}").into(),
+                    _ => path.clone(),
+                };
+                let (additions, deletions) = sizes.get(path.as_ref()).copied().unwrap_or_default();
+                let status = match file.status() {
+                    DiffFileStatus::Added => Some("Added file"),
+                    DiffFileStatus::Deleted => Some("Deleted file"),
+                    DiffFileStatus::Renamed => Some("Renamed"),
+                    DiffFileStatus::Copied => Some("Copied"),
+                    _ => None,
+                };
                 let weak = weak.clone();
-                let toggle_path = path.clone();
-                let (additions, deletions) = sizes.get(&path).copied().unwrap_or_default();
-                h_flex()
-                    .flex_none()
-                    .ml_3()
-                    .gap_3()
-                    .items_center()
-                    .when(with_size, |extra| {
-                        extra.child(widgets::diff_stat(additions, deletions))
-                    })
-                    .child(
-                        Checkbox::new(SharedString::from(format!("header-viewed-{path}")))
-                            .label("Viewed")
-                            .checked(checked)
-                            .on_change(move |checked, _, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.toggle_viewed(&toggle_path, *checked, cx)
-                                })
-                                .ok();
-                            }),
-                    )
-                    .into_any_element()
-            })
+                let toggle_path = path.to_string();
+                header::file_header(header::HeaderContent {
+                    viewed: viewed.contains(path.as_ref()),
+                    title,
+                    path,
+                    additions,
+                    deletions,
+                    status,
+                    fade,
+                    on_viewed: Rc::new(move |checked, _, cx| {
+                        weak.update(cx, |this, cx| this.toggle_viewed(&toggle_path, checked, cx))
+                            .ok();
+                    }),
+                })
+            }
         };
-        let (title_extra, end_extra) = (header_extra.clone(), header_extra);
         div()
             .debug_selector(|| "files-diff".into())
             .relative()
@@ -1067,25 +1070,9 @@ impl FilesTab {
                             .children(note)
                             .into_any_element()
                     })
-                    // While lines wrap, Viewed sits in the header's fixed
-                    // trailing lane, beside the size the component draws
-                    // there. While they scroll, the header is as wide as the
-                    // file and its far end is out of sight, so the size and
-                    // Viewed follow the path instead.
-                    .render_header_title_suffix(move |file, _, _| {
-                        if wrap {
-                            div().into_any_element()
-                        } else {
-                            title_extra(file.path().to_string(), true)
-                        }
-                    })
-                    .render_header_suffix(move |file, _, _| {
-                        if wrap {
-                            end_extra(file.path().to_string(), false)
-                        } else {
-                            div().into_any_element()
-                        }
-                    })
+                    // The path, the size, and Viewed in the part of the
+                    // header on screen, whether lines wrap or scroll.
+                    .render_header(header)
                     .on_add_annotation(move |range, window, cx| {
                         let range = range.clone();
                         add_weak
@@ -1099,13 +1086,19 @@ impl FilesTab {
             )
             .when(runs_on, |panel| {
                 let shade = tokens::background();
-                panel.child(div().absolute().top_0().bottom_0().right_0().w(dp(32.)).bg(
-                    linear_gradient(
-                        90.,
-                        linear_color_stop(shade.opacity(0.), 0.),
-                        linear_color_stop(shade, 1.),
-                    ),
-                ))
+                panel.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(dp(FADE_WIDTH))
+                        .bg(linear_gradient(
+                            90.,
+                            linear_color_stop(shade.opacity(0.), 0.),
+                            linear_color_stop(shade, 1.),
+                        )),
+                )
             })
             .into_any_element()
     }
@@ -1239,8 +1232,8 @@ mod tests {
     use chrono::{DateTime, Utc};
     use gpui_kit::{
         AppContext as _, Bounds, Entity, InputEvent as _, Modifiers, MouseButton, MouseDownEvent,
-        MouseMoveEvent, MouseUpEvent, Pixels, TestAppContext, VisualTestContext, WindowBounds,
-        WindowOptions, point, px, size,
+        MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, TestAppContext,
+        VisualTestContext, WindowBounds, WindowOptions, point, px, size,
     };
     use loupe_github::diff::{git_patch, parse_patch};
     use loupe_github::{
@@ -1300,6 +1293,25 @@ mod tests {
 
     /// The files tab alone in a window, with one changed file loaded.
     fn open_files_tab(cx: &mut TestAppContext) -> (VisualTestContext, Entity<FilesTab>) {
+        open_files_tab_with(
+            cx,
+            ChangedFile {
+                path: "src/main.rs".into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 1,
+                patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
+                viewed: ViewedState::Unviewed,
+            },
+        )
+    }
+
+    /// The files tab alone in a window, with `file` loaded.
+    fn open_files_tab_with(
+        cx: &mut TestAppContext,
+        file: ChangedFile,
+    ) -> (VisualTestContext, Entity<FilesTab>) {
         let (handle, tab) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::init(cx);
@@ -1329,15 +1341,6 @@ mod tests {
         // With no GitHub client the first load fails; then the files arrive.
         cx.run_until_parked();
         tab.update(&mut cx, |tab, cx| {
-            let file = ChangedFile {
-                path: "src/main.rs".into(),
-                previous_path: None,
-                status: FileStatus::Modified,
-                additions: 1,
-                deletions: 1,
-                patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
-                viewed: ViewedState::Unviewed,
-            };
             tab.finish_load(
                 Ok(build_files(vec![file], git_patch, |patch| {
                     parse_patch(patch).ok()
@@ -1478,5 +1481,113 @@ mod tests {
             (f32::from(diff.right()) - f32::from(tree.left())).abs() <= 1.,
             "the diff fills what the tree leaves"
         );
+    }
+
+    /// A path far wider than the diff beside the tree at its opening width.
+    const LONG_PATH: &str = "apps/web-api/src/modules/billing/application/service/reminders/scheduling/notifications/templates/billing.service.payment-reminder.spec.ts";
+
+    fn click(cx: &mut VisualTestContext, position: Point<Pixels>) {
+        let none = Modifiers::none();
+        dispatch(
+            cx,
+            MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: none,
+            }
+            .to_platform_input(),
+        );
+        dispatch(
+            cx,
+            MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: none,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+        );
+        dispatch(
+            cx,
+            MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: none,
+                click_count: 1,
+            }
+            .to_platform_input(),
+        );
+    }
+
+    /// The path and Viewed in the header, once the diff settled.
+    fn header(cx: &mut VisualTestContext) -> (Bounds<Pixels>, Bounds<Pixels>, Bounds<Pixels>) {
+        let (_, diff) = panes(cx);
+        (
+            diff,
+            cx.debug_bounds("header-path").expect("the path is drawn"),
+            cx.debug_bounds("header-viewed").expect("Viewed is drawn"),
+        )
+    }
+
+    fn assert_viewed_on_screen(cx: &mut VisualTestContext, case: &str) -> Bounds<Pixels> {
+        let (diff, path, viewed) = header(cx);
+        assert!(
+            viewed.left() >= diff.left() && viewed.right() <= diff.right(),
+            "{case}: Viewed {viewed:?} is outside the diff {diff:?}"
+        );
+        // Clear of the edge's fade and of the vertical scrollbar.
+        assert!(
+            diff.right() - viewed.right() >= px(12.),
+            "{case}: Viewed {viewed:?} is under the diff's edge {diff:?}"
+        );
+        assert!(
+            path.left() >= diff.left() && path.right() <= viewed.left(),
+            "{case}: the path {path:?} runs into Viewed {viewed:?}"
+        );
+        viewed
+    }
+
+    #[gpui_kit::test]
+    fn viewed_stays_on_screen_beside_a_long_path(cx: &mut TestAppContext) {
+        let line = "x".repeat(400);
+        let (mut cx, tab) = open_files_tab_with(
+            cx,
+            ChangedFile {
+                path: LONG_PATH.into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 1,
+                patch: Some(format!("@@ -1 +1 @@\n-old\n+{line}")),
+                viewed: ViewedState::Unviewed,
+            },
+        );
+        let cx = &mut cx;
+
+        // Lines scroll sideways: the header is as wide as the long line.
+        let before = assert_viewed_on_screen(cx, "lines scroll");
+        let (diff, _, _) = header(cx);
+        dispatch(
+            cx,
+            ScrollEvent {
+                position: point(diff.left() + px(200.), diff.top() + px(120.)),
+                delta: ScrollDelta::Pixels(point(px(-300.), px(0.))),
+                ..ScrollEvent::default()
+            }
+            .to_platform_input(),
+        );
+        let after = assert_viewed_on_screen(cx, "scrolled sideways");
+        assert_eq!(after, before, "Viewed stays put while the lines scroll");
+
+        click(cx, after.center());
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.files[0].viewed),
+            ViewedState::Viewed,
+            "a click on Viewed marks the file"
+        );
+
+        cx.update(|_, cx| update_settings(cx, |settings| settings.diff_wrap = true));
+        assert_viewed_on_screen(cx, "lines wrap");
     }
 }
