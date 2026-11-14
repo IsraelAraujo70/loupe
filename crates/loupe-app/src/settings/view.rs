@@ -301,14 +301,6 @@ impl SettingsView {
                     store::update_settings(cx, |settings| settings.sidebar_collapsed = checked);
                 })
                 .into_any_element()),
-            Item::GroupTabsByRepo => row(Switch::new("group-tabs-by-repo")
-                .checked(settings.group_tabs_by_repo)
-                .accessibility_label(entry.title)
-                .on_click(|checked, _, cx| {
-                    let checked = *checked;
-                    store::update_settings(cx, |settings| settings.group_tabs_by_repo = checked);
-                })
-                .into_any_element()),
             Item::InboxFilter => {
                 let filter = settings.notification_filter.join(" ");
                 let empty = filter.is_empty();
