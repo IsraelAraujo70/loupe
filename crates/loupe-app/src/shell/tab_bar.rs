@@ -25,8 +25,6 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::cell::Cell;
-use std::rc::Rc;
 
 use super::Workspace;
 use super::actions::{GoBack, GoForward, NewTab, ToggleSidebar};
@@ -69,49 +67,8 @@ pub(super) fn route_icon(route: &Route) -> IconName {
     }
 }
 
-/// The sideways scroll of a pane's row of tabs, and the open tab and row
-/// width it last scrolled for.
-#[derive(Clone, Default)]
-pub(super) struct TabRow {
-    scroll: ScrollHandle,
-    shown: Rc<Cell<Option<u64>>>,
-    width: Rc<Cell<Pixels>>,
-}
-
-impl TabRow {
-    /// Scrolls the row to the open tab of `pane` when that tab changed, or
-    /// the row's width did (the window, the sidebar, or the update pill
-    /// beside it), since it last did. Nothing happens before the row's first
-    /// layout, when its width is unknown.
-    /// `child` is the open tab's place among the row's children, which
-    /// counts the groups' names and leaves out hidden tabs.
-    fn follow_open_tab(&self, pane: &Pane<AnyView>, child: usize) {
-        let open = pane.tabs.active().id;
-        let bounds = self.scroll.bounds();
-        if bounds == Bounds::default()
-            || (self.shown.get() == Some(open) && self.width.get() == bounds.size.width)
-        {
-            return;
-        }
-        self.scroll.scroll_to_item(child);
-        self.shown.set(Some(open));
-        self.width.set(bounds.size.width);
-    }
-
-    /// Asks for another frame once the row was laid out at a new width: the
-    /// scroll handle learns the width only after this frame's scroll ran.
-    fn watch_width(
-        &self,
-        workspace: EntityId,
-    ) -> impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static {
-        let row = self.clone();
-        move |_, window, _| {
-            if row.scroll.bounds().size.width != row.width.get() {
-                window.on_next_frame(move |_, cx| cx.notify(workspace));
-            }
-        }
-    }
-}
+/// The sideways scroll of a pane's row of tabs, keyed by the open tab's id.
+pub(super) type TabRow = ui::ScrollRow<u64>;
 
 /// A tab while it is dragged: where it comes from, and the floating copy of
 /// it under the pointer.
@@ -568,7 +525,8 @@ fn tab_list(
 ) -> Stateful<Div> {
     let pane_id = pane.id;
     let (items, open_child) = tabs(pane, emphasized, lifted, cx);
-    row.follow_open_tab(pane, open_child);
+    // `open_child` counts the groups' names and leaves out hidden tabs.
+    row.follow(pane.tabs.active().id, open_child);
     h_flex()
         .on_children_prepainted(row.watch_width(cx.entity_id()))
         .id(("tabs", pane_id))
@@ -577,7 +535,7 @@ fn tab_list(
         .aria_label(label)
         .min_w_0()
         .overflow_x_scroll()
-        .track_scroll(&row.scroll)
+        .track_scroll(row.handle())
         // The row clips what it scrolls; the landing line before its first
         // tab and after its last needs this much room inside it.
         .px_1()
