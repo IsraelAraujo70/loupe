@@ -152,18 +152,6 @@ impl Render for DraggedTab {
     }
 }
 
-/// The fill of a group's name and line: a color every theme already has.
-pub(super) fn group_fill(color: TabGroupColor, cx: &App) -> Hsla {
-    match color {
-        TabGroupColor::Grey => tokens::draft_fill(),
-        TabGroupColor::Blue => cx.theme().primary,
-        TabGroupColor::Red => tokens::closed_fill(),
-        TabGroupColor::Yellow => tokens::pending(),
-        TabGroupColor::Green => tokens::open_fill(),
-        TabGroupColor::Purple => tokens::merged_fill(),
-    }
-}
-
 /// The name of group `group` of `pane`, before its first tab. `hidden` is
 /// how many tabs it hides while collapsed.
 fn group_label(
@@ -173,7 +161,7 @@ fn group_label(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let id = group.id;
-    let fill = group_fill(group.color, cx);
+    let fill = tokens::tab_group(group.color);
     let on_fill = tokens::on_accent();
     let ring = cx.theme().foreground;
     let name: SharedString = group.name.clone().into();
@@ -322,7 +310,7 @@ fn tabs(
         if index == active {
             open_child = items.len();
         }
-        let line_color = group.map(|group| group_fill(group.color, cx));
+        let line_color = group.map(|group| tokens::tab_group(group.color));
         let element = {
             let route = &tab.current().route;
             let label: SharedString = route.label().into();

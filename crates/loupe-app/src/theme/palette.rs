@@ -10,6 +10,8 @@ use std::fmt;
 use gpui_kit::{Hsla, Rgba};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::store::TabGroupColor;
+
 /// A color written as `#rrggbb` or `#rrggbbaa`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color(pub Hsla);
@@ -208,9 +210,31 @@ palette! {
     "Diff" diff_removed_bg,
     "Diff" diff_added_text,
     "Diff" diff_removed_text,
+    /// The tab group colors that are not a state color: Grey, Red, Yellow,
+    /// Green, and Purple are the draft, closed, pending, open, and merged
+    /// fills ([`Palette::tab_group`]). White text on each passes 4.5:1.
+    "Tab groups" group_blue,
+    "Tab groups" group_pink,
+    "Tab groups" group_cyan,
+    "Tab groups" group_orange,
 }
 
 impl Palette {
+    /// The fill of a tab group's name and line.
+    pub fn tab_group(&self, color: TabGroupColor) -> Color {
+        match color {
+            TabGroupColor::Grey => self.draft_fill,
+            TabGroupColor::Blue => self.group_blue,
+            TabGroupColor::Red => self.closed_fill,
+            TabGroupColor::Yellow => self.pending,
+            TabGroupColor::Green => self.open_fill,
+            TabGroupColor::Purple => self.merged_fill,
+            TabGroupColor::Pink => self.group_pink,
+            TabGroupColor::Cyan => self.group_cyan,
+            TabGroupColor::Orange => self.group_orange,
+        }
+    }
+
     /// The palette with `percent` contrast, 100 being the theme's own. Above
     /// 100, borders and washes grow stronger and muted and faint text move
     /// toward the primary text; below, borders and washes soften while text
@@ -334,6 +358,7 @@ mod tests {
     use gpui_kit::{Hsla, Rgba};
 
     use super::{Color, Contrast, TOKENS, ThemeFile};
+    use crate::store::TabGroupColor;
     use crate::theme::themes::BUILT_IN;
 
     /// WCAG contrast ratio between two opaque colors.
@@ -460,6 +485,77 @@ mod tests {
                         found >= 4.5,
                         "{id}/{variant}: on_accent on {name} {found:.2}"
                     );
+                }
+            }
+        }
+    }
+
+    /// A color in OKLab, where distance follows how different two colors
+    /// look.
+    fn oklab(color: Hsla) -> [f32; 3] {
+        let rgba = Rgba::from(color);
+        let linear = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let (r, g, b) = (linear(rgba.r), linear(rgba.g), linear(rgba.b));
+        let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+        let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+        let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+        [
+            0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+            1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+            0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+        ]
+    }
+
+    /// Issue #65: every theme names Pink, Cyan, and Orange in both variants
+    /// (a user's file may leave them out; a built-in one may not), white
+    /// text on them reads at 4.5:1 like the state pills, and each looks
+    /// apart from every other group color of the same palette.
+    #[test]
+    fn every_theme_gives_the_new_group_colors_their_own_tone() {
+        let new = [
+            (TabGroupColor::Pink, "group_pink"),
+            (TabGroupColor::Cyan, "group_cyan"),
+            (TabGroupColor::Orange, "group_orange"),
+        ];
+        for (id, json) in BUILT_IN {
+            let raw: serde_json::Value = serde_json::from_str(json).expect("a theme is JSON");
+            let file = ThemeFile::parse(json).unwrap_or_else(|error| panic!("{id}: {error}"));
+            for (variant, palette) in [("light", &file.light), ("dark", &file.dark)] {
+                for (color, key) in new {
+                    assert!(
+                        raw[variant].get(key).is_some(),
+                        "{id}/{variant} has no {key}"
+                    );
+                    let fill = palette.tab_group(color);
+                    let found = contrast_ratio(palette.on_accent.0, fill.0);
+                    assert!(
+                        found >= 4.5,
+                        "{id}/{variant}: on_accent on {key} {found:.2}"
+                    );
+                    for other in TabGroupColor::ALL {
+                        if other == color {
+                            continue;
+                        }
+                        let [a, b] = [fill, palette.tab_group(other)].map(|c| oklab(c.0));
+                        let apart = a
+                            .iter()
+                            .zip(b)
+                            .map(|(x, y)| (x - y).powi(2))
+                            .sum::<f32>()
+                            .sqrt();
+                        assert!(
+                            apart >= 0.08,
+                            "{id}/{variant}: {} looks like {} ({apart:.3} apart)",
+                            color.label(),
+                            other.label()
+                        );
+                    }
                 }
             }
         }
