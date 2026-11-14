@@ -49,6 +49,11 @@ use crate::theme::scale;
 use crate::ui;
 use crate::ui::MenuTriggerExt as _;
 
+/// Where the page's results are stored between runs. A copy from before the
+/// rows carried review requests would put every pull request in No reviewer
+/// until the refresh, so it is not read.
+pub(crate) const CACHE: &str = "reviews/2";
+
 gpui_kit::actions!(
     github,
     [
@@ -160,12 +165,10 @@ fn shown_needs_review<'a>(all: &Shown<'a>, inbox: &Inbox) -> Shown<'a> {
         .collect();
     Shown {
         count: items.len(),
-        note: all.note.as_ref().map(|_| {
-            format!(
-                "From the {} pull requests loaded; GitHub has more",
-                all.items.len()
-            )
-        }),
+        note: all
+            .note
+            .as_ref()
+            .map(|_| format!("Out of the {} in All; GitHub has more", all.count)),
         items,
     }
 }
@@ -598,7 +601,7 @@ impl InboxView {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let key = crate::cache::github_key(cx, "reviews");
+        let key = crate::cache::github_key(cx, CACHE);
         if self.inbox.value().is_none()
             && let Some(value) = key.as_deref().and_then(crate::cache::get)
         {
@@ -629,7 +632,7 @@ impl InboxView {
         if !again && self.all_open.contains_key(&query) {
             return;
         }
-        let key = crate::cache::github_key(cx, &format!("reviews/all-open/{query}"));
+        let key = crate::cache::github_key(cx, &format!("{CACHE}/all-open/{query}"));
         let state = self.all_open.entry(query.clone()).or_default();
         if state.value().is_none()
             && let Some(value) = key.as_deref().and_then(crate::cache::get)

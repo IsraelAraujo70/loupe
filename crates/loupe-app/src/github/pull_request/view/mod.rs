@@ -275,7 +275,7 @@ impl PullRequestView {
                     if let Some(key) = &key {
                         crate::cache::put(key, &detail);
                     }
-                    if let Some(key) = crate::cache::github_key(_cx, "reviews")
+                    if let Some(key) = crate::cache::github_key(_cx, crate::github::inbox::CACHE)
                         && let Some(mut inbox) = crate::cache::get::<loupe_github::Inbox>(&key)
                     {
                         for page in [

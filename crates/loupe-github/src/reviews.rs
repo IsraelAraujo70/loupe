@@ -329,8 +329,9 @@ pub fn all_open_query(clauses: &[Clause]) -> Option<String> {
 #[serde(rename_all = "camelCase")]
 pub enum ReviewTab {
     /// Open pull requests that wait on a review, in the groups of
-    /// [`needs_review`]. Views saved before it was renamed say `toReview`.
-    #[serde(alias = "toReview")]
+    /// [`needs_review`]. Saved as `toReview`, its name before, so a release
+    /// from before it still reads the file.
+    #[serde(rename = "toReview")]
     NeedsReview,
     /// `author:@me`.
     Mine,
@@ -1269,7 +1270,7 @@ mod tests {
             ]
         );
         let saved = serde_json::to_string(&file).unwrap();
-        assert!(saved.contains(r#""tab":"needsReview""#), "{saved}");
+        assert!(saved.contains(r#""tab":"toReview""#), "{saved}");
     }
 
     /// A pull request with these facts and nothing else.
