@@ -1570,7 +1570,6 @@ mod tests {
     fn picking_another_theme_closes_the_editor(cx: &mut TestAppContext) {
         let (view, mut cx) = open(cx);
         click(&mut cx, "create-theme");
-        let id = cx.update(|_, cx| Settings::get(cx).appearance.theme.clone());
         let open_editor = cx.update(|_, cx| view.read(cx).appearance.editor.is_some());
         assert!(open_editor);
         click(&mut cx, "theme-card-grove");
@@ -1579,7 +1578,6 @@ mod tests {
             !open_editor,
             "edits would land on a theme that is not shown"
         );
-        let _ = std::fs::remove_file(crate::theme::themes::themes_dir().join(format!("{id}.json")));
     }
 
     #[gpui_kit::test]
@@ -1596,7 +1594,6 @@ mod tests {
         assert_eq!(chosen, "grove-copy", "the copy is shown, not Grove itself");
         let copy = crate::theme::themes::themes_dir().join("grove-copy.json");
         assert!(copy.exists());
-        let _ = std::fs::remove_file(copy);
     }
 
     #[gpui_kit::test]
@@ -1604,9 +1601,7 @@ mod tests {
         let (view, mut cx) = open(cx);
         click(&mut cx, "create-theme");
         let id = cx.update(|_, cx| Settings::get(cx).appearance.theme.clone());
-        // Tests share one data folder, so another test's copy may hold
-        // `custom-theme`.
-        assert!(id.starts_with("custom-theme"), "{id}");
+        assert_eq!(id, "custom-theme");
         let saved = crate::theme::themes::themes_dir().join(format!("{id}.json"));
         assert!(saved.exists(), "the copy is a file in the themes folder");
 
@@ -1632,6 +1627,5 @@ mod tests {
             text.contains("\"accent\": \"#ff00aa\""),
             "saved to the file"
         );
-        let _ = std::fs::remove_file(saved);
     }
 }
