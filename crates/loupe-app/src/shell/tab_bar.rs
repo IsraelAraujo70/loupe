@@ -258,6 +258,11 @@ fn tabs(
     let lifted_index = lifted
         .filter(|(from, _)| *from == pane_id)
         .and_then(|(_, tab)| pane.tabs.index_of(tab));
+    // A tab dragged along its row lands on its own side of the pinned tabs,
+    // so a tab on the other side shows no landing line.
+    let lifted_pinned = lifted_index
+        .and_then(|index| pane.tabs.iter().nth(index))
+        .map(|tab| tab.pinned);
     let workspace = cx.entity().downgrade();
     let groups: Vec<(u64, SharedString)> = pane
         .tabs
@@ -299,24 +304,27 @@ fn tabs(
             let group = SharedString::from(format!("tab-{id}"));
             // A tab dropped here takes this one's place: from the left in
             // its own row it lands to the right of it, otherwise to the left.
-            let landing_line = lifted.filter(|(_, tab)| *tab != id).map(|_| {
-                let line = div()
-                    .absolute()
-                    .top_1()
-                    .bottom_1()
-                    .w(px(2.))
-                    .rounded_full()
-                    .group_drag_over::<DraggedTab>(group.clone(), move |style| style.bg(ring))
-                    // GPUI applies a group's drag-over style only to an
-                    // element with a hitbox of its own, which a drag-over
-                    // style of its own gives.
-                    .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(ring));
-                if lifted_index.is_some_and(|from| from < index) {
-                    line.right(px(-3.))
-                } else {
-                    line.left(px(-3.))
-                }
-            });
+            let landing_line = lifted
+                .filter(|(_, tab)| *tab != id)
+                .filter(|_| lifted_pinned.is_none_or(|lifted| lifted == pinned))
+                .map(|_| {
+                    let line = div()
+                        .absolute()
+                        .top_1()
+                        .bottom_1()
+                        .w(px(2.))
+                        .rounded_full()
+                        .group_drag_over::<DraggedTab>(group.clone(), move |style| style.bg(ring))
+                        // GPUI applies a group's drag-over style only to an
+                        // element with a hitbox of its own, which a drag-over
+                        // style of its own gives.
+                        .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(ring));
+                    if lifted_index.is_some_and(|from| from < index) {
+                        line.right(px(-3.))
+                    } else {
+                        line.left(px(-3.))
+                    }
+                });
             let dragged = DraggedTab {
                 pane: pane_id,
                 tab: id,

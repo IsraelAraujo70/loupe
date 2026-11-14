@@ -185,6 +185,17 @@ pub fn navigate(route: Route, window: &mut Window, cx: &mut App) {
     with_workspace(cx, |workspace, cx| workspace.push(route, window, cx));
 }
 
+/// Whether `to` shows the page `from` shows, with another filter: a pinned
+/// tab stays on it. Pages change their own filter this way when it is part
+/// of the route (the branch of a repository's runs, a team's saved view).
+fn same_page(from: &Route, to: &Route) -> bool {
+    match (from, to) {
+        (Route::Actions { repo: a, .. }, Route::Actions { repo: b, .. }) => a == b,
+        (Route::LinearTeam { team_id: a, .. }, Route::LinearTeam { team_id: b, .. }) => a == b,
+        _ => false,
+    }
+}
+
 /// Opens `route` in a new background tab, as a browser opens a link in a new
 /// tab: the active tab stays on screen.
 pub fn open_in_new_tab(route: Route, window: &mut Window, cx: &mut App) {
@@ -356,13 +367,14 @@ impl Workspace {
     }
 
     /// Shows `route` after the active tab's page; a pinned tab keeps its
-    /// page and the route opens in a new tab after the pinned ones.
+    /// page and the route opens in a new tab after the pinned ones, unless
+    /// it is the same page with another filter.
     fn push(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.panes.active().active();
         if active.current().route == route {
             return;
         }
-        if active.pinned {
+        if active.pinned && !same_page(&active.current().route, &route) {
             self.open_tab(route, window, cx);
             return;
         }
@@ -1919,6 +1931,46 @@ mod tests {
             (tabs[0].clone(), pinned),
             (Route::Inbox, 0),
             "unpinned in place"
+        );
+    }
+
+    /// A pinned tab that changes its own filter through its route (the
+    /// branch of a repository's runs) stays on its page; another
+    /// repository's runs open in a new tab.
+    #[gpui_kit::test]
+    fn a_pinned_tab_changes_its_own_filter_in_place(cx: &mut TestAppContext) {
+        use loupe_github::RepoRef;
+
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        let runs = |name: &str, branch: Option<&str>| Route::Actions {
+            repo: RepoRef::new("octo", name),
+            branch: branch.map(str::to_owned),
+        };
+        cx.update(|window, cx| super::navigate(runs("app", Some("main")), window, cx));
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(0, |tabs, index| tabs.pin(index), cx)
+        });
+        cx.update(|window, cx| super::navigate(runs("app", None), window, cx));
+        cx.run_until_parked();
+        let one = |tabs: Vec<Route>, active| PaneLayout::Pane {
+            tabs,
+            active,
+            groups: Vec::new(),
+            pinned: 1,
+        };
+        assert_eq!(
+            saved_panes(cx).0,
+            one(vec![runs("app", None)], 0),
+            "clearing the branch stays in the pinned tab"
+        );
+
+        cx.update(|window, cx| super::navigate(runs("web", None), window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            saved_panes(cx).0,
+            one(vec![runs("app", None), runs("web", None)], 1),
+            "another repository's runs open in a new tab"
         );
     }
 
