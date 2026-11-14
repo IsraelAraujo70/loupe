@@ -435,16 +435,32 @@ fn tabs(
                         let workspace = workspace.clone();
                         PopupMenuItem::new("Add to new group…").on_click(move |_, window, cx| {
                             let workspace = workspace.clone();
-                            tab_groups::ask_name(
+                            let color = workspace
+                                .read_with(cx, |this, _| {
+                                    let pane = this.panes.locate(id).map(|(pane, _)| pane);
+                                    pane.and_then(|pane| this.panes.pane(pane))
+                                        .map(|pane| pane.tabs.free_color())
+                                })
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
+                            tab_groups::ask_name_and_color(
                                 "New group",
                                 "Create",
-                                String::new(),
-                                move |name, _, cx| {
+                                color,
+                                move |name, color, _, cx| {
                                     workspace
                                         .update(cx, |this, cx| {
                                             this.edit_tab(
                                                 id,
-                                                |tabs, index| tabs.new_group(index, name).is_some(),
+                                                |tabs, index| {
+                                                    let Some(group) = tabs.new_group(index, name)
+                                                    else {
+                                                        return false;
+                                                    };
+                                                    tabs.set_group_color(group, color);
+                                                    true
+                                                },
                                                 cx,
                                             )
                                         })

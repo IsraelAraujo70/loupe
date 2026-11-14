@@ -9,6 +9,7 @@ use crate::route::Route;
 use crate::store::{PaneLayout, SplitAxis};
 
 use super::tabs::{Page, Tab, Tabs};
+use super::{GroupRef, GroupTarget};
 
 pub(super) type PaneId = u64;
 
@@ -593,6 +594,73 @@ impl<V> Panes<V> {
         true
     }
 
+    /// Puts a tab for each of `routes`, in their order, at the end of
+    /// `target`'s group, and leaves every pane's open tab on screen. A route
+    /// a tab already shows, in any pane, moves that tab instead of opening a
+    /// second one; a tab already in the group stays where it is. `page`
+    /// builds the page of a route no tab shows. A new group opens in the
+    /// active pane, where its first tab lands. Returns the group, or `None`
+    /// when the group to open in is gone or `routes` is empty.
+    pub fn open_in_group(
+        &mut self,
+        target: GroupTarget,
+        routes: &[Route],
+        mut page: impl FnMut(&Route) -> Page<V>,
+    ) -> Option<GroupRef> {
+        let (pane, mut group, new) = match target {
+            GroupTarget::Existing(GroupRef { pane, group }) => {
+                self.pane(pane)?.tabs.group(group)?;
+                (pane, Some(group), None)
+            }
+            GroupTarget::New { name, color } => (self.active, None, Some((name, color))),
+        };
+        for route in routes {
+            let open = self.find(route);
+            if let Some((holder, index)) = open
+                && holder == pane
+            {
+                let tabs = self.tabs_mut(pane)?;
+                match (group, &new) {
+                    (Some(id), _) => {
+                        if tabs.group_at(index) != Some(id) {
+                            tabs.add_to_group(index, id);
+                        }
+                    }
+                    (None, Some((name, color))) => {
+                        group = tabs.new_group(index, name);
+                        if let (Some(id), Some(color)) = (group, color) {
+                            tabs.set_group_color(id, *color);
+                        }
+                    }
+                    (None, None) => return None,
+                }
+                continue;
+            }
+            let tab = match open {
+                Some((holder, index)) => {
+                    let id = self.pane(holder)?.tabs.iter().nth(index)?.id;
+                    let Some(tab) = self.take(holder, id) else {
+                        continue;
+                    };
+                    tab
+                }
+                None => {
+                    let page = page(route);
+                    self.tab(page)
+                }
+            };
+            let tabs = self.tabs_mut(pane)?;
+            match (group, &new) {
+                (Some(id), _) => {
+                    tabs.append_to_group(tab, id);
+                }
+                (None, Some((name, color))) => group = tabs.open_in_new_group(tab, name, *color),
+                (None, None) => return None,
+            }
+        }
+        group.map(|group| GroupRef { pane, group })
+    }
+
     /// Drops tab `tab` of pane `from` on `zone` of pane `to`: into `to` for
     /// the middle, else into a new pane on that side of `to`, which becomes
     /// the active one. False when [`Self::can_drop`] says nothing changes.
@@ -670,7 +738,10 @@ fn clamp_ratio(ratio: f32) -> f32 {
 mod tests {
     use super::{MIN_RATIO, Node, OpenTab, Panes, Zone};
     use crate::route::Route;
+    use crate::shell::tabs::Page;
+    use crate::shell::{GroupRef, GroupTarget};
     use crate::store::{PaneLayout, SavedTabGroup, SplitAxis, TabGroupColor};
+    use loupe_github::{PrRef, RepoRef};
 
     fn issue(id: &str) -> Route {
         Route::LinearIssue {
@@ -914,6 +985,136 @@ mod tests {
         assert_eq!(Zone::at(0.5, 0.05), Zone::Up);
         assert_eq!(Zone::at(0.9, 0.95), Zone::Down, "the nearer edge wins");
         assert_eq!(Zone::at(0.3, 0.5), Zone::Center);
+    }
+
+    fn pr(number: u64) -> Route {
+        Route::PullRequest(PrRef::new(RepoRef::new("acme", "web"), number))
+    }
+
+    fn group(name: &str, color: TabGroupColor, first: usize, len: usize) -> SavedTabGroup {
+        SavedTabGroup {
+            name: name.into(),
+            color,
+            collapsed: false,
+            first,
+            len,
+        }
+    }
+
+    fn page(route: &Route) -> Page<()> {
+        Page {
+            route: route.clone(),
+            view: (),
+        }
+    }
+
+    #[test]
+    fn opening_in_a_group_appends_in_order_and_moves_tabs_already_open() {
+        // Reviews is open on the left; #1 is in Review, #2 is open outside
+        // it, and #5 is open in the other pane.
+        let mut panes = restore(
+            &PaneLayout::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(PaneLayout::Pane {
+                    tabs: vec![Route::Inbox, pr(1), pr(2), issue("ENG-1")],
+                    active: 0,
+                    groups: vec![group("Review", TabGroupColor::Red, 1, 1)],
+                }),
+                second: Box::new(pane(&[pr(5), issue("ENG-2")], 0)),
+            },
+            0,
+        );
+        let left = panes.active_pane();
+        let review = panes.active().groups()[0].id;
+        let target = GroupTarget::Existing(GroupRef {
+            pane: left,
+            group: review,
+        });
+        let picked = [pr(3), pr(2), pr(1), pr(5), pr(4)];
+        let opened = panes.open_in_group(target, &picked, page);
+        assert_eq!(
+            opened,
+            Some(GroupRef {
+                pane: left,
+                group: review
+            })
+        );
+        assert_eq!(
+            panes.layout(),
+            (
+                PaneLayout::Split {
+                    axis: SplitAxis::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(PaneLayout::Pane {
+                        tabs: vec![
+                            Route::Inbox,
+                            pr(1),
+                            pr(3),
+                            pr(2),
+                            pr(5),
+                            pr(4),
+                            issue("ENG-1"),
+                        ],
+                        active: 0,
+                        groups: vec![group("Review", TabGroupColor::Red, 1, 5)],
+                    }),
+                    second: Box::new(pane(&[issue("ENG-2")], 0)),
+                },
+                0,
+            ),
+            "the picked pull requests follow the group's tabs in list order, \
+             each in one tab, and Reviews stays on screen"
+        );
+    }
+
+    #[test]
+    fn opening_in_a_new_group_starts_it_after_the_open_tab() {
+        let mut panes = restore(
+            &PaneLayout::Pane {
+                tabs: vec![issue("ENG-1"), Route::Inbox, issue("ENG-2")],
+                active: 1,
+                groups: vec![group("Review", TabGroupColor::Grey, 0, 1)],
+            },
+            0,
+        );
+        let target = GroupTarget::New {
+            name: "Ready".into(),
+            color: Some(TabGroupColor::Pink),
+        };
+        assert!(panes.open_in_group(target, &[pr(1), pr(2)], page).is_some());
+        let target = GroupTarget::New {
+            name: "My view".into(),
+            color: None,
+        };
+        assert!(panes.open_in_group(target, &[pr(3)], page).is_some());
+        assert_eq!(
+            panes.layout().0,
+            PaneLayout::Pane {
+                tabs: vec![
+                    issue("ENG-1"),
+                    Route::Inbox,
+                    pr(3),
+                    pr(1),
+                    pr(2),
+                    issue("ENG-2"),
+                ],
+                active: 1,
+                groups: vec![
+                    group("Review", TabGroupColor::Grey, 0, 1),
+                    group("My view", TabGroupColor::Blue, 2, 1),
+                    group("Ready", TabGroupColor::Pink, 3, 2),
+                ],
+            },
+            "a new group opens right after the open tab, in the color picked \
+             or the first free one"
+        );
+        let gone = GroupTarget::Existing(GroupRef { pane: 0, group: 99 });
+        assert_eq!(panes.open_in_group(gone, &[pr(4)], page), None);
+        assert!(
+            panes.find(&pr(4)).is_none(),
+            "nothing opens without the group"
+        );
     }
 
     #[test]
