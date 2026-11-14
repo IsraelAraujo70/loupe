@@ -3246,4 +3246,54 @@ mod tests {
         view.update_in(cx, |view, window, cx| view.open_cursor(window, cx));
         assert!(bounds(cx, "pr-row-PR_11").is_some());
     }
+
+    #[gpui_kit::test]
+    fn shift_on_a_stack_extends_the_selection_over_it(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, stacked_inbox(), cx);
+        click(cx, "pr-select-PR_21");
+        let at = bounds(cx, "reviews-select-stack-a-repo-pr10").expect("the stack's box");
+        cx.simulate_click(at.center(), Modifiers::shift());
+        assert_eq!(picked(&view, cx), [10, 11, 12, 20, 21]);
+    }
+
+    #[gpui_kit::test]
+    fn a_pull_request_that_left_a_github_stack_shows_once(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        // 7 and 8 were read while GitHub listed 9 in their stack; 9 itself
+        // was read after it left.
+        let layer = |number: u64| PrSummary {
+            stack: Some(loupe_github::StackSummary {
+                number: 2,
+                open: [7, 8, 9]
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &number)| loupe_github::StackMember {
+                        position: at as u32 + 1,
+                        number,
+                        title: format!("Layer {number}"),
+                    })
+                    .collect(),
+            }),
+            ..pr("a", number)
+        };
+        let inbox = Inbox {
+            review_requested: page(vec![layer(7), layer(8), pr("a", 9)], 3, false),
+            authored: page(Vec::new(), 0, false),
+            involved: page(Vec::new(), 0, false),
+        };
+        load(&view, inbox, cx);
+        assert_eq!(numbers(&view, cx), [vec![7, 8, 9]]);
+        let lines = view.read_with(cx, |view, _| {
+            let inbox = view.inbox.value().expect("loaded");
+            view.groups(inbox)[0]
+                .lines
+                .iter()
+                .map(|line| line.rows().iter().map(|row| row.pr.number).collect())
+                .collect::<Vec<Vec<u64>>>()
+        });
+        assert_eq!(lines, [vec![7, 8], vec![9]]);
+    }
 }

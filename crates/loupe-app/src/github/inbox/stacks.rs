@@ -364,6 +364,11 @@ mod tests {
             pr(13, "b", "d"),
         ];
         assert_eq!(chains(&forked), vec![vec![11, 13]]);
+        // Counts read before the second pull request opened on `a` still
+        // say one: the loaded pull requests end the chain all the same.
+        let mut stale = counted(&forked);
+        stale.insert((RepoRef::new("acme", "web"), "a".into()), 1);
+        assert_eq!(chains_with(&forked, &stale), vec![vec![11, 13]]);
         // A fork's head named like a branch of the repository is not it.
         let mut fork = pr(20, "main", "x");
         fork.cross_repository = true;
