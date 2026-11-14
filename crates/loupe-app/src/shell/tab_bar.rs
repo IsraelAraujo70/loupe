@@ -19,9 +19,14 @@
 //! right-click menu renames, recolors, or ungroups it. A tab joins a group
 //! from its own right-click menu, or when it is dropped on the group's name
 //! or on one of its tabs; dropped on a tab outside every group, it leaves.
+//!
+//! Pinned tabs ("Pin tab" in a tab's right-click menu) come first, narrower,
+//! with their icon and a short name and no close button; the whole name is
+//! their tooltip. They are never in a group: adding one to a group unpins it.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -49,6 +54,8 @@ const TAB_MAX_WIDTH: f32 = 220.;
 /// Tabs shrink to this width and no further, so a title keeps about ten
 /// characters; past it the row scrolls.
 const TAB_MIN_WIDTH: f32 = 128.;
+/// A pinned tab is as wide as its icon and name, up to this.
+const PINNED_TAB_MAX_WIDTH: f32 = 96.;
 /// A pane's own row of tabs, once the window is split.
 const STRIP_HEIGHT: f32 = 36.;
 
@@ -328,6 +335,7 @@ fn tabs(
             let label: SharedString = route.label().into();
             let icon = route_icon(route);
             let selected = index == active;
+            let pinned = tab.pinned;
             let id = tab.id;
             let group = SharedString::from(format!("tab-{id}"));
             // A tab dropped here takes this one's place: from the left in
@@ -374,20 +382,32 @@ fn tabs(
                 .debug_selector(|| format!("tab-{id}"))
                 .group(group.clone())
                 .role(Role::Tab)
-                .aria_label(label.clone())
+                .aria_label(if pinned {
+                    format!("{label}, pinned").into()
+                } else {
+                    label.clone()
+                })
                 .aria_selected(selected)
                 .relative()
                 .h(px(28.))
-                .min_w(dp(TAB_MIN_WIDTH))
-                .max_w(dp(TAB_MAX_WIDTH))
-                .flex_shrink(1.)
+                .when(pinned, |tab| {
+                    let label = label.clone();
+                    tab.flex_none()
+                        .max_w(dp(PINNED_TAB_MAX_WIDTH))
+                        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                })
+                .when(!pinned, |tab| {
+                    tab.min_w(dp(TAB_MIN_WIDTH))
+                        .max_w(dp(TAB_MAX_WIDTH))
+                        .flex_shrink(1.)
+                })
                 // 12 px on both sides of every tab, so the space between two
                 // labels is the same whatever their length. The open tab
                 // makes room for its close button; the others show theirs
-                // over the label's end on hover.
+                // over the label's end on hover. A pinned tab has none.
                 .pl_3()
-                .when(selected, |tab| tab.pr_1())
-                .when(!selected, |tab| tab.pr_3())
+                .when(selected && !pinned, |tab| tab.pr_1())
+                .when(!selected || pinned, |tab| tab.pr_3())
                 .gap_1p5()
                 .items_center()
                 .rounded(radius)
@@ -423,33 +443,35 @@ fn tabs(
                     },
                 ))
                 .child(div().flex_1().min_w_0().truncate().child(label.clone()))
-                .child(
-                    div()
-                        .flex_none()
-                        .when(!selected, |slot| {
-                            slot.absolute()
-                                .right_1()
-                                .top_1()
-                                .rounded(radius)
-                                .bg(tokens::surface())
-                                .invisible()
-                                .group_hover(group.clone(), |style| style.visible())
-                        })
-                        .child(
-                            ui::icon_button(
-                                ("close-tab", id),
-                                IconName::Close,
-                                format!("Close {label}"),
-                            )
-                            .xsmall()
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.close_tab_id(id, window, cx);
-                                },
-                            )),
-                        ),
-                )
+                .when(!pinned, |tab| {
+                    tab.child(
+                        div()
+                            .flex_none()
+                            .when(!selected, |slot| {
+                                slot.absolute()
+                                    .right_1()
+                                    .top_1()
+                                    .rounded(radius)
+                                    .bg(tokens::surface())
+                                    .invisible()
+                                    .group_hover(group.clone(), |style| style.visible())
+                            })
+                            .child(
+                                ui::icon_button(
+                                    ("close-tab", id),
+                                    IconName::Close,
+                                    format!("Close {label}"),
+                                )
+                                .xsmall()
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.close_tab_id(id, window, cx);
+                                    },
+                                )),
+                            ),
+                    )
+                })
                 .children(landing_line)
                 .children(line_color.map(|color| {
                     div()
@@ -510,11 +532,34 @@ fn tabs(
                             );
                         })
                     };
+                    let pin = {
+                        let workspace = workspace.clone();
+                        let label = if pinned { "Unpin tab" } else { "Pin tab" };
+                        PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            workspace
+                                .update(cx, |this, cx| {
+                                    this.edit_tab(
+                                        id,
+                                        |tabs, index| {
+                                            if pinned {
+                                                tabs.unpin(index)
+                                            } else {
+                                                tabs.pin(index)
+                                            }
+                                        },
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        })
+                    };
                     let menu = menu
                         .item(item("Split right", Zone::Right))
                         .item(item("Split left", Zone::Left))
                         .item(item("Split up", Zone::Up))
                         .item(item("Split down", Zone::Down))
+                        .separator()
+                        .item(pin)
                         .separator()
                         .item(new_group);
                     let menu = if other_groups.is_empty() {
