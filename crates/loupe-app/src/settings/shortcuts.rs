@@ -54,6 +54,12 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut("Lists", "Next row", || Box::new(SelectNext)),
     shortcut("Lists", "Previous row", || Box::new(SelectPrevious)),
     shortcut("Lists", "Open the row", || Box::new(OpenSelected)),
+    shortcut("Lists", "Select every pull request in the section", || {
+        Box::new(crate::github::SelectSectionRows)
+    }),
+    shortcut("Lists", "Clear the selection", || {
+        Box::new(crate::github::ClearReviewsSelection)
+    }),
     shortcut("Lists", "Filter Reviews", || {
         Box::new(crate::github::OpenReviewsFilter)
     }),

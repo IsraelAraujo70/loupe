@@ -5,6 +5,7 @@
 
 mod dialogs;
 mod filter_menu;
+mod selection;
 mod views_store;
 
 use std::collections::HashMap;
@@ -14,19 +15,24 @@ use chrono::Utc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::reviews::{self, Clause, Op, Sort, SortDir, SortKey, ViewsFile};
-use loupe_github::{Inbox, Page, PrRef, PrSummary};
+use loupe_github::{
+    Inbox, Notification as GitHubNotification, NotificationSubject, Page, PrRef, PrSummary,
+};
 
 use self::filter_menu::{FilterMenu, FilterOptions};
+use self::selection::{CONFIRM_ABOVE, Selection};
 use super::common::{self, Loadable};
-use super::pr_row::{AgeFrom, OnSort, pr_row};
+use super::pr_row::{AgeFrom, OnSelect, OnSort, RowSelect, SelectGesture, pr_row, select_box};
 use crate::route::Route;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::theme::scale;
@@ -37,7 +43,12 @@ gpui_kit::actions!(
     github,
     [
         /// F on the Reviews screen: open "Add Filter…".
-        OpenReviewsFilter
+        OpenReviewsFilter,
+        /// Cmd+A on the Reviews screen: pick every row of the section with
+        /// the keyboard cursor or the last click.
+        SelectSectionRows,
+        /// Escape on the Reviews screen: drop the selection.
+        ClearReviewsSelection
     ]
 );
 
@@ -232,8 +243,31 @@ pub struct InboxView {
     /// The search in flight for each query, so leaving a view does not
     /// cancel it.
     all_open_loads: HashMap<String, Task<()>>,
+    /// The pull requests picked with the checkboxes.
+    selection: Selection,
+    /// Set while the selection bar asks before opening more than
+    /// [`CONFIRM_ABOVE`] pull requests.
+    confirm: Option<Bulk>,
+    /// "Mark as read" in flight.
+    marking: Option<Task<()>>,
+    /// Whether the last frame showed the selection bar.
+    bar_shown: bool,
+    /// What the last "Mark as read" did, or why it failed (`true`).
+    mark_note: Option<(SharedString, bool)>,
     _load: Option<Task<()>>,
     _checks: Subscription,
+}
+
+/// The unread notification threads about any pull request of `prs`.
+fn threads_of(notifications: &[GitHubNotification], prs: &[PrRef]) -> Vec<String> {
+    notifications
+        .iter()
+        .filter(|notification| notification.unread)
+        .filter(|notification| {
+            matches!(&notification.subject, NotificationSubject::PullRequest(pr) if prs.contains(pr))
+        })
+        .map(|notification| notification.id.clone())
+        .collect()
 }
 
 /// Where the keyboard cursor goes next among `rows`, the pull requests on
@@ -279,12 +313,26 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             cursor: None,
             all_open: HashMap::new(),
             all_open_loads: HashMap::new(),
+            selection: Selection::default(),
+            confirm: None,
+            marking: None,
+            bar_shown: false,
+            mark_note: None,
             _load: None,
             _checks: checks,
         };
         view.reload(cx);
         view
     })
+}
+
+/// Where the selection bar opens the picked pull requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bulk {
+    /// One background tab each, in Loupe.
+    Tabs,
+    /// One browser tab each, on GitHub.
+    Browser,
 }
 
 type Edit = Rc<dyn Fn(&mut Vec<Clause>)>;
@@ -491,7 +539,11 @@ impl InboxView {
     }
 
     fn edit_draft(&mut self, change: impl FnOnce(&mut Vec<Clause>), cx: &mut Context<Self>) {
+        let before = self.page.draft.clone();
         change(&mut self.page.draft);
+        if self.page.draft != before {
+            self.clear_selection(cx);
+        }
         self.load_all_open(false, cx);
         cx.notify();
     }
@@ -505,7 +557,11 @@ impl InboxView {
 
     fn switch_view(&mut self, id: Option<&str>, cx: &mut Context<Self>) {
         let views = views_store::snapshot(cx);
+        let before = self.page.draft.clone();
         self.page.switch(&views, id);
+        if self.page.draft != before {
+            self.clear_selection(cx);
+        }
         self.load_all_open(false, cx);
         cx.notify();
     }
@@ -583,6 +639,163 @@ impl InboxView {
                     .collect()
             })
             .collect()
+    }
+
+    /// The picked pull requests on screen, top to bottom, each once.
+    fn picked(&self) -> Vec<PrSummary> {
+        let Some(inbox) = self.inbox.value() else {
+            return Vec::new();
+        };
+        let sections = self.sections(inbox);
+        let rows: Vec<PrRef> = sections
+            .iter()
+            .flat_map(|(_, shown)| shown.items.iter().map(|summary| summary.pr.clone()))
+            .collect();
+        let summaries: Vec<&PrSummary> = sections
+            .iter()
+            .flat_map(|(_, shown)| shown.items.iter().copied())
+            .collect();
+        self.selection
+            .in_order(&rows)
+            .iter()
+            .filter_map(|pr| summaries.iter().find(|summary| summary.pr == *pr))
+            .map(|summary| (*summary).clone())
+            .collect()
+    }
+
+    /// A row's checkbox, or a Shift+click on it.
+    fn pick(&mut self, pr: &PrRef, gesture: SelectGesture, cx: &mut Context<Self>) {
+        match gesture {
+            SelectGesture::Toggle => self.selection.toggle(pr),
+            SelectGesture::Range => {
+                let rows: Vec<PrRef> = self.sections_shown().into_iter().flatten().collect();
+                self.selection.extend_to(&rows, pr);
+            }
+        }
+        self.selection_changed(cx);
+    }
+
+    fn on_select(&self, cx: &Context<Self>) -> OnSelect {
+        let view = cx.weak_entity();
+        Rc::new(move |pr, gesture, _, cx| {
+            view.update(cx, |this, cx| this.pick(pr, gesture, cx)).ok();
+        })
+    }
+
+    /// Picks every row of `rows`, one section's, or drops them all when
+    /// every one is already picked.
+    fn toggle_section(&mut self, rows: &[PrRef], cx: &mut Context<Self>) {
+        if !rows.is_empty() && rows.iter().all(|pr| self.selection.contains(pr)) {
+            self.selection.deselect_all(rows);
+        } else {
+            self.selection.select_all(rows);
+        }
+        self.selection_changed(cx);
+    }
+
+    /// Cmd+A: picks every row of the section with the keyboard cursor, or
+    /// else the last row clicked, or else the first section with rows.
+    fn select_section(&mut self, cx: &mut Context<Self>) {
+        let sections = self.sections_shown();
+        let holds =
+            |pr: Option<&PrRef>| pr.and_then(|pr| sections.iter().find(|rows| rows.contains(pr)));
+        let rows = holds(self.cursor.as_ref())
+            .or_else(|| holds(self.selection.anchor()))
+            .or_else(|| sections.iter().find(|rows| !rows.is_empty()));
+        if let Some(rows) = rows {
+            self.selection.select_all(rows);
+            self.selection_changed(cx);
+        }
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selection.clear();
+        self.selection_changed(cx);
+    }
+
+    /// A new selection drops a pending confirmation and the last note.
+    fn selection_changed(&mut self, cx: &mut Context<Self>) {
+        self.confirm = None;
+        self.mark_note = None;
+        cx.notify();
+    }
+
+    /// Opens every picked pull request, in list order, in a background tab
+    /// or in the browser. Above [`CONFIRM_ABOVE`] the bar asks first, unless
+    /// `confirmed`.
+    fn open_picked(
+        &mut self,
+        bulk: Bulk,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picked = self.picked();
+        if picked.len() > CONFIRM_ABOVE && !confirmed {
+            self.confirm = Some(bulk);
+            cx.notify();
+            return;
+        }
+        self.confirm = None;
+        for summary in picked {
+            match bulk {
+                Bulk::Tabs => {
+                    crate::shell::open_in_new_tab(Route::PullRequest(summary.pr), window, cx)
+                }
+                Bulk::Browser => cx.open_url(&summary.url),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Copies the picked pull requests' links, one per line, in list order.
+    fn copy_picked_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let links: Vec<String> = self
+            .picked()
+            .into_iter()
+            .map(|summary| summary.url)
+            .collect();
+        let note = match links.len() {
+            1 => "Copied 1 link".to_owned(),
+            count => format!("Copied {count} links"),
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(links.join("\n")));
+        window.push_notification(Notification::success(note), cx);
+    }
+
+    /// Marks the unread GitHub notifications of the picked pull requests as
+    /// read, and says in the bar how many there were.
+    fn mark_picked_read(&mut self, cx: &mut Context<Self>) {
+        let picked: Vec<PrRef> = self
+            .picked()
+            .into_iter()
+            .map(|summary| summary.pr)
+            .collect();
+        if picked.is_empty() {
+            return;
+        }
+        self.mark_note = None;
+        self.marking = Some(common::run(
+            cx,
+            move |gh| {
+                let ids = threads_of(&gh.notifications(false)?, &picked);
+                super::notifications::mark_threads_read(gh, &ids)?;
+                Ok(ids.len())
+            },
+            |view: &mut InboxView, result, _| {
+                view.marking = None;
+                view.mark_note = Some(match result {
+                    Ok(0) => ("No unread notifications for these".into(), false),
+                    Ok(1) => ("Marked 1 notification as read".into(), false),
+                    Ok(count) => (
+                        format!("Marked {count} notifications as read").into(),
+                        false,
+                    ),
+                    Err(error) => (error.message().into(), true),
+                });
+            },
+        ));
+        cx.notify();
     }
 
     /// Moves the keyboard cursor one row and scrolls it into view.
@@ -939,6 +1152,120 @@ impl InboxView {
             .into_any_element()
     }
 
+    /// The bar over the list while pull requests are picked: how many, and
+    /// what to do with them. Opening more than [`CONFIRM_ABOVE`] asks here
+    /// first.
+    fn selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let count = self.picked().len();
+        if count == 0 {
+            return None;
+        }
+        let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
+        let action = |id: &'static str, icon: IconName, label: &'static str| {
+            Button::new(id)
+                .debug_selector(move || id.into())
+                .outline()
+                .small()
+                .icon(icon)
+                .label(label)
+        };
+        let controls = h_flex().gap_2().items_center();
+        let controls = match self.confirm {
+            Some(bulk) => {
+                let question = match bulk {
+                    Bulk::Tabs => format!("Open {count} pull requests in new tabs?"),
+                    Bulk::Browser => format!("Open {count} pull requests on GitHub?"),
+                };
+                controls
+                    .child(div().text_sm().text_color(muted).child(question))
+                    .child(
+                        Button::new("reviews-selection-cancel")
+                            .ghost()
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("reviews-selection-confirm")
+                            .debug_selector(|| "reviews-selection-confirm".into())
+                            .primary()
+                            .small()
+                            .label(format!("Open {count}"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_picked(bulk, true, window, cx)
+                            })),
+                    )
+            }
+            None => controls
+                .child(
+                    action(
+                        "reviews-selection-tabs",
+                        IconName::AppWindow,
+                        "Open in new tabs",
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_picked(Bulk::Tabs, false, window, cx)
+                    })),
+                )
+                .child(
+                    action(
+                        "reviews-selection-github",
+                        IconName::Github,
+                        "Open on GitHub",
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_picked(Bulk::Browser, false, window, cx)
+                    })),
+                )
+                .child(
+                    action("reviews-selection-copy", IconName::Link, "Copy links").on_click(
+                        cx.listener(|this, _, window, cx| this.copy_picked_links(window, cx)),
+                    ),
+                )
+                .child(
+                    action("reviews-selection-read", IconName::Check, "Mark as read")
+                        .tooltip("Mark their GitHub notifications as read")
+                        .loading(self.marking.is_some())
+                        .disabled(self.marking.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.mark_picked_read(cx))),
+                ),
+        };
+        let note = self.mark_note.clone().map(|(text, failed)| {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(scale::meta())
+                .text_color(if failed { danger } else { muted })
+                .child(text)
+        });
+        Some(
+            ui::toolbar()
+                .debug_selector(|| "reviews-selection-bar".into())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_sm()
+                        .mr_1()
+                        .child(format!("{count} selected")),
+                )
+                .child(controls)
+                .child(div().flex_1())
+                .children(note)
+                .child(
+                    ui::icon_button(
+                        "reviews-selection-clear",
+                        IconName::Close,
+                        "Clear selection (Esc)",
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let text = self.notice.clone()?;
         Some(
@@ -968,9 +1295,16 @@ impl InboxView {
         section: Section,
         shown: Shown<'_>,
         on_sort: OnSort,
-        cx: &App,
+        on_select: OnSelect,
+        showing: bool,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        let rows: Vec<PrRef> = shown
+            .items
+            .iter()
+            .map(|summary| summary.pr.clone())
+            .collect();
         let age_from = AgeFrom::for_sort(self.page.sort);
         let (empty_icon, empty_text) = if self.page.draft.is_empty() {
             section.empty()
@@ -988,10 +1322,31 @@ impl InboxView {
                 true,
                 section.shows_author(),
                 self.cursor.as_ref() == Some(&summary.pr),
+                Some(RowSelect {
+                    checked: self.selection.contains(&summary.pr),
+                    showing,
+                    on_select: on_select.clone(),
+                }),
                 age_from,
                 cx,
             )
         }));
+        // The heading's box picks or drops the whole section.
+        let all_picked = !rows.is_empty() && rows.iter().all(|pr| self.selection.contains(pr));
+        let lead = (!rows.is_empty()).then(|| {
+            let view = cx.weak_entity();
+            select_box(
+                SharedString::from(format!("reviews-select-section-{}", section.title())),
+                SECTION_GROUP,
+                all_picked,
+                showing,
+                format!("Select every pull request in {}", section.title()),
+                move |_, cx| {
+                    view.update(cx, |this, cx| this.toggle_section(&rows, cx))
+                        .ok();
+                },
+            )
+        });
         let heading = h_flex()
             .gap_2()
             .items_center()
@@ -1007,11 +1362,12 @@ impl InboxView {
             // ids, and a click must reach the one under the pointer.
             .id(SharedString::from(section.title()))
             .w_full()
-            .child(section_heading(section, heading, cx))
+            .child(section_heading(section, lead, heading, cx))
             // Each section heads its own columns: the viewer's own pull
             // requests have no author lane.
             .when(!shown.items.is_empty(), |column| {
                 column.child(super::pr_row::column_header(
+                    true,
                     true,
                     section.shows_author(),
                     self.page.sort,
@@ -1037,7 +1393,7 @@ impl InboxView {
         Some(
             v_flex()
                 .w_full()
-                .child(section_heading(Section::AllOpen, div(), cx))
+                .child(section_heading(Section::AllOpen, None, div(), cx))
                 .child(body)
                 .into_any_element(),
         )
@@ -1056,6 +1412,17 @@ impl Render for InboxView {
         if crate::shell::page_may_take_focus(window, cx) {
             self.focus.focus(window, cx);
         }
+        let selection_bar = self.selection_bar(cx);
+        if selection_bar.is_some() != self.bar_shown {
+            // The bar pushes the list down by its height; scrolling as far
+            // keeps every row under the pointer, so the next click lands on
+            // the row it aimed at. A list too short to scroll moves once.
+            self.bar_shown = selection_bar.is_some();
+            let height = scale::toolbar_height().to_pixels(window.rem_size());
+            let mut offset = self.scroll.offset();
+            offset.y = (offset.y + if self.bar_shown { -height } else { height }).min(px(0.));
+            self.scroll.set_offset(offset);
+        }
         let body = match &self.inbox {
             Loadable::Failed(error) => {
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
@@ -1065,12 +1432,26 @@ impl Render for InboxView {
             Loadable::Loading => self.loading().into_any_element(),
             Loadable::Loaded(inbox) | Loadable::Refreshing(inbox) => {
                 let on_sort = self.on_sort(cx);
-                let sections: Vec<AnyElement> = self
-                    .sections(inbox)
+                let on_select = self.on_select(cx);
+                let sections = self.sections(inbox);
+                let showing = sections.iter().any(|(_, shown)| {
+                    shown
+                        .items
+                        .iter()
+                        .any(|summary| self.selection.contains(&summary.pr))
+                });
+                let sections: Vec<AnyElement> = sections
                     .into_iter()
                     .map(|(section, shown)| {
-                        self.section(section, shown, on_sort.clone(), cx)
-                            .into_any_element()
+                        self.section(
+                            section,
+                            shown,
+                            on_sort.clone(),
+                            on_select.clone(),
+                            showing,
+                            cx,
+                        )
+                        .into_any_element()
                     })
                     .collect();
                 v_flex()
@@ -1096,9 +1477,18 @@ impl Render for InboxView {
             .on_action(
                 cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &SelectSectionRows, _, cx| this.select_section(cx)))
+            .on_action(cx.listener(|this, _: &ClearReviewsSelection, _, cx| {
+                if this.selection == Selection::default() {
+                    cx.propagate();
+                } else {
+                    this.clear_selection(cx);
+                }
+            }))
             .child(self.header(cx))
             .children(self.filter_bar(cx))
             .children(self.notice(cx))
+            .children(selection_bar)
             .child(
                 div()
                     .id("inbox")
@@ -1113,16 +1503,32 @@ impl Render for InboxView {
     }
 }
 
-/// A section's 32 px heading on the rows' own grid: its icon over the state
-/// icons, its title over the numbers, then `detail` (count, note). The rows
-/// need no box around them.
-fn section_heading(section: Section, detail: impl IntoElement, cx: &App) -> impl IntoElement {
+/// The hover group of a section heading, which shows its checkbox.
+const SECTION_GROUP: &str = "reviews-section-heading";
+
+/// A section's 32 px heading on the rows' own grid: `lead` (the box that
+/// picks the section) over the rows' checkboxes, or an empty lane of their
+/// width, its icon over the state icons, its title over the numbers, then
+/// `detail` (count, note). The rows need no box around them.
+fn section_heading(
+    section: Section,
+    lead: Option<Div>,
+    detail: impl IntoElement,
+    cx: &App,
+) -> impl IntoElement {
     let muted = cx.theme().muted_foreground;
     h_flex()
+        .group(SECTION_GROUP)
         .h_8()
         .px_2()
         .gap_2()
         .items_center()
+        // 12 px after the lane, as in a row; the icon's own 8 px gap
+        // follows.
+        .child(
+            lead.unwrap_or_else(|| div().flex_none().w(scale::dp(16.)))
+                .mr_1(),
+        )
         .child(
             svg()
                 .path(section.icon().path())
@@ -1385,6 +1791,182 @@ mod tests {
         view.update(cx, |view, cx| view.switch_view(id.as_deref(), cx));
         assert_eq!(view.read_with(cx, |view, _| view.page.sort), smallest);
         assert_eq!(numbers(&view, cx), [vec![2, 1, 3], vec![], vec![5, 4]]);
+    }
+
+    /// The picked pull requests, in the order the bar acts on them.
+    fn picked(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> Vec<u64> {
+        view.read_with(cx, |view, _| {
+            view.picked()
+                .iter()
+                .map(|summary| summary.pr.number)
+                .collect()
+        })
+    }
+
+    #[gpui_kit::test]
+    fn checkboxes_pick_rows_in_the_sorted_order_and_a_filter_clears_them(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
+        let inbox = Inbox {
+            review_requested: page(
+                vec![sized("a", 1, 50), sized("a", 2, 5), sized("a", 3, 500)],
+                3,
+                false,
+            ),
+            authored: page(Vec::new(), 0, false),
+            involved: page(vec![sized("b", 4, 900), sized("b", 5, 1)], 2, false),
+        };
+        view.update(cx, |view, cx| {
+            view.inbox = Loadable::Loaded(inbox);
+            cx.notify();
+        });
+        assert_eq!(bounds(cx, "reviews-selection-bar"), None, "no bar yet");
+
+        // Sorted smallest first, a Shift+click picks the rows between on
+        // screen (2, 1, 3), not between in GitHub's order (2, 3).
+        click(cx, "reviews-sort-changes");
+        assert_eq!(numbers(&view, cx), [vec![2, 1, 3], vec![], vec![5, 4]]);
+        click(cx, "pr-select-PR_2");
+        let row = bounds(cx, "pr-row-PR_3").expect("row 3");
+        cx.simulate_click(row.center(), Modifiers::shift());
+        assert_eq!(picked(&view, cx), [2, 1, 3]);
+        assert!(
+            bounds(cx, "reviews-selection-bar").is_some(),
+            "the bar shows the selection"
+        );
+
+        // Cmd+A picks the section of the last click: Involved, after 5.
+        click(cx, "pr-select-PR_5");
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(picked(&view, cx), [2, 1, 3, 5, 4]);
+        click(cx, "pr-select-PR_1");
+        assert_eq!(picked(&view, cx), [2, 3, 5, 4]);
+
+        // A new sort keeps the selection and reorders what the bar opens.
+        click(cx, "reviews-sort-changes");
+        assert_eq!(picked(&view, cx), [3, 2, 4, 5]);
+
+        // The heading's box drops a section that is all picked.
+        click(cx, "reviews-select-section-Involved");
+        assert_eq!(picked(&view, cx), [3, 2]);
+        click(cx, "reviews-select-section-Involved");
+        assert_eq!(picked(&view, cx), [3, 2, 4, 5]);
+
+        // Escape drops it all.
+        cx.simulate_keystrokes("escape");
+        assert!(picked(&view, cx).is_empty());
+        assert_eq!(bounds(cx, "reviews-selection-bar"), None);
+
+        // Changing the filters clears the selection; a sort does not.
+        click(cx, "pr-select-PR_4");
+        view.update(cx, |view, cx| {
+            view.edit_draft(|draft| *draft = org("b"), cx)
+        });
+        assert!(picked(&view, cx).is_empty(), "a filter clears it");
+        click(cx, "pr-select-PR_4");
+        view.update(cx, |view, cx| {
+            view.save_as_new("B", cx);
+            view.switch_view(None, cx);
+        });
+        assert!(picked(&view, cx).is_empty(), "another view clears it");
+    }
+
+    #[gpui_kit::test]
+    fn the_bar_leaves_the_rows_under_the_pointer(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        view.update(cx, |view, cx| {
+            view.inbox = Loadable::Loaded(Inbox {
+                review_requested: page((1..=40).map(|n| pr("a", n)).collect(), 40, false),
+                authored: page(Vec::new(), 0, false),
+                involved: page(Vec::new(), 0, false),
+            });
+            cx.notify();
+        });
+        let row = bounds(cx, "pr-row-PR_2").expect("row 2");
+        click(cx, "pr-select-PR_1");
+        assert!(bounds(cx, "reviews-selection-bar").is_some());
+        assert_eq!(bounds(cx, "pr-row-PR_2"), Some(row), "the bar moved no row");
+        click(cx, "pr-select-PR_2");
+        assert_eq!(picked(&view, cx), [1, 2], "the second click hit row 2");
+        view.update(cx, |view, cx| view.clear_selection(cx));
+        assert_eq!(bounds(cx, "reviews-selection-bar"), None);
+        assert_eq!(bounds(cx, "pr-row-PR_2"), Some(row), "nor did its leaving");
+    }
+
+    #[gpui_kit::test]
+    fn opening_more_than_ten_asks_first(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
+        let many = |count: u64| page((1..=count).map(|n| pr("a", n)).collect(), 0, false);
+        let load = |view: &Entity<InboxView>, count: u64, cx: &mut VisualTestContext| {
+            view.update(cx, |view, cx| {
+                view.inbox = Loadable::Loaded(Inbox {
+                    review_requested: many(count),
+                    authored: page(Vec::new(), 0, false),
+                    involved: page(Vec::new(), 0, false),
+                });
+                view.selection = super::Selection::default();
+                cx.notify();
+            });
+            cx.simulate_keystrokes("cmd-a");
+            assert_eq!(picked(view, cx).len(), count as usize);
+        };
+        let confirm = |view: &Entity<InboxView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.confirm)
+        };
+
+        // Ten open at once.
+        load(&view, 10, cx);
+        click(cx, "reviews-selection-tabs");
+        assert_eq!(confirm(&view, cx), None);
+        click(cx, "reviews-selection-github");
+        assert_eq!(confirm(&view, cx), None);
+
+        // Eleven ask in the bar, for tabs and for the browser alike.
+        load(&view, 11, cx);
+        click(cx, "reviews-selection-tabs");
+        assert_eq!(confirm(&view, cx), Some(super::Bulk::Tabs));
+        assert!(bounds(cx, "reviews-selection-tabs").is_none());
+        click(cx, "reviews-selection-confirm");
+        assert_eq!(confirm(&view, cx), None, "confirmed and opened");
+        click(cx, "reviews-selection-github");
+        assert_eq!(confirm(&view, cx), Some(super::Bulk::Browser));
+    }
+
+    #[test]
+    fn mark_as_read_takes_only_unread_threads_of_the_picked_pull_requests() {
+        use loupe_github::{Notification, NotificationSubject};
+        let pr_ref = |number| PrRef::new(RepoRef::new("a", "repo"), number);
+        let thread = |id: &str, subject, unread| Notification {
+            id: id.into(),
+            repo: RepoRef::new("a", "repo"),
+            title: String::new(),
+            subject,
+            reason: "mention".into(),
+            unread,
+            updated_at: Utc::now(),
+        };
+        let notifications = vec![
+            thread("1", NotificationSubject::PullRequest(pr_ref(1)), true),
+            thread("2", NotificationSubject::PullRequest(pr_ref(1)), false),
+            thread("3", NotificationSubject::PullRequest(pr_ref(2)), true),
+            thread(
+                "4",
+                NotificationSubject::Issue {
+                    repo: RepoRef::new("a", "repo"),
+                    number: 1,
+                },
+                true,
+            ),
+        ];
+        assert_eq!(super::threads_of(&notifications, &[pr_ref(1)]), ["1"]);
+        assert_eq!(
+            super::threads_of(&notifications, &[pr_ref(1), pr_ref(2)]),
+            ["1", "3"]
+        );
     }
 
     #[test]
