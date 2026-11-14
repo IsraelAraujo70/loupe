@@ -283,6 +283,8 @@ mod tests {
             assignees: Vec::new(),
             reviewers: Vec::new(),
             mergeable: Mergeable::Unknown,
+            review_requests: Vec::new(),
+            reviewed_by: Vec::new(),
         }
     }
 

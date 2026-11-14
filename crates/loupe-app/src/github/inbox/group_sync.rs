@@ -13,7 +13,7 @@ use gpui_kit::{AnyWindowHandle, App, AppContext as _, Global, Task, Window};
 use loupe_github::reviews::{self, ReviewTab, SavedView};
 use loupe_github::{Inbox, Page, PrSummary};
 
-use super::{view_rows, views_store};
+use super::{uses_all_open, view_rows, views_store};
 use crate::services::{self, Services};
 use crate::shell::{self, SyncedGroup};
 
@@ -58,7 +58,7 @@ pub fn now(inbox: Option<Inbox>, cx: &mut App) {
 /// The "All open" search a group on `tab` of `view` needs, if any; it
 /// mirrors what the Reviews page shows for the view.
 fn all_open_query(view: &SavedView, tab: ReviewTab) -> Option<String> {
-    (tab == ReviewTab::All && view.all_open.unwrap_or(true))
+    (uses_all_open(tab) && view.all_open.unwrap_or(true))
         .then(|| reviews::all_open_query(&view.filters))
         .flatten()
 }

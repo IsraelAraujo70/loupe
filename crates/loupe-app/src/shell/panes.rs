@@ -1269,7 +1269,7 @@ mod tests {
     fn kept(seen: &[u64]) -> ViewSync {
         ViewSync {
             view: "ready".into(),
-            tab: ReviewTab::ToReview,
+            tab: ReviewTab::NeedsReview,
             seen: seen.iter().copied().map(number).collect(),
         }
     }

@@ -42,6 +42,13 @@ fn inbox_returns_three_pages() {
 
 #[test]
 #[ignore = "needs GITHUB_TOKEN and network"]
+fn inbox_names_the_viewer() {
+    let inbox = client().inbox().expect("inbox");
+    assert!(!inbox.viewer_login.is_empty());
+}
+
+#[test]
+#[ignore = "needs GITHUB_TOKEN and network"]
 fn search_pages_through_merged_pull_requests() {
     let gh = client();
     let first = gh
@@ -128,6 +135,21 @@ fn all_open_reads_every_page_of_a_search() {
     assert!(page.total_count > 100, "the two keep several pages open");
     assert_eq!(page.items.len(), (page.total_count as usize).min(500));
     assert!(page.items.iter().all(|pr| pr.state == PrState::Open));
+    let requests = page
+        .items
+        .iter()
+        .map(|pr| pr.review_requests.len())
+        .sum::<usize>();
+    let reviewed = page
+        .items
+        .iter()
+        .map(|pr| pr.reviewed_by.len())
+        .sum::<usize>();
+    println!("review requests: {requests}, reviewed by people: {reviewed}");
+    assert!(
+        reviewed > 0,
+        "someone reviewed one of hundreds of open pull requests"
+    );
     let mut ids: Vec<&str> = page.items.iter().map(|pr| pr.id.as_str()).collect();
     ids.sort_unstable();
     ids.dedup();

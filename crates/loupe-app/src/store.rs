@@ -258,8 +258,13 @@ pub struct SavedTabGroup {
     pub collapsed: bool,
     pub first: usize,
     pub len: usize,
-    /// The saved Reviews view the group keeps in sync with, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The saved Reviews view the group keeps in sync with, if any. One this
+    /// build cannot read leaves a plain group.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "readable_or_none"
+    )]
     pub sync: Option<ViewSync>,
 }
 
@@ -290,6 +295,13 @@ pub struct ClosedTabGroup {
     pub tabs: Vec<crate::route::Route>,
     #[serde(default)]
     pub position: usize,
+}
+
+fn readable_or_none<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 fn color_or_grey<'de, D: serde::Deserializer<'de>>(
@@ -1197,6 +1209,24 @@ mod tests {
 
     fn scratch_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("loupe-store-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn a_group_s_sync_comes_back_and_one_unreadable_leaves_a_plain_group() {
+        let group = |sync: &str| {
+            let json =
+                format!(r#"{{"name":"Loupe","color":"Blue","first":0,"len":1,"sync":{sync}}}"#);
+            serde_json::from_str::<SavedTabGroup>(&json).expect("the group reads")
+        };
+        let read = group(
+            r#"{"view":"rv_1","tab":"all","seen":[{"repo":{"owner":"o","name":"r"},"number":3}]}"#,
+        );
+        let sync = read.sync.expect("the sync reads");
+        assert_eq!(sync.view, "rv_1");
+        assert_eq!(sync.seen.len(), 1);
+        let unknown = group(r#"{"view":"rv_1","tab":"someNewTab"}"#);
+        assert_eq!(unknown.name, "Loupe");
+        assert_eq!(unknown.sync, None);
     }
 
     #[test]
