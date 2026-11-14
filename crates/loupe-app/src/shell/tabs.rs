@@ -433,11 +433,7 @@ impl<V> Tabs<V> {
         if index >= self.tabs.len() {
             return None;
         }
-        let used: Vec<TabGroupColor> = self.groups.iter().map(|group| group.color).collect();
-        let color = TabGroupColor::ALL
-            .into_iter()
-            .find(|color| !used.contains(color))
-            .unwrap_or(TabGroupColor::ALL[self.groups.len() % TabGroupColor::ALL.len()]);
+        let color = self.free_color();
         let id = self.next_group;
         self.next_group += 1;
         self.groups.push(TabGroup {
@@ -447,6 +443,57 @@ impl<V> Tabs<V> {
             collapsed: false,
         });
         self.regroup(index, Some(id));
+        Some(id)
+    }
+
+    /// The color a new group of this pane takes: the first no other group
+    /// has.
+    pub fn free_color(&self) -> TabGroupColor {
+        let used: Vec<TabGroupColor> = self.groups.iter().map(|group| group.color).collect();
+        TabGroupColor::ALL
+            .into_iter()
+            .find(|color| !used.contains(color))
+            .unwrap_or(TabGroupColor::ALL[self.groups.len() % TabGroupColor::ALL.len()])
+    }
+
+    /// Opens `tab` after the last tab of group `group`, in it, and leaves
+    /// the open tab on screen. False, and `tab` is dropped, when the pane
+    /// has no such group.
+    pub fn append_to_group(&mut self, mut tab: Tab<V>, group: u64) -> bool {
+        if self.group(group).is_none() {
+            return false;
+        }
+        tab.pinned = false;
+        let active = self.active().id;
+        let at = self.end_of_group(group) + 1;
+        self.place(at, tab, Some(group));
+        self.active = self.index_of(active).unwrap_or(0);
+        self.tidy();
+        true
+    }
+
+    /// Opens `tab` in a new group named `name`, in `color` or else the
+    /// [free one](Self::free_color), right after the open tab (after its
+    /// group, when it is in one; after the pinned tabs, when it is pinned),
+    /// and leaves the open tab on screen. Returns the new group's id.
+    pub fn open_in_new_group(
+        &mut self,
+        mut tab: Tab<V>,
+        name: &str,
+        color: Option<TabGroupColor>,
+    ) -> Option<u64> {
+        tab.pinned = false;
+        let active = self.active().id;
+        let at = match self.active().group {
+            Some(group) => self.end_of_group(group),
+            None => self.active,
+        } + 1;
+        let at = self.place(at, tab, None);
+        self.active = self.index_of(active).unwrap_or(0);
+        let id = self.new_group(at, name)?;
+        if let Some(color) = color {
+            self.set_group_color(id, color);
+        }
         Some(id)
     }
 
