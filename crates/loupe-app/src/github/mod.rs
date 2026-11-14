@@ -22,6 +22,7 @@ use crate::shell::PaletteItem;
 
 pub use self::inbox::{
     ClearReviewsSelection, CloseStack, OpenReviewsFilter, OpenStack, SelectTabRows,
+    start_group_sync,
 };
 
 pub fn inbox_view(window: &mut Window, cx: &mut App) -> AnyView {

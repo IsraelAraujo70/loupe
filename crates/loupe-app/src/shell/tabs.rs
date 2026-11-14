@@ -12,7 +12,7 @@
 //! keeps a pinned tab among the pinned ones and any other tab after them.
 
 use crate::route::Route;
-use crate::store::{ClosedTabGroup, SavedTabGroup, TabGroupColor};
+use crate::store::{ClosedTabGroup, SavedTabGroup, TabGroupColor, ViewSync};
 
 /// A named, colored group of tabs in one pane.
 #[derive(Clone, Debug, PartialEq)]
@@ -21,6 +21,8 @@ pub(super) struct TabGroup {
     pub name: String,
     pub color: TabGroupColor,
     pub collapsed: bool,
+    /// The saved Reviews view the group keeps in sync with.
+    pub sync: Option<ViewSync>,
 }
 
 pub(super) struct Page<V> {
@@ -391,6 +393,7 @@ impl<V> Tabs<V> {
             name: name.to_owned(),
             color,
             collapsed: false,
+            sync: None,
         });
         self.regroup(index, Some(id));
         Some(id)
@@ -630,6 +633,7 @@ impl<V> Tabs<V> {
             name: name.to_owned(),
             color,
             collapsed: false,
+            sync: None,
         });
         for tab in &mut tabs {
             tab.group = Some(id);
@@ -639,6 +643,17 @@ impl<V> Tabs<V> {
         self.active = at;
         self.tidy();
         Some(id)
+    }
+
+    /// Keeps group `id` in sync with a saved view, or stops (`None`).
+    pub fn set_group_sync(&mut self, id: u64, sync: Option<ViewSync>) -> bool {
+        match self.groups.iter_mut().find(|group| group.id == id) {
+            Some(group) if group.sync != sync => {
+                group.sync = sync;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn rename_group(&mut self, id: u64, name: &str) -> bool {
@@ -722,6 +737,7 @@ impl<V> Tabs<V> {
                 name: group.name.clone(),
                 color: group.color,
                 collapsed: group.collapsed,
+                sync: group.sync.clone(),
             });
             for tab in &mut self.tabs[range] {
                 tab.group = Some(id);
@@ -746,6 +762,7 @@ impl<V> Tabs<V> {
                     collapsed: group.collapsed,
                     first,
                     len: self.group_len(group.id),
+                    sync: group.sync.clone(),
                 })
             })
             .collect();
@@ -1271,6 +1288,7 @@ mod tests {
             collapsed: false,
             first: 0,
             len: 2,
+            sync: None,
         }]);
         assert!(
             tabs.groups().is_empty(),
@@ -1458,6 +1476,7 @@ mod tests {
                     collapsed: false,
                     first: 1,
                     len: 2,
+                    sync: None,
                 },
                 SavedTabGroup {
                     name: "Later".into(),
@@ -1465,6 +1484,7 @@ mod tests {
                     collapsed: true,
                     first: 4,
                     len: 1,
+                    sync: None,
                 },
             ]
         );

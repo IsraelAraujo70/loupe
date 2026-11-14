@@ -274,11 +274,83 @@ pub enum GroupTarget {
     /// A group that exists.
     Existing(GroupRef),
     /// A new group of the active pane named `name`, in `color`, or else in
-    /// the first color no other group of the pane has.
+    /// the first color no other group of the pane has; kept in sync with a
+    /// saved view when `sync` says so.
     New {
         name: String,
         color: Option<store::TabGroupColor>,
+        sync: Option<store::ViewSync>,
     },
+}
+
+/// A tab group kept in sync with a saved Reviews view, as
+/// [`synced_groups`] lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncedGroup {
+    pub group: GroupRef,
+    pub sync: store::ViewSync,
+}
+
+/// Every tab group, in every pane, kept in sync with a saved view.
+pub fn synced_groups(cx: &App) -> Vec<SyncedGroup> {
+    let Some(workspace) = cx
+        .try_global::<WorkspaceHandle>()
+        .and_then(|handle| handle.0.upgrade())
+    else {
+        return Vec::new();
+    };
+    workspace
+        .read(cx)
+        .panes
+        .panes()
+        .into_iter()
+        .flat_map(|pane| {
+            pane.tabs.groups().iter().filter_map(|group| {
+                Some(SyncedGroup {
+                    group: GroupRef {
+                        pane: pane.id,
+                        group: group.id,
+                    },
+                    sync: group.sync.clone()?,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Brings `group` in line with `list`, what its saved view lists now;
+/// `complete` is false when GitHub returned only part of it
+/// ([`panes::Panes::sync_group`]).
+pub fn sync_group(
+    group: GroupRef,
+    list: Vec<loupe_github::PrRef>,
+    complete: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    with_workspace(cx, |workspace, cx| {
+        let changed = workspace
+            .panes
+            .sync_group(group, &list, complete, |route| Page {
+                view: router::build(route, window, cx),
+                route: route.clone(),
+            });
+        if changed {
+            workspace.save_tabs(cx);
+            cx.notify();
+        }
+    });
+}
+
+/// Makes `group` a plain group, no longer kept in sync with its view.
+pub fn stop_syncing(group: GroupRef, cx: &mut App) {
+    with_workspace(cx, |workspace, cx| {
+        workspace.edit_tabs(
+            group.pane,
+            |tabs| tabs.set_group_sync(group.group, None),
+            cx,
+        )
+    });
 }
 
 /// A group of the active pane, for a menu outside the tab bar.
@@ -377,6 +449,7 @@ impl Workspace {
             router::build(route, window, cx)
         });
         let sidebar = cx.new(sidebar::SidebarData::new);
+        crate::github::start_group_sync(window, cx);
         let subscriptions = vec![
             // The focused element can leave the tree while its handle lives
             // on (a resolved thread's reply box, a sent composer, a closed
@@ -2056,6 +2129,7 @@ mod tests {
                     collapsed: false,
                     first: 2,
                     len: 1,
+                    sync: None,
                 }],
                 pinned: 0,
             },
@@ -2101,6 +2175,7 @@ mod tests {
                     collapsed: false,
                     first: 0,
                     len: 2,
+                    sync: None,
                 }],
                 pinned: 0,
             },

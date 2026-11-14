@@ -279,8 +279,14 @@ fn group_label(
     let name: SharedString = group.name.clone().into();
     let collapsed = group.collapsed;
     let color = group.color;
+    let synced = group.sync.is_some();
     let workspace = cx.entity().downgrade();
     let state = if collapsed { "collapsed" } else { "expanded" };
+    let kept = if synced {
+        ", kept in sync with its view"
+    } else {
+        ""
+    };
     let dragged = DraggedGroup {
         pane,
         group: id,
@@ -305,7 +311,7 @@ fn group_label(
             .id(("tab-group", id))
             .debug_selector(move || format!("tab-group-{pane}-{id}"))
             .role(Role::Button)
-            .aria_label(format!("{name} group, {state}"))
+            .aria_label(format!("{name} group{kept}, {state}"))
             .aria_expanded(!collapsed)
             .relative()
             .flex_none()
@@ -332,6 +338,15 @@ fn group_label(
                 this.drop_on_group(dragged, pane, id, cx)
             }));
     takes_groups(label, pane, first, true, cx)
+        .when(synced, |label| {
+            label.child(
+                svg()
+                    .path(IconName::RefreshCw.path())
+                    .flex_none()
+                    .size_3()
+                    .text_color(on_fill),
+            )
+        })
         .child(div().min_w_0().truncate().child(name.clone()))
         .when(collapsed, |label| {
             label.child(div().flex_none().opacity(0.8).child(hidden.to_string()))
@@ -377,6 +392,16 @@ fn group_label(
                         .ok();
                 })
             };
+            let stop_syncing = synced.then(|| {
+                let workspace = workspace.clone();
+                PopupMenuItem::new("Stop syncing").on_click(move |_, _, cx| {
+                    workspace
+                        .update(cx, |this, cx| {
+                            this.edit_tabs(pane, |tabs| tabs.set_group_sync(id, None), cx)
+                        })
+                        .ok();
+                })
+            });
             let workspace = workspace.clone();
             menu.item(rename)
                 .submenu("Color", window, cx, move |submenu, _, _| {
@@ -402,6 +427,7 @@ fn group_label(
                         })
                 })
                 .separator()
+                .when_some(stop_syncing, |menu, item| menu.item(item))
                 .item(ungroup)
                 .item(close)
         })
