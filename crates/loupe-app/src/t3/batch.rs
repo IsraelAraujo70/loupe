@@ -885,12 +885,14 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let sent: Arc<Mutex<Vec<ReviewLaunch>>> = Arc::default();
-        let fail_two = Arc::new(Mutex::new(true));
+        // The first pull request fails, so a launch that stopped at the
+        // first failure would never send the second.
+        let fail_first = Arc::new(Mutex::new(true));
         let launcher: Launcher = {
-            let (sent, fail_two) = (sent.clone(), fail_two.clone());
+            let (sent, fail_first) = (sent.clone(), fail_first.clone());
             Arc::new(move |launch: &ReviewLaunch| {
                 sent.lock().unwrap().push(launch.clone());
-                if launch.branch == "review/pr-2" && *fail_two.lock().unwrap() {
+                if launch.branch == "review/pr-1-2" && *fail_first.lock().unwrap() {
                     return Err(Error::Transport("connection reset".into()));
                 }
                 Ok(LaunchedReview {
@@ -924,23 +926,23 @@ mod tests {
         assert_eq!(
             launches(&form, &mut cx),
             [
-                Launch::Started(None),
                 Launch::Failed(
                     "T3 did not start the review: network error: connection reset".into()
                 ),
+                Launch::Started(None),
                 Launch::Idle,
             ]
         );
         let summary = cx.update(|_, cx| form.read(cx).counts().summary());
         assert_eq!(summary, "1 started · 1 failed · 1 skipped");
 
-        *fail_two.lock().unwrap() = false;
+        *fail_first.lock().unwrap() = false;
         form.update(&mut cx, |form, cx| form.send(cx));
         cx.run_until_parked();
         let all = sent.lock().unwrap().clone();
         assert_eq!(all.len(), 3, "a retry sends only the failed one");
         assert_eq!(
-            all[2].request_id, first[1].request_id,
+            all[2].request_id, first[0].request_id,
             "under the same request id"
         );
         assert_eq!(
