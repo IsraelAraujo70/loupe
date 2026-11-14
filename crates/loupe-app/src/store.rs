@@ -969,6 +969,7 @@ mod tests {
                         first: 0,
                         len: 1,
                     }],
+                    pinned: 0,
                 }),
                 ..Settings::default()
             };
