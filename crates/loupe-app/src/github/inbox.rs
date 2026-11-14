@@ -548,7 +548,9 @@ impl InboxView {
         self.save_display(cx);
     }
 
-    /// Folds or unfolds `step` in every tab; a saved view keeps it.
+    /// Folds or unfolds `step` in every tab; a saved view keeps it. The
+    /// rows a fold hides leave the selection, so unfolding never brings
+    /// back picks the bar no longer counted.
     fn toggle_group(&mut self, step: NextStep, cx: &mut Context<Self>) {
         match self
             .page
@@ -560,6 +562,14 @@ impl InboxView {
                 self.page.collapsed.remove(at);
             }
             None => {
+                let hidden: Vec<PrRef> = self
+                    .groups_shown()
+                    .into_iter()
+                    .filter(|(group, _, _)| *group == step)
+                    .flat_map(|(_, _, rows)| rows)
+                    .collect();
+                self.selection.deselect_all(&hidden);
+                self.selection_changed(cx);
                 self.page.collapsed.push(step);
                 self.page.collapsed.sort();
             }
@@ -2289,22 +2299,32 @@ mod tests {
         click(cx, "reviews-group-Ready to merge");
         assert_eq!(picked(&view, cx), [3, 2]);
         assert!(bounds(cx, "pr-row-PR_1").is_none(), "folded");
+        click(cx, "reviews-group-Ready to merge");
+        assert!(bounds(cx, "pr-row-PR_1").is_some(), "unfolded");
+        assert_eq!(picked(&view, cx), [3, 2], "unfolding picks nothing back");
+        click(cx, "reviews-group-Ready to merge");
         cx.simulate_keystrokes("escape");
         cx.simulate_keystrokes("cmd-a");
         assert_eq!(picked(&view, cx), [3, 2]);
         click(cx, "reviews-group-Ready to merge");
-        assert!(bounds(cx, "pr-row-PR_1").is_some(), "unfolded");
+        assert_eq!(
+            picked(&view, cx),
+            [3, 2],
+            "Cmd+A left the folded rows alone"
+        );
 
         // Escape drops it all.
         cx.simulate_keystrokes("escape");
         assert!(picked(&view, cx).is_empty());
         assert_eq!(bounds(cx, "reviews-selection-bar"), None);
 
-        // The selection belongs to its tab: another tab starts empty, and
-        // Cmd+A there picks that tab's rows.
+        // The selection belongs to its tab: another tab starts empty, even
+        // All, which lists the same pull request, and Cmd+A there picks
+        // that tab's rows.
         click(cx, "pr-select-PR_3");
-        click(cx, "reviews-tab-Involved");
+        click(cx, "reviews-tab-All");
         assert!(picked(&view, cx).is_empty(), "another tab clears it");
+        click(cx, "reviews-tab-Involved");
         cx.simulate_keystrokes("cmd-a");
         assert_eq!(picked(&view, cx), [4, 5]);
 
