@@ -43,7 +43,7 @@ fragment PrRow on PullRequest {
   labels(first: 20) { nodes { id name color } }
   assignees(first: 10) { nodes { login avatarUrl } }
   reviewRequests(first: 10) { nodes { requestedReviewer { ... on User { login avatarUrl } } } }
-  latestReviews(first: 20) { nodes { author { login avatarUrl } } }
+  latestReviews(first: 20) { nodes { state author { login avatarUrl } } }
 }
 fragment PrPage on SearchResultItemConnection {
   issueCount
@@ -445,6 +445,9 @@ struct WireReviewRequest {
 #[derive(Deserialize)]
 struct WireReview {
     author: Option<WireActor>,
+    /// `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, …
+    #[serde(default)]
+    state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -521,10 +524,15 @@ impl WirePullRequest {
             .into_items()
             .filter_map(|request| request.requested_reviewer)
             .filter_map(|reviewer| serde_json::from_value::<WireActor>(reviewer).ok());
-        let reviewed = self
-            .latest_reviews
-            .into_items()
-            .filter_map(|review| review.author);
+        let latest: Vec<WireReview> = self.latest_reviews.into_items().collect();
+        // GitHub sends no decision where the branch requires no review; the
+        // reviewers' latest reviews still say whether it was approved.
+        let decision = self
+            .review_decision
+            .as_deref()
+            .and_then(review_decision)
+            .or_else(|| decision_from_reviews(&latest));
+        let reviewed = latest.into_iter().filter_map(|review| review.author);
         for reviewer in requested.chain(reviewed).map(actor) {
             if reviewers.iter().all(|known| known.login != reviewer.login) {
                 reviewers.push(reviewer);
@@ -554,7 +562,7 @@ impl WirePullRequest {
             additions: self.additions,
             deletions: self.deletions,
             checks,
-            review_decision: self.review_decision.as_deref().and_then(review_decision),
+            review_decision: decision,
             head_ref: self.head_ref_name,
             labels: self
                 .labels
@@ -582,6 +590,23 @@ fn checks_state(rollup: &str) -> Option<ChecksState> {
         "FAILURE" | "ERROR" => Some(ChecksState::Failing),
         "PENDING" | "EXPECTED" => Some(ChecksState::Pending),
         _ => None,
+    }
+}
+
+/// The decision the reviewers' latest reviews add up to when GitHub gives
+/// none: changes requested by anyone, else approved by anyone, else none.
+fn decision_from_reviews(latest: &[WireReview]) -> Option<ReviewDecision> {
+    let any = |wanted: &str| {
+        latest
+            .iter()
+            .any(|review| review.state.as_deref() == Some(wanted))
+    };
+    if any("CHANGES_REQUESTED") {
+        Some(ReviewDecision::ChangesRequested)
+    } else if any("APPROVED") {
+        Some(ReviewDecision::Approved)
+    } else {
+        None
     }
 }
 
@@ -789,6 +814,40 @@ mod tests {
                 "decision {decision}"
             );
         }
+    }
+
+    #[test]
+    fn without_a_decision_the_latest_reviews_decide() {
+        let review =
+            |state: &str| json!({ "state": state, "author": { "login": "x", "avatarUrl": "" } });
+        let cases = [
+            (vec![review("COMMENTED")], None),
+            (
+                vec![review("APPROVED"), review("COMMENTED")],
+                Some(ReviewDecision::Approved),
+            ),
+            (
+                vec![review("APPROVED"), review("CHANGES_REQUESTED")],
+                Some(ReviewDecision::ChangesRequested),
+            ),
+            (Vec::new(), None),
+        ];
+        for (reviews, expected) in cases {
+            let mut node = pr_node(1);
+            node["reviewDecision"] = Value::Null;
+            node["latestReviews"] = json!({ "nodes": reviews });
+            let page = page_from(connection(vec![node], false)).unwrap();
+            assert_eq!(page.items[0].review_decision, expected);
+        }
+        // GitHub's own decision wins when it has one.
+        let mut node = pr_node(1);
+        node["reviewDecision"] = json!("REVIEW_REQUIRED");
+        node["latestReviews"] = json!({ "nodes": [review("APPROVED")] });
+        let page = page_from(connection(vec![node], false)).unwrap();
+        assert_eq!(
+            page.items[0].review_decision,
+            Some(ReviewDecision::ReviewRequired)
+        );
     }
 
     #[test]

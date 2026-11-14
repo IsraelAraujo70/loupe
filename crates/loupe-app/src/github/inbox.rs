@@ -1,7 +1,8 @@
-//! `Route::Inbox` (Reviews): the three dashboard sections, and on a saved
-//! view that names repositories every other open pull request in them
-//! ("All open"), narrowed by filter clauses (the Linear board's "Add
-//! Filter…" pattern) that can be saved as views.
+//! `Route::Inbox` (Reviews): a tab per dashboard search (To review, Mine,
+//! Involved) and All, which adds on a saved view that names repositories
+//! every other open pull request in them. Inside a tab, pull requests group
+//! by their next step. Filter clauses (the Linear board's "Add Filter…"
+//! pattern) narrow every tab and can be saved as views.
 
 mod dialogs;
 mod filter_menu;
@@ -19,12 +20,14 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::reviews::{self, Clause, Op, Sort, SortDir, SortKey, ViewsFile};
+use loupe_github::reviews::{
+    self, Clause, NextStep, Op, ReviewTab, Sort, SortDir, SortKey, ViewsFile,
+};
 use loupe_github::{
     Inbox, Notification as GitHubNotification, NotificationSubject, Page, PrRef, PrSummary,
 };
@@ -44,81 +47,43 @@ gpui_kit::actions!(
     [
         /// F on the Reviews screen: open "Add Filter…".
         OpenReviewsFilter,
-        /// Cmd+A on the Reviews screen: pick every row of the section with
-        /// the keyboard cursor or the last click.
-        SelectSectionRows,
+        /// Cmd+A on the Reviews screen: pick every row of the open tab.
+        SelectTabRows,
         /// Escape on the Reviews screen: drop the selection.
         ClearReviewsSelection
     ]
 );
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Section {
-    ReviewRequested,
-    Authored,
-    Involved,
-    /// Every open pull request in the view's repositories that the sections
-    /// above do not list.
-    AllOpen,
-}
+/// The tabs the one inbox request fills.
+const INBOX_TABS: [ReviewTab; 3] = [ReviewTab::ToReview, ReviewTab::Mine, ReviewTab::Involved];
 
-impl Section {
-    /// The sections the one inbox request fills.
-    const INBOX: [Section; 3] = [
-        Section::ReviewRequested,
-        Section::Authored,
-        Section::Involved,
-    ];
-
-    fn title(self) -> &'static str {
-        match self {
-            Section::ReviewRequested => "Waiting on your review",
-            Section::Authored => "Your pull requests",
-            Section::Involved => "Involved",
-            Section::AllOpen => "All open",
-        }
-    }
-
-    fn icon(self) -> IconName {
-        match self {
-            Section::ReviewRequested => IconName::Eye,
-            Section::Authored => IconName::GitPullRequest,
-            Section::Involved => IconName::AtSign,
-            Section::AllOpen => IconName::Users,
-        }
-    }
-
-    fn empty(self) -> (IconName, &'static str) {
-        match self {
-            Section::ReviewRequested => (IconName::CircleCheck, "Nothing waiting on you"),
-            Section::Authored => (IconName::GitPullRequest, "You have no open pull requests"),
-            Section::Involved => (IconName::AtSign, "No other open pull requests involve you"),
-            Section::AllOpen => (
-                IconName::CircleCheck,
-                "No other open pull requests in these repositories",
-            ),
-        }
-    }
-
-    /// The section's page in the inbox; `None` for "All open", which has a
-    /// search of its own.
-    fn page(self, inbox: &Inbox) -> Option<&Page<PrSummary>> {
-        match self {
-            Section::ReviewRequested => Some(&inbox.review_requested),
-            Section::Authored => Some(&inbox.authored),
-            Section::Involved => Some(&inbox.involved),
-            Section::AllOpen => None,
-        }
-    }
-
-    /// Whether its rows show the author: your own pull requests need none.
-    fn shows_author(self) -> bool {
-        self != Section::Authored
+/// The line an empty tab shows when no filter is set.
+fn tab_empty(tab: ReviewTab) -> (IconName, &'static str) {
+    match tab {
+        ReviewTab::ToReview => (IconName::CircleCheck, "Nothing waiting on you"),
+        ReviewTab::Mine => (IconName::GitPullRequest, "You have no open pull requests"),
+        ReviewTab::Involved => (IconName::AtSign, "No other open pull requests involve you"),
+        ReviewTab::All => (IconName::CircleCheck, "No open pull requests"),
     }
 }
 
-/// What one section shows under the clauses: its rows, the number on its
-/// heading, and a note when the page holds only part of the search.
+/// The tab's page in the inbox; `None` for All, which gathers the others.
+fn tab_page(tab: ReviewTab, inbox: &Inbox) -> Option<&Page<PrSummary>> {
+    match tab {
+        ReviewTab::ToReview => Some(&inbox.review_requested),
+        ReviewTab::Mine => Some(&inbox.authored),
+        ReviewTab::Involved => Some(&inbox.involved),
+        ReviewTab::All => None,
+    }
+}
+
+/// Whether its rows show the author: your own pull requests need none.
+fn shows_author(tab: ReviewTab) -> bool {
+    tab != ReviewTab::Mine
+}
+
+/// What one tab shows under the clauses: its rows, the number on the tab,
+/// and a note when the page holds only part of the search.
 struct Shown<'a> {
     items: Vec<&'a PrSummary>,
     count: usize,
@@ -153,30 +118,77 @@ fn shown<'a>(page: &'a Page<PrSummary>, clauses: &[Clause]) -> Shown<'a> {
     }
 }
 
-/// "All open" under the clauses: the open pull requests that pass them and
-/// that no section above lists (`above`). The heading counts the rows it
-/// shows and says how many more are already above, so the two add up to
-/// what GitHub lists as open.
-fn shown_all_open<'a>(
-    page: &'a Page<PrSummary>,
+/// The All tab under the clauses: every pull request the other tabs show,
+/// then those of the view's "All open" search (`all_open`) that none of them
+/// shows, each once. Its count is the rows it shows; the note says when the
+/// search, or any other tab, holds more than its first page.
+fn shown_all<'a>(
+    tabs: &[&Shown<'a>],
+    all_open: Option<&'a Page<PrSummary>>,
     clauses: &[Clause],
-    above: &[&PrRef],
 ) -> Shown<'a> {
-    let all = shown(page, clauses);
-    let (items, listed): (Vec<&PrSummary>, Vec<&PrSummary>) = all
-        .items
-        .into_iter()
-        .partition(|pr| !above.contains(&&pr.pr));
-    let listed = (!listed.is_empty()).then(|| format!("{} more listed above", listed.len()));
-    let note = match (all.note, listed) {
-        (Some(partial), Some(listed)) => Some(format!("{partial} · {listed}")),
-        (partial, listed) => partial.or(listed),
-    };
+    let mut items: Vec<&'a PrSummary> = Vec::new();
+    let open = all_open.map(|page| shown(page, clauses));
+    let candidates = tabs
+        .iter()
+        .flat_map(|shown| shown.items.iter().copied())
+        .chain(open.iter().flat_map(|open| open.items.iter().copied()));
+    for pr in candidates {
+        if !items.iter().any(|known| known.pr == pr.pr) {
+            items.push(pr);
+        }
+    }
+    let partial = tabs.iter().any(|shown| shown.note.is_some());
+    let note = open.and_then(|open| open.note).or_else(|| {
+        partial.then(|| format!("Showing the {} loaded; GitHub has more", items.len()))
+    });
     Shown {
         count: items.len(),
         note,
         items,
     }
+}
+
+/// The first tab with a row to show, in the tab row's order; To review when
+/// every tab is empty.
+fn first_with_rows(tabs: &[(ReviewTab, Shown<'_>)]) -> ReviewTab {
+    tabs.iter()
+        .find(|(_, shown)| !shown.items.is_empty())
+        .map_or(ReviewTab::ToReview, |(tab, _)| *tab)
+}
+
+/// One group of the open tab: its pull requests in their order on screen,
+/// and whether it is folded.
+struct Group<'a> {
+    step: NextStep,
+    collapsed: bool,
+    rows: Vec<&'a PrSummary>,
+}
+
+/// `items` in their groups ([`reviews::next_step`]), in [`NextStep::ALL`]'s
+/// order, each sorted by `sort` on its own. A group with no pull request is
+/// left out.
+fn grouped<'a>(
+    items: &[&'a PrSummary],
+    sort: Option<Sort>,
+    collapsed: &[NextStep],
+) -> Vec<Group<'a>> {
+    NextStep::ALL
+        .iter()
+        .filter_map(|&step| {
+            let mut rows: Vec<&PrSummary> = items
+                .iter()
+                .copied()
+                .filter(|pr| reviews::next_step(pr) == step)
+                .collect();
+            reviews::sort_rows(&mut rows, sort);
+            (!rows.is_empty()).then(|| Group {
+                step,
+                collapsed: collapsed.contains(&step),
+                rows,
+            })
+        })
+        .collect()
 }
 
 /// The saved view on screen and the clauses and sort order edited on top of
@@ -186,10 +198,14 @@ fn shown_all_open<'a>(
 struct PageState {
     view_id: Option<String>,
     draft: Vec<Clause>,
-    /// The order of each section's rows; `None` is GitHub's order.
+    /// The order of each group's rows; `None` is GitHub's order.
     sort: Option<Sort>,
     /// The view's saved "All open" choice; `None` means the default (on).
     all_open: Option<bool>,
+    /// The open tab; `None` until the first tab with rows is known.
+    tab: Option<ReviewTab>,
+    /// The groups folded in every tab.
+    collapsed: Vec<NextStep>,
 }
 
 impl PageState {
@@ -207,6 +223,8 @@ impl PageState {
         self.draft = view.map(|view| view.filters.clone()).unwrap_or_default();
         self.sort = view.and_then(|view| view.sort);
         self.all_open = view.and_then(|view| view.all_open);
+        self.tab = view.and_then(|view| view.tab);
+        self.collapsed = view.map(|view| view.collapsed.clone()).unwrap_or_default();
     }
 
     /// Whether "All open" is on for the view on screen. Only a saved view
@@ -257,6 +275,10 @@ pub struct InboxView {
     bar_shown: bool,
     /// What the last "Mark as read" did, or why it failed (`true`).
     mark_note: Option<(SharedString, bool)>,
+    /// The tab the page opened on, chosen once fresh results arrived; it
+    /// stands while no tab was picked or saved (`PageState::tab`), so a
+    /// refresh never switches tabs under the user. Never saved with a view.
+    opened_on: Option<ReviewTab>,
     _load: Option<Task<()>>,
     _checks: Subscription,
 }
@@ -322,6 +344,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             marking: None,
             bar_shown: false,
             mark_note: None,
+            opened_on: None,
             _load: None,
             _checks: checks,
         };
@@ -471,30 +494,141 @@ impl InboxView {
         self.all_open.get(&self.page.all_open_query()?)
     }
 
-    /// Each section with rows to show, top to bottom, under the clauses.
-    fn sections<'a>(&'a self, inbox: &'a Inbox) -> Vec<(Section, Shown<'a>)> {
-        let mut sections: Vec<(Section, Shown<'a>)> = Section::INBOX
+    /// Every tab in the tab row's order with what it shows under the
+    /// clauses, in GitHub's order.
+    fn tab_lists<'a>(&'a self, inbox: &'a Inbox) -> Vec<(ReviewTab, Shown<'a>)> {
+        let mut tabs: Vec<(ReviewTab, Shown<'a>)> = INBOX_TABS
             .iter()
-            .filter_map(|&section| Some((section, shown(section.page(inbox)?, &self.page.draft))))
+            .filter_map(|&tab| Some((tab, shown(tab_page(tab, inbox)?, &self.page.draft))))
             .collect();
-        if let Some(page) = self.all_open_state().and_then(Loadable::value) {
-            let above: Vec<&PrRef> = sections
-                .iter()
-                .flat_map(|(_, shown)| shown.items.iter().map(|summary| &summary.pr))
-                .collect();
-            let all_open = shown_all_open(page, &self.page.draft, &above);
-            sections.push((Section::AllOpen, all_open));
-        }
-        // Each section sorts its own rows: a sort never moves a pull
-        // request into another section.
-        for (_, shown) in &mut sections {
-            reviews::sort_rows(&mut shown.items, self.page.sort);
-        }
-        sections
+        let all = {
+            let others: Vec<&Shown<'a>> = tabs.iter().map(|(_, shown)| shown).collect();
+            shown_all(
+                &others,
+                self.all_open_state().and_then(Loadable::value),
+                &self.page.draft,
+            )
+        };
+        tabs.push((ReviewTab::All, all));
+        tabs
     }
 
-    /// Sorts every section by `sort` (`None`: GitHub's order). Like a
-    /// filter, it is part of the draft until the view is saved.
+    /// The open tab: the one picked or saved with the view, else the one
+    /// the page opened on, else the first with rows.
+    fn active_tab(&self, tabs: &[(ReviewTab, Shown<'_>)]) -> ReviewTab {
+        self.page
+            .tab
+            .or(self.opened_on)
+            .unwrap_or_else(|| first_with_rows(tabs))
+    }
+
+    /// The open tab, once the inbox has loaded.
+    fn current_tab(&self) -> Option<ReviewTab> {
+        let inbox = self.inbox.value()?;
+        Some(self.active_tab(&self.tab_lists(inbox)))
+    }
+
+    /// The open tab's groups, each sorted on its own: a sort never moves a
+    /// pull request into another group.
+    fn groups<'a>(&'a self, inbox: &'a Inbox) -> Vec<Group<'a>> {
+        let tabs = self.tab_lists(inbox);
+        let active = self.active_tab(&tabs);
+        tabs.into_iter()
+            .find(|(tab, _)| *tab == active)
+            .map(|(_, shown)| grouped(&shown.items, self.page.sort, &self.page.collapsed))
+            .unwrap_or_default()
+    }
+
+    /// Fixes the tab the page opened on once the results are fresh: a
+    /// stored copy shown while they load may no longer have rows where it
+    /// did, and "All open" may be the only tab with rows.
+    fn settle_tab(&mut self) {
+        let fresh = |state: Option<&Loadable<Page<PrSummary>>>| {
+            !matches!(state, Some(Loadable::Loading | Loadable::Refreshing(_)))
+        };
+        if self.page.tab.is_some()
+            || self.opened_on.is_some()
+            || !matches!(self.inbox, Loadable::Loaded(_))
+            || !fresh(self.all_open_state())
+        {
+            return;
+        }
+        self.opened_on = self.current_tab();
+    }
+
+    /// Opens `tab`. The selection and the cursor belong to the tab they were
+    /// made in; a saved view keeps the tab.
+    fn set_tab(&mut self, tab: ReviewTab, cx: &mut Context<Self>) {
+        if self.current_tab() == Some(tab) && self.page.tab.is_some() {
+            return;
+        }
+        let moved = self.current_tab() != Some(tab);
+        self.page.tab = Some(tab);
+        if moved {
+            self.left_tab(cx);
+        }
+        self.save_display(cx);
+    }
+
+    /// What leaving a tab drops: the cursor, the scroll, and the selection.
+    fn left_tab(&mut self, cx: &mut Context<Self>) {
+        self.cursor = None;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        self.clear_selection(cx);
+    }
+
+    /// Folds or unfolds `step` in every tab; a saved view keeps it. The
+    /// rows a fold hides leave the selection, so unfolding never brings
+    /// back picks the bar no longer counted.
+    fn toggle_group(&mut self, step: NextStep, cx: &mut Context<Self>) {
+        match self
+            .page
+            .collapsed
+            .iter()
+            .position(|folded| *folded == step)
+        {
+            Some(at) => {
+                self.page.collapsed.remove(at);
+            }
+            None => {
+                self.page.collapsed.push(step);
+                self.page.collapsed.sort();
+            }
+        }
+        // Folded or not, the group's rows leave the selection: a fold hides
+        // them, and a row that moved into a folded group (a refresh, new
+        // checks) was picked while the bar no longer counted it.
+        let rows: Vec<PrRef> = self
+            .groups_shown()
+            .into_iter()
+            .filter(|(group, _, _)| *group == step)
+            .flat_map(|(_, _, rows)| rows)
+            .collect();
+        self.selection.deselect_all(&rows);
+        self.selection_changed(cx);
+        self.save_display(cx);
+    }
+
+    /// Writes the open tab and the folded groups to the saved view on
+    /// screen. They are where the user is, not a change to the view, so they
+    /// save at once instead of waiting for Save.
+    fn save_display(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.page.view_id.clone() {
+            let (tab, collapsed) = (self.page.tab, self.page.collapsed.clone());
+            let result = views_store::update(cx, |views| {
+                let now = Utc::now();
+                views.set_tab(&id, tab, now);
+                views.set_collapsed(&id, collapsed, now);
+            });
+            if let Err(message) = result {
+                self.notice = Some(message);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Sorts every group by `sort` (`None`: GitHub's order). Like a filter,
+    /// it is part of the draft until the view is saved.
     fn set_sort(&mut self, sort: Option<Sort>, cx: &mut Context<Self>) {
         self.page.sort = sort;
         cx.notify();
@@ -531,9 +665,9 @@ impl InboxView {
     fn filter_options(&self) -> FilterOptions {
         match self.inbox.value() {
             Some(inbox) => FilterOptions::new(
-                Section::INBOX
+                INBOX_TABS
                     .iter()
-                    .filter_map(|section| section.page(inbox))
+                    .filter_map(|&tab| tab_page(tab, inbox))
                     .chain(self.all_open_state().and_then(Loadable::value))
                     .flat_map(|page| page.items.iter()),
                 &self.page.draft,
@@ -559,14 +693,26 @@ impl InboxView {
         cx.notify();
     }
 
+    /// Shows view `id` (or no view). Showing the same view again (its tab
+    /// clicked twice, Discard) keeps the open tab and the folded groups,
+    /// which a view without a saved copy holds only here.
     fn switch_view(&mut self, id: Option<&str>, cx: &mut Context<Self>) {
         let views = views_store::snapshot(cx);
-        let before = self.page.draft.clone();
+        let (draft, tab) = (self.page.draft.clone(), self.current_tab());
+        let same = self.page.view_id.as_deref() == id;
+        let display = (self.page.tab, self.page.collapsed.clone());
         self.page.switch(&views, id);
-        if self.page.draft != before {
-            self.clear_selection(cx);
+        if same {
+            (self.page.tab, self.page.collapsed) = display;
+        } else {
+            self.opened_on = None;
         }
         self.load_all_open(false, cx);
+        if self.current_tab() != tab {
+            self.left_tab(cx);
+        } else if self.page.draft != draft {
+            self.clear_selection(cx);
+        }
         cx.notify();
     }
 
@@ -590,9 +736,13 @@ impl InboxView {
 
     fn save_as_new(&mut self, name: &str, cx: &mut Context<Self>) {
         let (draft, sort) = (self.page.draft.clone(), self.page.sort);
+        let (tab, collapsed) = (self.page.tab, self.page.collapsed.clone());
         match views_store::update(cx, |views| {
-            let id = views.create(name, draft, Utc::now());
-            views.set_sort(&id, sort, Utc::now());
+            let now = Utc::now();
+            let id = views.create(name, draft, now);
+            views.set_sort(&id, sort, now);
+            views.set_tab(&id, tab, now);
+            views.set_collapsed(&id, collapsed, now);
             id
         }) {
             Ok(id) => self.page.view_id = Some(id),
@@ -628,20 +778,31 @@ impl InboxView {
         cx.notify();
     }
 
-    /// The pull requests each section shows, in order.
-    fn sections_shown(&self) -> Vec<Vec<PrRef>> {
+    /// The open tab's groups as the list shows them: each group's pull
+    /// requests in order, and whether it is folded.
+    fn groups_shown(&self) -> Vec<(NextStep, bool, Vec<PrRef>)> {
         let Some(inbox) = self.inbox.value() else {
             return Vec::new();
         };
-        self.sections(inbox)
+        self.groups(inbox)
             .into_iter()
-            .map(|(_, shown)| {
-                shown
-                    .items
+            .map(|group| {
+                let rows = group
+                    .rows
                     .iter()
                     .map(|summary| summary.pr.clone())
-                    .collect()
+                    .collect();
+                (group.step, group.collapsed, rows)
             })
+            .collect()
+    }
+
+    /// The rows on screen, top to bottom: those of every unfolded group.
+    fn rows_shown(&self) -> Vec<PrRef> {
+        self.groups_shown()
+            .into_iter()
+            .filter(|(_, collapsed, _)| !collapsed)
+            .flat_map(|(_, _, rows)| rows)
             .collect()
     }
 
@@ -650,15 +811,13 @@ impl InboxView {
         let Some(inbox) = self.inbox.value() else {
             return Vec::new();
         };
-        let sections = self.sections(inbox);
-        let rows: Vec<PrRef> = sections
-            .iter()
-            .flat_map(|(_, shown)| shown.items.iter().map(|summary| summary.pr.clone()))
+        let summaries: Vec<&PrSummary> = self
+            .groups(inbox)
+            .into_iter()
+            .filter(|group| !group.collapsed)
+            .flat_map(|group| group.rows)
             .collect();
-        let summaries: Vec<&PrSummary> = sections
-            .iter()
-            .flat_map(|(_, shown)| shown.items.iter().copied())
-            .collect();
+        let rows: Vec<PrRef> = summaries.iter().map(|summary| summary.pr.clone()).collect();
         self.selection
             .in_order(&rows)
             .iter()
@@ -672,8 +831,7 @@ impl InboxView {
         match gesture {
             SelectGesture::Toggle => self.selection.toggle(pr),
             SelectGesture::Range => {
-                let rows: Vec<PrRef> = self.sections_shown().into_iter().flatten().collect();
-                self.selection.extend_to(&rows, pr);
+                self.selection.extend_to(&self.rows_shown(), pr);
             }
         }
         self.selection_changed(cx);
@@ -686,9 +844,9 @@ impl InboxView {
         })
     }
 
-    /// Picks every row of `rows`, one section's, or drops them all when
-    /// every one is already picked.
-    fn toggle_section(&mut self, rows: &[PrRef], cx: &mut Context<Self>) {
+    /// Picks every row of `rows`, one group's, or drops them all when every
+    /// one is already picked.
+    fn toggle_rows(&mut self, rows: &[PrRef], cx: &mut Context<Self>) {
         if !rows.is_empty() && rows.iter().all(|pr| self.selection.contains(pr)) {
             self.selection.deselect_all(rows);
         } else {
@@ -697,17 +855,11 @@ impl InboxView {
         self.selection_changed(cx);
     }
 
-    /// Cmd+A: picks every row of the section with the keyboard cursor, or
-    /// else the last row clicked, or else the first section with rows.
-    fn select_section(&mut self, cx: &mut Context<Self>) {
-        let sections = self.sections_shown();
-        let holds =
-            |pr: Option<&PrRef>| pr.and_then(|pr| sections.iter().find(|rows| rows.contains(pr)));
-        let rows = holds(self.cursor.as_ref())
-            .or_else(|| holds(self.selection.anchor()))
-            .or_else(|| sections.iter().find(|rows| !rows.is_empty()));
-        if let Some(rows) = rows {
-            self.selection.select_all(rows);
+    /// Cmd+A: picks every row the open tab shows.
+    fn select_tab(&mut self, cx: &mut Context<Self>) {
+        let rows = self.rows_shown();
+        if !rows.is_empty() {
+            self.selection.select_all(&rows);
             self.selection_changed(cx);
         }
     }
@@ -804,40 +956,39 @@ impl InboxView {
 
     /// Moves the keyboard cursor one row and scrolls it into view.
     fn move_cursor(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let sections = self.sections_shown();
-        let rows: Vec<PrRef> = sections.iter().flatten().cloned().collect();
+        let groups = self.groups_shown();
+        let rows = self.rows_shown();
         let Some(next) = step_cursor(&rows, self.cursor.as_ref(), down) else {
             return;
         };
         // The row's place in the scrolled content, from the fixed heights
-        // of what is above it: 8 px of padding, then per section a 32 px
-        // heading, a 24 px column heading when it has rows, its rows, and a
-        // 12 px gap.
+        // of what is above it: 8 px of padding, then per group a 32 px
+        // heading, its rows unless it is folded, and a 12 px gap.
         let rem = window.rem_size();
         let row = scale::row_height().to_pixels(rem);
-        let (heading, columns, gap, pad) = (
+        let (heading, gap, pad) = (
             rems(2.).to_pixels(rem),
-            rems(1.5).to_pixels(rem),
             rems(0.75).to_pixels(rem),
             rems(0.5).to_pixels(rem),
         );
         let mut top = pad;
-        for section in &sections {
+        for (_, collapsed, group) in &groups {
             top += heading;
-            if !section.is_empty() {
-                top += columns;
+            if *collapsed {
+                top += gap;
+                continue;
             }
-            if let Some(index) = section.iter().position(|pr| *pr == next) {
+            if let Some(index) = group.iter().position(|pr| *pr == next) {
                 top += row * index as f32;
                 break;
             }
-            top += row * section.len() as f32 + gap;
+            top += row * group.len() as f32 + gap;
         }
         let viewport = self.scroll.bounds().size.height;
         let mut offset = self.scroll.offset();
-        if top < -offset.y + columns {
-            // Room for the column heading above the first row of a section.
-            offset.y = -(top - heading - columns).max(px(0.));
+        if top < -offset.y {
+            // Room for the group's heading above its first row.
+            offset.y = -(top - heading).max(px(0.));
         } else if top + row > -offset.y + viewport {
             offset.y = -(top + row + pad - viewport);
         }
@@ -852,7 +1003,7 @@ impl InboxView {
         let on_screen = self
             .cursor
             .as_ref()
-            .filter(|pr| self.sections_shown().iter().flatten().any(|row| row == *pr));
+            .filter(|pr| self.rows_shown().contains(pr));
         match on_screen {
             Some(pr) => crate::shell::navigate(Route::PullRequest(pr.clone()), window, cx),
             None => cx.propagate(),
@@ -871,7 +1022,7 @@ impl InboxView {
             header
         };
         header
-            .after_title(self.tabs(cx))
+            .after_title(self.view_tabs(cx))
             .action(
                 ui::icon_button("inbox-add-repo", IconName::Plus, "Add repository…")
                     .debug_selector(|| "inbox-add-repo".into())
@@ -896,7 +1047,7 @@ impl InboxView {
     /// menu moves when a filter is picked. The tabs scroll sideways when
     /// they do not fit, and the open one scrolls into view when it changes;
     /// the controls after them never scroll or shrink.
-    fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn view_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let views = views_store::snapshot(cx);
         let dirty = self.page.is_dirty(&views);
         let active = self.page.view_id.clone();
@@ -938,7 +1089,7 @@ impl InboxView {
                 .debug_selector(|| "reviews-view-menu".into())
                 .menu_trigger()
                 .dropdown_menu(move |menu, _, _| {
-                    // Without a repository or an organization the section
+                    // Without a repository or an organization the All tab
                     // would list all of GitHub, so the switch waits for one.
                     let all_open = {
                         let view = view.clone();
@@ -1138,7 +1289,7 @@ impl InboxView {
                 sort.key.label().to_lowercase(),
                 sort.describe().to_lowercase()
             ),
-            None => "Sort the pull requests in each section".to_owned(),
+            None => "Sort the pull requests in each group".to_owned(),
         };
         ui::icon_button("reviews-sort-open", IconName::ArrowDownUp, tip)
             .debug_selector(|| "reviews-sort-open".into())
@@ -1329,113 +1480,125 @@ impl InboxView {
         )
     }
 
-    fn section(
+    /// The tab row over the list: each tab with its count under the
+    /// filters, and the open tab's note at the trailing edge.
+    fn tab_strip(
         &self,
-        section: Section,
-        shown: Shown<'_>,
-        on_sort: OnSort,
+        tabs: &[(ReviewTab, Shown<'_>)],
+        active: ReviewTab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let buttons: Vec<AnyElement> = tabs
+            .iter()
+            .map(|(tab, shown)| {
+                let (tab, count) = (*tab, shown.count);
+                let id = format!("reviews-tab-{}", tab.label());
+                ui::view_tab(
+                    SharedString::from(id.clone()),
+                    tab.label(),
+                    tab == active,
+                    cx,
+                )
+                .debug_selector(move || id.clone())
+                .accessibility_label(format!("{}, {count}", tab.label()))
+                .child(ui::count_badge(count, cx))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+                .into_any_element()
+            })
+            .collect();
+        let note = tabs
+            .iter()
+            .find(|(tab, _)| *tab == active)
+            .and_then(|(_, shown)| shown.note.clone())
+            .map(|text| {
+                div()
+                    .flex_none()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(text)
+            });
+        ui::toolbar()
+            .gap_1()
+            .children(buttons)
+            .child(div().flex_1())
+            .children(note)
+            .into_any_element()
+    }
+
+    /// One group of the open tab: its heading, which folds it, and its rows
+    /// unless it is folded.
+    fn group(
+        &self,
+        tab: ReviewTab,
+        group: Group<'_>,
         on_select: OnSelect,
         showing: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let rows: Vec<PrRef> = shown
-            .items
+    ) -> AnyElement {
+        let step = group.step;
+        let rows: Vec<PrRef> = group
+            .rows
             .iter()
             .map(|summary| summary.pr.clone())
             .collect();
-        let age_from = AgeFrom::for_sort(self.page.sort);
-        let (empty_icon, empty_text) = if self.page.draft.is_empty() {
-            section.empty()
-        } else {
-            (IconName::ListFilter, "No pull requests match the filters")
-        };
-        // An empty section is one line: its heading says what is missing.
-        let empty = shown
-            .items
-            .is_empty()
-            .then(|| ui::empty_line(empty_icon, empty_text, cx).ml_2());
-        let list = v_flex().children(shown.items.iter().map(|summary| {
-            pr_row(
-                summary,
-                true,
-                section.shows_author(),
-                self.cursor.as_ref() == Some(&summary.pr),
-                Some(RowSelect {
-                    checked: self.selection.contains(&summary.pr),
-                    showing,
-                    on_select: on_select.clone(),
-                }),
-                age_from,
-                cx,
-            )
-        }));
-        // The heading's box picks or drops the whole section.
-        let all_picked = !rows.is_empty() && rows.iter().all(|pr| self.selection.contains(pr));
-        let lead = (!rows.is_empty()).then(|| {
+        // The heading's box picks or drops the whole group; a folded group
+        // has no rows on screen to pick.
+        let all_picked = rows.iter().all(|pr| self.selection.contains(pr));
+        let lead = (!group.collapsed).then(|| {
             let view = cx.weak_entity();
             select_box(
-                SharedString::from(format!("reviews-select-section-{}", section.title())),
-                SECTION_GROUP,
+                SharedString::from(format!("reviews-select-group-{}", step.label())),
+                GROUP_HEADING,
                 all_picked,
                 showing,
-                format!("Select every pull request in {}", section.title()),
+                format!("Select every pull request in {}", step.label()),
                 move |_, cx| {
-                    view.update(cx, |this, cx| this.toggle_section(&rows, cx))
-                        .ok();
+                    view.update(cx, |this, cx| this.toggle_rows(&rows, cx)).ok();
                 },
             )
         });
-        let heading = h_flex()
-            .gap_2()
-            .items_center()
-            .child(ui::count_badge(shown.count, cx))
-            .children(
-                shown
-                    .note
-                    .map(|text| div().text_size(scale::meta()).text_color(muted).child(text)),
-            )
-            .children(empty);
-        v_flex()
-            // Its own id scope: every section's column heading has the same
-            // ids, and a click must reach the one under the pointer.
-            .id(SharedString::from(section.title()))
-            .w_full()
-            .child(section_heading(section, lead, heading, cx))
-            // Each section heads its own columns: the viewer's own pull
-            // requests have no author lane.
-            .when(!shown.items.is_empty(), |column| {
-                column.child(super::pr_row::column_header(
+        let heading = group_heading(step, group.collapsed, group.rows.len(), lead, cx)
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(step, cx)));
+        let age_from = AgeFrom::for_sort(self.page.sort);
+        let rows = (!group.collapsed).then(|| {
+            v_flex().children(group.rows.iter().map(|summary| {
+                pr_row(
+                    summary,
                     true,
-                    true,
-                    section.shows_author(),
-                    self.page.sort,
-                    Some(on_sort),
+                    shows_author(tab),
+                    self.cursor.as_ref() == Some(&summary.pr),
+                    Some(RowSelect {
+                        checked: self.selection.contains(&summary.pr),
+                        showing,
+                        on_select: on_select.clone(),
+                    }),
+                    age_from,
                     cx,
-                ))
-            })
-            .child(list)
+                )
+            }))
+        });
+        v_flex()
+            .w_full()
+            .child(heading)
+            .children(rows)
+            .into_any_element()
     }
 
     /// "All open" while its first search runs or after it failed with
-    /// nothing to show; `None` once it has rows (they render as a section).
+    /// nothing to show; `None` once it has rows (they join the All tab).
     fn all_open_placeholder(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let body = match self.all_open_state()? {
-            Loadable::Loading => ui::skeleton_rows(3).into_any_element(),
-            Loadable::Failed(error) => common::load_error(
-                error,
-                cx.listener(|view, _, _, cx| view.load_all_open(true, cx)),
-            )
-            .into_any_element(),
-            Loadable::Loaded(_) | Loadable::Refreshing(_) => return None,
-        };
-        Some(
-            v_flex()
-                .w_full()
-                .child(section_heading(Section::AllOpen, None, div(), cx))
-                .child(body)
+        match self.all_open_state()? {
+            Loadable::Loading => Some(ui::skeleton_rows(3).into_any_element()),
+            Loadable::Failed(error) => Some(
+                common::load_error(
+                    error,
+                    cx.listener(|view, _, _, cx| view.load_all_open(true, cx)),
+                )
                 .into_any_element(),
-        )
+            ),
+            Loadable::Loaded(_) | Loadable::Refreshing(_) => None,
+        }
     }
 
     fn loading(&self) -> impl IntoElement {
@@ -1451,6 +1614,7 @@ impl Render for InboxView {
         if crate::shell::page_may_take_focus(window, cx) {
             self.focus.focus(window, cx);
         }
+        self.settle_tab();
         let selection_bar = self.selection_bar(cx);
         if selection_bar.is_some() != self.bar_shown {
             // The bar pushes the list down by its height; scrolling as far
@@ -1462,42 +1626,70 @@ impl Render for InboxView {
             offset.y = (offset.y + if self.bar_shown { -height } else { height }).min(px(0.));
             self.scroll.set_offset(offset);
         }
-        let body = match &self.inbox {
-            Loadable::Failed(error) => {
+        let (strip, columns, body) = match &self.inbox {
+            Loadable::Failed(error) => (
+                None,
+                None,
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
                     .px_0()
-                    .into_any_element()
-            }
-            Loadable::Loading => self.loading().into_any_element(),
+                    .into_any_element(),
+            ),
+            Loadable::Loading => (None, None, self.loading().into_any_element()),
             Loadable::Loaded(inbox) | Loadable::Refreshing(inbox) => {
-                let on_sort = self.on_sort(cx);
-                let on_select = self.on_select(cx);
-                let sections = self.sections(inbox);
-                let showing = sections.iter().any(|(_, shown)| {
-                    shown
-                        .items
+                let tabs = self.tab_lists(inbox);
+                let active = self.active_tab(&tabs);
+                let strip = self.tab_strip(&tabs, active, cx);
+                let items: Vec<&PrSummary> = tabs
+                    .into_iter()
+                    .find(|(tab, _)| *tab == active)
+                    .map(|(_, shown)| shown.items)
+                    .unwrap_or_default();
+                let groups = grouped(&items, self.page.sort, &self.page.collapsed);
+                let showing = groups.iter().filter(|group| !group.collapsed).any(|group| {
+                    group
+                        .rows
                         .iter()
                         .any(|summary| self.selection.contains(&summary.pr))
                 });
-                let sections: Vec<AnyElement> = sections
-                    .into_iter()
-                    .map(|(section, shown)| {
-                        self.section(
-                            section,
-                            shown,
-                            on_sort.clone(),
-                            on_select.clone(),
-                            showing,
+                // One column heading for the whole tab, outside the scroll,
+                // so its labels stay over the rows' lanes.
+                let columns = (!items.is_empty()).then(|| {
+                    div()
+                        .w_full()
+                        .px_2()
+                        .child(super::pr_row::column_header(
+                            true,
+                            true,
+                            shows_author(active),
+                            self.page.sort,
+                            Some(self.on_sort(cx)),
                             cx,
-                        )
+                        ))
                         .into_any_element()
-                    })
+                });
+                let placeholder = (active == ReviewTab::All)
+                    .then(|| self.all_open_placeholder(cx))
+                    .flatten();
+                let empty = (items.is_empty() && placeholder.is_none()).then(|| {
+                    let (icon, text) = if self.page.draft.is_empty() {
+                        tab_empty(active)
+                    } else {
+                        (IconName::ListFilter, "No pull requests match the filters")
+                    };
+                    ui::empty_line(icon, text, cx).px_2().h_8()
+                });
+                let on_select = self.on_select(cx);
+                let groups: Vec<AnyElement> = groups
+                    .into_iter()
+                    .map(|group| self.group(active, group, on_select.clone(), showing, cx))
                     .collect();
-                v_flex()
+                let body = v_flex()
                     .gap_3()
-                    .children(sections)
-                    .children(self.all_open_placeholder(cx))
-                    .into_any_element()
+                    .children(groups)
+                    .children(empty)
+                    .children(placeholder)
+                    .into_any_element();
+                (Some(strip), columns, body)
             }
         };
         v_flex()
@@ -1516,9 +1708,11 @@ impl Render for InboxView {
             .on_action(
                 cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &SelectSectionRows, _, cx| this.select_section(cx)))
+            .on_action(cx.listener(|this, _: &SelectTabRows, _, cx| this.select_tab(cx)))
             .on_action(cx.listener(|this, _: &ClearReviewsSelection, _, cx| {
-                if this.selection == Selection::default() {
+                // Picks hidden in a folded group do not hold the key.
+                if this.picked().is_empty() {
+                    this.selection.clear();
                     cx.propagate();
                 } else {
                     this.clear_selection(cx);
@@ -1527,7 +1721,9 @@ impl Render for InboxView {
             .child(self.header(cx))
             .children(self.filter_bar(cx))
             .children(self.notice(cx))
+            .children(strip)
             .children(selection_bar)
+            .children(columns)
             .child(
                 div()
                     .id("inbox")
@@ -1542,41 +1738,53 @@ impl Render for InboxView {
     }
 }
 
-/// The hover group of a section heading, which shows its checkbox.
-const SECTION_GROUP: &str = "reviews-section-heading";
+/// The hover group of a group heading, which shows its checkbox.
+const GROUP_HEADING: &str = "reviews-group-heading";
 
-/// A section's 32 px heading on the rows' own grid: `lead` (the box that
-/// picks the section) over the rows' checkboxes, or an empty lane of their
-/// width, its icon over the state icons, its title over the numbers, then
-/// `detail` (count, note). The rows need no box around them.
-fn section_heading(
-    section: Section,
+/// A group's 32 px heading on the rows' own grid: `lead` (the box that
+/// picks the group) over the rows' checkboxes, or an empty lane of their
+/// width, a chevron that says whether it is folded over the state icons,
+/// its title over the numbers, then its count. A click folds or unfolds it.
+fn group_heading(
+    step: NextStep,
+    collapsed: bool,
+    count: usize,
     lead: Option<Div>,
-    detail: impl IntoElement,
     cx: &App,
-) -> impl IntoElement {
-    let muted = cx.theme().muted_foreground;
+) -> Stateful<Div> {
+    let (muted, hover) = (cx.theme().muted_foreground, cx.theme().list_hover);
+    let label = step.label();
     h_flex()
-        .group(SECTION_GROUP)
+        .id(SharedString::from(format!("reviews-group-{label}")))
+        .debug_selector(move || format!("reviews-group-{label}"))
+        .role(Role::Button)
+        .aria_label(format!("{label}, {count}"))
+        .aria_expanded(!collapsed)
+        .group(GROUP_HEADING)
         .h_8()
         .px_2()
         .gap_2()
         .items_center()
-        // 12 px after the lane, as in a row; the icon's own 8 px gap
+        .rounded(cx.theme().radius)
+        .cursor_pointer()
+        .hover(move |row| row.bg(hover))
+        // 12 px after the lane, as in a row; the chevron's own 8 px gap
         // follows.
         .child(
             lead.unwrap_or_else(|| div().flex_none().w(scale::dp(16.)))
                 .mr_1(),
         )
         .child(
-            svg()
-                .path(section.icon().path())
-                .flex_none()
-                .size_4()
-                .text_color(muted),
+            Icon::new(if collapsed {
+                IconName::ChevronRight
+            } else {
+                IconName::ChevronDown
+            })
+            .with_size(scale::dp(16.))
+            .text_color(muted),
         )
-        .child(ui::group_title(section.title()))
-        .child(detail)
+        .child(ui::group_title(label))
+        .child(ui::count_badge(count, cx))
 }
 
 #[cfg(test)]
@@ -1590,7 +1798,10 @@ mod tests {
     use loupe_github::reviews::{Clause, Field, Op, Sort, SortDir, SortKey, ViewsFile};
     use loupe_github::{Inbox, Page, PrRef, PrState, PrSummary, RepoRef};
 
-    use super::{InboxView, PageState, build, shown, shown_all_open, step_cursor};
+    use loupe_github::reviews::{NextStep, ReviewTab};
+    use loupe_github::{ChecksState, ReviewDecision};
+
+    use super::{InboxView, PageState, build, shown, shown_all, step_cursor};
     use crate::github::common::Loadable;
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
@@ -1887,41 +2098,70 @@ mod tests {
         }
     }
 
+    /// Approved with passing checks: ready to merge.
+    fn ready(pr: PrSummary) -> PrSummary {
+        PrSummary {
+            review_decision: Some(ReviewDecision::Approved),
+            checks: Some(ChecksState::Passing),
+            ..pr
+        }
+    }
+
+    /// The open tab's groups, folded or not, as pull request numbers.
     fn numbers(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> Vec<Vec<u64>> {
         view.read_with(cx, |view, _| {
-            view.sections_shown()
+            view.groups_shown()
                 .iter()
-                .map(|section| section.iter().map(|pr| pr.number).collect())
+                .map(|(_, _, rows)| rows.iter().map(|pr| pr.number).collect())
                 .collect()
         })
     }
 
-    #[gpui_kit::test]
-    fn a_column_heading_sorts_each_section_on_its_own_and_a_view_keeps_it(cx: &mut TestAppContext) {
-        let (mut cx, view) = open(cx);
-        let cx = &mut cx;
-        let inbox = Inbox {
+    fn active(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> Option<ReviewTab> {
+        view.read_with(cx, |view, _| view.current_tab())
+    }
+
+    /// To review holds two ready to merge (1, 6) and two waiting for a
+    /// review (2, 3); Involved two waiting (4, 5); Mine none.
+    fn inbox() -> Inbox {
+        Inbox {
             review_requested: page(
-                vec![sized("a", 1, 50), sized("a", 2, 5), sized("a", 3, 500)],
-                3,
+                vec![
+                    ready(sized("a", 1, 50)),
+                    sized("a", 2, 5),
+                    sized("a", 3, 500),
+                    ready(sized("a", 6, 20)),
+                ],
+                4,
                 false,
             ),
             authored: page(Vec::new(), 0, false),
             involved: page(vec![sized("b", 4, 900), sized("b", 5, 1)], 2, false),
-        };
+        }
+    }
+
+    fn load(view: &Entity<InboxView>, inbox: Inbox, cx: &mut VisualTestContext) {
         view.update(cx, |view, cx| {
             view.inbox = Loadable::Loaded(inbox);
             cx.notify();
         });
-        let github = vec![vec![1, 2, 3], vec![], vec![4, 5]];
-        assert_eq!(numbers(&view, cx), github);
+        bounds(cx, "reviews-tab-All");
+    }
+
+    #[gpui_kit::test]
+    fn a_column_heading_sorts_each_group_on_its_own_and_a_view_keeps_it(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, inbox(), cx);
+        let github = vec![vec![1, 6], vec![2, 3]];
+        assert_eq!(numbers(&view, cx), github, "ready to merge, then waiting");
 
         // Ascending, descending, then GitHub's order again; a row never
-        // leaves its section.
+        // leaves its group.
         click(cx, "reviews-sort-changes");
-        assert_eq!(numbers(&view, cx), [vec![2, 1, 3], vec![], vec![5, 4]]);
+        assert_eq!(numbers(&view, cx), [vec![6, 1], vec![2, 3]]);
         click(cx, "reviews-sort-changes");
-        assert_eq!(numbers(&view, cx), [vec![3, 1, 2], vec![], vec![4, 5]]);
+        assert_eq!(numbers(&view, cx), [vec![1, 6], vec![3, 2]]);
         click(cx, "reviews-sort-changes");
         assert_eq!(numbers(&view, cx), github);
 
@@ -1936,7 +2176,12 @@ mod tests {
                 .expect("a row under the cursor")
             })
             .collect();
-        assert_eq!(walk, [2, 1, 3, 5, 4]);
+        assert_eq!(walk, [6, 1, 2, 3, 3]);
+
+        // The sort holds in every tab.
+        click(cx, "reviews-tab-Involved");
+        assert_eq!(numbers(&view, cx), [vec![5, 4]]);
+        click(cx, "reviews-tab-To review");
 
         // A sort is a change to the view: saved with it, and back with it.
         let smallest = Some(Sort {
@@ -1953,7 +2198,179 @@ mod tests {
         assert_eq!(numbers(&view, cx), github, "All has its own order");
         view.update(cx, |view, cx| view.switch_view(id.as_deref(), cx));
         assert_eq!(view.read_with(cx, |view, _| view.page.sort), smallest);
-        assert_eq!(numbers(&view, cx), [vec![2, 1, 3], vec![], vec![5, 4]]);
+        assert_eq!(numbers(&view, cx), [vec![6, 1], vec![2, 3]]);
+    }
+
+    #[gpui_kit::test]
+    fn the_page_opens_on_the_first_tab_with_rows_unless_the_view_keeps_another(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        // Nothing to review and nothing of yours: Involved comes first.
+        let only_involved = Inbox {
+            review_requested: page(Vec::new(), 0, false),
+            ..inbox()
+        };
+        load(&view, only_involved, cx);
+        assert_eq!(active(&view, cx), Some(ReviewTab::Involved));
+        assert_eq!(numbers(&view, cx), [vec![4, 5]]);
+
+        // A refresh that empties it does not switch tabs under the user.
+        load(
+            &view,
+            Inbox {
+                involved: page(Vec::new(), 0, false),
+                ..inbox()
+            },
+            cx,
+        );
+        assert_eq!(active(&view, cx), Some(ReviewTab::Involved));
+        assert!(numbers(&view, cx).is_empty());
+
+        // A view keeps the tab and the folded groups it was left on.
+        load(&view, inbox(), cx);
+        view.update(cx, |view, cx| view.save_as_new("Mine first", cx));
+        click(cx, "reviews-tab-Mine");
+        let id = view.read_with(cx, |view, _| view.page.view_id.clone());
+        view.update(cx, |view, cx| view.switch_view(None, cx));
+        assert_eq!(
+            active(&view, cx),
+            Some(ReviewTab::ToReview),
+            "no view: the first tab with rows"
+        );
+        view.update(cx, |view, cx| view.switch_view(id.as_deref(), cx));
+        assert_eq!(
+            active(&view, cx),
+            Some(ReviewTab::Mine),
+            "saved, though empty"
+        );
+        click(cx, "reviews-tab-All");
+        click(cx, "reviews-group-Ready to merge");
+        let saved = view.update(cx, |_, cx| {
+            let id = id.as_deref().expect("a saved view");
+            super::views_store::snapshot(cx)
+                .get(id)
+                .cloned()
+                .expect("still saved")
+        });
+        assert_eq!(saved.tab, Some(ReviewTab::All));
+        assert_eq!(saved.collapsed, [NextStep::ReadyToMerge]);
+        let dirty = view.update(cx, |view, cx| {
+            view.page.is_dirty(&super::views_store::snapshot(cx))
+        });
+        assert!(!dirty, "a tab or a fold is no unsaved change");
+    }
+
+    #[gpui_kit::test]
+    fn a_stored_copy_does_not_choose_the_tab_the_fresh_results_do(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        // The stored copy had something to review; since then it was
+        // reviewed, and two of yours opened.
+        let stored = Inbox {
+            involved: page(Vec::new(), 0, false),
+            ..inbox()
+        };
+        view.update(cx, |view, cx| {
+            view.inbox = Loadable::Refreshing(stored);
+            cx.notify();
+        });
+        bounds(cx, "reviews-tab-All");
+        assert_eq!(active(&view, cx), Some(ReviewTab::ToReview));
+        let fresh = Inbox {
+            review_requested: page(Vec::new(), 0, false),
+            authored: page(vec![pr("c", 11), pr("c", 12)], 2, false),
+            involved: page(Vec::new(), 0, false),
+        };
+        load(&view, fresh, cx);
+        assert_eq!(active(&view, cx), Some(ReviewTab::Mine));
+    }
+
+    #[gpui_kit::test]
+    fn views_keep_the_tab_only_when_it_was_picked_and_a_second_click_keeps_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, inbox(), cx);
+        let saved = |view: &Entity<InboxView>, id: &Option<String>, cx: &mut VisualTestContext| {
+            let id = id.clone().expect("a saved view");
+            view.update(cx, |_, cx| {
+                super::views_store::snapshot(cx)
+                    .get(&id)
+                    .cloned()
+                    .expect("saved")
+            })
+        };
+        // Folding under a view that keeps no tab does not save the tab the
+        // page opened on.
+        view.update(cx, |view, cx| view.save_as_new("Plain", cx));
+        let plain = view.read_with(cx, |view, _| view.page.view_id.clone());
+        click(cx, "reviews-group-Ready to merge");
+        let kept = saved(&view, &plain, cx);
+        assert_eq!(
+            (kept.tab, kept.collapsed),
+            (None, vec![NextStep::ReadyToMerge])
+        );
+        click(cx, "reviews-group-Ready to merge");
+
+        // With no view, a second click on "All" keeps the tab and the folds.
+        view.update(cx, |view, cx| view.switch_view(None, cx));
+        click(cx, "reviews-tab-Involved");
+        click(cx, "reviews-group-Waiting for review");
+        click(cx, "reviews-view-all");
+        assert_eq!(active(&view, cx), Some(ReviewTab::Involved));
+        let folded = view.read_with(cx, |view, _| view.page.collapsed.clone());
+        assert_eq!(folded, [NextStep::WaitingForReview]);
+        click(cx, "reviews-group-Waiting for review");
+
+        // A view with the same filters that opens on another tab drops the
+        // selection, though that tab lists the picked pull request too.
+        click(cx, "reviews-tab-All");
+        view.update(cx, |view, cx| view.save_as_new("Everything", cx));
+        let everything = view.read_with(cx, |view, _| view.page.view_id.clone());
+        view.update(cx, |view, cx| view.switch_view(None, cx));
+        assert_eq!(active(&view, cx), Some(ReviewTab::ToReview));
+        click(cx, "pr-select-PR_2");
+        assert_eq!(picked(&view, cx), [2]);
+        view.update(cx, |view, cx| view.switch_view(everything.as_deref(), cx));
+        assert_eq!(active(&view, cx), Some(ReviewTab::All));
+        assert!(
+            picked(&view, cx).is_empty(),
+            "the tab changed with the view"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn tabs_count_what_the_filters_leave_and_all_lists_each_once(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, inbox(), cx);
+        let counts = |view: &Entity<InboxView>, cx: &mut VisualTestContext| -> Vec<usize> {
+            view.read_with(cx, |view, _| {
+                let inbox = view.inbox.value().expect("loaded");
+                view.tab_lists(inbox)
+                    .iter()
+                    .map(|(_, shown)| shown.count)
+                    .collect()
+            })
+        };
+        assert_eq!(counts(&view, cx), [4, 0, 2, 6]);
+        view.update(cx, |view, cx| {
+            view.edit_draft(|draft| *draft = org("b"), cx)
+        });
+        assert_eq!(counts(&view, cx), [0, 0, 2, 2]);
+        assert_eq!(
+            active(&view, cx),
+            Some(ReviewTab::ToReview),
+            "a filter keeps the tab"
+        );
+        assert!(numbers(&view, cx).is_empty());
+        assert!(
+            bounds(cx, "reviews-tab-Involved").is_some(),
+            "every tab stays"
+        );
     }
 
     /// The picked pull requests, in the order the bar acts on them.
@@ -1967,62 +2384,77 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn checkboxes_pick_rows_in_the_sorted_order_and_a_filter_clears_them(cx: &mut TestAppContext) {
+    fn checkboxes_pick_rows_of_the_open_tab_and_a_filter_or_a_tab_clears_them(
+        cx: &mut TestAppContext,
+    ) {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
         cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
-        let inbox = Inbox {
-            review_requested: page(
-                vec![sized("a", 1, 50), sized("a", 2, 5), sized("a", 3, 500)],
-                3,
-                false,
-            ),
-            authored: page(Vec::new(), 0, false),
-            involved: page(vec![sized("b", 4, 900), sized("b", 5, 1)], 2, false),
-        };
-        view.update(cx, |view, cx| {
-            view.inbox = Loadable::Loaded(inbox);
-            cx.notify();
-        });
+        load(&view, inbox(), cx);
         assert_eq!(bounds(cx, "reviews-selection-bar"), None, "no bar yet");
 
         // Sorted smallest first, a Shift+click picks the rows between on
-        // screen (2, 1, 3), not between in GitHub's order (2, 3).
+        // screen, across groups (1, 2), not between in GitHub's order.
         click(cx, "reviews-sort-changes");
-        assert_eq!(numbers(&view, cx), [vec![2, 1, 3], vec![], vec![5, 4]]);
-        click(cx, "pr-select-PR_2");
-        let row = bounds(cx, "pr-row-PR_3").expect("row 3");
+        assert_eq!(numbers(&view, cx), [vec![6, 1], vec![2, 3]]);
+        click(cx, "pr-select-PR_1");
+        let row = bounds(cx, "pr-row-PR_2").expect("row 2");
         cx.simulate_click(row.center(), Modifiers::shift());
-        assert_eq!(picked(&view, cx), [2, 1, 3]);
+        assert_eq!(picked(&view, cx), [1, 2]);
         assert!(
             bounds(cx, "reviews-selection-bar").is_some(),
             "the bar shows the selection"
         );
 
-        // Cmd+A picks the section of the last click: Involved, after 5.
-        click(cx, "pr-select-PR_5");
+        // Cmd+A picks the whole tab, every group.
         cx.simulate_keystrokes("cmd-a");
-        assert_eq!(picked(&view, cx), [2, 1, 3, 5, 4]);
-        click(cx, "pr-select-PR_1");
-        assert_eq!(picked(&view, cx), [2, 3, 5, 4]);
+        assert_eq!(picked(&view, cx), [6, 1, 2, 3]);
 
         // A new sort keeps the selection and reorders what the bar opens.
         click(cx, "reviews-sort-changes");
-        assert_eq!(picked(&view, cx), [3, 2, 4, 5]);
+        assert_eq!(picked(&view, cx), [1, 6, 3, 2]);
 
-        // The heading's box drops a section that is all picked.
-        click(cx, "reviews-select-section-Involved");
+        // The group heading's box drops a group that is all picked.
+        click(cx, "reviews-select-group-Ready to merge");
         assert_eq!(picked(&view, cx), [3, 2]);
-        click(cx, "reviews-select-section-Involved");
-        assert_eq!(picked(&view, cx), [3, 2, 4, 5]);
+        click(cx, "reviews-select-group-Ready to merge");
+        assert_eq!(picked(&view, cx), [1, 6, 3, 2]);
+
+        // A folded group's rows leave the screen and the selection; Cmd+A
+        // skips them.
+        click(cx, "reviews-group-Ready to merge");
+        assert_eq!(picked(&view, cx), [3, 2]);
+        assert!(bounds(cx, "pr-row-PR_1").is_none(), "folded");
+        click(cx, "reviews-group-Ready to merge");
+        assert!(bounds(cx, "pr-row-PR_1").is_some(), "unfolded");
+        assert_eq!(picked(&view, cx), [3, 2], "unfolding picks nothing back");
+        click(cx, "reviews-group-Ready to merge");
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(picked(&view, cx), [3, 2]);
+        click(cx, "reviews-group-Ready to merge");
+        assert_eq!(
+            picked(&view, cx),
+            [3, 2],
+            "Cmd+A left the folded rows alone"
+        );
 
         // Escape drops it all.
         cx.simulate_keystrokes("escape");
         assert!(picked(&view, cx).is_empty());
         assert_eq!(bounds(cx, "reviews-selection-bar"), None);
 
+        // The selection belongs to its tab: another tab starts empty, even
+        // All, which lists the same pull request, and Cmd+A there picks
+        // that tab's rows.
+        click(cx, "pr-select-PR_3");
+        click(cx, "reviews-tab-All");
+        assert!(picked(&view, cx).is_empty(), "another tab clears it");
+        click(cx, "reviews-tab-Involved");
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(picked(&view, cx), [4, 5]);
+
         // Changing the filters clears the selection; a sort does not.
-        click(cx, "pr-select-PR_4");
         view.update(cx, |view, cx| {
             view.edit_draft(|draft| *draft = org("b"), cx)
         });
@@ -2133,11 +2565,12 @@ mod tests {
     }
 
     #[test]
-    fn all_open_lists_only_what_the_sections_above_do_not() {
+    fn all_lists_every_tab_then_the_rest_of_all_open_each_once() {
         let mut draft = pr("a", 3);
         draft.is_draft = true;
         let open = page(vec![pr("a", 1), pr("a", 2), draft, pr("b", 4)], 4, false);
-        let above = PrRef::new(RepoRef::new("a", "repo"), 2);
+        let mine = page(vec![pr("a", 2), pr("c", 9)], 2, false);
+        let mine = shown(&mine, &[]);
         let numbers = |shown: &super::Shown| -> Vec<u64> {
             shown
                 .items
@@ -2146,26 +2579,31 @@ mod tests {
                 .collect()
         };
 
-        let all = shown_all_open(&open, &[], &[&above]);
-        assert_eq!(numbers(&all), [1, 3, 4]);
-        assert_eq!(all.count, 3);
-        assert_eq!(all.note.as_deref(), Some("1 more listed above"));
+        let all = shown_all(&[&mine], Some(&open), &[]);
+        assert_eq!(numbers(&all), [2, 9, 1, 3, 4]);
+        assert_eq!((all.count, all.note), (5, None));
+        assert_eq!(numbers(&shown_all(&[&mine], None, &[])), [2, 9]);
 
-        // The view's clauses apply as in every other section.
-        let in_a = shown_all_open(&open, &org("a"), &[&above]);
-        assert_eq!(numbers(&in_a), [1, 3]);
+        // The view's clauses apply as in every other tab.
+        let in_a = shown_all(&[], Some(&open), &org("a"));
+        assert_eq!(numbers(&in_a), [1, 2, 3]);
         let no_drafts = vec![Clause {
             field: Field::Status,
             op: Op::NotIn,
             values: vec!["draft".into()],
         }];
-        assert_eq!(numbers(&shown_all_open(&open, &no_drafts, &[])), [1, 2, 4]);
-        assert_eq!(shown_all_open(&open, &no_drafts, &[]).note, None);
+        assert_eq!(numbers(&shown_all(&[], Some(&open), &no_drafts)), [1, 2, 4]);
 
         let partial = page(vec![pr("a", 1), pr("a", 2)], 700, true);
         assert_eq!(
-            shown_all_open(&partial, &[], &[&above]).note.as_deref(),
-            Some("Showing 2 of 700 · 1 more listed above")
+            shown_all(&[&mine], Some(&partial), &[]).note.as_deref(),
+            Some("Showing 2 of 700")
+        );
+        let first_page = page(vec![pr("a", 1)], 120, true);
+        let to_review = shown(&first_page, &[]);
+        assert_eq!(
+            shown_all(&[&to_review, &mine], None, &[]).note.as_deref(),
+            Some("Showing the 3 loaded; GitHub has more")
         );
     }
 
