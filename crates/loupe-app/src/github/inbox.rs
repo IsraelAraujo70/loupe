@@ -241,6 +241,9 @@ impl PageState {
 pub struct InboxView {
     inbox: Loadable<Inbox>,
     scroll: ScrollHandle,
+    /// The sideways scroll of the views' tabs, keyed by the open tab's
+    /// place in the row ("All" is 0).
+    views_row: ui::ScrollRow<usize>,
     page: PageState,
     /// Focused while nothing more specific is, so F reaches the screen.
     focus: FocusHandle,
@@ -319,6 +322,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
         let mut view = InboxView {
             inbox: Loadable::Loading,
             scroll: ScrollHandle::new(),
+            views_row: ui::ScrollRow::default(),
             page: PageState::default(),
             focus: cx.focus_handle(),
             filter_menu,
@@ -967,6 +971,7 @@ impl InboxView {
             .after_title(self.view_tabs(cx))
             .action(
                 ui::icon_button("inbox-add-repo", IconName::Plus, "Add repository…")
+                    .debug_selector(|| "inbox-add-repo".into())
                     .on_click(|_, window, cx| super::repo::open_add_repository(window, cx)),
             )
             .action(
@@ -975,6 +980,7 @@ impl InboxView {
                     IconName::RefreshCw,
                     if busy { "Refreshing…" } else { "Refresh" },
                 )
+                .debug_selector(|| "inbox-refresh".into())
                 .loading(busy)
                 .disabled(busy)
                 .on_click(cx.listener(|view, _, _, cx| view.reload(cx))),
@@ -984,7 +990,9 @@ impl InboxView {
     /// "All" and the saved views as tabs, save as new, the active view's
     /// menu, Filter, and the unsaved-changes controls. Filter comes before
     /// the controls that appear with a change, so neither it nor its open
-    /// menu moves when a filter is picked.
+    /// menu moves when a filter is picked. The tabs scroll sideways when
+    /// they do not fit, and the open one scrolls into view when it changes;
+    /// the controls after them never scroll or shrink.
     fn view_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let views = views_store::snapshot(cx);
         let dirty = self.page.is_dirty(&views);
@@ -992,6 +1000,7 @@ impl InboxView {
         let view = cx.weak_entity();
         let muted = cx.theme().muted_foreground;
         let all = ui::view_tab("reviews-view-all", "All", active.is_none(), cx)
+            .debug_selector(|| "reviews-view-all".into())
             .accessibility_label("All pull requests")
             .on_click(cx.listener(|this, _, _, cx| this.switch_view(None, cx)));
         let tabs: Vec<AnyElement> = views
@@ -1002,6 +1011,7 @@ impl InboxView {
                 let id = saved.id.clone();
                 let selected = active.as_deref() == Some(saved.id.as_str());
                 ui::view_tab(("reviews-view-tab", ix), saved.name.clone(), selected, cx)
+                    .debug_selector(move || format!("reviews-view-tab-{ix}"))
                     .accessibility_label(format!("View {}", saved.name))
                     .on_click(cx.listener(move |this, _, _, cx| this.switch_view(Some(&id), cx)))
                     .into_any_element()
@@ -1010,6 +1020,7 @@ impl InboxView {
         let save_as = {
             let view = view.clone();
             ui::icon_button("reviews-view-save-as", IconName::Plus, "Save as new view…")
+                .debug_selector(|| "reviews-view-save-as".into())
                 .on_click(move |_, window, cx| dialogs::save_as(view.clone(), window, cx))
         };
         let active_view = active
@@ -1021,6 +1032,7 @@ impl InboxView {
         let view_menu = active_view.map(|(id, name)| {
             let view = view.clone();
             ui::icon_button("reviews-view-menu", IconName::Ellipsis, "View actions")
+                .debug_selector(|| "reviews-view-menu".into())
                 .menu_trigger()
                 .dropdown_menu(move |menu, _, _| {
                     // Without a repository or an organization the All tab
@@ -1067,47 +1079,74 @@ impl InboxView {
                         .item(delete)
                 })
         });
+        let open_tab = active
+            .as_deref()
+            .and_then(|id| views.views.iter().position(|saved| saved.id == id))
+            .map_or(0, |ix| ix + 1);
+        self.views_row.follow(open_tab, open_tab);
+        let tab_row = h_flex()
+            .on_children_prepainted(self.views_row.watch_width(cx.entity_id()))
+            .id("reviews-views")
+            .debug_selector(|| "reviews-views".into())
+            .role(Role::TabList)
+            .aria_label("Views")
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(self.views_row.handle())
+            .gap_1()
+            .items_center()
+            .child(all)
+            .children(tabs);
         // In the header's own row, after the title: one view needs no row
         // of its own.
         h_flex()
             .min_w_0()
+            // The header shares a short row among the title and this; the
+            // tabs give way first, so the title keeps its width while they
+            // can scroll.
+            .flex_shrink(1000.)
             .ml_2()
             .gap_1()
             .items_center()
-            .overflow_hidden()
-            .child(all)
-            .children(tabs)
-            .child(save_as)
-            .children(view_menu)
-            .child(div().w_2())
-            .child(self.filter_button(cx))
-            .child(self.sort_button(cx))
-            .when(dirty, |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(muted)
-                        .mx_1()
-                        .child("Unsaved changes"),
-                )
-                .when(self.page.view_id.is_some(), |row| {
-                    row.child(
-                        Button::new("reviews-view-discard")
-                            .ghost()
-                            .small()
-                            .label("Discard")
-                            .on_click(cx.listener(|this, _, _, cx| this.discard_draft(cx))),
-                    )
-                    .child(
-                        Button::new("reviews-view-save")
-                            .debug_selector(|| "reviews-view-save".into())
-                            .small()
-                            .label("Save")
-                            .on_click(cx.listener(|this, _, _, cx| this.save_draft(cx))),
-                    )
-                })
-            })
+            .child(tab_row)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .items_center()
+                    .child(save_as)
+                    .children(view_menu)
+                    .child(div().w_2())
+                    .child(self.filter_button(cx))
+                    .child(self.sort_button(cx))
+                    .when(dirty, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .mx_1()
+                                .child("Unsaved changes"),
+                        )
+                        .when(self.page.view_id.is_some(), |row| {
+                            row.child(
+                                Button::new("reviews-view-discard")
+                                    .debug_selector(|| "reviews-view-discard".into())
+                                    .ghost()
+                                    .small()
+                                    .label("Discard")
+                                    .on_click(cx.listener(|this, _, _, cx| this.discard_draft(cx))),
+                            )
+                            .child(
+                                Button::new("reviews-view-save")
+                                    .debug_selector(|| "reviews-view-save".into())
+                                    .small()
+                                    .label("Save")
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_draft(cx))),
+                            )
+                        })
+                    }),
+            )
     }
 
     /// Chips for every clause and Clear, shown only while a filter is set.
@@ -1696,8 +1735,9 @@ fn group_heading(
 mod tests {
     use chrono::Utc;
     use gpui_kit::{
-        Bounds, Entity, Modifiers, Pixels, TestAppContext, VisualTestContext, WindowBounds,
-        WindowOptions, px, size,
+        Bounds, Entity, InputEvent as _, Modifiers, MouseMoveEvent, Pixels, PlatformInput,
+        ScrollDelta, ScrollEvent, TestAppContext, VisualTestContext, WindowBounds, WindowOptions,
+        point, px, size,
     };
     use loupe_github::reviews::{Clause, Field, Op, Sort, SortDir, SortKey, ViewsFile};
     use loupe_github::{Inbox, Page, PrRef, PrState, PrSummary, RepoRef};
@@ -1869,6 +1909,129 @@ mod tests {
         let unsaved = bounds(cx, "reviews-filter-open").expect("the Filter button");
         view.update(cx, |view, cx| view.edit_draft(|draft| draft.clear(), cx));
         assert_eq!(bounds(cx, "reviews-filter-open"), Some(unsaved));
+    }
+
+    /// Where the element with `selector` was drawn, after two frames: the
+    /// row of views follows its open tab on the frame after it was laid out.
+    fn settled(cx: &mut VisualTestContext, selector: &str) -> Bounds<Pixels> {
+        bounds(cx, "reviews-views");
+        cx.run_until_parked();
+        let selector: &'static str = selector.to_owned().leak();
+        bounds(cx, selector).unwrap_or_else(|| panic!("{selector} is on screen"))
+    }
+
+    fn in_view(row: Bounds<Pixels>, tab: Bounds<Pixels>) -> bool {
+        row.left() <= tab.left() && tab.right() <= row.right()
+    }
+
+    fn wheel(cx: &mut VisualTestContext, at: Bounds<Pixels>, dy: f32) {
+        let events: [PlatformInput; 2] = [
+            MouseMoveEvent {
+                position: at.center(),
+                pressed_button: None,
+                modifiers: Modifiers::none(),
+            }
+            .to_platform_input(),
+            ScrollEvent {
+                position: at.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                modifiers: Modifiers::none(),
+                ..ScrollEvent::default()
+            }
+            .to_platform_input(),
+        ];
+        for event in events {
+            cx.update(|window, cx| {
+                window.dispatch_event(event, cx);
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_row_of_views_too_long_for_the_header_scrolls_and_keeps_every_control_whole(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+
+        // While the views fit, the row is as wide as its tabs and does not
+        // scroll.
+        let row = settled(cx, "reviews-views");
+        let all = settled(cx, "reviews-view-all");
+        assert_eq!(all.left(), row.left(), "nothing is scrolled");
+        let first_view = view.update(cx, |_, cx| super::views_store::snapshot(cx).views.len());
+        if first_view > 0 {
+            let last = settled(cx, &format!("reviews-view-tab-{}", first_view - 1));
+            assert_eq!(last.right(), row.right(), "the row ends at its last tab");
+        }
+
+        // Eight more views, the last one open with an unsaved change, in a
+        // narrow window.
+        view.update(cx, |view, cx| {
+            for n in 1..=8 {
+                view.switch_view(None, cx);
+                view.edit_draft(|draft| *draft = org(&format!("org-{n}")), cx);
+                view.save_as_new(&format!("Review queue {n}"), cx);
+            }
+            view.edit_draft(|draft| draft.extend(org("acme")), cx);
+        });
+        cx.simulate_resize(size(px(900.), px(820.)));
+        cx.run_until_parked();
+        let last_ix = view.update(cx, |_, cx| super::views_store::snapshot(cx).views.len()) - 1;
+        let last = format!("reviews-view-tab-{last_ix}");
+
+        let row = settled(cx, "reviews-views");
+        assert!(
+            in_view(row, settled(cx, &last)),
+            "the open view, the last one, is scrolled into view"
+        );
+        let actions = settled(cx, "inbox-add-repo");
+        assert!(
+            settled(cx, "inbox-refresh").right() <= px(900.),
+            "Add repository and Refresh stay in the window"
+        );
+        let mut edge = row.right();
+        for control in [
+            "reviews-view-save-as",
+            "reviews-view-menu",
+            "reviews-filter-open",
+            "reviews-sort-open",
+            "reviews-view-discard",
+            "reviews-view-save",
+        ] {
+            let at = settled(cx, control);
+            assert!(
+                at.left() >= edge && at.right() <= actions.left(),
+                "{control} is whole, after the tabs and before Add repository: {at:?}"
+            );
+            edge = at.right();
+        }
+
+        // The wheel scrolls the row back toward the first views.
+        let before = settled(cx, &last);
+        wheel(cx, row, 200.);
+        assert_eq!(
+            settled(cx, &last).left(),
+            before.left() + px(200.),
+            "the wheel scrolls the row sideways"
+        );
+
+        // Opening "All" scrolls back to it, and the wheel reaches the last
+        // view again.
+        view.update(cx, |view, cx| view.switch_view(None, cx));
+        let all = settled(cx, "reviews-view-all");
+        // "All" has no unsaved change: the controls after the row are fewer
+        // and the row is wider.
+        let row = settled(cx, "reviews-views");
+        assert!(
+            in_view(row, all),
+            "the open view, All, is scrolled into view"
+        );
+        wheel(cx, row, -5000.);
+        assert!(
+            in_view(row, settled(cx, &last)),
+            "the wheel reaches the last view"
+        );
     }
 
     /// A pull request in `owner/repo` with `lines` changed.

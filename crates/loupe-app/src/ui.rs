@@ -22,9 +22,11 @@ use crate::theme::{scale, tokens};
 
 mod menu;
 mod reading;
+mod scroll_row;
 mod segmented;
 pub use menu::{MenuRow, menu_row};
 pub use reading::{READING_WIDTH, markdown};
+pub use scroll_row::ScrollRow;
 pub use segmented::segmented;
 
 /// Height of every page header and of the sidebar header beside it. It is

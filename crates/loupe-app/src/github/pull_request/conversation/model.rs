@@ -414,6 +414,7 @@ mod tests {
             pending_review: None,
             viewer_login: "me".into(),
             viewer_can_update: true,
+            stack: None,
         }
     }
 

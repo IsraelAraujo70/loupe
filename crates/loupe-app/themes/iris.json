@@ -51,6 +51,10 @@
     "diff_removed_bg": "#ff818233",
     "diff_added_text": "#116329",
     "diff_removed_text": "#a40e26",
+    "group_blue": "#2f6fe4",
+    "group_pink": "#c83d8b",
+    "group_cyan": "#007f98",
+    "group_orange": "#c45100",
     "syntax": {
       "keyword": {
         "color": "#cf222e"
@@ -186,6 +190,10 @@
     "diff_removed_bg": "#f8514924",
     "diff_added_text": "#7ee787",
     "diff_removed_text": "#ffa198",
+    "group_blue": "#2f6fe4",
+    "group_pink": "#c83d8b",
+    "group_cyan": "#007f98",
+    "group_orange": "#c45100",
     "syntax": {
       "keyword": {
         "color": "#ff7b72"

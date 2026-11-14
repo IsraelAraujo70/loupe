@@ -10,7 +10,9 @@ docs/DESIGN.md:
 
 - faint, muted, and primary text reach 4.8:1 on every opaque surface;
 - white on the primary fill, the merge fill, and the state pills reaches 4.5:1;
-- links reach 4.5:1 on the panel and on cards.
+- links reach 4.5:1 on the panel and on cards;
+- white on every tab group color reaches 4.5:1, and each group color added
+  after the first six stays apart from the others (see `GROUP_FILLS`).
 
 Run it after changing a seed: `python3 scripts/make-themes.py`. The Rust test
 `theme::palette::tests::built_in_themes_pass_the_contrast_rules` checks the
@@ -229,6 +231,22 @@ LIGHT_STATES = {
     "diff_removed_text": "#a40e26",
 }
 
+# The tab group colors that are not a state color (Grey, Red, Yellow, Green,
+# and Purple are the draft, closed, pending, open, and merged fills). Each is
+# as light as white text on it allows (4.5:1), in Chrome's hue for it. Blue
+# is a blue in every theme, so it stays apart from Cyan and from an accent of
+# another hue (Ember's is orange); a theme whose accent is blue uses it.
+GROUP_FILLS = {
+    "group_blue": "#2f6fe4",
+    "group_pink": "#c83d8b",
+    "group_cyan": "#007f98",
+    "group_orange": "#c45100",
+}
+
+# How far apart, in OKLab, a group color added after the first six stays
+# from every other group color of its palette.
+GROUP_DISTANCE = 0.08
+
 # Loupe's dark palette as the app drew it before themes existed.
 LOUPE_DARK = {
     "window": "#0e0f11",
@@ -266,6 +284,7 @@ LOUPE_DARK = {
     "indent_guide": "#ffffff14",
     "indent_guide_active": "#ffffff38",
     **DARK_STATES,
+    **GROUP_FILLS,
 }
 
 
@@ -322,6 +341,7 @@ def dark_palette(hue, chroma, accent, overrides=None):
         "indent_guide": white(0.08),
         "indent_guide_active": white(0.22),
         **DARK_STATES,
+        **GROUP_FILLS,
     }
     palette.update(overrides or {})
     return palette
@@ -368,6 +388,7 @@ def light_palette(hue, chroma, accent, overrides=None):
         "indent_guide": black(0.08),
         "indent_guide_active": black(0.22),
         **LIGHT_STATES,
+        **GROUP_FILLS,
     }
     palette.update(overrides or {})
     return palette
@@ -469,6 +490,7 @@ def themes():
             "diff_removed_text": "#f7768e",
         },
     )
+    tokyo_dark["group_blue"] = tokyo_dark["accent_fill"]
     tokyo_dark["text_muted"] = shift_until("#a9b1d6", [tokyo_dark[k] for k in ("window", "panel", "surface", "overlay")], 6.0, 0.005)
     tokyo_dark["text_faint"] = shift_until("#737aa2", [tokyo_dark[k] for k in ("window", "panel", "surface", "overlay")], 4.8, 0.005)
     tokyo_light = light_palette(
@@ -492,10 +514,16 @@ def themes():
     tokyo_light["accent_fill"] = shift_until("#2e7de9", ["#ffffff"], 4.6, -0.005)
     tokyo_light["accent_fill_hover"] = shade(tokyo_light["accent_fill"], 0.93)
     tokyo_light["accent_fill_active"] = shade(tokyo_light["accent_fill"], 0.86)
+    tokyo_light["group_blue"] = tokyo_light["accent_fill"]
     tokyo_light["secondary"] = "#d0d1d8"
     tokyo_light["secondary_hover"] = "#c6c8d1"
     tokyo_light["secondary_active"] = "#bcbfca"
     yield "tokyo-night", "Tokyo Night", (tokyo_light, TOKYO_LIGHT_SYNTAX), (tokyo_dark, TOKYO_DARK_SYNTAX)
+
+
+def oklab(hex_value):
+    l, c, h = rgb_to_oklch(hex_to_rgb(hex_value))
+    return l, c * math.cos(math.radians(h)), c * math.sin(math.radians(h))
 
 
 def check(theme_id, variant, palette):
@@ -506,9 +534,15 @@ def check(theme_id, variant, palette):
     for key in ("panel", "surface"):
         worst = contrast(palette["link"], palette[key])
         assert worst >= 4.5, f"{theme_id}/{variant}: link on {key} {worst:.2f}"
-    for key in ("accent_fill", "merge_fill", "open_fill", "merged_fill", "closed_fill", "draft_fill"):
+    for key in ("accent_fill", "merge_fill", "open_fill", "merged_fill", "closed_fill", "draft_fill", *GROUP_FILLS):
         worst = contrast(palette["on_accent"], palette[key])
         assert worst >= 4.5, f"{theme_id}/{variant}: on_accent on {key} {worst:.2f}"
+    groups = ["draft_fill", "group_blue", "closed_fill", "pending", "open_fill", "merged_fill", "group_pink", "group_cyan", "group_orange"]
+    for key in groups[6:]:
+        for other in groups:
+            if other != key:
+                apart = math.dist(oklab(palette[key]), oklab(palette[other]))
+                assert apart >= GROUP_DISTANCE, f"{theme_id}/{variant}: {key} and {other} {apart:.3f} apart"
 
 
 def main():

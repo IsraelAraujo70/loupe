@@ -14,6 +14,7 @@ mod merge;
 mod rate;
 mod rest;
 pub mod reviews;
+mod stack;
 pub mod suggestion;
 mod types;
 mod workflow;
@@ -25,6 +26,7 @@ pub use ids::{PrRef, RepoRef};
 pub use merge::MergeOutcome;
 pub use rate::{RateLimit, RateLimits};
 pub use rest::{ChecksEtag, ChecksPoll, NOTIFICATIONS_LIMIT};
+pub use stack::{PrStack, StackEntry};
 pub use types::*;
 pub use workflow::{
     Annotation, AnnotationLevel, JobLog, JobStep, LogLine, LogLineKind, RUNS_PAGE, RunArtifact,
