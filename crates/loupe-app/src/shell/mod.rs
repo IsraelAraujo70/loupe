@@ -178,10 +178,22 @@ pub fn is_on_screen(view: EntityId, cx: &App) -> bool {
             })
 }
 
-/// Shows `route` in the active tab, after its current page. Re-navigating to
-/// the current route does nothing.
+/// Shows `route` in the active tab, after its current page; from a pinned
+/// tab, in a new tab right after the pinned ones, so the pinned tab keeps
+/// its page. Re-navigating to the current route does nothing.
 pub fn navigate(route: Route, window: &mut Window, cx: &mut App) {
     with_workspace(cx, |workspace, cx| workspace.push(route, window, cx));
+}
+
+/// Whether `to` shows the page `from` shows, with another filter: a pinned
+/// tab stays on it. Pages change their own filter this way when it is part
+/// of the route (the branch of a repository's runs, a team's saved view).
+fn same_page(from: &Route, to: &Route) -> bool {
+    match (from, to) {
+        (Route::Actions { repo: a, .. }, Route::Actions { repo: b, .. }) => a == b,
+        (Route::LinearTeam { team_id: a, .. }, Route::LinearTeam { team_id: b, .. }) => a == b,
+        _ => false,
+    }
 }
 
 /// Opens `route` in a new background tab, as a browser opens a link in a new
@@ -354,8 +366,16 @@ impl Workspace {
         }
     }
 
+    /// Shows `route` after the active tab's page; a pinned tab keeps its
+    /// page and the route opens in a new tab after the pinned ones, unless
+    /// it is the same page with another filter.
     fn push(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
-        if self.panes.active().active().current().route == route {
+        let active = self.panes.active().active();
+        if active.current().route == route {
+            return;
+        }
+        if active.pinned && !same_page(&active.current().route, &route) {
+            self.open_tab(route, window, cx);
             return;
         }
         let page = self.page(route, window, cx);
@@ -1642,6 +1662,7 @@ mod tests {
             tabs: tabs.to_vec(),
             active: 0,
             groups: Vec::new(),
+            pinned: 0,
         }
     }
 
@@ -1717,6 +1738,7 @@ mod tests {
                 tabs: vec![Route::Notifications, Route::LinearMyIssues, Route::Inbox],
                 active: 2,
                 groups: Vec::new(),
+                pinned: 0,
             },
             "the dragged tab takes the place of the one it is dropped on, and stays active"
         );
@@ -1800,8 +1822,155 @@ mod tests {
                     first: 2,
                     len: 1,
                 }],
+                pinned: 0,
             },
             "a tab dropped on a tab outside the group leaves it"
+        );
+    }
+
+    /// A pinned Reviews tab keeps its list: a pull request opened from it
+    /// (what a click on a row does) and a page the sidebar opens go to a new
+    /// tab right after the pinned ones, and Cmd+click still opens one in the
+    /// background. The pinned tab is narrower than the others.
+    #[gpui_kit::test]
+    fn a_page_opened_from_a_pinned_tab_opens_in_a_new_tab(cx: &mut TestAppContext) {
+        use loupe_github::{PrRef, RepoRef};
+
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        // Reviews (0), and Inbox (1) in the background; Reviews pinned, as
+        // "Pin tab" does.
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(0, |tabs, index| tabs.pin(index), cx)
+        });
+        assert!(
+            center(cx, "tab-0").x < center(cx, "tab-1").x,
+            "the pinned tab comes first"
+        );
+        let width = |cx: &mut VisualTestContext, selector| {
+            center(cx, selector);
+            f32::from(cx.debug_bounds(selector).expect("on screen").size.width)
+        };
+        assert!(
+            width(cx, "tab-0") <= 112. && width(cx, "tab-1") >= 128.,
+            "a pinned tab is narrower than the others"
+        );
+
+        let pr = Route::PullRequest(PrRef::new(RepoRef::new("octo", "app"), 7));
+        cx.update(|window, cx| super::navigate(pr.clone(), window, cx));
+        cx.run_until_parked();
+        let pinned_pane = |tabs: Vec<Route>, active| PaneLayout::Pane {
+            tabs,
+            active,
+            groups: Vec::new(),
+            pinned: 1,
+        };
+        assert_eq!(
+            saved_panes(cx).0,
+            pinned_pane(vec![Route::Inbox, pr.clone(), Route::Notifications], 1),
+            "the pull request opens in a new tab after the pinned one"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let pinned = workspace.panes.active().iter().next().expect("a tab");
+            assert!(pinned.pinned);
+            assert_eq!(
+                pinned.current().route,
+                Route::Inbox,
+                "the pinned tab still shows Reviews"
+            );
+            assert!(!pinned.can_go_back());
+        });
+
+        click(cx, "tab-0", MouseButton::Left, Modifiers::none());
+        click(
+            cx,
+            "sidebar-my-issues",
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert_eq!(
+            saved_panes(cx).0,
+            pinned_pane(
+                vec![
+                    Route::Inbox,
+                    Route::LinearMyIssues,
+                    pr.clone(),
+                    Route::Notifications
+                ],
+                1
+            ),
+            "a sidebar row opened from a pinned tab opens a new tab too"
+        );
+
+        click(cx, "tab-0", MouseButton::Left, Modifiers::none());
+        click(cx, "sidebar-inbox", MouseButton::Left, Modifiers::command());
+        assert_eq!(
+            saved_panes(cx).0,
+            pinned_pane(
+                vec![
+                    Route::Inbox,
+                    Route::LinearMyIssues,
+                    pr,
+                    Route::Notifications,
+                    Route::Notifications
+                ],
+                0
+            ),
+            "Cmd+click opens in the background, after the last tab opened that way \
+             from the pinned tab, and the pinned tab stays open"
+        );
+
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(0, |tabs, index| tabs.unpin(index), cx)
+        });
+        let PaneLayout::Pane { tabs, pinned, .. } = saved_panes(cx).0 else {
+            panic!("one pane")
+        };
+        assert_eq!(
+            (tabs[0].clone(), pinned),
+            (Route::Inbox, 0),
+            "unpinned in place"
+        );
+    }
+
+    /// A pinned tab that changes its own filter through its route (the
+    /// branch of a repository's runs) stays on its page; another
+    /// repository's runs open in a new tab.
+    #[gpui_kit::test]
+    fn a_pinned_tab_changes_its_own_filter_in_place(cx: &mut TestAppContext) {
+        use loupe_github::RepoRef;
+
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        let runs = |name: &str, branch: Option<&str>| Route::Actions {
+            repo: RepoRef::new("octo", name),
+            branch: branch.map(str::to_owned),
+        };
+        cx.update(|window, cx| super::navigate(runs("app", Some("main")), window, cx));
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(0, |tabs, index| tabs.pin(index), cx)
+        });
+        cx.update(|window, cx| super::navigate(runs("app", None), window, cx));
+        cx.run_until_parked();
+        let one = |tabs: Vec<Route>, active| PaneLayout::Pane {
+            tabs,
+            active,
+            groups: Vec::new(),
+            pinned: 1,
+        };
+        assert_eq!(
+            saved_panes(cx).0,
+            one(vec![runs("app", None)], 0),
+            "clearing the branch stays in the pinned tab"
+        );
+
+        cx.update(|window, cx| super::navigate(runs("web", None), window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            saved_panes(cx).0,
+            one(vec![runs("app", None), runs("web", None)], 1),
+            "another repository's runs open in a new tab"
         );
     }
 
