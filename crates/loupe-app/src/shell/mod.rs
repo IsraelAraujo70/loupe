@@ -1956,6 +1956,65 @@ mod tests {
         );
     }
 
+    /// With grouping by repository on, a pull request followed from a pinned
+    /// tab opens the way every new tab does: after the pinned tab, in its
+    /// repository's group.
+    #[gpui_kit::test]
+    fn a_link_from_a_pinned_tab_joins_its_repository_s_group(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(0, |tabs, index| tabs.pin(index), cx)
+        });
+        cx.update(|_, cx| {
+            store::update_settings(cx, |settings| settings.group_tabs_by_repo = true)
+        });
+        let pr = |number| Route::PullRequest(PrRef::new(RepoRef::new("octo", "app"), number));
+        cx.update(|window, cx| super::navigate(pr(7), window, cx));
+        cx.run_until_parked();
+        let saved = |cx: &mut VisualTestContext| match saved_panes(cx).0 {
+            PaneLayout::Pane {
+                tabs,
+                active,
+                groups,
+                pinned,
+            } => (
+                tabs,
+                active,
+                pinned,
+                groups
+                    .into_iter()
+                    .map(|group| (group.name, group.first, group.len))
+                    .collect::<Vec<_>>(),
+            ),
+            split => panic!("expected one pane, got {split:?}"),
+        };
+        assert_eq!(
+            saved(cx),
+            (
+                vec![Route::Inbox, pr(7)],
+                1,
+                1,
+                vec![("app".to_string(), 1, 1)]
+            ),
+            "the pull request opens after the pinned tab, in a new group named after its repository"
+        );
+
+        click(cx, "tab-0", MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| super::navigate(pr(8), window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            saved(cx),
+            (
+                vec![Route::Inbox, pr(7), pr(8)],
+                2,
+                1,
+                vec![("app".to_string(), 1, 2)]
+            ),
+            "the next one joins the same group"
+        );
+    }
+
     /// A pinned tab that changes its own filter through its route (the
     /// branch of a repository's runs) stays on its page; another
     /// repository's runs open in a new tab.
