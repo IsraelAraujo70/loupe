@@ -14,7 +14,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_t3::{Error, PullRequestKey, ReviewLaunch, T3};
+use loupe_t3::{Error, ModelChoice, Provider, PullRequestKey, ReviewLaunch, T3};
 
 use super::review::{self, OPERATE_HINT, Plan, ReviewPrompt};
 use crate::links::PrLinkContext;
@@ -122,7 +122,7 @@ impl ReviewForm {
 
     /// The model the open tab runs on, or why the server cannot run it,
     /// which keeps Send off.
-    fn model(&self) -> Result<loupe_t3::ModelChoice, String> {
+    fn model(&self) -> Result<ModelChoice, String> {
         self.plan.model(&self.prompts[self.selected])
     }
 
@@ -215,7 +215,7 @@ impl ReviewForm {
     }
 }
 
-fn failure_text(error: &Error) -> String {
+pub(super) fn failure_text(error: &Error) -> String {
     match error {
         Error::MissingScope(_) => OPERATE_HINT.to_owned(),
         Error::Unauthorized => review::REJECTED_HINT.to_owned(),
@@ -232,72 +232,20 @@ impl Render for ReviewForm {
             Submit::Idle | Submit::Sending => None,
         };
         let model = self.model();
-        let tabs = h_flex()
-            .id("t3-review-prompts")
-            .role(Role::TabList)
-            .aria_label("Review prompt")
-            .flex_wrap()
-            .gap_1()
-            .children(self.prompts.iter().enumerate().map(|(index, prompt)| {
-                let unavailable = self.plan.model(prompt).err();
-                ui::view_tab(
-                    ("t3-review-prompt", index),
-                    prompt.name.clone(),
-                    index == self.selected,
-                    cx,
-                )
-                .when_some(unavailable, |tab, why| {
-                    tab.icon(IconName::TriangleAlert).tooltip(why)
-                })
-                .disabled(sending && index != self.selected)
-                .on_click(cx.listener(move |form, _, window, cx| form.pick(index, window, cx)))
-            }));
-        let runs_on = match &model {
-            Ok(choice) => div()
-                .text_size(scale::meta())
-                .text_color(muted)
-                .child(format!(
-                    "Runs on {}.",
-                    review::model_summary(&self.plan.providers, choice)
-                )),
-            Err(why) => h_flex()
-                .gap_1p5()
-                .items_start()
-                .text_size(scale::meta())
-                .text_color(cx.theme().danger)
-                .child(
-                    gpui_kit::component::Icon::new(IconName::TriangleAlert)
-                        .xsmall()
-                        .flex_none()
-                        .mt_0p5(),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(format!("Unavailable: {why}")),
-                ),
-        };
+        let tabs = prompt_tabs(
+            &self.prompts,
+            self.selected,
+            Some(&self.plan.providers),
+            sending,
+            Self::pick,
+            cx,
+        );
+        let runs_on = runs_on(&model, &self.plan.providers, cx);
         let place = format!(
             "A new thread in {} on a worktree of {} ({}).",
             self.plan.project_title, self.context.head_ref, self.plan.branch
         );
-        let risk = (!self.plan.risk.is_empty()).then(|| {
-            format!(
-                "Risky pull request: {}.",
-                self.plan
-                    .risk
-                    .iter()
-                    .take(3)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-                    + &match self.plan.risk.len().saturating_sub(3) {
-                        0 => String::new(),
-                        more => format!(" and {more} more"),
-                    }
-            )
-        });
+        let risk = risk_line(&self.plan.risk);
         v_flex()
             .gap_3()
             .child(v_flex().gap_2().child(tabs).child(runs_on))
@@ -336,6 +284,92 @@ impl Render for ReviewForm {
                             .on_click(cx.listener(|form, _, window, cx| form.send(window, cx))),
                     ),
             )
+    }
+}
+
+/// The row of review prompt tabs, the open one at `selected`. With the
+/// server's `providers`, a tab whose model the server cannot run warns and
+/// says why in its tooltip. `locked` keeps the other tabs off while sending.
+pub(super) fn prompt_tabs<T: 'static>(
+    prompts: &[ReviewPrompt],
+    selected: usize,
+    providers: Option<&[Provider]>,
+    locked: bool,
+    pick: fn(&mut T, usize, &mut Window, &mut Context<T>),
+    cx: &mut Context<T>,
+) -> Stateful<Div> {
+    h_flex()
+        .id("t3-review-prompts")
+        .role(Role::TabList)
+        .aria_label("Review prompt")
+        .flex_wrap()
+        .gap_1()
+        .children(prompts.iter().enumerate().map(|(index, prompt)| {
+            let unavailable =
+                providers.and_then(|providers| review::model_choice(providers, prompt).err());
+            ui::view_tab(
+                ("t3-review-prompt", index),
+                prompt.name.clone(),
+                index == selected,
+                cx,
+            )
+            .when_some(unavailable, |tab, why| {
+                tab.icon(IconName::TriangleAlert).tooltip(why)
+            })
+            .disabled(locked && index != selected)
+            .on_click(cx.listener(move |form, _, window, cx| pick(form, index, window, cx)))
+        }))
+}
+
+/// "Risky pull request: …" with the first three reasons, or `None` for an
+/// ordinary pull request.
+pub(super) fn risk_line(risk: &[String]) -> Option<String> {
+    let (shown, more) = (risk.iter().take(3), risk.len().saturating_sub(3));
+    (!risk.is_empty()).then(|| {
+        format!(
+            "Risky pull request: {}{}.",
+            shown.cloned().collect::<Vec<_>>().join(", "),
+            match more {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            }
+        )
+    })
+}
+
+/// The model the open tab runs on, or why the server cannot run it.
+pub(super) fn runs_on(
+    model: &Result<ModelChoice, String>,
+    providers: &[Provider],
+    cx: &App,
+) -> AnyElement {
+    match model {
+        Ok(choice) => div()
+            .text_size(scale::meta())
+            .text_color(cx.theme().muted_foreground)
+            .child(format!(
+                "Runs on {}.",
+                review::model_summary(providers, choice)
+            ))
+            .into_any_element(),
+        Err(why) => h_flex()
+            .gap_1p5()
+            .items_start()
+            .text_size(scale::meta())
+            .text_color(cx.theme().danger)
+            .child(
+                gpui_kit::component::Icon::new(IconName::TriangleAlert)
+                    .xsmall()
+                    .flex_none()
+                    .mt_0p5(),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(format!("Unavailable: {why}")),
+            )
+            .into_any_element(),
     }
 }
 

@@ -4,7 +4,7 @@
 //! here is tested without a server.
 
 use loupe_t3::{
-    ModelChoice, Project, Provider, ProviderModel, PullRequestKey, ReviewFacts, Session,
+    Error, ModelChoice, Project, Provider, ProviderModel, PullRequestKey, ReviewFacts, Session, T3,
 };
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +15,8 @@ use crate::links::PrLinkContext;
 pub const OPERATE_HINT: &str = "Review with T3 Code starts an agent, so it needs a T3 token \
      with full access (orchestration:operate). A read-only token still lists the threads.";
 
-pub(super) const CONNECT_HINT: &str = "Connect T3 Code in Settings to start a review.";
+/// Why a review cannot start while T3 is not connected.
+pub const CONNECT_HINT: &str = "Connect T3 Code in Settings to start a review.";
 pub(super) const REJECTED_HINT: &str = "T3 rejected the token. Check it in Settings.";
 
 /// Where a review of this pull request would run, once every check passed.
@@ -83,6 +84,111 @@ pub(super) fn assess(
         providers,
         risk: risk(settings, &context.labels, files),
     })
+}
+
+/// What the T3 server answered for a review, asked once for all the pull
+/// requests of a batch.
+#[derive(Clone, Debug)]
+pub(super) struct Server {
+    pub session: Session,
+    pub projects: Vec<Project>,
+    pub facts: ReviewFacts,
+    pub providers: Vec<Provider>,
+}
+
+impl Server {
+    /// Asks the server, or says why it could not, in the words the single
+    /// review button uses.
+    pub(super) fn load(t3: &T3) -> Result<Server, String> {
+        let load = || -> Result<Server, Error> {
+            Ok(Server {
+                session: t3.session()?,
+                projects: t3.projects()?,
+                facts: t3.review_facts()?,
+                providers: t3.providers()?,
+            })
+        };
+        load().map_err(|error| match error {
+            Error::Unauthorized | Error::MissingScope(_) => REJECTED_HINT.to_owned(),
+            other => format!("Could not check T3: {other}"),
+        })
+    }
+}
+
+/// One pull request of a batch as GitHub described it, with its changed
+/// paths (empty when they did not load: the labels alone decide the risk).
+#[derive(Clone, Debug)]
+pub(super) struct Candidate {
+    pub context: PrLinkContext,
+    pub files: Vec<String>,
+}
+
+/// Why a pull request gets no review button: its author is gone, or it is
+/// the user's own.
+pub(super) fn not_reviewable(context: &PrLinkContext) -> Option<String> {
+    if context.author.is_none() {
+        Some("Its author's GitHub account is deleted.".to_owned())
+    } else if context.is_own() {
+        Some("You opened it, and T3 reviews someone else's pull request.".to_owned())
+    } else {
+        None
+    }
+}
+
+/// The readiness of each pull request of a batch, in order, as the single
+/// button would report it: GitHub's error, the user's own, a fork, the
+/// server's error, or [`assess`]. Each ready one gets a branch no thread of
+/// its project holds and no earlier pull request of the batch was given.
+pub(super) fn assess_batch(
+    candidates: &[Result<Candidate, String>],
+    server: &Result<Server, String>,
+    settings: &ReviewSettings,
+) -> Vec<Readiness> {
+    let mut facts = server
+        .as_ref()
+        .map(|server| server.facts.clone())
+        .unwrap_or_else(|_| ReviewFacts {
+            branches: Default::default(),
+        });
+    candidates
+        .iter()
+        .map(|candidate| {
+            let candidate = match candidate {
+                Ok(candidate) => candidate,
+                Err(why) => {
+                    return Readiness::Unavailable(format!("GitHub did not load it: {why}"));
+                }
+            };
+            let context = &candidate.context;
+            if let Some(why) = not_reviewable(context) {
+                return Readiness::Unavailable(why);
+            }
+            if let Some(readiness) = precheck(context) {
+                return readiness;
+            }
+            let server = match server {
+                Ok(server) => server,
+                Err(why) => return Readiness::Unavailable(why.clone()),
+            };
+            let readiness = assess(
+                context,
+                server.session,
+                &server.projects,
+                &facts,
+                server.providers.clone(),
+                &candidate.files,
+                settings,
+            );
+            if let Readiness::Ready(plan) = &readiness {
+                facts
+                    .branches
+                    .entry(plan.project_id.clone())
+                    .or_default()
+                    .push(plan.branch.clone());
+            }
+            readiness
+        })
+        .collect()
 }
 
 /// The model a prompt runs on: its provider instance, or else the first one
@@ -668,6 +774,22 @@ pub(super) fn request(
     risk: &[String],
     template: &str,
 ) -> String {
+    fill_request(context, risk, &shared_request(template, prompt))
+}
+
+/// The request one review of several starts from: `template` with the
+/// review prompt's text where `{prompt}` is, and every other variable left
+/// for [`fill_request`] to fill per pull request.
+pub(super) fn shared_request(template: &str, prompt: &str) -> String {
+    fill(template, |name| match name {
+        "prompt" | OLD_PROMPT_VARIABLE => Some(prompt.to_owned()),
+        _ => None,
+    })
+}
+
+/// `shared` (see [`shared_request`]) with its variables filled for this
+/// pull request.
+pub(super) fn fill_request(context: &PrLinkContext, risk: &[String], shared: &str) -> String {
     let why = if risk.is_empty() {
         "O usuário pediu também a revisão de segurança".to_owned()
     } else {
@@ -688,11 +810,7 @@ pub(super) fn request(
             _ => return None,
         })
     };
-    let prompt = fill(prompt, value);
-    fill(template, |name| match name {
-        "prompt" | OLD_PROMPT_VARIABLE => Some(prompt.clone()),
-        other => value(other),
-    })
+    fill(shared, value)
 }
 
 /// `template` with each `{variable}` that `value` knows replaced in one

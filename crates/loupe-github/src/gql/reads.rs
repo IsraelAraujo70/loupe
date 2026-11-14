@@ -1,5 +1,7 @@
 //! Search-backed lists: the inbox, repository PR lists, and repositories.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -7,7 +9,8 @@ use serde_json::{Value, json};
 
 use crate::{
     Actor, ChecksState, Error, GitHub, Inbox, Label, Mergeable, Page, PrListFilter, PrRef, PrState,
-    PrSummary, RepoRef, RepoSummary, Result, ReviewDecision, ReviewRequest,
+    PrSummary, RepoRef, RepoSummary, Result, ReviewDecision, ReviewRequest, StackMember,
+    StackSummary,
 };
 
 const REPO_PR_PAGE_SIZE: u32 = 30;
@@ -34,6 +37,8 @@ fragment PrRow on PullRequest {
   additions
   deletions
   headRefName
+  baseRefName
+  isCrossRepository
   repository { owner { login } name }
   author { login avatarUrl }
   comments { totalCount }
@@ -44,6 +49,10 @@ fragment PrRow on PullRequest {
   assignees(first: 10) { nodes { login avatarUrl } }
   reviewRequests(first: 10) { nodes { requestedReviewer { __typename ... on User { login avatarUrl } ... on Team { combinedSlug } } } }
   latestReviews(first: 20) { nodes { state author { __typename login avatarUrl } } }
+  stack {
+    number
+    entries(first: 50) { nodes { position pullRequest { number title state } } }
+  }
 }
 fragment PrPage on SearchResultItemConnection {
   issueCount
@@ -121,6 +130,30 @@ const REPOSITORY_LABELS_QUERY: &str = "query RepositoryLabels($owner: String!, $
 /// and some runs fail with 502).
 const ALL_OPEN_PAGE_SIZE: u32 = 50;
 const MAX_ALL_OPEN_PAGES: usize = 10;
+
+/// Branches counted per request by [`GitHub::open_pull_requests_by_base`].
+const BASES_PER_REQUEST: usize = 50;
+
+/// One field per branch asking how many open pull requests target it, with
+/// the repository and the branch as variables, never spliced into the text.
+pub(crate) fn open_by_base_query(count: usize) -> String {
+    let variables: Vec<String> = (0..count)
+        .map(|at| format!("$o{at}: String!, $n{at}: String!, $b{at}: String!"))
+        .collect();
+    let fields: Vec<String> = (0..count)
+        .map(|at| {
+            format!(
+                "  b{at}: repository(owner: $o{at}, name: $n{at}) {{ \
+                 pullRequests(baseRefName: $b{at}, states: OPEN) {{ totalCount }} }}"
+            )
+        })
+        .collect();
+    format!(
+        "query OpenPullRequestsByBase({}) {{\n{}\n}}",
+        variables.join(", "),
+        fields.join("\n")
+    )
+}
 
 /// Pages of labels read at most; GitHub repositories rarely have more than a
 /// few dozen.
@@ -244,6 +277,34 @@ impl GitHub {
         Ok(labels)
     }
 
+    /// How many open pull requests target each `(repository, branch)` of
+    /// `bases`, in the same order; `None` for a repository GitHub did not
+    /// return. A pull request is stacked on another only when it is the one
+    /// open pull request on that one's head branch, which the loaded pages
+    /// alone cannot tell: a long-lived branch (`staging`) has others.
+    pub fn open_pull_requests_by_base(
+        &self,
+        bases: &[(RepoRef, String)],
+    ) -> Result<Vec<Option<u32>>> {
+        let mut counts = Vec::with_capacity(bases.len());
+        for chunk in bases.chunks(BASES_PER_REQUEST) {
+            let mut variables = serde_json::Map::new();
+            for (at, (repo, branch)) in chunk.iter().enumerate() {
+                variables.insert(format!("o{at}"), json!(repo.owner));
+                variables.insert(format!("n{at}"), json!(repo.name));
+                variables.insert(format!("b{at}"), json!(branch));
+            }
+            let data: HashMap<String, Option<WireBaseCount>> =
+                self.graphql(&open_by_base_query(chunk.len()), Value::Object(variables))?;
+            counts.extend((0..chunk.len()).map(|at| {
+                data.get(&format!("b{at}"))
+                    .and_then(Option::as_ref)
+                    .map(|repo| repo.pull_requests.total_count)
+            }));
+        }
+        Ok(counts)
+    }
+
     /// Repository search (GitHub search syntax), up to 20 results.
     pub fn search_repositories(&self, query: &str) -> Result<Vec<RepoSummary>> {
         let data: SearchData =
@@ -286,6 +347,12 @@ fn repo_search_query(repo: &RepoRef, filter: PrListFilter, text: Option<&str>) -
     }
     query.push_str(" sort:updated-desc");
     query
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireBaseCount {
+    pull_requests: WireCount,
 }
 
 #[derive(Deserialize)]
@@ -413,6 +480,8 @@ struct WirePullRequest {
     additions: u32,
     deletions: u32,
     head_ref_name: String,
+    base_ref_name: String,
+    is_cross_repository: bool,
     repository: WireRepoRef,
     author: Option<WireActor>,
     comments: WireCount,
@@ -423,6 +492,52 @@ struct WirePullRequest {
     assignees: WireList<WireActor>,
     review_requests: WireList<WireReviewRequest>,
     latest_reviews: WireList<WireReview>,
+    /// Null outside a stack.
+    #[serde(default)]
+    stack: Option<WireRowStack>,
+}
+
+#[derive(Deserialize)]
+struct WireRowStack {
+    number: u64,
+    entries: WireList<WireRowStackEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireRowStackEntry {
+    position: u32,
+    /// Null when the viewer cannot see the pull request.
+    pull_request: Option<WireRowStackPull>,
+}
+
+#[derive(Deserialize)]
+struct WireRowStackPull {
+    number: u64,
+    title: String,
+    state: WirePrState,
+}
+
+impl WireRowStack {
+    fn into_summary(self) -> StackSummary {
+        let mut open: Vec<StackMember> = self
+            .entries
+            .into_items()
+            .filter_map(|entry| {
+                let pr = entry.pull_request?;
+                matches!(pr.state, WirePrState::Open).then_some(StackMember {
+                    position: entry.position,
+                    number: pr.number,
+                    title: pr.title,
+                })
+            })
+            .collect();
+        open.sort_by_key(|member| member.position);
+        StackSummary {
+            number: self.number,
+            open,
+        }
+    }
 }
 
 /// A connection read only for its first page of nodes.
@@ -602,6 +717,9 @@ impl WirePullRequest {
             checks,
             review_decision: decision,
             head_ref: self.head_ref_name,
+            base_ref: self.base_ref_name,
+            cross_repository: self.is_cross_repository,
+            stack: self.stack.map(WireRowStack::into_summary),
             labels: self
                 .labels
                 .into_items()
@@ -708,6 +826,8 @@ mod tests {
             "additions": 12,
             "deletions": 3,
             "headRefName": "feat/diff",
+            "baseRefName": "main",
+            "isCrossRepository": false,
             "repository": { "owner": { "login": "acme" }, "name": "web" },
             "author": { "login": "ana", "avatarUrl": "https://avatars.example/ana" },
             "comments": { "totalCount": 4 },
@@ -745,6 +865,47 @@ mod tests {
     fn page_from(search: Value) -> crate::Result<crate::Page<crate::PrSummary>> {
         let data: SearchData = serde_json::from_value(json!({ "search": search })).unwrap();
         data.search.into_page()
+    }
+
+    #[test]
+    fn a_row_reads_its_base_its_fork_and_the_open_layers_of_its_stack() {
+        let mut stacked = pr_node(31);
+        stacked["baseRefName"] = json!("layer-a");
+        stacked["stack"] = json!({
+            "number": 4,
+            "entries": { "nodes": [
+                { "position": 3, "pullRequest": { "number": 32, "title": "Layer C", "state": "OPEN" } },
+                { "position": 1, "pullRequest": { "number": 29, "title": "Layer A", "state": "MERGED" } },
+                { "position": 2, "pullRequest": { "number": 31, "title": "Layer B", "state": "OPEN" } },
+                { "position": 4, "pullRequest": null },
+                null
+            ] }
+        });
+        let mut fork = pr_node(40);
+        fork["isCrossRepository"] = json!(true);
+        fork["stack"] = Value::Null;
+
+        let page = page_from(connection(vec![stacked, fork, pr_node(41)], false)).unwrap();
+
+        let stacked = &page.items[0];
+        assert_eq!(
+            (stacked.base_ref.as_str(), stacked.cross_repository),
+            ("layer-a", false)
+        );
+        let stack = stacked.stack.as_ref().expect("a stack");
+        assert_eq!(stack.number, 4);
+        let open: Vec<(u32, u64, &str)> = stack
+            .open
+            .iter()
+            .map(|member| (member.position, member.number, member.title.as_str()))
+            .collect();
+        assert_eq!(open, vec![(2, 31, "Layer B"), (3, 32, "Layer C")]);
+        assert!(page.items[1].cross_repository);
+        assert_eq!(page.items[1].stack, None);
+        assert_eq!(
+            page.items[2].stack, None,
+            "a node without the field is outside a stack"
+        );
     }
 
     #[test]

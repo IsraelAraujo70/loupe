@@ -11,7 +11,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::reviews::{self, Sort, SortDir, SortKey};
-use loupe_github::{PrRef, PrSummary, ReviewDecision};
+use loupe_github::{ChecksState, PrRef, PrSummary, ReviewDecision};
 
 use super::widgets;
 use crate::route::Route;
@@ -110,7 +110,7 @@ fn lane(width: f32) -> Div {
 }
 
 /// The hover group of a row, which shows its checkbox.
-const ROW_GROUP: &str = "pr-row";
+pub const ROW_GROUP: &str = "pr-row";
 
 /// What a click on a column heading does: sort by that column.
 pub type OnSort = Rc<dyn Fn(SortKey, &mut Window, &mut App)>;
@@ -246,6 +246,24 @@ impl AgeFrom {
     }
 }
 
+/// The lanes a list's rows show besides those every list has: the
+/// repository, the author, and which date the age counts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lanes {
+    pub repo: bool,
+    pub author: bool,
+    pub age_from: AgeFrom,
+}
+
+/// A row inside an open stack: its place from the stack's base, and whether
+/// it is the last row shown, where the line linking the stack ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackPlace {
+    pub position: usize,
+    pub total: usize,
+    pub last: bool,
+}
+
 /// What a lane shows when the row has no value for it: a faint dash, so an
 /// empty cell reads as "none" and not as missing.
 fn none(cx: &App) -> Div {
@@ -267,22 +285,28 @@ fn review_chip(decision: ReviewDecision) -> Tag {
     }
 }
 
-/// One 36 px row: state icon, `#number`, the title with its review decision
-/// right after it, then fixed lanes on the right for the author (when
-/// `show_author`), the repository (when `show_repo`), diff size, comments,
-/// checks, and age (counted from `age_from`). Fixed lanes keep every column
-/// on one spine down the list. `selected` marks the row under the keyboard
-/// cursor. Clicking it opens `Route::PullRequest`. With `select`, a checkbox
-/// lane leads the row and a Shift+click picks instead of opening.
+/// One 32 px row: state icon, `#number`, the title with its review decision
+/// right after it, then fixed lanes on the right for the author and the
+/// repository (as `lanes` asks), diff size, comments, checks, and age.
+/// Fixed lanes keep every column on one spine down the list. `selected`
+/// marks the row under the keyboard cursor. Clicking it opens
+/// `Route::PullRequest`. With `select`, a checkbox lane leads the row and a
+/// Shift+click picks instead of opening. With `place`, the row sits inside
+/// an open stack: indented past the stack's chevron, on the line linking the
+/// stack, with its place after the title.
 pub fn pr_row(
     summary: &PrSummary,
-    show_repo: bool,
-    show_author: bool,
+    lanes: Lanes,
     selected: bool,
     select: Option<RowSelect>,
-    age_from: AgeFrom,
+    place: Option<StackPlace>,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let Lanes {
+        repo: show_repo,
+        author: show_author,
+        age_from,
+    } = lanes;
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     let hover = theme.list_hover;
@@ -383,6 +407,7 @@ pub fn pr_row(
                 },
             ))
         })
+        .when_some(place, |row, place| row.child(stack_guide(place.last, cx)))
         .child(hint(
             SharedString::from(format!("pr-state-{id}")),
             widgets::state_label(summary.state, summary.is_draft),
@@ -415,6 +440,13 @@ pub fn pr_row(
                         .text_size(scale::body())
                         .child(summary.title.clone()),
                 )
+                .children(place.map(|place| {
+                    div()
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .child(format!("{}/{}", place.position, place.total))
+                }))
                 .children(summary.review_decision.map(review_chip)),
         )
         // The author, before the columns every section shares, and only
@@ -478,6 +510,252 @@ pub fn pr_row(
     with_item_menu(row, item)
 }
 
+/// The 16 px lane under an open stack's chevron that holds the line linking
+/// its rows; on the last row the line stops at the row's middle.
+fn stack_guide(last: bool, cx: &App) -> Div {
+    let line = cx.theme().border;
+    div().flex_none().w(dp(16.)).h_full().relative().child(
+        div()
+            .absolute()
+            .top_0()
+            .left(dp(7.5))
+            .w(px(1.))
+            .bg(line)
+            .map(|guide| {
+                if last {
+                    guide.h_1_2()
+                } else {
+                    guide.bottom_0()
+                }
+            }),
+    )
+}
+
+/// A stack as one row of the list.
+pub struct StackRow<'a> {
+    /// Stable across renders, so hover and the accessibility tree hold.
+    pub id: SharedString,
+    pub name: &'a str,
+    /// The stack's rows the list shows, base first.
+    pub rows: &'a [&'a PrSummary],
+    /// The stack's open pull requests, shown or not.
+    pub total: usize,
+    pub expanded: bool,
+}
+
+/// What a stack's row says after its name: how many pull requests it holds
+/// (or how many of them the filters leave), then how many fail their checks,
+/// or if none does, how many still run them.
+pub fn stack_summary(rows: &[&PrSummary], total: usize) -> String {
+    let shown = rows.len();
+    let mut text = if shown < total {
+        format!("{shown} of {total} shown")
+    } else {
+        format!("{shown} PRs")
+    };
+    let count = |state: ChecksState| {
+        rows.iter()
+            .filter(|summary| summary.checks == Some(state))
+            .count()
+    };
+    let (failing, running) = (count(ChecksState::Failing), count(ChecksState::Pending));
+    let checks = match (failing, running) {
+        (0, 0) => None,
+        (0, 1) => Some("1 check running".to_owned()),
+        (0, running) => Some(format!("{running} checks running")),
+        (1, _) => Some("1 check failing".to_owned()),
+        (failing, _) => Some(format!("{failing} checks failing")),
+    };
+    if let Some(checks) = checks {
+        text.push_str(" · ");
+        text.push_str(&checks);
+    }
+    text
+}
+
+/// The worst of the rows' checks: failing over running over passing.
+fn worst_checks(rows: &[&PrSummary]) -> Option<ChecksState> {
+    let has = |state: ChecksState| rows.iter().any(|summary| summary.checks == Some(state));
+    [
+        ChecksState::Failing,
+        ChecksState::Pending,
+        ChecksState::Passing,
+    ]
+    .into_iter()
+    .find(|&state| has(state))
+}
+
+/// A stack's 32 px row on the rows' grid: `lead` (the box that picks the
+/// stack's rows) or an empty lane, a chevron over the state icons (down
+/// open, right folded), a stack mark in the number lane, its name and
+/// [`stack_summary`], then the lanes added up over its shown rows: the
+/// author when they share one, the repository, the changes and comments
+/// summed, the worst checks, and the latest age. The caller makes a click
+/// open or fold it.
+pub fn stack_row(
+    stack: StackRow<'_>,
+    lanes: Lanes,
+    selected: bool,
+    lead: Option<Div>,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+    let rows = stack.rows;
+    let summary = stack_summary(rows, stack.total);
+    let name = format!("Stack {}, {summary}", stack.name);
+    let (additions, deletions, comments) = rows.iter().fold((0, 0, 0), |sum, row| {
+        (
+            sum.0 + row.additions,
+            sum.1 + row.deletions,
+            sum.2 + row.comment_count,
+        )
+    });
+    let latest = rows
+        .iter()
+        .map(|row| match lanes.age_from {
+            AgeFrom::Updated => row.updated_at,
+            AgeFrom::Created => row.created_at,
+        })
+        .max();
+    let author = rows.first().and_then(|first| {
+        let login = first.author.as_ref().map(|author| &author.login);
+        rows.iter()
+            .all(|row| row.author.as_ref().map(|author| &author.login) == login)
+            .then(|| first.author.clone())
+            .flatten()
+    });
+    let repo = rows.first().map(|row| row.pr.repo.clone());
+    let checks = worst_checks(rows);
+    let id = stack.id.clone();
+    h_flex()
+        .id(stack.id.clone())
+        .debug_selector(move || id.to_string())
+        .role(Role::Button)
+        .aria_label(name)
+        .aria_expanded(stack.expanded)
+        .w_full()
+        .h(scale::row_height())
+        .px_2()
+        .gap_3()
+        .items_center()
+        .relative()
+        .group(ROW_GROUP)
+        .rounded(theme.radius)
+        .hover(move |row| row.bg(hover))
+        .when(selected, |row| {
+            row.bg(theme.list_active).child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_1p5()
+                    .bottom_1p5()
+                    .w(px(2.))
+                    .rounded(px(1.))
+                    .bg(tokens::accent()),
+            )
+        })
+        .child(
+            div()
+                .absolute()
+                .left_2()
+                .right_2()
+                .bottom_0()
+                .h(px(1.))
+                .bg(tokens::border_subtle()),
+        )
+        .children(lead)
+        .child(
+            Icon::new(if stack.expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .with_size(dp(16.))
+            .text_color(muted),
+        )
+        .child(
+            h_flex()
+                .flex_none()
+                .w_10()
+                .justify_end()
+                .text_color(muted)
+                .child(Icon::new(IconName::Layers).with_size(dp(16.))),
+        )
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(scale::body())
+                        .child(stack.name.to_owned()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .child(summary),
+                ),
+        )
+        .when(lanes.author, |row| {
+            row.child(match author {
+                Some(author) => lane(AUTHOR_LANE).justify_center().child(ui::avatar_named(
+                    author.avatar_url,
+                    author.login,
+                    dp(20.),
+                )),
+                None => lane(AUTHOR_LANE).justify_center().child(none(cx)),
+            })
+        })
+        .when(lanes.repo, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .w(dp(REPO_LANE))
+                    .truncate()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .children(repo.map(|repo| repo.name)),
+            )
+        })
+        .child(lane(CHANGES_LANE).child(widgets::diff_stat(additions, deletions)))
+        .child(
+            lane(COMMENTS_LANE)
+                .gap_1()
+                .text_size(scale::meta())
+                .text_color(muted)
+                .when(comments > 0, |lane| {
+                    lane.child(Icon::new(IconName::MessageSquare).xsmall())
+                        .child(comments.to_string())
+                })
+                .when(comments == 0, |lane| lane.child(none(cx))),
+        )
+        .child(
+            lane(CHECKS_LANE)
+                .justify_center()
+                .when(checks.is_none(), |lane| lane.child(none(cx)))
+                .when_some(checks, |lane, checks| {
+                    lane.child(
+                        Icon::new(widgets::checks_icon_name(checks))
+                            .with_size(dp(16.))
+                            .text_color(widgets::checks_color(checks)),
+                    )
+                }),
+        )
+        .child(
+            lane(AGE_LANE)
+                .text_size(scale::meta())
+                .text_color(muted)
+                .children(latest.map(|at| ui::relative_time(at, Utc::now()))),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -491,7 +769,7 @@ mod tests {
     };
     use loupe_github::{PrRef, PrState, PrSummary, RepoRef};
 
-    use super::{AgeFrom, RowSelect, SelectGesture, pr_row};
+    use super::{AgeFrom, Lanes, RowSelect, SelectGesture, pr_row};
     use crate::store::Settings;
 
     type Picks = Rc<RefCell<Vec<SelectGesture>>>;
@@ -521,6 +799,9 @@ mod tests {
                 checks: None,
                 review_decision: None,
                 head_ref: String::new(),
+                base_ref: String::new(),
+                cross_repository: false,
+                stack: None,
                 labels: Vec::new(),
                 assignees: Vec::new(),
                 reviewers: Vec::new(),
@@ -536,8 +817,11 @@ mod tests {
                 .on_click(move |_, _, _| *parent_clicks.borrow_mut() += 1)
                 .child(pr_row(
                     &summary,
-                    true,
-                    true,
+                    Lanes {
+                        repo: true,
+                        author: true,
+                        age_from: AgeFrom::Updated,
+                    },
                     false,
                     Some(RowSelect {
                         checked: false,
@@ -546,7 +830,7 @@ mod tests {
                             picks.borrow_mut().push(gesture)
                         }),
                     }),
-                    AgeFrom::Updated,
+                    None,
                     cx,
                 ))
         }

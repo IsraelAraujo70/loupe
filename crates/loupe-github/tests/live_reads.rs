@@ -155,3 +155,19 @@ fn all_open_reads_every_page_of_a_search() {
     ids.dedup();
     assert_eq!(ids.len(), page.items.len(), "a page repeats another");
 }
+
+#[test]
+#[ignore = "needs GITHUB_TOKEN and network"]
+fn counts_open_pull_requests_by_base_branch() {
+    let loupe = RepoRef::new("IsraelAraujo70", "loupe");
+    let counts = client()
+        .open_pull_requests_by_base(&[
+            (loupe.clone(), "main".to_owned()),
+            (loupe, "no-such-branch-for-a-test".to_owned()),
+        ])
+        .expect("counts");
+    println!("{counts:?}");
+    assert_eq!(counts.len(), 2);
+    assert!(counts[0].is_some());
+    assert_eq!(counts[1], Some(0));
+}

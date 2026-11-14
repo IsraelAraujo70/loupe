@@ -3,13 +3,14 @@
 //! someone else's pull request. Loupe does not read transcripts. Owned by
 //! the T3 front.
 
+mod batch;
 mod dialog;
 mod panel;
 mod review;
 
 pub use review::{
-    DEFAULT_PROMPT, OPERATE_HINT, ReviewPrompt, ReviewSettings, RiskList, VARIABLES, format_list,
-    model_choice, model_summary, unknown_variables,
+    CONNECT_HINT, DEFAULT_PROMPT, OPERATE_HINT, ReviewPrompt, ReviewSettings, RiskList, VARIABLES,
+    format_list, model_choice, model_summary, unknown_variables,
 };
 
 use gpui_kit::{AnyView, App, Task, Window};
@@ -19,6 +20,18 @@ use crate::links::PrLinkContext;
 /// The T3 threads linked to a pull request, for the PR view's side column.
 pub fn pr_linked_threads(context: PrLinkContext, window: &mut Window, cx: &mut App) -> AnyView {
     panel::LinkedThreads::view(context, window, cx)
+}
+
+/// Opens "Review with T3 Code" for several pull requests, `picked` in the
+/// order on screen: one dialog, then one review thread per pull request
+/// that can get one. Says so in a notification when T3 or GitHub is not
+/// connected.
+pub fn review_pull_requests(
+    picked: Vec<loupe_github::PrSummary>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    batch::open(picked, window, cx);
 }
 
 /// The T3 Code deep link of the thread linked to `pr` that changed last,

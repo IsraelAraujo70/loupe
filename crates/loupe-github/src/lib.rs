@@ -26,7 +26,7 @@ pub use ids::{PrRef, RepoRef};
 pub use merge::MergeOutcome;
 pub use rate::{RateLimit, RateLimits};
 pub use rest::{ChecksEtag, ChecksPoll, NOTIFICATIONS_LIMIT};
-pub use stack::{PrStack, StackEntry};
+pub use stack::{PrStack, StackEntry, StackMember, StackSummary};
 pub use types::*;
 pub use workflow::{
     Annotation, AnnotationLevel, JobLog, JobStep, LogLine, LogLineKind, RUNS_PAGE, RunArtifact,

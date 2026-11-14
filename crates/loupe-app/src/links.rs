@@ -1,4 +1,4 @@
-use loupe_github::PrRef;
+use loupe_github::{PrRef, PullRequestDetail};
 
 /// What the pull request view knows about a PR, handed to the Linear and T3
 /// panels so they can find related issues and threads, and start a review.
@@ -21,6 +21,26 @@ pub struct PrLinkContext {
 }
 
 impl PrLinkContext {
+    /// What GitHub's detail of a pull request says about it.
+    pub fn from_detail(detail: &PullRequestDetail) -> Self {
+        PrLinkContext {
+            pr: detail.pr.clone(),
+            url: detail.url.clone(),
+            title: detail.title.clone(),
+            body: detail.body.clone(),
+            head_ref: detail.head_ref.clone(),
+            head_oid: detail.head_oid.clone(),
+            head_fork: detail.head_repo.as_ref().map(ToString::to_string),
+            author: detail.author.as_ref().map(|author| author.login.clone()),
+            viewer_login: detail.viewer_login.clone(),
+            labels: detail
+                .labels
+                .iter()
+                .map(|label| label.name.clone())
+                .collect(),
+        }
+    }
+
     /// Whether the signed-in account opened this pull request. GitHub logins
     /// ignore case.
     pub fn is_own(&self) -> bool {
