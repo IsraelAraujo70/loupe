@@ -21,7 +21,15 @@ fn path() -> PathBuf {
 
 fn saved(cx: &mut App) -> &mut SavedViews {
     if !cx.has_global::<SavedViews>() {
-        let (file, warning) = match reviews::load(&path()) {
+        // Tests run in parallel in one process and share its data
+        // directory: each starts on no saved views, not on those another
+        // test saved.
+        let loaded = if cfg!(test) {
+            Loaded::Missing
+        } else {
+            reviews::load(&path())
+        };
+        let (file, warning) = match loaded {
             Loaded::Read(file) => (file, None),
             Loaded::Missing => (ViewsFile::default(), None),
             Loaded::Recovered { reason } => (
