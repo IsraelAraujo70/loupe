@@ -281,6 +281,14 @@ mod tests {
         // Two pull requests build on `a`: neither joins 10.
         let forked = [pr(10, "main", "a"), pr(11, "a", "b"), pr(12, "a", "c")];
         assert!(chains(&forked).is_empty());
+        // Past the fork, a branch with one pull request on it is a stack.
+        let forked = [
+            pr(10, "main", "a"),
+            pr(11, "a", "b"),
+            pr(12, "a", "c"),
+            pr(13, "b", "d"),
+        ];
+        assert_eq!(chains(&forked), vec![vec![11, 13]]);
         // A fork's head named like a branch of the repository is not it.
         let mut fork = pr(20, "main", "x");
         fork.cross_repository = true;
