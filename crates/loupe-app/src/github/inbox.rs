@@ -121,7 +121,7 @@ fn shown<'a>(page: &'a Page<PrSummary>, clauses: &[Clause]) -> Shown<'a> {
 /// The All tab under the clauses: every pull request the other tabs show,
 /// then those of the view's "All open" search (`all_open`) that none of them
 /// shows, each once. Its count is the rows it shows; the note says when the
-/// search holds more than its first page.
+/// search, or any other tab, holds more than its first page.
 fn shown_all<'a>(
     tabs: &[&Shown<'a>],
     all_open: Option<&'a Page<PrSummary>>,
@@ -138,9 +138,13 @@ fn shown_all<'a>(
             items.push(pr);
         }
     }
+    let partial = tabs.iter().any(|shown| shown.note.is_some());
+    let note = open.and_then(|open| open.note).or_else(|| {
+        partial.then(|| format!("Showing the {} loaded; GitHub has more", items.len()))
+    });
     Shown {
         count: items.len(),
-        note: open.and_then(|open| open.note),
+        note,
         items,
     }
 }
@@ -271,6 +275,10 @@ pub struct InboxView {
     bar_shown: bool,
     /// What the last "Mark as read" did, or why it failed (`true`).
     mark_note: Option<(SharedString, bool)>,
+    /// The tab the page opened on, chosen once fresh results arrived; it
+    /// stands while no tab was picked or saved (`PageState::tab`), so a
+    /// refresh never switches tabs under the user. Never saved with a view.
+    opened_on: Option<ReviewTab>,
     _load: Option<Task<()>>,
     _checks: Subscription,
 }
@@ -336,6 +344,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             marking: None,
             bar_shown: false,
             mark_note: None,
+            opened_on: None,
             _load: None,
             _checks: checks,
         };
@@ -504,10 +513,19 @@ impl InboxView {
         tabs
     }
 
-    /// The open tab: the one picked or saved with the view, else the first
-    /// with rows.
+    /// The open tab: the one picked or saved with the view, else the one
+    /// the page opened on, else the first with rows.
     fn active_tab(&self, tabs: &[(ReviewTab, Shown<'_>)]) -> ReviewTab {
-        self.page.tab.unwrap_or_else(|| first_with_rows(tabs))
+        self.page
+            .tab
+            .or(self.opened_on)
+            .unwrap_or_else(|| first_with_rows(tabs))
+    }
+
+    /// The open tab, once the inbox has loaded.
+    fn current_tab(&self) -> Option<ReviewTab> {
+        let inbox = self.inbox.value()?;
+        Some(self.active_tab(&self.tab_lists(inbox)))
     }
 
     /// The open tab's groups, each sorted on its own: a sort never moves a
@@ -521,31 +539,42 @@ impl InboxView {
             .unwrap_or_default()
     }
 
-    /// Keeps the tab the page opened on once it is known, so a refresh that
-    /// empties it does not switch tabs under the user. It waits while "All
-    /// open" runs its first search, which may be the only tab with rows.
+    /// Fixes the tab the page opened on once the results are fresh: a
+    /// stored copy shown while they load may no longer have rows where it
+    /// did, and "All open" may be the only tab with rows.
     fn settle_tab(&mut self) {
-        if self.page.tab.is_some() || matches!(self.all_open_state(), Some(Loadable::Loading)) {
+        let fresh = |state: Option<&Loadable<Page<PrSummary>>>| {
+            !matches!(state, Some(Loadable::Loading | Loadable::Refreshing(_)))
+        };
+        if self.page.tab.is_some()
+            || self.opened_on.is_some()
+            || !matches!(self.inbox, Loadable::Loaded(_))
+            || !fresh(self.all_open_state())
+        {
             return;
         }
-        let Some(inbox) = self.inbox.value() else {
-            return;
-        };
-        let tab = first_with_rows(&self.tab_lists(inbox));
-        self.page.tab = Some(tab);
+        self.opened_on = self.current_tab();
     }
 
     /// Opens `tab`. The selection and the cursor belong to the tab they were
     /// made in; a saved view keeps the tab.
     fn set_tab(&mut self, tab: ReviewTab, cx: &mut Context<Self>) {
-        if self.page.tab == Some(tab) {
+        if self.current_tab() == Some(tab) && self.page.tab.is_some() {
             return;
         }
+        let moved = self.current_tab() != Some(tab);
         self.page.tab = Some(tab);
+        if moved {
+            self.left_tab(cx);
+        }
+        self.save_display(cx);
+    }
+
+    /// What leaving a tab drops: the cursor, the scroll, and the selection.
+    fn left_tab(&mut self, cx: &mut Context<Self>) {
         self.cursor = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.clear_selection(cx);
-        self.save_display(cx);
     }
 
     /// Folds or unfolds `step` in every tab; a saved view keeps it. The
@@ -562,18 +591,21 @@ impl InboxView {
                 self.page.collapsed.remove(at);
             }
             None => {
-                let hidden: Vec<PrRef> = self
-                    .groups_shown()
-                    .into_iter()
-                    .filter(|(group, _, _)| *group == step)
-                    .flat_map(|(_, _, rows)| rows)
-                    .collect();
-                self.selection.deselect_all(&hidden);
-                self.selection_changed(cx);
                 self.page.collapsed.push(step);
                 self.page.collapsed.sort();
             }
         }
+        // Folded or not, the group's rows leave the selection: a fold hides
+        // them, and a row that moved into a folded group (a refresh, new
+        // checks) was picked while the bar no longer counted it.
+        let rows: Vec<PrRef> = self
+            .groups_shown()
+            .into_iter()
+            .filter(|(group, _, _)| *group == step)
+            .flat_map(|(_, _, rows)| rows)
+            .collect();
+        self.selection.deselect_all(&rows);
+        self.selection_changed(cx);
         self.save_display(cx);
     }
 
@@ -661,14 +693,26 @@ impl InboxView {
         cx.notify();
     }
 
+    /// Shows view `id` (or no view). Showing the same view again (its tab
+    /// clicked twice, Discard) keeps the open tab and the folded groups,
+    /// which a view without a saved copy holds only here.
     fn switch_view(&mut self, id: Option<&str>, cx: &mut Context<Self>) {
         let views = views_store::snapshot(cx);
-        let before = self.page.draft.clone();
+        let (draft, tab) = (self.page.draft.clone(), self.current_tab());
+        let same = self.page.view_id.as_deref() == id;
+        let display = (self.page.tab, self.page.collapsed.clone());
         self.page.switch(&views, id);
-        if self.page.draft != before {
-            self.clear_selection(cx);
+        if same {
+            (self.page.tab, self.page.collapsed) = display;
+        } else {
+            self.opened_on = None;
         }
         self.load_all_open(false, cx);
+        if self.current_tab() != tab {
+            self.left_tab(cx);
+        } else if self.page.draft != draft {
+            self.clear_selection(cx);
+        }
         cx.notify();
     }
 
@@ -1666,7 +1710,9 @@ impl Render for InboxView {
             )
             .on_action(cx.listener(|this, _: &SelectTabRows, _, cx| this.select_tab(cx)))
             .on_action(cx.listener(|this, _: &ClearReviewsSelection, _, cx| {
-                if this.selection == Selection::default() {
+                // Picks hidden in a folded group do not hold the key.
+                if this.picked().is_empty() {
+                    this.selection.clear();
                     cx.propagate();
                 } else {
                     this.clear_selection(cx);
@@ -2072,7 +2118,7 @@ mod tests {
     }
 
     fn active(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> Option<ReviewTab> {
-        view.read_with(cx, |view, _| view.page.tab)
+        view.read_with(cx, |view, _| view.current_tab())
     }
 
     /// To review holds two ready to merge (1, 6) and two waiting for a
@@ -2214,6 +2260,86 @@ mod tests {
             view.page.is_dirty(&super::views_store::snapshot(cx))
         });
         assert!(!dirty, "a tab or a fold is no unsaved change");
+    }
+
+    #[gpui_kit::test]
+    fn a_stored_copy_does_not_choose_the_tab_the_fresh_results_do(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        // The stored copy had something to review; since then it was
+        // reviewed, and two of yours opened.
+        let stored = Inbox {
+            involved: page(Vec::new(), 0, false),
+            ..inbox()
+        };
+        view.update(cx, |view, cx| {
+            view.inbox = Loadable::Refreshing(stored);
+            cx.notify();
+        });
+        bounds(cx, "reviews-tab-All");
+        assert_eq!(active(&view, cx), Some(ReviewTab::ToReview));
+        let fresh = Inbox {
+            review_requested: page(Vec::new(), 0, false),
+            authored: page(vec![pr("c", 11), pr("c", 12)], 2, false),
+            involved: page(Vec::new(), 0, false),
+        };
+        load(&view, fresh, cx);
+        assert_eq!(active(&view, cx), Some(ReviewTab::Mine));
+    }
+
+    #[gpui_kit::test]
+    fn views_keep_the_tab_only_when_it_was_picked_and_a_second_click_keeps_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, inbox(), cx);
+        let saved = |view: &Entity<InboxView>, id: &Option<String>, cx: &mut VisualTestContext| {
+            let id = id.clone().expect("a saved view");
+            view.update(cx, |_, cx| {
+                super::views_store::snapshot(cx)
+                    .get(&id)
+                    .cloned()
+                    .expect("saved")
+            })
+        };
+        // Folding under a view that keeps no tab does not save the tab the
+        // page opened on.
+        view.update(cx, |view, cx| view.save_as_new("Plain", cx));
+        let plain = view.read_with(cx, |view, _| view.page.view_id.clone());
+        click(cx, "reviews-group-Ready to merge");
+        let kept = saved(&view, &plain, cx);
+        assert_eq!(
+            (kept.tab, kept.collapsed),
+            (None, vec![NextStep::ReadyToMerge])
+        );
+        click(cx, "reviews-group-Ready to merge");
+
+        // With no view, a second click on "All" keeps the tab and the folds.
+        view.update(cx, |view, cx| view.switch_view(None, cx));
+        click(cx, "reviews-tab-Involved");
+        click(cx, "reviews-group-Waiting for review");
+        click(cx, "reviews-view-all");
+        assert_eq!(active(&view, cx), Some(ReviewTab::Involved));
+        let folded = view.read_with(cx, |view, _| view.page.collapsed.clone());
+        assert_eq!(folded, [NextStep::WaitingForReview]);
+        click(cx, "reviews-group-Waiting for review");
+
+        // A view with the same filters that opens on another tab drops the
+        // selection, though that tab lists the picked pull request too.
+        click(cx, "reviews-tab-All");
+        view.update(cx, |view, cx| view.save_as_new("Everything", cx));
+        let everything = view.read_with(cx, |view, _| view.page.view_id.clone());
+        view.update(cx, |view, cx| view.switch_view(None, cx));
+        assert_eq!(active(&view, cx), Some(ReviewTab::ToReview));
+        click(cx, "pr-select-PR_2");
+        assert_eq!(picked(&view, cx), [2]);
+        view.update(cx, |view, cx| view.switch_view(everything.as_deref(), cx));
+        assert_eq!(active(&view, cx), Some(ReviewTab::All));
+        assert!(
+            picked(&view, cx).is_empty(),
+            "the tab changed with the view"
+        );
     }
 
     #[gpui_kit::test]
@@ -2472,6 +2598,12 @@ mod tests {
         assert_eq!(
             shown_all(&[&mine], Some(&partial), &[]).note.as_deref(),
             Some("Showing 2 of 700")
+        );
+        let first_page = page(vec![pr("a", 1)], 120, true);
+        let to_review = shown(&first_page, &[]);
+        assert_eq!(
+            shown_all(&[&to_review, &mine], None, &[]).note.as_deref(),
+            Some("Showing the 3 loaded; GitHub has more")
         );
     }
 
