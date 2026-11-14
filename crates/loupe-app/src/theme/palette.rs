@@ -479,6 +479,7 @@ mod tests {
                     ("merged_fill", palette.merged_fill),
                     ("closed_fill", palette.closed_fill),
                     ("draft_fill", palette.draft_fill),
+                    ("group_blue", palette.group_blue),
                 ] {
                     let found = contrast_ratio(palette.on_accent.0, fill.0);
                     assert!(
