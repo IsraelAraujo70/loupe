@@ -366,6 +366,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Every open tab, titled as its tab shows it, for the palette.
+    fn open_tabs(&self, cx: &App) -> Vec<panes::OpenTab> {
+        self.panes
+            .open_tabs(|page| tab_bar::page_label(page, cx).into())
+    }
+
     fn page(&self, route: Route, window: &mut Window, cx: &mut Context<Self>) -> Page<AnyView> {
         Page {
             view: router::build(&route, window, cx),
@@ -1302,10 +1308,10 @@ impl Render for Workspace {
                     }))
                     .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                         let target = item_menu::target(this.active_page(), cx);
-                        palette::toggle(target, this.panes.open_tabs(), window, cx)
+                        palette::toggle(target, this.open_tabs(cx), window, cx)
                     }))
                     .on_action(cx.listener(|this, _: &SearchTabs, window, cx| {
-                        palette::toggle_tabs(this.panes.open_tabs(), window, cx)
+                        palette::toggle_tabs(this.open_tabs(cx), window, cx)
                     }))
                     .on_action(cx.listener(|this, _: &OpenItemInNewTab, window, cx| {
                         this.run_on_target(Command::OpenInNewTab, window, cx)
@@ -2625,6 +2631,77 @@ mod tests {
         assert_eq!(after.1, 1, "Enter shows the first match, in the left pane");
         assert_eq!(after.2, Route::Notifications);
         assert_ne!(after.0, before.0, "its pane becomes the active one");
+    }
+
+    /// Two Reviews tabs on different views are told apart: the tab whose
+    /// page opens a saved view takes its name, the other stays "Reviews".
+    #[gpui_kit::test]
+    fn a_reviews_tab_is_named_after_its_saved_view(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        cx.update(|window, cx| super::open_in_new_tab(Route::Inbox, window, cx));
+        cx.run_until_parked();
+        let labels = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .open_tabs(cx)
+                    .into_iter()
+                    .map(|tab| tab.label)
+                    .collect::<Vec<String>>()
+            })
+        };
+        assert_eq!(labels(cx), ["Reviews", "Reviews"]);
+
+        // Save the first tab's page as a new view, as the user does.
+        click(
+            cx,
+            "reviews-view-save-as",
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.simulate_input("Mine");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            labels(cx),
+            ["Mine", "Reviews"],
+            "the tab on the saved view takes its name; the one on All does not"
+        );
+        // The row of tabs draws the same names.
+        let ids: Vec<u64> = workspace.read_with(cx, |workspace, cx| {
+            workspace.open_tabs(cx).iter().map(|tab| tab.id).collect()
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        for (&id, name) in ids.iter().zip(["Mine", "Reviews"]) {
+            let selector: &'static str = format!("tab-{id}-label:{name}").leak();
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "tab {id} reads {name:?}"
+            );
+        }
+
+        // The palette's tab search finds the tab by its view's name.
+        cx.dispatch_action(crate::shell::actions::SearchTabs);
+        cx.run_until_parked();
+        cx.simulate_input("Mine");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let listed: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                let selector: &'static str = format!("palette-tab-{id}").leak();
+                cx.debug_bounds(selector).is_some()
+            })
+            .collect();
+        assert_eq!(listed, [ids[0]], "\"Mine\" finds the tab on that view");
     }
 
     /// With the pointer on no row, the item keys act on the page on screen:
