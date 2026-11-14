@@ -168,6 +168,11 @@ pub struct Settings {
     /// Which pane was active, counting the panes in reading order: left
     /// before right, top before bottom.
     pub active_pane: usize,
+    /// Whether a new tab of a GitHub repository's page joins the tab group
+    /// named after the repository, made on the spot, and a new tab without
+    /// a repository opens outside every group. Off by default; turning it
+    /// off keeps the groups there are.
+    pub group_tabs_by_repo: bool,
     /// The whole-window zoom (Cmd+=, Cmd+-, Cmd+0).
     pub zoom: crate::theme::Zoom,
     /// The theme, color scheme, contrast, density, and fonts.

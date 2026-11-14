@@ -57,6 +57,27 @@ pub enum Route {
 }
 
 impl Route {
+    /// The GitHub repository the page belongs to: a repository's pull
+    /// requests, one pull request, its Actions runs, or one run. `None` for
+    /// pages that span repositories (Reviews, Inbox) and for Linear.
+    pub fn repo(&self) -> Option<&RepoRef> {
+        match self {
+            Route::Repo(repo) | Route::Actions { repo, .. } | Route::WorkflowRun { repo, .. } => {
+                Some(repo)
+            }
+            Route::PullRequest(pr) => Some(&pr.repo),
+            Route::Inbox
+            | Route::Notifications
+            | Route::LinearMyIssues
+            | Route::LinearTeam { .. }
+            | Route::LinearProjects { .. }
+            | Route::LinearProject { .. }
+            | Route::LinearViews { .. }
+            | Route::LinearIssue { .. }
+            | Route::Settings => None,
+        }
+    }
+
     /// Whether the page shows one Linear workspace's own things (a team, a
     /// project, an issue), which another workspace does not have.
     pub fn is_in_linear_workspace(&self) -> bool {
