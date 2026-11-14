@@ -20,8 +20,8 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{
-    ActionsJob, ChecksEtag, ChecksPoll, GitHub, Label, MergeMethod, PrRef, PullRequestDetail,
-    ReviewEvent,
+    ActionsJob, ChecksEtag, ChecksPoll, GitHub, Label, MergeMethod, MergeOutcome, PrRef,
+    PullRequestDetail, ReviewEvent,
 };
 
 use super::checks::{ChecksTab, Freshness};
@@ -71,17 +71,34 @@ enum Write {
     RemoveLabel(String),
 }
 
+/// Shown after a merge that GitHub had not finished when Loupe stopped
+/// waiting for it.
+const MERGE_STILL_RUNNING: &str =
+    "GitHub is still merging this pull request. Refresh in a moment to see the result.";
+
 impl Write {
-    fn perform(self, gh: &GitHub, detail: &PullRequestDetail) -> loupe_github::Result<()> {
+    /// Sends the write. `Ok(Some(note))` succeeded with something to tell the
+    /// user once the pull request reloads.
+    fn perform(
+        self,
+        gh: &GitHub,
+        detail: &PullRequestDetail,
+    ) -> loupe_github::Result<Option<&'static str>> {
         let id = detail.id.as_str();
-        match self {
+        let done = match self {
+            Write::Merge(method) => {
+                return gh
+                    .merge(&detail.pr, method, &detail.head_oid)
+                    .map(|outcome| {
+                        (outcome == MergeOutcome::Pending).then_some(MERGE_STILL_RUNNING)
+                    });
+            }
             Write::Review {
                 event,
                 body,
                 review_id,
             } => gh.submit_review(id, review_id.as_deref(), event, &body),
             Write::DiscardReview { review_id } => gh.discard_review(&review_id),
-            Write::Merge(method) => gh.merge(id, method, &detail.head_oid),
             Write::MarkReady => gh.mark_ready_for_review(id),
             Write::ConvertToDraft => gh.convert_to_draft(id),
             Write::Close => gh.close_pull_request(id),
@@ -89,7 +106,8 @@ impl Write {
             Write::EditTitle(title) => gh.update_pull_request(id, Some(&title), None),
             Write::AddLabel(label_id) => gh.add_labels(id, &[label_id]),
             Write::RemoveLabel(label_id) => gh.remove_labels(id, &[label_id]),
-        }
+        };
+        done.map(|()| None)
     }
 }
 
@@ -106,6 +124,9 @@ pub struct PullRequestView {
     panel: Panel,
     merge_method: Option<MergeMethod>,
     write: Submit,
+    /// What a write that succeeded left to say, such as a merge GitHub was
+    /// still running when Loupe stopped waiting.
+    write_note: Option<&'static str>,
     /// The title being edited, while the edit row is open.
     title_edit: Option<Entity<InputState>>,
     /// The repository's labels while the label editor is open.
@@ -196,6 +217,7 @@ impl PullRequestView {
             panel: Panel::Closed,
             merge_method: None,
             write: Submit::Idle,
+            write_note: None,
             title_edit: None,
             labels_picker: None,
             labels_task: None,
@@ -529,19 +551,29 @@ impl PullRequestView {
             return;
         };
         let clears_review_body = matches!(write, Write::Review { .. });
+        let is_merge = matches!(write, Write::Merge(_));
         self.write = Submit::Busy;
+        self.write_note = None;
         self.write_task = Some(common::run(
             cx,
             move |gh| write.perform(gh, &detail),
             move |view, result, cx| match result {
-                Ok(()) => {
+                Ok(note) => {
                     view.write = Submit::Idle;
+                    view.write_note = note;
                     view.panel = Panel::Closed;
                     view.title_edit = None;
                     view.clear_review_body |= clears_review_body;
                     view.reload(cx);
                 }
-                Err(error) => view.write = Submit::Failed(error.detail()),
+                Err(error) => {
+                    view.write = Submit::Failed(error.detail());
+                    // GitHub may still be merging after a network error while
+                    // Loupe was reading the result; the reload shows the state.
+                    if is_merge {
+                        view.reload(cx);
+                    }
+                }
             },
         ));
         cx.notify();

@@ -6,7 +6,7 @@
 //! Run: `gh auth token | read -r GITHUB_TOKEN; export GITHUB_TOKEN;
 //! cargo test -p loupe-github --test live_mutations -- --ignored --nocapture`
 
-use loupe_github::{Error, GitHub, LineAnchor, MergeMethod, NewThread, Result, ReviewEvent, Side};
+use loupe_github::{Error, GitHub, LineAnchor, NewThread, Result, ReviewEvent, Side};
 
 const BOGUS_PR: &str = "PR_kwDOBogusBogus";
 const BOGUS_THREAD: &str = "PRRT_kwDOBogus";
@@ -15,7 +15,6 @@ const BOGUS_ISSUE_COMMENT: &str = "IC_kwDOBogus";
 const BOGUS_REVIEW_COMMENT: &str = "PRRC_kwDOBogus";
 const BOGUS_USER: &str = "U_kgDOBogus";
 const BOGUS_LABEL: &str = "LA_kwDOBogus";
-const BOGUS_OID: &str = "0000000000000000000000000000000000000000";
 
 fn thread(anchor: LineAnchor) -> NewThread {
     NewThread {
@@ -37,11 +36,6 @@ fn every_mutation_reaches_node_resolution() {
         ("comment", ReviewEvent::Comment),
         ("approve", ReviewEvent::Approve),
         ("request_changes", ReviewEvent::RequestChanges),
-    ];
-    let methods = [
-        ("merge", MergeMethod::Merge),
-        ("squash", MergeMethod::Squash),
-        ("rebase", MergeMethod::Rebase),
     ];
 
     let mut calls: Vec<(String, Result<()>)> = vec![
@@ -123,12 +117,6 @@ fn every_mutation_reaches_node_resolution() {
         calls.push((
             format!("submit_review (None, {label})"),
             github.submit_review(BOGUS_PR, None, event, "bogus"),
-        ));
-    }
-    for (label, method) in methods {
-        calls.push((
-            format!("merge ({label})"),
-            github.merge(BOGUS_PR, method, BOGUS_OID),
         ));
     }
 
