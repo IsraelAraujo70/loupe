@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 pid=$1; target=$2; stage=$3; source=$4; platform=$5; tag=$6; notice=$7
+# Lets the new version tell a live helper from one killed mid-install.
+echo $$ >"$stage/helper"
 while kill -0 "$pid" 2>/dev/null; do sleep 1; done
 backup="$stage/previous"
 mv "$target" "$backup"

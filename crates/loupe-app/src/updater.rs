@@ -148,7 +148,8 @@ pub fn state(cx: &App) -> UpdateState {
     if updater.token.as_deref().is_none_or(str::is_empty) {
         return UpdateState::SignedOut;
     }
-    if let (Some(tag), Status::Quiet | Status::Checking | Status::Current | Status::CheckFailed) =
+    // A running check shows as Checking, so Settings can show its spinner.
+    if let (Some(tag), Status::Quiet | Status::Current | Status::CheckFailed) =
         (&updater.rolled_back, &updater.status)
     {
         return UpdateState::RolledBack(tag.clone());
@@ -220,11 +221,15 @@ fn rolled_back_hint(tag: &str) -> String {
 
 /// Renders one nonmodal action beside the tabs; errors can retry discovery.
 pub fn render<T: 'static>(cx: &mut Context<T>) -> impl IntoElement {
-    let rolled_back = match state(cx) {
-        UpdateState::RolledBack(tag) => Some(tag),
+    let status = cx.try_global::<Updater>().map(|s| &s.status);
+    // Stays on the pill while a check runs, unlike `state`.
+    let rolled_back = match (state(cx), status) {
+        (UpdateState::RolledBack(tag), _) => Some(tag),
+        (UpdateState::Checking, _) => cx
+            .try_global::<Updater>()
+            .and_then(|s| s.rolled_back.clone()),
         _ => None,
     };
-    let status = cx.try_global::<Updater>().map(|s| &s.status);
     // A short label on the pill; the tooltip says what the click does.
     let (label, hint) = if let Some(tag) = &rolled_back {
         ("Update rolled back".to_owned(), rolled_back_hint(tag))

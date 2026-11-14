@@ -240,11 +240,31 @@ pub fn confirm_start(executable: &Path) -> Result<bool> {
         .join(".loupe-update");
     // Only the helper creates `previous`, after the old version quit; a download
     // still being staged by this process has none.
-    if !stage.join("previous").exists() {
+    if !stage.join("previous").exists() && !stage.join("healthy").exists() {
         return Ok(false);
     }
-    fs::write(stage.join("healthy"), b"")?;
-    Ok(true)
+    if helper_alive(&stage) {
+        fs::write(stage.join("healthy"), b"")?;
+        return Ok(true);
+    }
+    // The helper died mid-install (logout, reboot) or an older helper raced this
+    // write. This version has drawn its first screen, so keep it and free the
+    // stage, which would otherwise block every later update.
+    fs::remove_dir_all(&stage)?;
+    Ok(false)
+}
+
+fn helper_alive(stage: &Path) -> bool {
+    let Ok(pid) = fs::read_to_string(stage.join("helper")) else {
+        return false;
+    };
+    let pid = pid.trim();
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", pid])
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 /// The release tag the helper rolled back because it exited before it finished
@@ -253,9 +273,13 @@ pub fn confirm_start(executable: &Path) -> Result<bool> {
 pub fn rolled_back(notice: &Path, current: &str) -> Option<String> {
     let tag = fs::read_to_string(notice).ok()?;
     let tag = tag.trim();
-    let newer = match (stable(tag), stable(current)) {
-        (Some(tag), Some(current)) => tag > current,
-        _ => !tag.is_empty() && tag.trim_start_matches('v') != current,
+    // A test tag such as v0.1.1-rc.1 counts as its stable triple.
+    let base = |version: &str| stable(version.split('-').next().unwrap_or(version));
+    let newer = match (base(tag), base(current)) {
+        (Some(rejected), Some(running)) => {
+            rejected > running || (rejected == running && tag.trim_start_matches('v') != current)
+        }
+        _ => false,
     };
     newer.then(|| tag.to_owned())
 }
@@ -424,6 +448,14 @@ mod install_tests {
         assert_eq!(rolled_back(&notice, "0.1.9").as_deref(), Some("v0.1.10"));
         assert_eq!(rolled_back(&notice, "0.1.10"), None);
         assert_eq!(rolled_back(&notice, "0.1.11"), None);
+        fs::write(&notice, "v0.1.1-rc.1\n").unwrap();
+        assert_eq!(
+            rolled_back(&notice, "0.1.0").as_deref(),
+            Some("v0.1.1-rc.1")
+        );
+        assert_eq!(rolled_back(&notice, "0.1.1"), Some("v0.1.1-rc.1".into()));
+        assert_eq!(rolled_back(&notice, "0.1.1-rc.1"), None);
+        assert_eq!(rolled_back(&notice, "0.1.2"), None);
         fs::remove_file(&notice).unwrap();
         assert_eq!(rolled_back(&notice, "0.1.9"), None);
     }
@@ -440,6 +472,22 @@ mod install_tests {
         assert!(!stage.join("healthy").exists());
         fs::remove_dir_all(&stage).unwrap();
         assert!(!confirm_start(&target).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stage_whose_helper_died_is_cleared_and_the_new_version_kept() {
+        let root = std::env::temp_dir().join(format!("loupe-orphan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let stage = root.join(".loupe-update");
+        fs::create_dir_all(stage.join("previous")).unwrap();
+        let target = root.join("loupe");
+        fs::write(&target, "new").unwrap();
+        // A pid no process has: the helper was killed before the first frame.
+        fs::write(stage.join("helper"), "99999999\n").unwrap();
+        assert!(!confirm_start(&target).unwrap());
+        assert!(!stage.exists(), "the next update can stage again");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
         fs::remove_dir_all(root).unwrap();
     }
 }
