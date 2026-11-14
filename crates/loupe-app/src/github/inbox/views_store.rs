@@ -16,6 +16,14 @@ struct SavedViews {
 impl Global for SavedViews {}
 
 fn path() -> PathBuf {
+    // UI tests run in parallel in one process, which has one data
+    // directory: each test thread keeps its own views, so a test never
+    // shows the view tabs another one saved.
+    if cfg!(test) {
+        let thread = format!("{:?}", std::thread::current().id());
+        let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
+        return crate::store::data_dir().join(format!("reviews-views-{thread}.json"));
+    }
     crate::store::data_dir().join("reviews-views.json")
 }
 
