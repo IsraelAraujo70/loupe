@@ -27,9 +27,18 @@ PATs require Contents: read on this repository. Stable releases only are offered
 A quiet button beside the tabs shows the version and asks to update and restart.
 Download errors leave the current app running and offer Retry. The download is
 size-bounded, checked against GitHub's SHA-256 digest, and staged beside the install.
-The helper waits for the app to quit before replacing it and restarting. Linux
-rolls back if the replacement exits within three seconds; macOS rolls back if
-Launch Services rejects opening it. This cannot detect later runtime crashes.
+The helper waits for the app to quit before replacing it and restarting. It keeps
+the previous version until the new one reports a healthy start: once the main
+window has drawn its first frame, the new version writes `healthy` into the
+staging directory. If the new version exits first (a crash, or Launch Services
+refusing to open it on macOS), the helper puts the previous version back, records
+the rejected tag in `update-rolled-back` in the data directory, and restarts the
+previous version. That version shows "Update rolled back" beside the tabs and in
+Settings > About, and does not offer that tag again; a newer release is offered
+as usual, and an install through the helper clears the record. A new version that
+hangs before its first frame stays until it is quit, then rolls back. Crashes
+after the first frame are not detected. The helper comes from the running
+version, so this protection applies from the update after the one that adds it.
 The installation directory must be writable; macOS Loupe must run from a .app.
 
 For a manual test release, dispatch Release with version `0.1.1-rc.1` (choose an

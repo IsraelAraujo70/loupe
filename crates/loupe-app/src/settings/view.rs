@@ -771,6 +771,10 @@ fn updates_row(entry: &Entry, colors: Palette, cx: &App) -> AnyElement {
         UpdateState::Available(tag) => format!("Loupe {tag} is available.").into(),
         UpdateState::Installing => "Installing the update…".into(),
         UpdateState::InstallFailed => "The update failed.".into(),
+        UpdateState::RolledBack(tag) => {
+            format!("Loupe {tag} quit before it finished starting, so this version was restored.")
+                .into()
+        }
     };
     let button = match &state {
         UpdateState::Available(_) => Button::new("update-install")
