@@ -153,7 +153,7 @@ impl LinkedThreads {
     /// changed files whether the pull request is risky.
     fn reload_review(&mut self, cx: &mut Context<Self>) {
         self.review_load = None;
-        if self.context.author.is_none() || self.context.is_own() {
+        if review::not_reviewable(&self.context).is_some() {
             self.review = None;
             return;
         }

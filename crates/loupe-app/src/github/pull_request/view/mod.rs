@@ -339,19 +339,7 @@ impl PullRequestView {
         }
         let link_context = PrLinkContext {
             pr: self.pr.clone(),
-            url: detail.url.clone(),
-            title: detail.title.clone(),
-            body: detail.body.clone(),
-            head_ref: detail.head_ref.clone(),
-            head_oid: detail.head_oid.clone(),
-            head_fork: detail.head_repo.as_ref().map(ToString::to_string),
-            author: detail.author.as_ref().map(|author| author.login.clone()),
-            viewer_login: detail.viewer_login.clone(),
-            labels: detail
-                .labels
-                .iter()
-                .map(|label| label.name.clone())
-                .collect(),
+            ..PrLinkContext::from_detail(&detail)
         };
         if let Some(loaded) = &mut self.loaded {
             loaded
