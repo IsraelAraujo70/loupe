@@ -17,6 +17,9 @@ pub(crate) const PROTOCOL_VERSION: &str = "2";
 
 pub(crate) const LAUNCH_THREAD: &str = "orchestration.launchThread";
 pub(crate) const DISPATCH_COMMAND: &str = "orchestration.dispatchCommand";
+/// The server's configuration, whose `providers` list the provider
+/// instances and their models. Needs `orchestration:read`.
+pub(crate) const GET_CONFIG: &str = "server.getConfig";
 
 /// The review runs the repository's tests on its own, so it starts with
 /// every permission the credential can give.

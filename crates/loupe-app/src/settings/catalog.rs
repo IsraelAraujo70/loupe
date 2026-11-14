@@ -81,7 +81,8 @@ impl Section {
     /// Whether the section has preferences Restore defaults can put back.
     /// Accounts and the watched repositories are not preferences: they are
     /// the user's data, and only their own actions change them. T3 Code's
-    /// are its review request and risk rules, not its server.
+    /// are its review request, review prompts, and risk rules, not its
+    /// server.
     pub fn has_defaults(self) -> bool {
         matches!(
             self,
@@ -148,7 +149,9 @@ pub enum Item {
     WorkspaceMappings,
     T3Server,
     ReviewPrompt,
+    ReviewPrompts,
     RiskCheck,
+    RiskPrompt,
     RiskList(crate::t3::RiskList),
     /// The shortcut at this index of [`SHORTCUTS`].
     Shortcut(usize),
@@ -371,12 +374,28 @@ pub fn entries() -> Vec<Entry> {
             "prompt template variables restore default",
         ),
         entry(
+            ReviewPrompts,
+            S::T3,
+            "Review prompts",
+            "Review prompts",
+            "Each is a tab of the review dialog, with its own text, model, and effort.",
+            "prompt reviewer model effort provider add edit reorder delete default security",
+        ),
+        entry(
             RiskCheck,
             S::T3,
             "Risky pull requests",
             "Detect risky pull requests",
-            "A risky pull request starts on the security review.",
+            "A risky pull request starts on the prompt chosen for risk.",
             "risk security reviewer",
+        ),
+        entry(
+            RiskPrompt,
+            S::T3,
+            "Risky pull requests",
+            "Prompt for risky pull requests",
+            "The review prompt the dialog starts on for a risky pull request.",
+            "risk security reviewer prompt",
         ),
         entry(
             RiskList(crate::t3::RiskList::Labels),
@@ -445,6 +464,7 @@ impl Item {
                 | Item::LinearAccount
                 | Item::T3Server
                 | Item::ReviewPrompt
+                | Item::ReviewPrompts
                 | Item::ColorScheme
                 | Item::Themes
         )

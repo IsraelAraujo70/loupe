@@ -11,8 +11,8 @@ use tungstenite::client::IntoClientRequest as _;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{HandshakeError, Message, WebSocket};
 
-use crate::rpc;
-use crate::{Error, LaunchedReview, Result, ReviewLaunch, T3};
+use crate::{Error, LaunchedReview, Provider, Result, ReviewLaunch, T3};
+use crate::{rpc, wire};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The server answers a launch once it recorded the thread; the worktree
@@ -45,6 +45,14 @@ pub(crate) fn launch_review(t3: &T3, launch: &ReviewLaunch) -> Result<LaunchedRe
         thread_id,
         link_error,
     })
+}
+
+/// The provider instances and their models, from the server's configuration.
+pub(crate) fn providers(t3: &T3) -> Result<Vec<Provider>> {
+    let mut socket = open(t3)?;
+    let config = call(&mut socket, "1", rpc::GET_CONFIG, serde_json::json!({}));
+    let _ = socket.close(None);
+    wire::providers(config?)
 }
 
 #[derive(serde::Deserialize)]

@@ -8,8 +8,8 @@ mod panel;
 mod review;
 
 pub use review::{
-    DEFAULT_PROMPT, OPERATE_HINT, ReviewSettings, RiskList, VARIABLES, format_list,
-    unknown_variables,
+    DEFAULT_PROMPT, OPERATE_HINT, ReviewPrompt, ReviewSettings, RiskList, VARIABLES, format_list,
+    model_choice, model_summary, unknown_variables,
 };
 
 use gpui_kit::{AnyView, App, Task, Window};

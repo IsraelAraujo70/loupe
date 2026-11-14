@@ -17,7 +17,9 @@
 //!
 //! Starting a thread needs the `orchestration:operate` scope and goes
 //! through the server's WebSocket RPC (`rpc`): the HTTP API has no call for
-//! it, and `/mcp` only takes sessions of T3's own OAuth clients.
+//! it, and `/mcp` only takes sessions of T3's own OAuth clients. The same
+//! socket reads the server's provider instances and their models
+//! (`server.getConfig`), which `orchestration:read` allows.
 
 mod http;
 mod rpc;
@@ -108,13 +110,44 @@ pub struct ReviewLaunch {
 /// What the server's threads say about starting a review.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReviewFacts {
-    /// For each model asked about, the provider instance the most recent
-    /// active thread on it ran on. A model no active thread has used is left
-    /// out: the server has no other list of who serves a model.
-    pub instances: HashMap<String, String>,
     /// The worktree branches of each project's threads, archived ones
     /// included, by project id. A new worktree cannot reuse one.
     pub branches: HashMap<String, Vec<String>>,
+}
+
+/// A provider instance of the server (such as a Claude account) and the
+/// models it offers, as the server reports them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provider {
+    /// What a thread's model selection names it by.
+    pub instance_id: String,
+    /// Its display name, such as "Claude Pool".
+    pub name: String,
+    /// Why it cannot run a thread now (turned off, not installed, failing),
+    /// in the server's words when it gives them; `None` when it can.
+    pub unavailable: Option<String>,
+    pub models: Vec<ProviderModel>,
+}
+
+/// A model a provider instance offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderModel {
+    /// The id a thread's model selection names, such as `claude-opus-5-5`.
+    pub slug: String,
+    /// The display name, such as "Claude Opus 5.5".
+    pub name: String,
+    /// The efforts it takes, in the server's order; empty when it takes no
+    /// effort setting.
+    pub efforts: Vec<Effort>,
+}
+
+/// One value of a model's effort setting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Effort {
+    pub id: String,
+    pub label: String,
+    /// The effort the model runs at when a thread names none.
+    pub is_default: bool,
 }
 
 /// A review thread the server started.
@@ -279,10 +312,16 @@ impl T3 {
         http::projects(self)
     }
 
-    /// What a review launch needs to know from the server's threads: who
-    /// serves each of `models`, and which worktree branches are taken.
-    pub fn review_facts(&self, models: &[&str]) -> Result<ReviewFacts> {
-        http::review_facts(self, models)
+    /// What a review launch needs to know from the server's threads: which
+    /// worktree branches are taken.
+    pub fn review_facts(&self) -> Result<ReviewFacts> {
+        http::review_facts(self)
+    }
+
+    /// The server's provider instances, enabled or not, each with the
+    /// models it offers, in the server's order.
+    pub fn providers(&self) -> Result<Vec<Provider>> {
+        socket::providers(self)
     }
 
     /// Starts a review thread and links it to its pull request. Needs

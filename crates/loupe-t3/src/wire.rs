@@ -9,8 +9,8 @@ use serde::de::{DeserializeOwned, Deserializer};
 use serde_json::Value;
 
 use crate::{
-    Environment, Error, LinkedThread, OPERATE_SCOPE, Project, PullRequestKey, ReviewFacts, Session,
-    ThreadStatus,
+    Effort, Environment, Error, LinkedThread, OPERATE_SCOPE, Project, Provider, ProviderModel,
+    PullRequestKey, ReviewFacts, Session, ThreadStatus,
 };
 
 /// Decodes a list one element at a time and drops the elements that do not
@@ -151,8 +151,6 @@ struct ThreadShellWire {
     #[serde(default)]
     deleted_at: Option<Value>,
     #[serde(default)]
-    model_selection: Option<ModelSelectionWire>,
-    #[serde(default)]
     branch: Option<String>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pull_requests: Vec<PullRequestLinkWire>,
@@ -160,15 +158,6 @@ struct ThreadShellWire {
     linked_pull_request: Option<ThreadPullRequestWire>,
     #[serde(default)]
     branch_pull_request: Option<ThreadPullRequestWire>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ModelSelectionWire {
-    #[serde(default)]
-    instance_id: String,
-    #[serde(default)]
-    model: String,
 }
 
 #[derive(Deserialize)]
@@ -264,11 +253,9 @@ pub(crate) fn linked_threads(shell: ShellWire, pr: &PullRequestKey) -> Vec<Linke
     linked
 }
 
-/// What a review launch needs from the shell: the provider instance of the
-/// most recently updated active thread on each of `models` (an archived or
-/// deleted thread may have run on an instance that is now off), and the worktree
-/// branches each project's threads hold, archived ones included.
-pub(crate) fn review_facts(shell: ShellWire, models: &[&str]) -> ReviewFacts {
+/// What a review launch needs from the shell: the worktree branches each
+/// project's threads hold, archived ones included.
+pub(crate) fn review_facts(shell: ShellWire) -> ReviewFacts {
     let mut branches: HashMap<String, Vec<String>> = HashMap::new();
     for thread in shell.threads.iter().chain(&shell.archived_threads) {
         if let Some(branch) = thread.branch.as_ref().filter(|branch| !branch.is_empty()) {
@@ -278,31 +265,187 @@ pub(crate) fn review_facts(shell: ShellWire, models: &[&str]) -> ReviewFacts {
                 .push(branch.clone());
         }
     }
-    let mut latest: HashMap<String, (DateTime<Utc>, String)> = HashMap::new();
-    for thread in shell.threads {
-        if thread.deleted_at.is_some() {
-            continue;
+    ReviewFacts { branches }
+}
+
+/// The part of `server.getConfig`'s answer Loupe reads: the providers.
+#[derive(Deserialize)]
+struct ConfigWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    providers: Vec<ProviderWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderWire {
+    instance_id: String,
+    #[serde(default)]
+    driver: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    installed: bool,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    availability: Option<String>,
+    #[serde(default)]
+    unavailable_reason: Option<String>,
+    #[serde(default)]
+    auth: Option<AuthWire>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    models: Vec<ModelWire>,
+}
+
+#[derive(Deserialize)]
+struct AuthWire {
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelWire {
+    slug: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    capabilities: Option<CapabilitiesWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CapabilitiesWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    option_descriptors: Vec<OptionWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OptionWire {
+    id: String,
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    options: Vec<ChoiceWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChoiceWire {
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    is_default: bool,
+}
+
+/// The effort id a thread's model selection sets (`rpc::model_selection`).
+const EFFORT_OPTION: &str = "effort";
+
+impl ProviderWire {
+    /// Why the instance cannot run a thread, or `None` when it can: it is
+    /// enabled, installed, available, signed in, and not failing. T3's own
+    /// client asks the same, and a signed-out instance may still report
+    /// `ready`.
+    fn unavailable(&self, name: &str) -> Option<String> {
+        let signed_out = self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.status == "unauthenticated");
+        let usable = self.enabled
+            && self.installed
+            && !signed_out
+            && self.availability.as_deref() != Some("unavailable")
+            && self.status != "error"
+            && self.status != "disabled";
+        if usable {
+            return None;
         }
-        let Some(selection) = thread.model_selection else {
-            continue;
-        };
-        if selection.instance_id.is_empty() || !models.contains(&selection.model.as_str()) {
-            continue;
-        }
-        let newer = latest
-            .get(&selection.model)
-            .is_none_or(|(at, _)| thread.updated_at > *at);
-        if newer {
-            latest.insert(selection.model, (thread.updated_at, selection.instance_id));
-        }
+        let said = self
+            .unavailable_reason
+            .as_ref()
+            .or(self.message.as_ref())
+            .filter(|text| !text.trim().is_empty());
+        Some(match said {
+            Some(text) => text.trim().to_owned(),
+            None if !self.enabled || self.status == "disabled" => {
+                format!("{name} is turned off in T3 Code.")
+            }
+            None if !self.installed => format!("{name} is not installed on the T3 server."),
+            None if signed_out => format!("{name} is signed out on the T3 server."),
+            None => format!("{name} is not available on the T3 server."),
+        })
     }
-    ReviewFacts {
-        instances: latest
+}
+
+impl From<ModelWire> for ProviderModel {
+    fn from(wire: ModelWire) -> Self {
+        let efforts = wire
+            .capabilities
             .into_iter()
-            .map(|(model, (_, instance))| (model, instance))
-            .collect(),
-        branches,
+            .flat_map(|capabilities| capabilities.option_descriptors)
+            .find(|option| option.id == EFFORT_OPTION && option.kind == "select")
+            .map(|option| {
+                option
+                    .options
+                    .into_iter()
+                    .map(|choice| Effort {
+                        label: if choice.label.is_empty() {
+                            choice.id.clone()
+                        } else {
+                            choice.label
+                        },
+                        id: choice.id,
+                        is_default: choice.is_default,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ProviderModel {
+            name: if wire.name.is_empty() {
+                wire.slug.clone()
+            } else {
+                wire.name
+            },
+            slug: wire.slug,
+            efforts,
+        }
     }
+}
+
+/// The providers of a `server.getConfig` answer, in the server's order.
+pub(crate) fn providers(config: Value) -> Result<Vec<Provider>, Error> {
+    let config: ConfigWire =
+        serde_json::from_value(config).map_err(|error| Error::Decode(error.to_string()))?;
+    Ok(config
+        .providers
+        .into_iter()
+        .filter(|provider| !provider.instance_id.is_empty())
+        .map(|provider| {
+            let name = provider
+                .display_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if provider.driver.is_empty() {
+                        provider.instance_id.clone()
+                    } else {
+                        provider.driver.clone()
+                    }
+                });
+            Provider {
+                instance_id: provider.instance_id.clone(),
+                unavailable: provider.unavailable(&name),
+                name,
+                models: provider.models.into_iter().map(Into::into).collect(),
+            }
+        })
+        .collect())
 }
 
 fn is_pchar(byte: u8) -> bool {
@@ -440,34 +583,103 @@ mod tests {
         assert!(!projects.iter().any(|project| project.holds(&other)));
     }
 
+    /// `server.getConfig` as the server answered on 2026-11-13, cut down to
+    /// three providers with their names and messages anonymized.
+    const CONFIG: &str = include_str!("../tests/fixtures/config.json");
+
     #[test]
-    fn a_model_runs_on_the_instance_of_its_latest_active_thread() {
-        let thread = |id: &str, at: &str, instance: &str, model: &str| {
-            json!({"id": id, "projectId": "p", "updatedAt": at,
-                   "modelSelection": {"instanceId": instance, "model": model}})
-        };
-        let shell: ShellWire = serde_json::from_value(json!({
-            "threads": [
-                thread("a", "2026-11-01T00:00:00Z", "claudeAgent", "claude-opus-5-5"),
-                thread("b", "2026-11-10T00:00:00Z", "claude_pool", "claude-opus-5-5"),
-                thread("c", "2026-11-05T00:00:00Z", "codex", "gpt-6"),
-                thread("f", "2026-11-08T00:00:00Z", "claude_pool", "claude-fable-5-2"),
-                {"id": "g", "projectId": "p", "updatedAt": "2026-11-11T00:00:00Z",
-                 "deletedAt": "2026-11-11T00:00:00Z",
-                 "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5-5"}},
-                {"id": "d", "projectId": "p", "updatedAt": "2026-11-11T00:00:00Z"},
+    fn the_providers_are_the_servers_with_their_models_and_efforts() {
+        let config: Value = serde_json::from_str(CONFIG).unwrap();
+        let providers = super::providers(config).unwrap();
+        let ids: Vec<&str> = providers
+            .iter()
+            .map(|provider| provider.instance_id.as_str())
+            .collect();
+        assert_eq!(ids, ["claudeAgent", "claude_pool", "codex"]);
+
+        let off = &providers[0];
+        assert_eq!(off.name, "Claude");
+        assert_eq!(
+            off.unavailable.as_deref(),
+            Some("Claude is disabled in T3 Code settings.")
+        );
+        assert_eq!(
+            off.models.len(),
+            2,
+            "a provider that is off keeps its models"
+        );
+
+        let pool = &providers[1];
+        assert_eq!(pool.name, "Claude Pool");
+        assert_eq!(pool.unavailable, None);
+        let opus = &pool.models[0];
+        assert_eq!(
+            (opus.slug.as_str(), opus.name.as_str()),
+            ("claude-opus-5-5", "Claude Opus 5.5")
+        );
+        let efforts: Vec<(&str, bool)> = opus
+            .efforts
+            .iter()
+            .map(|effort| (effort.id.as_str(), effort.is_default))
+            .collect();
+        assert_eq!(
+            efforts,
+            [
+                ("low", false),
+                ("medium", true),
+                ("high", false),
+                ("xhigh", false),
+                ("max", false)
+            ]
+        );
+        assert_eq!(opus.efforts[2].label, "High");
+        let haiku = &pool.models[1];
+        assert!(
+            haiku.efforts.is_empty(),
+            "a boolean option is not an effort"
+        );
+
+        let codex = &providers[2];
+        assert_eq!(
+            codex.unavailable.as_deref(),
+            Some("codex is not installed on the T3 server."),
+            "without a display name or a message the driver names it"
+        );
+    }
+
+    #[test]
+    fn a_signed_out_provider_cannot_run_threads() {
+        let mut config: Value = serde_json::from_str(CONFIG).unwrap();
+        config["providers"][1]["auth"]["status"] = json!("unauthenticated");
+        let providers = super::providers(config.clone()).unwrap();
+        assert_eq!(
+            providers[1].unavailable.as_deref(),
+            Some("Claude Pool is signed out on the T3 server."),
+            "even while it still reports ready"
+        );
+        config["providers"][1]["message"] = json!("Run claude login.");
+        let providers = super::providers(config).unwrap();
+        assert_eq!(
+            providers[1].unavailable.as_deref(),
+            Some("Run claude login.")
+        );
+    }
+
+    #[test]
+    fn a_provider_from_a_newer_server_that_does_not_fit_is_dropped() {
+        let providers = super::providers(json!({
+            "providers": [
+                {"driver": "x"},
+                {"instanceId": "ok", "enabled": true, "installed": true, "status": "ready",
+                 "models": [{"slug": "m"}, {"name": "no slug"}]},
             ],
-            "archivedThreads": [
-                // Archived today, on an instance that is off now.
-                thread("e", "2026-11-11T00:00:00Z", "claudeAgent", "claude-fable-5-2"),
-            ],
+            "keybindings": [],
         }))
         .unwrap();
-        let found =
-            super::review_facts(shell, &["claude-opus-5-5", "claude-fable-5-2", "none"]).instances;
-        assert_eq!(found.len(), 2);
-        assert_eq!(found["claude-opus-5-5"], "claude_pool");
-        assert_eq!(found["claude-fable-5-2"], "claude_pool");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "ok");
+        assert_eq!(providers[0].models.len(), 1);
+        assert_eq!(providers[0].models[0].name, "m");
     }
 
     #[test]
@@ -485,7 +697,7 @@ mod tests {
             "archivedThreads": [thread("d", "api", Some("review/pr-374-2"))],
         }))
         .unwrap();
-        let branches = super::review_facts(shell, &[]).branches;
+        let branches = super::review_facts(shell).branches;
         assert_eq!(branches["api"], ["review/pr-374", "review/pr-374-2"]);
         assert_eq!(branches["web"], ["review/pr-9"]);
     }
