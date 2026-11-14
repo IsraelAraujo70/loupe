@@ -28,6 +28,13 @@ pub fn inbox_view(window: &mut Window, cx: &mut App) -> AnyView {
     inbox::view(window, cx)
 }
 
+/// The title of the Reviews page `view`: its open saved view's name, or
+/// "Reviews". `None` when `view` is not a Reviews page.
+pub fn inbox_title(view: &AnyView, cx: &App) -> Option<SharedString> {
+    let inbox = view.clone().downcast::<inbox::InboxView>().ok()?;
+    Some(inbox.read(cx).title(cx))
+}
+
 pub fn notifications_view(window: &mut Window, cx: &mut App) -> AnyView {
     notifications::view(window, cx)
 }
