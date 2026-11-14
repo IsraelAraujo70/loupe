@@ -4,6 +4,7 @@
 //! The list then reports what started and what failed.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,6 +33,11 @@ type Launcher = Arc<dyn Fn(&ReviewLaunch) -> loupe_t3::Result<LaunchedReview> + 
 
 /// How many pull requests are read from GitHub at once.
 const GITHUB_AT_ONCE: usize = 6;
+
+/// How many review threads start at once: each makes T3 create a worktree,
+/// and each launch holds one of the app's background threads until T3
+/// answers.
+const LAUNCHES_AT_ONCE: usize = 4;
 
 /// Opens the dialog for `picked`, in the order on screen, and reads each
 /// pull request and the T3 server behind it.
@@ -107,8 +113,11 @@ impl Item {
 struct BatchForm {
     items: Vec<Item>,
     launcher: Launcher,
-    /// The server's providers; `None` until the server answered.
-    providers: Option<Vec<Provider>>,
+    /// The server's providers, or why it could not be asked; `None` until
+    /// it answered.
+    providers: Option<Result<Vec<Provider>, String>>,
+    /// Launches waiting for one of the [`LAUNCHES_AT_ONCE`] places.
+    queue: VecDeque<(usize, ReviewLaunch)>,
     /// The review prompts of Settings > T3 Code when the dialog opened.
     prompts: Vec<ReviewPrompt>,
     selected: usize,
@@ -125,7 +134,7 @@ struct BatchForm {
 struct Loaded {
     contexts: Vec<Option<PrLinkContext>>,
     readiness: Vec<Readiness>,
-    providers: Option<Vec<Provider>>,
+    providers: Result<Vec<Provider>, String>,
 }
 
 impl BatchForm {
@@ -165,6 +174,7 @@ impl BatchForm {
             items,
             launcher,
             providers: None,
+            queue: VecDeque::new(),
             prompts,
             selected,
             template,
@@ -194,7 +204,8 @@ impl BatchForm {
     }
 
     /// Shows what the load found. A risky ready pull request moves the
-    /// dialog to the risk prompt, unless the user picked a tab.
+    /// dialog to the risk prompt, unless the user already picked a tab or
+    /// edited the request.
     fn apply(&mut self, loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) {
         for ((item, context), readiness) in self
             .items
@@ -205,12 +216,14 @@ impl BatchForm {
             item.context = context;
             item.readiness = readiness;
         }
-        self.providers = loaded.providers;
+        self.providers = Some(loaded.providers);
+        let untouched =
+            !self.picked_tab && self.text.read(cx).value() == self.shared_for(self.selected);
         let risky = self
             .items
             .iter()
             .any(|item| matches!(&item.readiness, Readiness::Ready(plan) if !plan.risk.is_empty()));
-        if risky && !self.picked_tab {
+        if risky && untouched {
             let index = Settings::get(cx).t3_review.starting_index(true);
             self.select(index, window, cx);
         }
@@ -221,13 +234,13 @@ impl BatchForm {
         self.items.iter().any(|item| item.launch == Launch::Sending)
     }
 
-    /// The model every thread runs on, or why the server cannot run it.
+    /// The model every thread runs on, or why the server cannot run it;
+    /// `None` while the server is being asked.
     fn model(&self) -> Option<Result<ModelChoice, String>> {
-        let providers = self.providers.as_ref()?;
-        Some(review::model_choice(
-            providers,
-            &self.prompts[self.selected],
-        ))
+        Some(match self.providers.as_ref()? {
+            Ok(providers) => review::model_choice(providers, &self.prompts[self.selected]),
+            Err(why) => Err(why.clone()),
+        })
     }
 
     fn shared_for(&self, index: usize) -> String {
@@ -258,8 +271,9 @@ impl BatchForm {
         cx.notify();
     }
 
-    /// Starts a thread for every pending pull request, each on its own;
-    /// one that fails leaves the others running.
+    /// Starts a thread for every pending pull request, each on its own and
+    /// [`LAUNCHES_AT_ONCE`] at a time; one that fails leaves the others
+    /// running.
     fn send(&mut self, cx: &mut Context<Self>) {
         if self.sending() {
             return;
@@ -307,16 +321,26 @@ impl BatchForm {
             .collect();
         for (index, launch) in launches {
             self.items[index].launch = Launch::Sending;
-            let launcher = self.launcher.clone();
-            let task = services::background(cx, move || launcher(&launch));
-            cx.spawn(async move |this, cx| {
-                let result = task.await;
-                this.update(cx, |form, cx| form.finish(index, result, cx))
-                    .ok();
-            })
-            .detach();
+            self.queue.push_back((index, launch));
+        }
+        for _ in 0..LAUNCHES_AT_ONCE {
+            self.launch_next(cx);
         }
         cx.notify();
+    }
+
+    fn launch_next(&mut self, cx: &mut Context<Self>) {
+        let Some((index, launch)) = self.queue.pop_front() else {
+            return;
+        };
+        let launcher = self.launcher.clone();
+        let task = services::background(cx, move || launcher(&launch));
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |form, cx| form.finish(index, result, cx))
+                .ok();
+        })
+        .detach();
     }
 
     fn finish(
@@ -329,6 +353,7 @@ impl BatchForm {
             Ok(launched) => Launch::Started(launched.link_error.map(|error| error.to_string())),
             Err(error) => Launch::Failed(failure_text(&error)),
         };
+        self.launch_next(cx);
         cx.notify();
     }
 
@@ -410,7 +435,7 @@ fn load(t3: &T3, github: &GitHub, prs: &[PrRef], settings: &ReviewSettings) -> L
             .into_iter()
             .map(|candidate| candidate.ok().map(|candidate| candidate.context))
             .collect(),
-        providers: server.ok().map(|server| server.providers),
+        providers: server.map(|server| server.providers),
     }
 }
 
@@ -437,17 +462,21 @@ impl Render for BatchForm {
         let model = self.model();
         let theme = cx.theme();
         let (muted, danger) = (theme.muted_foreground, theme.danger);
+        let providers = self
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.as_deref().ok());
         let tabs = prompt_tabs(
             &self.prompts,
             self.selected,
-            self.providers.as_deref(),
+            providers,
             sending,
             Self::pick,
             cx,
         );
-        let runs_on = match (&model, &self.providers) {
-            (Some(model), Some(providers)) => runs_on(model, providers, cx),
-            _ => div()
+        let runs_on = match &model {
+            Some(model) => runs_on(model, providers.unwrap_or_default(), cx),
+            None => div()
                 .text_size(scale::meta())
                 .text_color(muted)
                 .child("Checking T3\u{2026}")
@@ -825,24 +854,32 @@ mod tests {
         assert_eq!(counts.summary(), "2 started · 1 failed · 1 skipped");
     }
 
-    /// The dialog for three pull requests (two ready, one from a fork),
-    /// with the load already done and `launcher` standing in for T3.
-    fn open(launcher: Launcher, cx: &mut TestAppContext) -> (Entity<BatchForm>, VisualTestContext) {
-        let contexts = [context("app", 1), context("app", 2), {
-            let mut fork = context("app", 3);
-            fork.head_fork = Some("someone/app".into());
-            fork
-        }];
-        let candidates: Vec<_> = contexts.iter().map(|c| of(c.clone(), &[])).collect();
+    /// The dialog for `prs` (each with its changed files) on `server`, with
+    /// the load already done and `launcher` standing in for T3. `typed`, if
+    /// any, is what the user typed in the request before the load ended.
+    fn open_with(
+        prs: Vec<(PrLinkContext, &[&str])>,
+        server: Result<Server, String>,
+        typed: Option<&'static str>,
+        launcher: Launcher,
+        cx: &mut TestAppContext,
+    ) -> (Entity<BatchForm>, VisualTestContext) {
+        let candidates: Vec<_> = prs
+            .iter()
+            .map(|(context, files)| of(context.clone(), files))
+            .collect();
         let settings = review::ReviewSettings::default();
         let loaded = Loaded {
-            readiness: review::assess_batch(&candidates, &Ok(server()), &settings),
-            contexts: contexts.iter().cloned().map(Some).collect(),
-            providers: Some(server().providers),
+            readiness: review::assess_batch(&candidates, &server, &settings),
+            contexts: prs
+                .iter()
+                .map(|(context, _)| Some(context.clone()))
+                .collect(),
+            providers: server.map(|server| server.providers),
         };
-        let picked = contexts
+        let picked = prs
             .iter()
-            .map(|context| (context.pr.clone(), context.title.clone()))
+            .map(|(context, _)| (context.pr.clone(), context.title.clone()))
             .collect();
         let (handle, form) = cx.update(|cx| {
             gpui_kit::init(cx);
@@ -860,6 +897,10 @@ mod tests {
                 |window, cx| {
                     cx.new(|cx| {
                         let mut form = BatchForm::new(picked, launcher, window, cx);
+                        if let Some(typed) = typed {
+                            form.text
+                                .update(cx, |state, cx| state.set_value(typed, window, cx));
+                        }
                         form.apply(loaded, window, cx);
                         form
                     })
@@ -868,6 +909,112 @@ mod tests {
             .expect("open the window")
         });
         (form, VisualTestContext::from_window(handle, cx))
+    }
+
+    /// Two ready pull requests and one from a fork.
+    fn open(launcher: Launcher, cx: &mut TestAppContext) -> (Entity<BatchForm>, VisualTestContext) {
+        let mut fork = context("app", 3);
+        fork.head_fork = Some("someone/app".into());
+        open_with(
+            vec![
+                (context("app", 1), &[][..]),
+                (context("app", 2), &[][..]),
+                (fork, &[][..]),
+            ],
+            Ok(server()),
+            None,
+            launcher,
+            cx,
+        )
+    }
+
+    /// A launcher that records each launch and starts every thread.
+    fn recorder() -> (Launcher, Arc<Mutex<Vec<ReviewLaunch>>>) {
+        let sent: Arc<Mutex<Vec<ReviewLaunch>>> = Arc::default();
+        let launcher: Launcher = {
+            let sent = sent.clone();
+            Arc::new(move |launch: &ReviewLaunch| {
+                sent.lock().unwrap().push(launch.clone());
+                Ok(LaunchedReview {
+                    thread_id: "t".into(),
+                    link_error: None,
+                })
+            })
+        };
+        (launcher, sent)
+    }
+
+    fn prompt_name(form: &Entity<BatchForm>, cx: &mut VisualTestContext) -> String {
+        cx.update(|_, cx| {
+            let form = form.read(cx);
+            form.prompts[form.selected].name.clone()
+        })
+    }
+
+    /// One ordinary and one risky pull request.
+    fn one_risky() -> Vec<(PrLinkContext, &'static [&'static str])> {
+        vec![
+            (context("app", 1), &[][..]),
+            (context("app", 2), &["src/auth/session.ts"][..]),
+        ]
+    }
+
+    #[gpui_kit::test]
+    fn a_risky_pull_request_moves_the_batch_to_the_risk_prompt(cx: &mut TestAppContext) {
+        let (form, mut cx) = open_with(one_risky(), Ok(server()), None, recorder().0, cx);
+        assert_eq!(prompt_name(&form, &mut cx), "General + security");
+        let text = cx.update(|_, cx| form.read(cx).text.read(cx).value().to_string());
+        assert!(
+            text.contains("revisar-seguranca"),
+            "the request follows: {text}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_request_edited_before_the_load_keeps_its_prompt(cx: &mut TestAppContext) {
+        let (form, mut cx) = open_with(
+            one_risky(),
+            Ok(server()),
+            Some("Mine: #{number}"),
+            recorder().0,
+            cx,
+        );
+        assert_eq!(prompt_name(&form, &mut cx), "General");
+    }
+
+    #[gpui_kit::test]
+    fn a_server_that_did_not_answer_says_why_and_starts_nothing(cx: &mut TestAppContext) {
+        let (launcher, sent) = recorder();
+        let (form, mut cx) = open_with(
+            vec![(context("app", 1), &[][..])],
+            Err("Could not check T3: offline".to_owned()),
+            None,
+            launcher,
+            cx,
+        );
+        let model = cx.update(|_, cx| form.read(cx).model());
+        assert_eq!(model, Some(Err("Could not check T3: offline".to_owned())));
+        form.update(&mut cx, |form, cx| form.send(cx));
+        cx.run_until_parked();
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn at_most_four_threads_start_at_once(cx: &mut TestAppContext) {
+        let (launcher, sent) = recorder();
+        let prs = (1..=6).map(|n| (context("app", 10 + n), &[][..])).collect();
+        let (form, mut cx) = open_with(prs, Ok(server()), None, launcher, cx);
+        form.update(&mut cx, |form, cx| form.send(cx));
+        let waiting = cx.update(|_, cx| form.read(cx).queue.len());
+        assert_eq!(waiting, 2, "two wait for a place");
+        cx.run_until_parked();
+        assert_eq!(sent.lock().unwrap().len(), 6);
+        assert!(
+            launches(&form, &mut cx)
+                .iter()
+                .all(|launch| *launch == Launch::Started(None)),
+            "each one that finishes lets the next start"
+        );
     }
 
     fn launches(form: &Entity<BatchForm>, cx: &mut VisualTestContext) -> Vec<Launch> {
