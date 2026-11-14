@@ -295,8 +295,16 @@ struct ProviderWire {
     availability: Option<String>,
     #[serde(default)]
     unavailable_reason: Option<String>,
+    #[serde(default)]
+    auth: Option<AuthWire>,
     #[serde(default, deserialize_with = "lenient_vec")]
     models: Vec<ModelWire>,
+}
+
+#[derive(Deserialize)]
+struct AuthWire {
+    #[serde(default)]
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -341,10 +349,17 @@ const EFFORT_OPTION: &str = "effort";
 
 impl ProviderWire {
     /// Why the instance cannot run a thread, or `None` when it can: it is
-    /// enabled, installed, available, and not failing.
+    /// enabled, installed, available, signed in, and not failing. T3's own
+    /// client asks the same, and a signed-out instance may still report
+    /// `ready`.
     fn unavailable(&self, name: &str) -> Option<String> {
+        let signed_out = self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.status == "unauthenticated");
         let usable = self.enabled
             && self.installed
+            && !signed_out
             && self.availability.as_deref() != Some("unavailable")
             && self.status != "error"
             && self.status != "disabled";
@@ -362,6 +377,7 @@ impl ProviderWire {
                 format!("{name} is turned off in T3 Code.")
             }
             None if !self.installed => format!("{name} is not installed on the T3 server."),
+            None if signed_out => format!("{name} is signed out on the T3 server."),
             None => format!("{name} is not available on the T3 server."),
         })
     }
@@ -628,6 +644,24 @@ mod tests {
             codex.unavailable.as_deref(),
             Some("codex is not installed on the T3 server."),
             "without a display name or a message the driver names it"
+        );
+    }
+
+    #[test]
+    fn a_signed_out_provider_cannot_run_threads() {
+        let mut config: Value = serde_json::from_str(CONFIG).unwrap();
+        config["providers"][1]["auth"]["status"] = json!("unauthenticated");
+        let providers = super::providers(config.clone()).unwrap();
+        assert_eq!(
+            providers[1].unavailable.as_deref(),
+            Some("Claude Pool is signed out on the T3 server."),
+            "even while it still reports ready"
+        );
+        config["providers"][1]["message"] = json!("Run claude login.");
+        let providers = super::providers(config).unwrap();
+        assert_eq!(
+            providers[1].unavailable.as_deref(),
+            Some("Run claude login.")
         );
     }
 

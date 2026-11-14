@@ -301,9 +301,14 @@ impl ReviewSettings {
         self.prompt = (text != DEFAULT_PROMPT).then(|| text.to_owned());
     }
 
-    /// The review prompts, the user's or the default ones.
+    /// The review prompts, the user's or the default ones. The dialog needs
+    /// one at least, so an empty list (only a hand-edited file has one)
+    /// reads as the default.
     pub fn prompts(&self) -> Vec<ReviewPrompt> {
-        self.prompts.clone().unwrap_or_else(default_prompts)
+        self.prompts
+            .clone()
+            .filter(|prompts| !prompts.is_empty())
+            .unwrap_or_else(default_prompts)
     }
 
     /// Keeps `prompts`; the default prompts are kept as the default.
@@ -1305,6 +1310,17 @@ mod tests {
                 .expect("parse a file from before review prompts");
         assert_eq!(older.prompts(), default_prompts());
         assert!(!older.risk_check);
+        let emptied: ReviewSettings =
+            serde_json::from_str(r#"{"prompts":[]}"#).expect("parse an emptied list");
+        assert_eq!(
+            emptied.prompts(),
+            default_prompts(),
+            "the dialog always has a tab"
+        );
+        assert_eq!(
+            emptied.prompts()[emptied.starting_index(true)].name,
+            "General + security"
+        );
     }
 
     #[test]

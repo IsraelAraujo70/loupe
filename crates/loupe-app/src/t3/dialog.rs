@@ -120,6 +120,12 @@ impl ReviewForm {
         matches!(self.submit, Submit::Sending)
     }
 
+    /// The model the open tab runs on, or why the server cannot run it,
+    /// which keeps Send off.
+    fn model(&self) -> Result<loupe_t3::ModelChoice, String> {
+        self.plan.model(&self.prompts[self.selected])
+    }
+
     fn request_for(&self, index: usize) -> String {
         review::request(
             &self.context,
@@ -149,7 +155,7 @@ impl ReviewForm {
         if self.sending() {
             return;
         }
-        let model = match self.plan.model(&self.prompts[self.selected]) {
+        let model = match self.model() {
             Ok(model) => model,
             Err(why) => {
                 self.submit = Submit::Failed(why.into());
@@ -225,7 +231,7 @@ impl Render for ReviewForm {
             Submit::Failed(message) => Some(message.clone()),
             Submit::Idle | Submit::Sending => None,
         };
-        let model = self.plan.model(&self.prompts[self.selected]);
+        let model = self.model();
         let tabs = h_flex()
             .id("t3-review-prompts")
             .role(Role::TabList)
@@ -330,5 +336,152 @@ impl Render for ReviewForm {
                             .on_click(cx.listener(|form, _, window, cx| form.send(window, cx))),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui_kit::{
+        AppContext as _, Bounds, Entity, TestAppContext, VisualTestContext, WindowBounds,
+        WindowOptions, px, size,
+    };
+    use loupe_github::{PrRef, RepoRef};
+    use loupe_t3::{Effort, Provider, ProviderModel, T3};
+
+    use super::{ReviewForm, Submit};
+    use crate::links::PrLinkContext;
+    use crate::store::Settings;
+    use crate::t3::ReviewSettings;
+    use crate::t3::review::Plan;
+
+    fn context() -> PrLinkContext {
+        PrLinkContext {
+            pr: PrRef::new(RepoRef::new("acme", "app"), 7),
+            url: "https://github.com/acme/app/pull/7".into(),
+            title: "Fix the thing".into(),
+            body: String::new(),
+            head_ref: "fix/thing".into(),
+            head_oid: "abc123".into(),
+            head_fork: None,
+            author: Some("hubot".into()),
+            viewer_login: "octocat".into(),
+            labels: Vec::new(),
+        }
+    }
+
+    /// A server whose one provider offers both default models.
+    fn plan(risk: &[&str]) -> Plan {
+        let model = |slug: &str| ProviderModel {
+            slug: slug.into(),
+            name: slug.into(),
+            efforts: ["low", "medium", "high"]
+                .map(|id| Effort {
+                    id: id.into(),
+                    label: id.into(),
+                    is_default: id == "medium",
+                })
+                .to_vec(),
+        };
+        Plan {
+            project_id: "p".into(),
+            project_title: "app".into(),
+            branch: "review/pr-7".into(),
+            providers: vec![Provider {
+                instance_id: "pool".into(),
+                name: "Pool".into(),
+                unavailable: None,
+                models: vec![model("claude-opus-5-5"), model("claude-fable-5-2")],
+            }],
+            risk: risk.iter().map(|reason| (*reason).to_owned()).collect(),
+        }
+    }
+
+    /// The dialog's form for `plan` under `review`. Nothing reaches a
+    /// server: the T3 address is never called unless Send goes through.
+    fn open(
+        plan: Plan,
+        review: ReviewSettings,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ReviewForm>, VisualTestContext) {
+        let (handle, form) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(Settings {
+                t3_review: review,
+                ..Settings::default()
+            });
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(640.), px(600.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let t3 = Arc::new(T3::new("http://127.0.0.1:9", "unused"));
+                    cx.new(|cx| {
+                        ReviewForm::new(context(), plan, t3, Box::new(|_, _| {}), window, cx)
+                    })
+                },
+            )
+            .expect("open the window")
+        });
+        (form, VisualTestContext::from_window(handle, cx))
+    }
+
+    #[gpui_kit::test]
+    fn a_risky_pull_request_opens_on_the_risk_prompt(cx: &mut TestAppContext) {
+        let (form, mut cx) = open(plan(&["src/auth.ts"]), ReviewSettings::default(), cx);
+        let (name, text) = cx.update(|_, cx| {
+            let form = form.read(cx);
+            (
+                form.prompts[form.selected].name.clone(),
+                form.text.read(cx).value().to_string(),
+            )
+        });
+        assert_eq!(name, "General + security");
+        assert!(
+            text.contains("Este PR é de risco (`src/auth.ts`)"),
+            "{text}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn an_ordinary_pull_request_opens_on_the_default_prompt(cx: &mut TestAppContext) {
+        let mut review = ReviewSettings::default();
+        let quick = review.add_prompt();
+        review.set_default_prompt(&quick);
+        let (form, mut cx) = open(plan(&[]), review, cx);
+        let name = cx.update(|_, cx| {
+            let form = form.read(cx);
+            form.prompts[form.selected].name.clone()
+        });
+        assert_eq!(name, "New prompt");
+    }
+
+    #[gpui_kit::test]
+    fn a_prompt_the_server_cannot_run_is_not_sent(cx: &mut TestAppContext) {
+        let mut review = ReviewSettings::default();
+        let gone = review.add_prompt();
+        review.update_prompt(&gone, |prompt| prompt.provider = Some("gone".into()));
+        review.set_default_prompt(&gone);
+        let (form, mut cx) = open(plan(&[]), review, cx);
+        cx.update(|window, cx| {
+            form.update(cx, |form, cx| form.send(window, cx));
+        });
+        cx.update(|_, cx| {
+            let form = form.read(cx);
+            assert!(form.model().is_err(), "Send is off for this tab");
+            match &form.submit {
+                Submit::Failed(why) => {
+                    assert_eq!(why.as_ref(), "The T3 server has no provider gone.");
+                }
+                Submit::Idle | Submit::Sending => panic!("the review was sent"),
+            }
+        });
     }
 }
