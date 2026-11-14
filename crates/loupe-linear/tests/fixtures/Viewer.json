@@ -1,0 +1,17 @@
+{
+  "data": {
+    "viewer": {
+      "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+      "name": "Ada Okafor",
+      "displayName": "ada",
+      "email": "ada@acme.test",
+      "avatarUrl": "https://avatars.example.test/ada.png",
+      "organization": {
+        "id": "de85dab6-98a9-5b59-8bb6-bae02a605116",
+        "name": "Acme Robotics",
+        "urlKey": "acme",
+        "logoUrl": "https://uploads.linear.app/de85dab6/0c9f7e60/256x256/logo"
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "data": {
+    "viewer": {
+      "teams": {
+        "nodes": [
+          {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          {
+            "id": "a1b2c3d4-0000-4000-8000-000000000003",
+            "key": "BE",
+            "name": "Back-end"
+          }
+        ]
+      }
+    }
+  }
+}

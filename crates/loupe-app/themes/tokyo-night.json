@@ -1,0 +1,273 @@
+{
+  "name": "Tokyo Night",
+  "light": {
+    "window": "#d5d6db",
+    "panel": "#e1e2e7",
+    "surface": "#e9e9ed",
+    "overlay": "#f2f2f5",
+    "scrim": "#00000059",
+    "hover": "#0000000a",
+    "selected": "#00000012",
+    "ghost_hover": "#0000000f",
+    "segmented_track": "#d5d6db",
+    "segmented_thumb": "#f2f2f5",
+    "segmented_thumb_shadow": "#0000002e",
+    "border": "#0000001f",
+    "border_subtle": "#00000012",
+    "input_border": "#00000033",
+    "text": "#343b58",
+    "text_muted": "#454957",
+    "text_faint": "#56586d",
+    "accent": "#2e7de9",
+    "accent_fill": "#2272dd",
+    "accent_fill_hover": "#1166cf",
+    "accent_fill_active": "#0059c2",
+    "on_accent": "#ffffff",
+    "on_bright": "#ffffff",
+    "link": "#0054bd",
+    "code_inline": "#0000000f",
+    "secondary": "#d0d1d8",
+    "secondary_hover": "#c6c8d1",
+    "secondary_active": "#bcbfca",
+    "skeleton": "#0000000f",
+    "scrollbar_thumb": "#0000002e",
+    "scrollbar_thumb_hover": "#0000004c",
+    "edge_shadow": "#0000001f",
+    "indent_guide": "#00000014",
+    "indent_guide_active": "#00000038",
+    "open": "#1a7f37",
+    "merged": "#8250df",
+    "closed": "#cf222e",
+    "draft": "#59636e",
+    "pending": "#9a6700",
+    "open_fill": "#1a7f37",
+    "merged_fill": "#8250df",
+    "closed_fill": "#cf222e",
+    "draft_fill": "#59636e",
+    "merge_fill": "#1f883d",
+    "merge_fill_hover": "#1a7f37",
+    "merge_fill_active": "#116329",
+    "diff_added_bg": "#2da44e26",
+    "diff_removed_bg": "#ff818233",
+    "diff_added_text": "#116329",
+    "diff_removed_text": "#a40e26",
+    "syntax": {
+      "keyword": {
+        "color": "#7847bd"
+      },
+      "operator": {
+        "color": "#006a83"
+      },
+      "string": {
+        "color": "#485e30"
+      },
+      "string.special": {
+        "color": "#485e30"
+      },
+      "string.special.symbol": {
+        "color": "#485e30"
+      },
+      "string.escape": {
+        "color": "#006a83"
+      },
+      "string.regex": {
+        "color": "#166775"
+      },
+      "comment": {
+        "color": "#5f6488",
+        "italic": true
+      },
+      "comment.doc": {
+        "color": "#5f6488",
+        "italic": true
+      },
+      "function": {
+        "color": "#2959aa"
+      },
+      "constructor": {
+        "color": "#006c86"
+      },
+      "type": {
+        "color": "#006c86"
+      },
+      "enum": {
+        "color": "#006c86"
+      },
+      "variant": {
+        "color": "#965027"
+      },
+      "constant": {
+        "color": "#965027"
+      },
+      "number": {
+        "color": "#965027"
+      },
+      "boolean": {
+        "color": "#965027"
+      },
+      "property": {
+        "color": "#33635c"
+      },
+      "attribute": {
+        "color": "#8f5e15"
+      },
+      "variable.special": {
+        "color": "#8c4351"
+      },
+      "label": {
+        "color": "#2959aa"
+      },
+      "tag": {
+        "color": "#8c4351"
+      },
+      "title": {
+        "color": "#2959aa",
+        "bold": true
+      },
+      "link_uri": {
+        "color": "#33635c"
+      },
+      "text.literal": {
+        "color": "#485e30"
+      },
+      "punctuation.special": {
+        "color": "#006a83"
+      }
+    }
+  },
+  "dark": {
+    "window": "#16161e",
+    "panel": "#1a1b26",
+    "surface": "#1f2335",
+    "overlay": "#24283b",
+    "scrim": "#0000008c",
+    "hover": "#ffffff0a",
+    "selected": "#ffffff14",
+    "ghost_hover": "#ffffff12",
+    "segmented_track": "#181a2b",
+    "segmented_thumb": "#ffffff2e",
+    "segmented_thumb_shadow": "#00000059",
+    "border": "#ffffff1c",
+    "border_subtle": "#ffffff0f",
+    "input_border": "#ffffff33",
+    "text": "#c0caf5",
+    "text_muted": "#a9b1d6",
+    "text_faint": "#8b92bb",
+    "accent": "#7aa2f7",
+    "accent_fill": "#4d72c3",
+    "accent_fill_hover": "#4266b6",
+    "accent_fill_active": "#375aa9",
+    "on_accent": "#ffffff",
+    "on_bright": "#16161e",
+    "link": "#8cb5ff",
+    "code_inline": "#ffffff1c",
+    "secondary": "#1f2133",
+    "secondary_hover": "#26293a",
+    "secondary_active": "#2c2f41",
+    "skeleton": "#ffffff0f",
+    "scrollbar_thumb": "#ffffff26",
+    "scrollbar_thumb_hover": "#ffffff40",
+    "edge_shadow": "#00000059",
+    "indent_guide": "#ffffff14",
+    "indent_guide_active": "#ffffff38",
+    "open": "#9ece6a",
+    "merged": "#bb9af7",
+    "closed": "#f7768e",
+    "draft": "#8b949e",
+    "pending": "#e0af68",
+    "open_fill": "#238636",
+    "merged_fill": "#8250df",
+    "closed_fill": "#cf222e",
+    "draft_fill": "#57606a",
+    "merge_fill": "#238636",
+    "merge_fill_hover": "#1f7a30",
+    "merge_fill_active": "#1a6b2a",
+    "diff_added_bg": "#3fb95024",
+    "diff_removed_bg": "#f8514924",
+    "diff_added_text": "#9ece6a",
+    "diff_removed_text": "#f7768e",
+    "syntax": {
+      "keyword": {
+        "color": "#bb9af7"
+      },
+      "operator": {
+        "color": "#89ddff"
+      },
+      "string": {
+        "color": "#9ece6a"
+      },
+      "string.special": {
+        "color": "#9ece6a"
+      },
+      "string.special.symbol": {
+        "color": "#9ece6a"
+      },
+      "string.escape": {
+        "color": "#89ddff"
+      },
+      "string.regex": {
+        "color": "#b4f9f8"
+      },
+      "comment": {
+        "color": "#7a83ad",
+        "italic": true
+      },
+      "comment.doc": {
+        "color": "#7a83ad",
+        "italic": true
+      },
+      "function": {
+        "color": "#7aa2f7"
+      },
+      "constructor": {
+        "color": "#2ac3de"
+      },
+      "type": {
+        "color": "#2ac3de"
+      },
+      "enum": {
+        "color": "#2ac3de"
+      },
+      "variant": {
+        "color": "#ff9e64"
+      },
+      "constant": {
+        "color": "#ff9e64"
+      },
+      "number": {
+        "color": "#ff9e64"
+      },
+      "boolean": {
+        "color": "#ff9e64"
+      },
+      "property": {
+        "color": "#73daca"
+      },
+      "attribute": {
+        "color": "#e0af68"
+      },
+      "variable.special": {
+        "color": "#f7768e"
+      },
+      "label": {
+        "color": "#7aa2f7"
+      },
+      "tag": {
+        "color": "#f7768e"
+      },
+      "title": {
+        "color": "#7aa2f7",
+        "bold": true
+      },
+      "link_uri": {
+        "color": "#73daca"
+      },
+      "text.literal": {
+        "color": "#9ece6a"
+      },
+      "punctuation.special": {
+        "color": "#89ddff"
+      }
+    }
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "data": {
+    "favorites": {
+      "nodes": [
+        {
+          "id": "b",
+          "title": "Second",
+          "sortOrder": 20,
+          "type": "issue",
+          "icon": "Bolt",
+          "color": "#4cb782",
+          "url": "https://linear.app/test",
+          "parent": null,
+          "customView": null,
+          "predefinedViewType": null,
+          "predefinedViewTeam": null,
+          "issue": {
+            "identifier": "ENG-101"
+          }
+        },
+        {
+          "id": "a",
+          "title": "First",
+          "sortOrder": -1,
+          "type": "customView",
+          "icon": "Bolt",
+          "color": "#4cb782",
+          "url": "https://linear.app/test",
+          "parent": null,
+          "customView": {
+            "id": "view-1",
+            "team": null
+          },
+          "predefinedViewType": null,
+          "predefinedViewTeam": null,
+          "issue": null
+        },
+        {
+          "id": "c",
+          "title": "Project",
+          "sortOrder": 30,
+          "type": "project",
+          "icon": "Bolt",
+          "color": "#4cb782",
+          "url": "https://linear.app/test",
+          "parent": null,
+          "customView": null,
+          "predefinedViewType": null,
+          "predefinedViewTeam": null,
+          "issue": null
+        },
+        {
+          "id": "d",
+          "title": "Cycle",
+          "sortOrder": 40,
+          "type": "cycle",
+          "icon": "Bolt",
+          "color": "#4cb782",
+          "url": "https://linear.app/test",
+          "parent": null,
+          "customView": null,
+          "predefinedViewType": null,
+          "predefinedViewTeam": null,
+          "issue": null
+        }
+      ],
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      }
+    }
+  }
+}

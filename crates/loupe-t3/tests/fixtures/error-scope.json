@@ -1,0 +1,6 @@
+{
+    "_tag": "EnvironmentScopeRequiredError",
+    "code": "insufficient_scope",
+    "requiredScope": "orchestration:read",
+    "traceId": "15096081d5790b5f4e92fd2326375de7"
+}

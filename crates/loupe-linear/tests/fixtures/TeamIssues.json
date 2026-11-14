@@ -1,0 +1,933 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {
+          "id": "5dc66de0-9866-5e89-a450-41a72269148f",
+          "identifier": "ENG-101",
+          "title": "Crash when the sync worker restarts mid-batch",
+          "priority": 1,
+          "sortOrder": -10.5,
+          "estimate": 5,
+          "dueDate": "2026-11-14",
+          "url": "https://linear.app/acme/issue/ENG-101/crash-when-the-sync-worker-restarts-mid-",
+          "createdAt": "2026-10-21T09:12:44.318Z",
+          "updatedAt": "2026-11-09T17:45:10.902Z",
+          "state": {
+            "id": "14457ad8-6b5c-5393-ba07-6062251f97bd",
+            "name": "In Progress",
+            "type": "started",
+            "color": "#f2c94c"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+            "name": "Ada Okafor",
+            "displayName": "ada",
+            "avatarUrl": "https://avatars.example.test/ada.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "8f50f439-a216-5087-adf6-dccbbb7710f4",
+                "name": "Bug",
+                "color": "#eb5757",
+                "parent": null
+              }
+            ]
+          },
+          "project": {
+            "id": "5efd5ba8-d18e-528e-baee-30f02656bb32",
+            "name": "Atlas",
+            "color": "#bb87fc"
+          },
+          "cycle": {
+            "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+            "number": 41,
+            "name": null
+          },
+          "creator": {
+            "id": "c40de612-aefd-556d-af82-9b7ec35e04c0"
+          },
+          "parent": null,
+          "children": {
+            "nodes": [
+              {
+                "id": "x"
+              }
+            ]
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": [
+              {
+                "url": "https://github.com/acme/sync-worker/pull/412",
+                "metadata": {
+                  "status": "merged",
+                  "mergedAt": "2026-11-08T10:00:00.000Z"
+                }
+              },
+              {
+                "url": "https://github.com/acme/web/pull/1187/",
+                "metadata": {
+                  "status": "open",
+                  "draft": false
+                }
+              }
+            ]
+          }
+        },
+        {
+          "id": "57a8dbe6-1faa-55a6-8bdc-e1bed66b7f37",
+          "identifier": "ENG-102",
+          "title": "Paginate the audit log endpoint",
+          "priority": 2,
+          "sortOrder": -21.0,
+          "estimate": 3,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-102/paginate-the-audit-log-endpoint",
+          "createdAt": "2026-10-22T13:02:11.054Z",
+          "updatedAt": "2026-11-09T15:20:31.447Z",
+          "state": {
+            "id": "b01682c5-afc0-5095-b94a-fcdcfb5027a0",
+            "name": "In Review",
+            "type": "started",
+            "color": "#4cb782"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "1bd93919-de71-5b4d-983f-f69c74716823",
+            "name": "Ben Lindqvist",
+            "displayName": "ben",
+            "avatarUrl": "https://avatars.example.test/ben.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "f8617d0d-ab27-507b-ab83-d87f63b708f2",
+                "name": "Feature",
+                "color": "#bb87fc",
+                "parent": null
+              },
+              {
+                "id": "6633221c-9776-5acb-9da1-a383f525a2bf",
+                "name": "API",
+                "color": "#6b6f76",
+                "parent": {
+                  "id": "647a5fa6-1ab2-59f8-826d-7c12719911e0"
+                }
+              }
+            ]
+          },
+          "project": {
+            "id": "5efd5ba8-d18e-528e-baee-30f02656bb32",
+            "name": "Atlas",
+            "color": "#bb87fc"
+          },
+          "cycle": {
+            "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+            "number": 41,
+            "name": null
+          },
+          "creator": {
+            "id": "1bd93919-de71-5b4d-983f-f69c74716823"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": {
+            "id": "6b1f1d8e-3c47-5a51-9e0b-6f2a4b1d7c10",
+            "name": "Beta launch"
+          },
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": [
+              {
+                "url": "https://github.com/acme/api/pull/88",
+                "metadata": {
+                  "status": "open",
+                  "draft": true
+                }
+              }
+            ]
+          }
+        },
+        {
+          "id": "83be82ce-2d69-56a2-b9e6-286b733917ff",
+          "identifier": "ENG-106",
+          "title": "Add OpenTelemetry spans to the job runner",
+          "priority": 3,
+          "sortOrder": -31.5,
+          "estimate": 8,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-106/add-opentelemetry-spans-to-the-job-runne",
+          "createdAt": "2026-10-26T14:30:02.777Z",
+          "updatedAt": "2026-11-09T12:31:55.003Z",
+          "state": {
+            "id": "14457ad8-6b5c-5393-ba07-6062251f97bd",
+            "name": "In Progress",
+            "type": "started",
+            "color": "#f2c94c"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "49ec13de-8cb6-55c0-a685-729f826fc158",
+            "name": "Dmitri Vasquez",
+            "displayName": "dmitri",
+            "avatarUrl": "https://avatars.example.test/dmitri.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "18255c0a-8939-52fe-abd0-0e5e1f5e5118",
+                "name": "Improvement",
+                "color": "#4ea7fc",
+                "parent": null
+              },
+              {
+                "id": "722ee3d9-d4fc-5e9a-a870-7be0ea75e237",
+                "name": "Tech debt",
+                "color": "#f2994a",
+                "parent": null
+              }
+            ]
+          },
+          "project": {
+            "id": "5efd5ba8-d18e-528e-baee-30f02656bb32",
+            "name": "Atlas",
+            "color": "#bb87fc"
+          },
+          "cycle": {
+            "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+            "number": 41,
+            "name": null
+          },
+          "creator": {
+            "id": "c40de612-aefd-556d-af82-9b7ec35e04c0"
+          },
+          "parent": {
+            "id": "5dc66de0-9866-5e89-a450-41a72269148f"
+          },
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": {
+            "id": "6b1f1d8e-3c47-5a51-9e0b-6f2a4b1d7c10",
+            "name": "Beta launch"
+          },
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "9748cac4-ecce-5db0-a5ae-75372d54b87a",
+          "identifier": "ENG-114",
+          "title": "Cache the feature flag snapshot per request",
+          "priority": 2,
+          "sortOrder": -42.0,
+          "estimate": 2,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-114/cache-the-feature-flag-snapshot-per-requ",
+          "createdAt": "2026-10-28T09:20:00.000Z",
+          "updatedAt": "2026-11-09T09:02:48.360Z",
+          "state": {
+            "id": "14457ad8-6b5c-5393-ba07-6062251f97bd",
+            "name": "In Progress",
+            "type": "started",
+            "color": "#f2c94c"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "1bd93919-de71-5b4d-983f-f69c74716823",
+            "name": "Ben Lindqvist",
+            "displayName": "ben",
+            "avatarUrl": "https://avatars.example.test/ben.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "18255c0a-8939-52fe-abd0-0e5e1f5e5118",
+                "name": "Improvement",
+                "color": "#4ea7fc",
+                "parent": null
+              }
+            ]
+          },
+          "project": {
+            "id": "5efd5ba8-d18e-528e-baee-30f02656bb32",
+            "name": "Atlas",
+            "color": "#bb87fc"
+          },
+          "cycle": {
+            "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+            "number": 41,
+            "name": null
+          },
+          "creator": {
+            "id": "49ec13de-8cb6-55c0-a685-729f826fc158"
+          },
+          "parent": {
+            "id": "5dc66de0-9866-5e89-a450-41a72269148f"
+          },
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": {
+            "id": "6b1f1d8e-3c47-5a51-9e0b-6f2a4b1d7c10",
+            "name": "Beta launch"
+          },
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "81b4073d-1952-53c8-b204-d40769dff4f4",
+          "identifier": "ENG-105",
+          "title": "Rate limiter returns 500 on empty header",
+          "priority": 3,
+          "sortOrder": -52.5,
+          "estimate": null,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-105/rate-limiter-returns-500-on-empty-header",
+          "createdAt": "2026-11-09T07:55:20.611Z",
+          "updatedAt": "2026-11-09T07:55:20.611Z",
+          "state": {
+            "id": "7636a155-bede-5302-a5a7-356c93999dae",
+            "name": "Triage",
+            "type": "triage",
+            "color": "#e2e2e2"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": null,
+          "labels": {
+            "nodes": [
+              {
+                "id": "8f50f439-a216-5087-adf6-dccbbb7710f4",
+                "name": "Bug",
+                "color": "#eb5757",
+                "parent": null
+              }
+            ]
+          },
+          "project": null,
+          "cycle": null,
+          "creator": {
+            "id": "afeafca3-3a55-572c-854d-0a31a8331b3d"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "e1848065-d691-5b55-9af2-296ed88808ee",
+          "identifier": "ENG-113",
+          "title": "Surface queue depth on the status page",
+          "priority": 3,
+          "sortOrder": -63.0,
+          "estimate": 3,
+          "dueDate": "2026-11-27",
+          "url": "https://linear.app/acme/issue/ENG-113/surface-queue-depth-on-the-status-page",
+          "createdAt": "2026-11-01T10:00:00.000Z",
+          "updatedAt": "2026-11-08T14:00:00.000Z",
+          "state": {
+            "id": "e6fedd25-ff44-5529-84b5-e1a5e158666d",
+            "name": "Todo",
+            "type": "unstarted",
+            "color": "#e2e2e2"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+            "name": "Ada Okafor",
+            "displayName": "ada",
+            "avatarUrl": "https://avatars.example.test/ada.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "f8617d0d-ab27-507b-ab83-d87f63b708f2",
+                "name": "Feature",
+                "color": "#bb87fc",
+                "parent": null
+              },
+              {
+                "id": "2bedc668-6eb0-5a96-a66d-5200dfbde894",
+                "name": "Customer",
+                "color": "#5e6ad2",
+                "parent": null
+              }
+            ]
+          },
+          "project": {
+            "id": "3163630f-ddfc-5c0e-87de-8249cba97736",
+            "name": "Beacon",
+            "color": "#4cb782"
+          },
+          "cycle": {
+            "id": "2179eb1f-aaad-55e6-bbe3-8399e87ce139",
+            "number": 42,
+            "name": "Polish sprint"
+          },
+          "creator": {
+            "id": "f149cdf3-5ed5-5c4a-b895-0af7f5a07d72"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "a33b9f6d-e117-5238-9093-9209ccc97d89",
+          "identifier": "ENG-103",
+          "title": "Retry webhook deliveries with backoff",
+          "priority": 2,
+          "sortOrder": -73.5,
+          "estimate": 2,
+          "dueDate": "2026-11-20",
+          "url": "https://linear.app/acme/issue/ENG-103/retry-webhook-deliveries-with-backoff",
+          "createdAt": "2026-10-24T08:40:00.000Z",
+          "updatedAt": "2026-11-08T10:11:12.250Z",
+          "state": {
+            "id": "e6fedd25-ff44-5529-84b5-e1a5e158666d",
+            "name": "Todo",
+            "type": "unstarted",
+            "color": "#e2e2e2"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "f149cdf3-5ed5-5c4a-b895-0af7f5a07d72",
+            "name": "Chloe Tanaka",
+            "displayName": "chloe",
+            "avatarUrl": "https://avatars.example.test/chloe.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "18255c0a-8939-52fe-abd0-0e5e1f5e5118",
+                "name": "Improvement",
+                "color": "#4ea7fc",
+                "parent": null
+              }
+            ]
+          },
+          "project": {
+            "id": "3163630f-ddfc-5c0e-87de-8249cba97736",
+            "name": "Beacon",
+            "color": "#4cb782"
+          },
+          "cycle": {
+            "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+            "number": 41,
+            "name": null
+          },
+          "creator": {
+            "id": "f149cdf3-5ed5-5c4a-b895-0af7f5a07d72"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "8a6f01bc-4740-5a57-8323-8a4a4bb55ccb",
+          "identifier": "ENG-104",
+          "title": "Remove the legacy session cookie path",
+          "priority": 4,
+          "sortOrder": -84.0,
+          "estimate": null,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-104/remove-the-legacy-session-cookie-path",
+          "createdAt": "2026-10-02T11:00:00.000Z",
+          "updatedAt": "2026-11-07T09:00:03.120Z",
+          "state": {
+            "id": "fc8ef667-f2fd-5635-94bc-2aadbd3f8211",
+            "name": "Backlog",
+            "type": "backlog",
+            "color": "#bec2c8"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": null,
+          "labels": {
+            "nodes": [
+              {
+                "id": "722ee3d9-d4fc-5e9a-a870-7be0ea75e237",
+                "name": "Tech debt",
+                "color": "#f2994a",
+                "parent": null
+              }
+            ]
+          },
+          "project": null,
+          "cycle": null,
+          "creator": {
+            "id": "49ec13de-8cb6-55c0-a685-729f826fc158"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "9952708d-1178-5569-9db5-aae22c0b08f4",
+          "identifier": "ENG-107",
+          "title": "Dark mode flashes white on first paint",
+          "priority": 0,
+          "sortOrder": -94.5,
+          "estimate": null,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-107/dark-mode-flashes-white-on-first-paint",
+          "createdAt": "2026-11-03T16:22:09.140Z",
+          "updatedAt": "2026-11-06T18:05:41.882Z",
+          "state": {
+            "id": "e6fedd25-ff44-5529-84b5-e1a5e158666d",
+            "name": "Todo",
+            "type": "unstarted",
+            "color": "#e2e2e2"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "1bd93919-de71-5b4d-983f-f69c74716823",
+            "name": "Ben Lindqvist",
+            "displayName": "ben",
+            "avatarUrl": "https://avatars.example.test/ben.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "8f50f439-a216-5087-adf6-dccbbb7710f4",
+                "name": "Bug",
+                "color": "#eb5757",
+                "parent": null
+              },
+              {
+                "id": "4003d5a8-6648-5d06-ad65-de4618bb937d",
+                "name": "Needs design",
+                "color": "#26b5ce",
+                "parent": null
+              }
+            ]
+          },
+          "project": null,
+          "cycle": null,
+          "creator": {
+            "id": "1bd93919-de71-5b4d-983f-f69c74716823"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "7eed3266-5631-56df-9263-41b46eb5f53a",
+          "identifier": "ENG-108",
+          "title": "Ship the CSV export for usage reports",
+          "priority": 2,
+          "sortOrder": -105.0,
+          "estimate": 5,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-108/ship-the-csv-export-for-usage-reports",
+          "createdAt": "2026-10-10T10:10:10.100Z",
+          "updatedAt": "2026-11-05T13:50:00.019Z",
+          "state": {
+            "id": "a2da5732-2483-5374-abc6-b7860b49625b",
+            "name": "Done",
+            "type": "completed",
+            "color": "#5e6ad2"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "f149cdf3-5ed5-5c4a-b895-0af7f5a07d72",
+            "name": "Chloe Tanaka",
+            "displayName": "chloe",
+            "avatarUrl": "https://avatars.example.test/chloe.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "f8617d0d-ab27-507b-ab83-d87f63b708f2",
+                "name": "Feature",
+                "color": "#bb87fc",
+                "parent": null
+              },
+              {
+                "id": "2bedc668-6eb0-5a96-a66d-5200dfbde894",
+                "name": "Customer",
+                "color": "#5e6ad2",
+                "parent": null
+              }
+            ]
+          },
+          "project": {
+            "id": "3163630f-ddfc-5c0e-87de-8249cba97736",
+            "name": "Beacon",
+            "color": "#4cb782"
+          },
+          "cycle": {
+            "id": "44d9fbec-5bc5-5169-bf3d-4276d5909f9e",
+            "number": 41,
+            "name": null
+          },
+          "creator": {
+            "id": "f149cdf3-5ed5-5c4a-b895-0af7f5a07d72"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": {
+            "id": "6b1f1d8e-3c47-5a51-9e0b-6f2a4b1d7c10",
+            "name": "Beta launch"
+          },
+          "completedAt": "2026-11-05T13:50:00.019Z",
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "c18b79dc-2970-590d-ace3-a852f8ab32ad",
+          "identifier": "ENG-109",
+          "title": "Upgrade the Postgres driver to 0.9",
+          "priority": 0,
+          "sortOrder": -115.5,
+          "estimate": 2,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-109/upgrade-the-postgres-driver-to-0.9",
+          "createdAt": "2026-10-14T09:00:00.000Z",
+          "updatedAt": "2026-11-04T08:33:20.250Z",
+          "state": {
+            "id": "a2da5732-2483-5374-abc6-b7860b49625b",
+            "name": "Done",
+            "type": "completed",
+            "color": "#5e6ad2"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "afeafca3-3a55-572c-854d-0a31a8331b3d",
+            "name": "Ada Okafor",
+            "displayName": "ada",
+            "avatarUrl": "https://avatars.example.test/ada.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "722ee3d9-d4fc-5e9a-a870-7be0ea75e237",
+                "name": "Tech debt",
+                "color": "#f2994a",
+                "parent": null
+              }
+            ]
+          },
+          "project": null,
+          "cycle": null,
+          "creator": {
+            "id": "49ec13de-8cb6-55c0-a685-729f826fc158"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": "2026-11-04T08:33:20.250Z",
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "996f01c1-f3ea-57e2-9395-c3f667dc5c09",
+          "identifier": "ENG-110",
+          "title": "Investigate flaky integration test in CI",
+          "priority": 4,
+          "sortOrder": -126.0,
+          "estimate": null,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-110/investigate-flaky-integration-test-in-ci",
+          "createdAt": "2026-10-18T12:00:45.500Z",
+          "updatedAt": "2026-11-03T09:14:00.730Z",
+          "state": {
+            "id": "51106e5e-6296-51f9-bc85-7c2771da7423",
+            "name": "Canceled",
+            "type": "canceled",
+            "color": "#95a2b3"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "49ec13de-8cb6-55c0-a685-729f826fc158",
+            "name": "Dmitri Vasquez",
+            "displayName": "dmitri",
+            "avatarUrl": "https://avatars.example.test/dmitri.png"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "8f50f439-a216-5087-adf6-dccbbb7710f4",
+                "name": "Bug",
+                "color": "#eb5757",
+                "parent": null
+              }
+            ]
+          },
+          "project": null,
+          "cycle": null,
+          "creator": {
+            "id": "afeafca3-3a55-572c-854d-0a31a8331b3d"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": "2026-11-03T09:14:00.730Z",
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "08ab39fc-d1ca-528e-8302-db508dc8fac8",
+          "identifier": "ENG-112",
+          "title": "Document the plugin manifest format",
+          "priority": 0,
+          "sortOrder": -136.5,
+          "estimate": null,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-112/document-the-plugin-manifest-format",
+          "createdAt": "2026-09-29T15:45:00.000Z",
+          "updatedAt": "2026-11-02T11:11:11.111Z",
+          "state": {
+            "id": "fc8ef667-f2fd-5635-94bc-2aadbd3f8211",
+            "name": "Backlog",
+            "type": "backlog",
+            "color": "#bec2c8"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": null,
+          "labels": {
+            "nodes": [
+              {
+                "id": "18255c0a-8939-52fe-abd0-0e5e1f5e5118",
+                "name": "Improvement",
+                "color": "#4ea7fc",
+                "parent": null
+              }
+            ]
+          },
+          "project": null,
+          "cycle": null,
+          "creator": {
+            "id": "1bd93919-de71-5b4d-983f-f69c74716823"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "2a09d853-3079-5089-9819-d55a6792317c",
+          "identifier": "ENG-115",
+          "title": "Fix typo in the onboarding email",
+          "priority": 4,
+          "sortOrder": -147.0,
+          "estimate": null,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-115/fix-typo-in-the-onboarding-email",
+          "createdAt": "2026-10-05T17:00:00.000Z",
+          "updatedAt": "2026-10-31T10:00:00.000Z",
+          "state": {
+            "id": "fc8ef667-f2fd-5635-94bc-2aadbd3f8211",
+            "name": "Backlog",
+            "type": "backlog",
+            "color": "#bec2c8"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": {
+            "id": "c40de612-aefd-556d-af82-9b7ec35e04c0",
+            "name": "Esme Hartley",
+            "displayName": "esme",
+            "avatarUrl": null
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "8f50f439-a216-5087-adf6-dccbbb7710f4",
+                "name": "Bug",
+                "color": "#eb5757",
+                "parent": null
+              }
+            ]
+          },
+          "project": null,
+          "cycle": null,
+          "creator": {
+            "id": "afeafca3-3a55-572c-854d-0a31a8331b3d"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "pullRequests": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "c8559039-4db0-58f1-a04b-48ad3702088f",
+          "identifier": "ENG-111",
+          "title": "Duplicate: sync worker crash on restart",
+          "priority": 1,
+          "sortOrder": -157.5,
+          "estimate": null,
+          "dueDate": null,
+          "url": "https://linear.app/acme/issue/ENG-111/duplicate:-sync-worker-crash-on-restart",
+          "createdAt": "2026-10-23T08:05:00.000Z",
+          "updatedAt": "2026-10-30T16:41:22.318Z",
+          "state": {
+            "id": "a3be0177-56e3-595d-83df-2f91d984b8ae",
+            "name": "Duplicate",
+            "type": "duplicate",
+            "color": "#95a2b3"
+          },
+          "team": {
+            "id": "5000d841-3752-5b9f-b1f8-3950816642e1",
+            "key": "ENG",
+            "name": "Engineering"
+          },
+          "assignee": null,
+          "labels": {
+            "nodes": [
+              {
+                "id": "8f50f439-a216-5087-adf6-dccbbb7710f4",
+                "name": "Bug",
+                "color": "#eb5757",
+                "parent": null
+              }
+            ]
+          },
+          "project": null,
+          "cycle": null,
+          "creator": {
+            "id": "c40de612-aefd-556d-af82-9b7ec35e04c0"
+          },
+          "parent": null,
+          "children": {
+            "nodes": []
+          },
+          "projectMilestone": null,
+          "completedAt": null,
+          "canceledAt": "2026-10-30T16:41:22.318Z",
+          "pullRequests": {
+            "nodes": []
+          }
+        }
+      ],
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "c8559039-4db0-58f1-a04b-48ad3702088f"
+      }
+    }
+  }
+}

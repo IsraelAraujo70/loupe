@@ -1,0 +1,131 @@
+{
+  "data": {
+    "project": {
+      "id": "project-1",
+      "name": "Vendor Integrations",
+      "icon": "Shield",
+      "color": "#4cb782",
+      "description": "Bureau checks before onboarding.",
+      "content": "## Scope\n\nVendor C, Vendor B, and Vendor A.",
+      "url": "https://linear.app/acme/project/vendor-integrations-1",
+      "progress": 0.375,
+      "startDate": "2026-11-06",
+      "targetDate": "2026-11-20",
+      "status": {
+        "id": "status-started",
+        "name": "In Progress",
+        "type": "started",
+        "color": "#f2c94c"
+      },
+      "lead": {
+        "id": "user-2",
+        "name": "Maya Moreau",
+        "displayName": "maya",
+        "avatarUrl": null
+      },
+      "leadTeam": {
+        "id": "team-1"
+      },
+      "teams": {
+        "nodes": [
+          {
+            "id": "team-1",
+            "key": "API",
+            "name": "Back-end"
+          }
+        ]
+      },
+      "members": {
+        "nodes": [
+          {
+            "id": "user-1",
+            "name": "Israel Araujo",
+            "displayName": "israel",
+            "avatarUrl": null
+          },
+          {
+            "id": "user-2",
+            "name": "Maya Moreau",
+            "displayName": "maya",
+            "avatarUrl": null
+          }
+        ]
+      },
+      "labels": {
+        "nodes": [
+          {
+            "id": "plabel-1",
+            "name": "vendor-a",
+            "color": "#5e6ad2"
+          }
+        ]
+      },
+      "projectMilestones": {
+        "nodes": [
+          {
+            "id": "ms-2",
+            "name": "M1 - Vendor C",
+            "progress": 0.5,
+            "targetDate": null,
+            "sortOrder": 2.0
+          },
+          {
+            "id": "ms-1",
+            "name": "M0 - Decisions",
+            "progress": 1.0,
+            "targetDate": "2026-11-10",
+            "sortOrder": 1.0
+          }
+        ]
+      },
+      "projectUpdates": {
+        "nodes": [
+          {
+            "id": "pu-1",
+            "body": "Kicked off.",
+            "health": "onTrack",
+            "createdAt": "2026-11-07T12:00:00.000Z",
+            "url": "https://linear.app/acme/project-update/pu-1",
+            "user": {
+              "id": "user-2",
+              "name": "Maya Moreau",
+              "displayName": "maya",
+              "avatarUrl": null
+            }
+          },
+          {
+            "id": "pu-2",
+            "body": "Vendor A contract is late.",
+            "health": "atRisk",
+            "createdAt": "2026-11-10T12:00:00.000Z",
+            "url": "https://linear.app/acme/project-update/pu-2",
+            "user": {
+              "id": "user-1",
+              "name": "Israel Araujo",
+              "displayName": "israel",
+              "avatarUrl": null
+            }
+          }
+        ]
+      },
+      "documents": {
+        "nodes": [
+          {
+            "id": "doc-1",
+            "title": "Bureau matrix",
+            "url": "https://linear.app/acme/document/bureau-matrix-1"
+          }
+        ]
+      },
+      "externalLinks": {
+        "nodes": [
+          {
+            "id": "link-1",
+            "label": "Vendor A API",
+            "url": "https://api.vendor-a.example"
+          }
+        ]
+      }
+    }
+  }
+}

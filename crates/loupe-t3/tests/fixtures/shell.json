@@ -1,0 +1,168 @@
+{
+    "schemaVersion": 2,
+    "snapshotSequence": 90,
+    "threads": [
+        {
+            "createdBy": "agent",
+            "creationSource": "mcp",
+            "id": "mcp:7161af08-315d-402d-a20e-3711a7c1de88",
+            "projectId": "6da0bfb8-e3d0-47f7-a4b3-092a01c07b56",
+            "title": "Scratch: idle compaction fix review",
+            "providerInstanceId": "claudeAgent",
+            "modelSelection": {
+                "instanceId": "claudeAgent",
+                "model": "claude-haiku-5-5"
+            },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "branch": null,
+            "worktreePath": null,
+            "linkedPullRequest": null,
+            "pullRequests": [
+                {
+                    "host": "github.com",
+                    "repository": "israelaraujo70/t3code",
+                    "number": 23,
+                    "url": "https://github.com/IsraelAraujo70/t3code/pull/23",
+                    "source": "agent",
+                    "linkedAt": "2026-11-10T14:26:15.001Z",
+                    "snapshot": {
+                        "state": "merged",
+                        "title": "fix(server): idle compaction skips a thread whose workspace folder is gone",
+                        "headBranch": "fix/idle-compact-missing-worktree",
+                        "baseBranch": "friend/main",
+                        "isDraft": false,
+                        "updatedAt": "2026-11-05T12:12:13Z",
+                        "syncedAt": "2026-11-10T14:26:15.007Z",
+                        "closedAt": "2026-11-05T12:12:13Z",
+                        "mergedAt": "2026-11-05T12:12:13Z",
+                        "author": {
+                            "login": "IsraelAraujo70",
+                            "name": "Israel Ara\u00fajo de Oliveira",
+                            "avatarUrl": "https://avatars.githubusercontent.com/u/142555301?u=545d7058c5ee2842cc9d223e847dbb3a75f3a9e4&v=4"
+                        },
+                        "additions": 83,
+                        "deletions": 4,
+                        "changedFiles": 3,
+                        "reviewDecision": null,
+                        "checksState": null,
+                        "mergeability": "unknown"
+                    },
+                    "stack": null
+                },
+                {
+                    "host": "github.com",
+                    "repository": "israelaraujo70/t3code",
+                    "number": 22,
+                    "url": "https://github.com/IsraelAraujo70/t3code/pull/22",
+                    "source": "agent",
+                    "linkedAt": "2026-11-10T14:26:15.014Z",
+                    "snapshot": {
+                        "state": "merged",
+                        "title": "fix(workflows): a call skipped by a busy workflow says why and is listed",
+                        "headBranch": "fix/workflows-call-skip-visibility",
+                        "baseBranch": "friend/main",
+                        "isDraft": false,
+                        "updatedAt": "2026-11-05T09:53:32Z",
+                        "syncedAt": "2026-11-10T14:26:15.648Z",
+                        "closedAt": "2026-11-05T09:53:32Z",
+                        "mergedAt": "2026-11-05T09:53:32Z",
+                        "author": {
+                            "login": "IsraelAraujo70",
+                            "name": "Israel Ara\u00fajo de Oliveira",
+                            "avatarUrl": "https://avatars.githubusercontent.com/u/142555301?u=545d7058c5ee2842cc9d223e847dbb3a75f3a9e4&v=4"
+                        },
+                        "additions": 233,
+                        "deletions": 23,
+                        "changedFiles": 8,
+                        "reviewDecision": null,
+                        "checksState": null,
+                        "mergeability": "unknown"
+                    },
+                    "stack": null
+                }
+            ],
+            "lineage": {
+                "parentThreadId": null,
+                "relationshipToParent": null,
+                "rootThreadId": "mcp:7161af08-315d-402d-a20e-3711a7c1de88"
+            },
+            "forkedFrom": null,
+            "activeProviderThreadId": "provider-thread:provider:claudeAgent:native-thread:pending%3Arun%3Athread%3Amcp%253A7161af08-315d-402d-a20e-3711a7c1de88%3Aordinal%3A1",
+            "latestRunId": "run:thread:mcp%3A7161af08-315d-402d-a20e-3711a7c1de88:ordinal:2",
+            "latestRunRequestedAt": "2026-11-10T14:26:11.617Z",
+            "latestRunStartedAt": "2026-11-10T14:26:11.677Z",
+            "latestRunCompletedAt": "2026-11-10T14:26:16.588Z",
+            "latestRunStopRequested": false,
+            "activeRunId": null,
+            "activityRunStartedAt": null,
+            "activityRunStatus": null,
+            "blockedOnThreadWait": false,
+            "status": "completed",
+            "lastError": null,
+            "lastErrorClass": null,
+            "lastErrorCode": null,
+            "usageLimitResetAt": null,
+            "pendingRuntimeRequest": null,
+            "pendingGuestMessageCount": 0,
+            "latestVisibleMessage": null,
+            "latestUserMessageAt": "2026-11-10T14:26:11.617Z",
+            "latestUserAuthoredMessageAt": null,
+            "hasActionableProposedPlan": false,
+            "pendingBackgroundTasks": [],
+            "providerInstanceHistory": [
+                "claudeAgent"
+            ],
+            "goal": null,
+            "itemCount": 11,
+            "visibleItemCount": 11,
+            "createdAt": "2026-11-10T14:25:37.437Z",
+            "updatedAt": "2026-11-10T14:26:16.588Z",
+            "archivedAt": null,
+            "settledOverride": null,
+            "settledAt": null,
+            "unsettledAt": null,
+            "snoozedUntil": null,
+            "snoozedAt": null,
+            "limitRecovery": null,
+            "pinnedAt": null,
+            "autoSettleDisabledAt": null,
+            "pinOrderKey": null,
+            "lastVisitedAt": "2026-11-10T14:25:37.458Z",
+            "opens": null,
+            "titleRegeneration": null,
+            "deletedAt": null
+        }
+    ],
+    "archivedThreads": [],
+    "projects": [
+        {
+            "id": "6da0bfb8-e3d0-47f7-a4b3-092a01c07b56",
+            "title": "t3code scratch",
+            "workspaceRoot": "/home/user/projects/t3code",
+            "repositoryIdentity": {
+                "canonicalKey": "github.com/israelaraujo70/t3code",
+                "locator": {
+                    "source": "git-remote",
+                    "remoteName": "origin",
+                    "remoteUrl": "https://github.com/IsraelAraujo70/t3code.git"
+                },
+                "rootPath": "/home/user/projects/t3code",
+                "displayName": "IsraelAraujo70/t3code",
+                "provider": "github",
+                "owner": "IsraelAraujo70",
+                "name": "t3code"
+            },
+            "defaultModelSelection": null,
+            "defaultThreadEnvMode": null,
+            "autoPull": false,
+            "faviconPath": null,
+            "projectIcon": null,
+            "scripts": [],
+            "pinnedAt": null,
+            "archivedAt": null,
+            "createdAt": "2026-11-10T14:25:36.756Z",
+            "updatedAt": "2026-11-10T14:25:36.756Z"
+        }
+    ]
+}

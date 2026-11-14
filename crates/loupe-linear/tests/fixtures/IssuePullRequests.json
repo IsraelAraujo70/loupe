@@ -1,0 +1,14 @@
+{
+  "data": {
+    "issue": {
+      "pullRequests": {
+        "nodes": [
+          { "url": "https://github.com/acme/sync-worker/pull/412", "metadata": { "status": "merged", "mergedAt": "2026-11-08T10:00:00.000Z" } },
+          { "url": "https://github.com/acme/web/pull/1187/", "metadata": { "status": "open", "draft": false } },
+          { "url": "https://github.com/acme/web/pull/1201", "metadata": { "status": "closed" } }
+        ],
+        "pageInfo": { "hasNextPage": false, "endCursor": null }
+      }
+    }
+  }
+}
