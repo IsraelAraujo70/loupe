@@ -78,6 +78,8 @@ mod tests {
             assignees: Vec::new(),
             reviewers: Vec::new(),
             mergeable: Mergeable::Unknown,
+            review_requests: Vec::new(),
+            reviewed_by: Vec::new(),
         }
     }
 
@@ -96,6 +98,7 @@ mod tests {
             review_requested: page(vec![summary(7, pending), summary(8, pending)]),
             authored: page(Vec::new()),
             involved: page(vec![summary(7, pending)]),
+            viewer_login: String::new(),
         };
         let loaded = ChecksLoaded {
             pr: PrRef::new(RepoRef::new("acme", "app"), 7),

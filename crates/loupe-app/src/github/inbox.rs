@@ -1,7 +1,8 @@
-//! `Route::Inbox` (Reviews): a tab per dashboard search (To review, Mine,
-//! Involved) and All, which adds on a saved view that names repositories
-//! every other open pull request in them. Inside a tab, pull requests group
-//! by their next step. Filter clauses (the Linear board's "Add Filter…"
+//! `Route::Inbox` (Reviews): Needs review, a tab per dashboard search (Mine,
+//! Involved), and All, which adds on a saved view that names repositories
+//! every other open pull request in them. Needs review holds the pull
+//! requests of All that wait on a review, grouped by why; inside every other
+//! tab, pull requests group by their next step. Filter clauses (the Linear board's "Add Filter…"
 //! pattern) narrow every tab and can be saved as views.
 
 mod dialogs;
@@ -27,7 +28,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::reviews::{
-    self, Clause, NextStep, Op, ReviewTab, Sort, SortDir, SortKey, ViewsFile,
+    self, Clause, NeedsReview, NextStep, Op, ReviewGroup, ReviewTab, Sort, SortDir, SortKey,
+    ViewsFile,
 };
 use loupe_github::{
     Inbox, Notification as GitHubNotification, NotificationSubject, Page, PrRef, PrSummary, RepoRef,
@@ -48,6 +50,11 @@ use crate::theme::scale;
 use crate::ui;
 use crate::ui::MenuTriggerExt as _;
 
+/// Where the page's results are stored between runs. A copy from before the
+/// rows carried review requests would put every pull request in No reviewer
+/// until the refresh, so it is not read.
+pub(crate) const CACHE: &str = "reviews/2";
+
 gpui_kit::actions!(
     github,
     [
@@ -65,26 +72,13 @@ gpui_kit::actions!(
     ]
 );
 
-/// The tabs the one inbox request fills.
-const INBOX_TABS: [ReviewTab; 3] = [ReviewTab::ToReview, ReviewTab::Mine, ReviewTab::Involved];
-
 /// The line an empty tab shows when no filter is set.
 fn tab_empty(tab: ReviewTab) -> (IconName, &'static str) {
     match tab {
-        ReviewTab::ToReview => (IconName::CircleCheck, "Nothing waiting on you"),
+        ReviewTab::NeedsReview => (IconName::CircleCheck, "Nothing waits on a review"),
         ReviewTab::Mine => (IconName::GitPullRequest, "You have no open pull requests"),
         ReviewTab::Involved => (IconName::AtSign, "No other open pull requests involve you"),
         ReviewTab::All => (IconName::CircleCheck, "No open pull requests"),
-    }
-}
-
-/// The tab's page in the inbox; `None` for All, which gathers the others.
-fn tab_page(tab: ReviewTab, inbox: &Inbox) -> Option<&Page<PrSummary>> {
-    match tab {
-        ReviewTab::ToReview => Some(&inbox.review_requested),
-        ReviewTab::Mine => Some(&inbox.authored),
-        ReviewTab::Involved => Some(&inbox.involved),
-        ReviewTab::All => None,
     }
 }
 
@@ -160,6 +154,38 @@ fn shown_all<'a>(
     }
 }
 
+/// The Needs review tab: the pull requests All shows (`all`) that wait on a
+/// review ([`reviews::needs_review`]). Its count is the rows it shows, the
+/// sum of its groups.
+fn shown_needs_review<'a>(all: &Shown<'a>, inbox: &Inbox) -> Shown<'a> {
+    let items: Vec<&'a PrSummary> = all
+        .items
+        .iter()
+        .copied()
+        .filter(|pr| needs_review_group(pr, inbox).is_some())
+        .collect();
+    Shown {
+        count: items.len(),
+        note: all
+            .note
+            .as_ref()
+            .map(|_| format!("Out of the {} in All; GitHub has more", all.count)),
+        items,
+    }
+}
+
+/// `pr`'s group in Needs review, with GitHub's word on whether its review is
+/// asked of you: the `review-requested:@me` search, which also covers your
+/// teams.
+fn needs_review_group(pr: &PrSummary, inbox: &Inbox) -> Option<NeedsReview> {
+    let asked_of_you = inbox
+        .review_requested
+        .items
+        .iter()
+        .any(|requested| requested.pr == pr.pr);
+    reviews::needs_review(pr, &inbox.viewer_login, asked_of_you)
+}
+
 /// What a Reviews page and its tab are called with view `view_id` open:
 /// the saved view's name, or "Reviews" on All (or when the view is gone).
 fn title(view_id: Option<&str>, views: &ViewsFile) -> SharedString {
@@ -168,19 +194,19 @@ fn title(view_id: Option<&str>, views: &ViewsFile) -> SharedString {
         .map_or_else(|| "Reviews".into(), |view| view.name.clone().into())
 }
 
-/// The first tab with a row to show, in the tab row's order; To review when
-/// every tab is empty.
+/// The first tab with a row to show, in the tab row's order; Needs review
+/// when every tab is empty.
 fn first_with_rows(tabs: &[(ReviewTab, Shown<'_>)]) -> ReviewTab {
     tabs.iter()
         .find(|(_, shown)| !shown.items.is_empty())
-        .map_or(ReviewTab::ToReview, |(tab, _)| *tab)
+        .map_or(ReviewTab::NeedsReview, |(tab, _)| *tab)
 }
 
 /// One group of the open tab: its lines, its pull requests in their order
 /// on screen (a stack's under its row, folded or not), and whether it is
 /// folded.
 struct Group<'a> {
-    step: NextStep,
+    step: ReviewGroup,
     collapsed: bool,
     lines: Vec<Line<'a>>,
     rows: Vec<&'a PrSummary>,
@@ -205,36 +231,61 @@ impl<'a> Line<'a> {
     }
 }
 
-/// `items` in their groups ([`reviews::next_step`]), in [`NextStep::ALL`]'s
-/// order, each sorted by `sort` on its own. A stack with two or more rows in
-/// `items` is one line, in the group of its most urgent row (the first
-/// group in that order), where the sort places its first row; its rows keep
-/// the stack's order. A group with no pull request is left out.
+/// `tab`'s groups in their order: Needs review's, or else the next steps.
+fn tab_groups(tab: ReviewTab) -> Vec<ReviewGroup> {
+    match tab {
+        ReviewTab::NeedsReview => NeedsReview::ALL
+            .into_iter()
+            .map(ReviewGroup::NeedsReview)
+            .collect(),
+        _ => NextStep::ALL.into_iter().map(ReviewGroup::Step).collect(),
+    }
+}
+
+/// The group `pr` belongs to in `tab`.
+fn group_of(tab: ReviewTab, pr: &PrSummary, inbox: &Inbox) -> Option<ReviewGroup> {
+    match tab {
+        ReviewTab::NeedsReview => needs_review_group(pr, inbox).map(ReviewGroup::NeedsReview),
+        _ => Some(ReviewGroup::Step(reviews::next_step(pr))),
+    }
+}
+
+/// `items` in `tab`'s groups ([`group_of`]), in [`tab_groups`]' order, each
+/// sorted by `sort` on its own. A stack with two or more rows in `items` is
+/// one line, in the group of its most urgent row (the first group in that
+/// order), where the sort places its first row; its rows keep the stack's
+/// order. A group with no pull request is left out.
 fn grouped<'a>(
+    tab: ReviewTab,
+    inbox: &Inbox,
     items: &[&'a PrSummary],
     sort: Option<Sort>,
-    collapsed: &[NextStep],
+    collapsed: &[ReviewGroup],
     stacks: &Stacks,
 ) -> Vec<Group<'a>> {
-    let mut in_stack: HashMap<&StackKey, (usize, NextStep)> = HashMap::new();
+    let mut in_stack: HashMap<&StackKey, (usize, Option<ReviewGroup>)> = HashMap::new();
     for pr in items {
         if let Some(stack) = stacks.of(&pr.pr) {
-            let (count, step) = in_stack.entry(&stack.key).or_insert((0, NextStep::Draft));
+            let (count, group) = in_stack.entry(&stack.key).or_insert((0, None));
             *count += 1;
-            *step = (*step).min(reviews::next_step(pr));
+            let own = group_of(tab, pr, inbox);
+            *group = match (*group, own) {
+                (Some(known), Some(own)) => Some(known.min(own)),
+                (known, own) => known.or(own),
+            };
         }
     }
     let stacked = |pr: &PrSummary| stacks.of(&pr.pr).filter(|stack| in_stack[&stack.key].0 > 1);
-    let step_of = |pr: &PrSummary| {
-        stacked(pr).map_or_else(|| reviews::next_step(pr), |stack| in_stack[&stack.key].1)
+    let group_of_row = |pr: &PrSummary| {
+        stacked(pr).map_or_else(|| group_of(tab, pr, inbox), |stack| in_stack[&stack.key].1)
     };
-    NextStep::ALL
-        .iter()
-        .filter_map(|&step| {
+    tab_groups(tab)
+        .into_iter()
+        .filter_map(|step| {
             let mut rows: Vec<&PrSummary> = items
                 .iter()
                 .copied()
-                .filter(|pr| step_of(pr) == step)
+                .filter(|pr| group_of_row(pr) == Some(step))
                 .collect();
             reviews::sort_rows(&mut rows, sort);
             let mut lines: Vec<Line<'a>> = Vec::new();
@@ -282,7 +333,7 @@ enum Spot {
 /// One group of the open tab as the list shows it: every pull request in
 /// order (those of a folded stack too), and the lines on screen.
 struct GroupShown {
-    step: NextStep,
+    step: ReviewGroup,
     collapsed: bool,
     rows: Vec<PrRef>,
     spots: Vec<Spot>,
@@ -302,7 +353,7 @@ struct PageState {
     /// The open tab; `None` until the first tab with rows is known.
     tab: Option<ReviewTab>,
     /// The groups folded in every tab.
-    collapsed: Vec<NextStep>,
+    collapsed: Vec<ReviewGroup>,
 }
 
 impl PageState {
@@ -590,7 +641,7 @@ impl InboxView {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let key = crate::cache::github_key(cx, "reviews");
+        let key = crate::cache::github_key(cx, CACHE);
         if self.inbox.value().is_none()
             && let Some(value) = key.as_deref().and_then(crate::cache::get)
         {
@@ -621,7 +672,7 @@ impl InboxView {
         if !again && self.all_open.contains_key(&query) {
             return;
         }
-        let key = crate::cache::github_key(cx, &format!("reviews/all-open/{query}"));
+        let key = crate::cache::github_key(cx, &format!("{CACHE}/all-open/{query}"));
         let state = self.all_open.entry(query.clone()).or_default();
         if state.value().is_none()
             && let Some(value) = key.as_deref().and_then(crate::cache::get)
@@ -654,20 +705,21 @@ impl InboxView {
     /// Every tab in the tab row's order with what it shows under the
     /// clauses, in GitHub's order.
     fn tab_lists<'a>(&'a self, inbox: &'a Inbox) -> Vec<(ReviewTab, Shown<'a>)> {
-        let mut tabs: Vec<(ReviewTab, Shown<'a>)> = INBOX_TABS
-            .iter()
-            .filter_map(|&tab| Some((tab, shown(tab_page(tab, inbox)?, &self.page.draft))))
-            .collect();
-        let all = {
-            let others: Vec<&Shown<'a>> = tabs.iter().map(|(_, shown)| shown).collect();
-            shown_all(
-                &others,
-                self.all_open_state().and_then(Loadable::value),
-                &self.page.draft,
-            )
-        };
-        tabs.push((ReviewTab::All, all));
-        tabs
+        let clauses = &self.page.draft;
+        let requested = shown(&inbox.review_requested, clauses);
+        let mine = shown(&inbox.authored, clauses);
+        let involved = shown(&inbox.involved, clauses);
+        let all = shown_all(
+            &[&requested, &mine, &involved],
+            self.all_open_state().and_then(Loadable::value),
+            clauses,
+        );
+        vec![
+            (ReviewTab::NeedsReview, shown_needs_review(&all, inbox)),
+            (ReviewTab::Mine, mine),
+            (ReviewTab::Involved, involved),
+            (ReviewTab::All, all),
+        ]
     }
 
     /// The open tab: the one picked or saved with the view, else the one
@@ -689,9 +741,8 @@ impl InboxView {
     /// tab; one listed in two tabs comes twice.
     fn loaded<'a>(&'a self, inbox: &'a Inbox) -> impl Iterator<Item = &'a PrSummary> {
         let all_open = self.all_open_state().and_then(Loadable::value);
-        INBOX_TABS
-            .iter()
-            .filter_map(|&tab| tab_page(tab, inbox))
+        [&inbox.review_requested, &inbox.authored, &inbox.involved]
+            .into_iter()
             .chain(all_open)
             .flat_map(|page| page.items.iter())
     }
@@ -762,7 +813,16 @@ impl InboxView {
         let stacks = self.stacks(inbox);
         tabs.into_iter()
             .find(|(tab, _)| *tab == active)
-            .map(|(_, shown)| grouped(&shown.items, self.page.sort, &self.page.collapsed, &stacks))
+            .map(|(_, shown)| {
+                grouped(
+                    active,
+                    inbox,
+                    &shown.items,
+                    self.page.sort,
+                    &self.page.collapsed,
+                    &stacks,
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -857,7 +917,7 @@ impl InboxView {
     /// Folds or unfolds `step` in every tab; a saved view keeps it. The
     /// rows a fold hides leave the selection, so unfolding never brings
     /// back picks the bar no longer counted.
-    fn toggle_group(&mut self, step: NextStep, cx: &mut Context<Self>) {
+    fn toggle_group(&mut self, step: ReviewGroup, cx: &mut Context<Self>) {
         match self
             .page
             .collapsed
@@ -942,9 +1002,8 @@ impl InboxView {
     fn filter_options(&self) -> FilterOptions {
         match self.inbox.value() {
             Some(inbox) => FilterOptions::new(
-                INBOX_TABS
-                    .iter()
-                    .filter_map(|&tab| tab_page(tab, inbox))
+                [&inbox.review_requested, &inbox.authored, &inbox.involved]
+                    .into_iter()
                     .chain(self.all_open_state().and_then(Loadable::value))
                     .flat_map(|page| page.items.iter()),
                 &self.page.draft,
@@ -2143,7 +2202,14 @@ impl Render for InboxView {
                     .map(|(_, shown)| shown.items)
                     .unwrap_or_default();
                 let stacks = self.stacks(inbox);
-                let groups = grouped(&items, self.page.sort, &self.page.collapsed, &stacks);
+                let groups = grouped(
+                    active,
+                    inbox,
+                    &items,
+                    self.page.sort,
+                    &self.page.collapsed,
+                    &stacks,
+                );
                 let showing = groups.iter().filter(|group| !group.collapsed).any(|group| {
                     group
                         .rows
@@ -2247,7 +2313,7 @@ const GROUP_HEADING: &str = "reviews-group-heading";
 /// width, a chevron that says whether it is folded over the state icons,
 /// its title over the numbers, then its count. A click folds or unfolds it.
 fn group_heading(
-    step: NextStep,
+    step: ReviewGroup,
     collapsed: bool,
     count: usize,
     lead: Option<Div>,
@@ -2299,7 +2365,7 @@ mod tests {
     use loupe_github::reviews::{Clause, Field, Op, Sort, SortDir, SortKey, ViewsFile};
     use loupe_github::{Inbox, Page, PrRef, PrState, PrSummary, RepoRef};
 
-    use loupe_github::reviews::{NextStep, ReviewTab};
+    use loupe_github::reviews::{NeedsReview, NextStep, ReviewGroup, ReviewTab};
     use loupe_github::{ChecksState, ReviewDecision};
 
     use super::{InboxView, PageState, Spot, build, shown, shown_all, step_cursor, title};
@@ -2332,6 +2398,8 @@ mod tests {
             assignees: Vec::new(),
             reviewers: Vec::new(),
             mergeable: loupe_github::Mergeable::Unknown,
+            review_requests: Vec::new(),
+            reviewed_by: Vec::new(),
         }
     }
 
@@ -2679,8 +2747,10 @@ mod tests {
         view.read_with(cx, |view, _| view.current_tab())
     }
 
-    /// To review holds two ready to merge (1, 6) and two waiting for a
-    /// review (2, 3); Involved two waiting (4, 5); Mine none.
+    /// Your review is asked for four: two ready to merge (1, 6) and two
+    /// waiting for a review (2, 3); Involved has two waiting (4, 5) that
+    /// nobody reviews; Mine none. Needs review lists 2 and 3 as requested
+    /// from you, then 4 and 5 with no reviewer.
     fn inbox() -> Inbox {
         Inbox {
             review_requested: page(
@@ -2695,6 +2765,15 @@ mod tests {
             ),
             authored: page(Vec::new(), 0, false),
             involved: page(vec![sized("b", 4, 900), sized("b", 5, 1)], 2, false),
+            viewer_login: "me".into(),
+        }
+    }
+
+    /// Reviewed by someone else, so it stays out of Needs review.
+    fn reviewed(pr: PrSummary) -> PrSummary {
+        PrSummary {
+            reviewed_by: vec!["zed".into()],
+            ..pr
         }
     }
 
@@ -2727,15 +2806,19 @@ mod tests {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
         load(&view, inbox(), cx);
-        let github = vec![vec![1, 6], vec![2, 3]];
-        assert_eq!(numbers(&view, cx), github, "ready to merge, then waiting");
+        let github = vec![vec![2, 3], vec![4, 5]];
+        assert_eq!(
+            numbers(&view, cx),
+            github,
+            "Needs review: requested from you, then no reviewer"
+        );
 
         // Ascending, descending, then GitHub's order again; a row never
         // leaves its group.
         click(cx, "reviews-sort-changes");
-        assert_eq!(numbers(&view, cx), [vec![6, 1], vec![2, 3]]);
+        assert_eq!(numbers(&view, cx), [vec![2, 3], vec![5, 4]]);
         click(cx, "reviews-sort-changes");
-        assert_eq!(numbers(&view, cx), [vec![1, 6], vec![3, 2]]);
+        assert_eq!(numbers(&view, cx), [vec![3, 2], vec![4, 5]]);
         click(cx, "reviews-sort-changes");
         assert_eq!(numbers(&view, cx), github);
 
@@ -2753,12 +2836,14 @@ mod tests {
                 .expect("a row under the cursor")
             })
             .collect();
-        assert_eq!(walk, [6, 1, 2, 3, 3]);
+        assert_eq!(walk, [2, 3, 5, 4, 4]);
 
         // The sort holds in every tab.
         click(cx, "reviews-tab-Involved");
         assert_eq!(numbers(&view, cx), [vec![5, 4]]);
-        click(cx, "reviews-tab-To review");
+        click(cx, "reviews-tab-All");
+        assert_eq!(numbers(&view, cx), [vec![6, 1], vec![5, 2, 3, 4]]);
+        click(cx, "reviews-tab-Needs review");
 
         // A sort is a change to the view: saved with it, and back with it.
         let smallest = Some(Sort {
@@ -2775,7 +2860,7 @@ mod tests {
         assert_eq!(numbers(&view, cx), github, "All has its own order");
         view.update(cx, |view, cx| view.switch_view(id.as_deref(), cx));
         assert_eq!(view.read_with(cx, |view, _| view.page.sort), smallest);
-        assert_eq!(numbers(&view, cx), [vec![6, 1], vec![2, 3]]);
+        assert_eq!(numbers(&view, cx), [vec![2, 3], vec![5, 4]]);
     }
 
     #[gpui_kit::test]
@@ -2784,9 +2869,15 @@ mod tests {
     ) {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
-        // Nothing to review and nothing of yours: Involved comes first.
+        // Nothing waits on a review and nothing of yours: Involved comes
+        // first.
         let only_involved = Inbox {
             review_requested: page(Vec::new(), 0, false),
+            involved: page(
+                vec![reviewed(sized("b", 4, 900)), reviewed(sized("b", 5, 1))],
+                2,
+                false,
+            ),
             ..inbox()
         };
         load(&view, only_involved, cx);
@@ -2813,7 +2904,7 @@ mod tests {
         view.update(cx, |view, cx| view.switch_view(None, cx));
         assert_eq!(
             active(&view, cx),
-            Some(ReviewTab::ToReview),
+            Some(ReviewTab::NeedsReview),
             "no view: the first tab with rows"
         );
         view.update(cx, |view, cx| view.switch_view(id.as_deref(), cx));
@@ -2832,7 +2923,7 @@ mod tests {
                 .expect("still saved")
         });
         assert_eq!(saved.tab, Some(ReviewTab::All));
-        assert_eq!(saved.collapsed, [NextStep::ReadyToMerge]);
+        assert_eq!(saved.collapsed, [ReviewGroup::Step(NextStep::ReadyToMerge)]);
         let dirty = view.update(cx, |view, cx| {
             view.page.is_dirty(&super::views_store::snapshot(cx))
         });
@@ -2844,7 +2935,7 @@ mod tests {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
         // The stored copy had something to review; since then it was
-        // reviewed, and two of yours opened.
+        // reviewed, and two drafts of yours opened.
         let stored = Inbox {
             involved: page(Vec::new(), 0, false),
             ..inbox()
@@ -2854,11 +2945,16 @@ mod tests {
             cx.notify();
         });
         bounds(cx, "reviews-tab-All");
-        assert_eq!(active(&view, cx), Some(ReviewTab::ToReview));
+        assert_eq!(active(&view, cx), Some(ReviewTab::NeedsReview));
+        let draft = |number| PrSummary {
+            is_draft: true,
+            ..pr("c", number)
+        };
         let fresh = Inbox {
             review_requested: page(Vec::new(), 0, false),
-            authored: page(vec![pr("c", 11), pr("c", 12)], 2, false),
+            authored: page(vec![draft(11), draft(12)], 2, false),
             involved: page(Vec::new(), 0, false),
+            viewer_login: "me".into(),
         };
         load(&view, fresh, cx);
         assert_eq!(active(&view, cx), Some(ReviewTab::Mine));
@@ -2884,13 +2980,16 @@ mod tests {
         // page opened on.
         view.update(cx, |view, cx| view.save_as_new("Plain", cx));
         let plain = view.read_with(cx, |view, _| view.page.view_id.clone());
-        click(cx, "reviews-group-Ready to merge");
+        click(cx, "reviews-group-Requested from you");
         let kept = saved(&view, &plain, cx);
         assert_eq!(
             (kept.tab, kept.collapsed),
-            (None, vec![NextStep::ReadyToMerge])
+            (
+                None,
+                vec![ReviewGroup::NeedsReview(NeedsReview::RequestedFromYou)]
+            )
         );
-        click(cx, "reviews-group-Ready to merge");
+        click(cx, "reviews-group-Requested from you");
 
         // With no view, a second click on "All" keeps the tab and the folds.
         view.update(cx, |view, cx| view.switch_view(None, cx));
@@ -2899,7 +2998,7 @@ mod tests {
         click(cx, "reviews-view-all");
         assert_eq!(active(&view, cx), Some(ReviewTab::Involved));
         let folded = view.read_with(cx, |view, _| view.page.collapsed.clone());
-        assert_eq!(folded, [NextStep::WaitingForReview]);
+        assert_eq!(folded, [ReviewGroup::Step(NextStep::WaitingForReview)]);
         click(cx, "reviews-group-Waiting for review");
 
         // A view with the same filters that opens on another tab drops the
@@ -2908,7 +3007,7 @@ mod tests {
         view.update(cx, |view, cx| view.save_as_new("Everything", cx));
         let everything = view.read_with(cx, |view, _| view.page.view_id.clone());
         view.update(cx, |view, cx| view.switch_view(None, cx));
-        assert_eq!(active(&view, cx), Some(ReviewTab::ToReview));
+        assert_eq!(active(&view, cx), Some(ReviewTab::NeedsReview));
         click(cx, "pr-select-PR_2");
         assert_eq!(picked(&view, cx), [2]);
         view.update(cx, |view, cx| view.switch_view(everything.as_deref(), cx));
@@ -2937,17 +3036,109 @@ mod tests {
         view.update(cx, |view, cx| {
             view.edit_draft(|draft| *draft = org("b"), cx)
         });
-        assert_eq!(counts(&view, cx), [0, 0, 2, 2]);
+        assert_eq!(counts(&view, cx), [2, 0, 2, 2]);
         assert_eq!(
             active(&view, cx),
-            Some(ReviewTab::ToReview),
+            Some(ReviewTab::NeedsReview),
             "a filter keeps the tab"
         );
-        assert!(numbers(&view, cx).is_empty());
+        assert_eq!(numbers(&view, cx), [vec![4, 5]]);
         assert!(
             bounds(cx, "reviews-tab-Involved").is_some(),
             "every tab stays"
         );
+    }
+
+    #[gpui_kit::test]
+    fn needs_review_groups_what_waits_on_a_review_and_counts_their_sum(cx: &mut TestAppContext) {
+        use loupe_github::{Actor, ReviewRequest};
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        let by = |login: &str, pr: PrSummary| PrSummary {
+            author: Some(Actor {
+                login: login.into(),
+                avatar_url: String::new(),
+            }),
+            ..pr
+        };
+        let asking = |login: &str, pr: PrSummary| PrSummary {
+            review_requests: vec![ReviewRequest::User(login.into())],
+            ..pr
+        };
+        let inbox = Inbox {
+            // Asked of you, by GitHub's search.
+            review_requested: page(vec![by("ana", pr("a", 1))], 1, false),
+            // Yours, asked of someone; yours and approved.
+            authored: page(
+                vec![
+                    asking("bo", by("me", pr("c", 5))),
+                    ready(by("me", pr("c", 6))),
+                ],
+                2,
+                false,
+            ),
+            // Nobody asked; asked of someone else; a draft.
+            involved: page(
+                vec![
+                    by("ana", pr("b", 2)),
+                    asking("bo", by("ana", pr("b", 3))),
+                    PrSummary {
+                        is_draft: true,
+                        ..by("ana", pr("b", 4))
+                    },
+                ],
+                3,
+                false,
+            ),
+            viewer_login: "me".into(),
+        };
+        load(&view, inbox, cx);
+        assert_eq!(active(&view, cx), Some(ReviewTab::NeedsReview));
+        let groups = view.read_with(cx, |view, _| {
+            view.groups_shown()
+                .into_iter()
+                .map(|group| {
+                    (
+                        group.step.label(),
+                        group.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            groups,
+            [
+                ("Requested from you", vec![1]),
+                ("No reviewer", vec![2]),
+                ("Yours", vec![5]),
+            ]
+        );
+        let counts = view.read_with(cx, |view, _| {
+            let inbox = view.inbox.value().expect("loaded");
+            view.tab_lists(inbox)
+                .iter()
+                .map(|(tab, shown)| (*tab, shown.count))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            counts,
+            [
+                (ReviewTab::NeedsReview, 3),
+                (ReviewTab::Mine, 2),
+                (ReviewTab::Involved, 3),
+                (ReviewTab::All, 6),
+            ],
+            "the tab counts its three groups; asked of someone else, a draft, \
+             and an approved one stay in All"
+        );
+        assert!(bounds(cx, "reviews-group-Yours").is_some(), "on screen");
+
+        // A group folds like a next step's (a saved view keeps the page's
+        // folds: see the views tests).
+        click(cx, "reviews-group-No reviewer");
+        let folded = view.read_with(cx, |view, _| view.page.collapsed.clone());
+        assert_eq!(folded, [ReviewGroup::NeedsReview(NeedsReview::NoReviewer)]);
+        assert!(bounds(cx, "pr-row-PR_2").is_none(), "folded");
     }
 
     /// The picked pull requests, in the order the bar acts on them.
@@ -2971,13 +3162,13 @@ mod tests {
         assert_eq!(bounds(cx, "reviews-selection-bar"), None, "no bar yet");
 
         // Sorted smallest first, a Shift+click picks the rows between on
-        // screen, across groups (1, 2), not between in GitHub's order.
+        // screen, across groups (3, 5), not between in GitHub's order.
         click(cx, "reviews-sort-changes");
-        assert_eq!(numbers(&view, cx), [vec![6, 1], vec![2, 3]]);
-        click(cx, "pr-select-PR_1");
-        let row = bounds(cx, "pr-row-PR_2").expect("row 2");
+        assert_eq!(numbers(&view, cx), [vec![2, 3], vec![5, 4]]);
+        click(cx, "pr-select-PR_3");
+        let row = bounds(cx, "pr-row-PR_5").expect("row 5");
         cx.simulate_click(row.center(), Modifiers::shift());
-        assert_eq!(picked(&view, cx), [1, 2]);
+        assert_eq!(picked(&view, cx), [3, 5]);
         assert!(
             bounds(cx, "reviews-selection-bar").is_some(),
             "the bar shows the selection"
@@ -2985,34 +3176,34 @@ mod tests {
 
         // Cmd+A picks the whole tab, every group.
         cx.simulate_keystrokes("cmd-a");
-        assert_eq!(picked(&view, cx), [6, 1, 2, 3]);
+        assert_eq!(picked(&view, cx), [2, 3, 5, 4]);
 
         // A new sort keeps the selection and reorders what the bar opens.
         click(cx, "reviews-sort-changes");
-        assert_eq!(picked(&view, cx), [1, 6, 3, 2]);
+        assert_eq!(picked(&view, cx), [3, 2, 4, 5]);
 
         // The group heading's box drops a group that is all picked.
-        click(cx, "reviews-select-group-Ready to merge");
-        assert_eq!(picked(&view, cx), [3, 2]);
-        click(cx, "reviews-select-group-Ready to merge");
-        assert_eq!(picked(&view, cx), [1, 6, 3, 2]);
+        click(cx, "reviews-select-group-Requested from you");
+        assert_eq!(picked(&view, cx), [4, 5]);
+        click(cx, "reviews-select-group-Requested from you");
+        assert_eq!(picked(&view, cx), [3, 2, 4, 5]);
 
         // A folded group's rows leave the screen and the selection; Cmd+A
         // skips them.
-        click(cx, "reviews-group-Ready to merge");
-        assert_eq!(picked(&view, cx), [3, 2]);
-        assert!(bounds(cx, "pr-row-PR_1").is_none(), "folded");
-        click(cx, "reviews-group-Ready to merge");
-        assert!(bounds(cx, "pr-row-PR_1").is_some(), "unfolded");
-        assert_eq!(picked(&view, cx), [3, 2], "unfolding picks nothing back");
-        click(cx, "reviews-group-Ready to merge");
+        click(cx, "reviews-group-Requested from you");
+        assert_eq!(picked(&view, cx), [4, 5]);
+        assert!(bounds(cx, "pr-row-PR_2").is_none(), "folded");
+        click(cx, "reviews-group-Requested from you");
+        assert!(bounds(cx, "pr-row-PR_2").is_some(), "unfolded");
+        assert_eq!(picked(&view, cx), [4, 5], "unfolding picks nothing back");
+        click(cx, "reviews-group-Requested from you");
         cx.simulate_keystrokes("escape");
         cx.simulate_keystrokes("cmd-a");
-        assert_eq!(picked(&view, cx), [3, 2]);
-        click(cx, "reviews-group-Ready to merge");
+        assert_eq!(picked(&view, cx), [4, 5]);
+        click(cx, "reviews-group-Requested from you");
         assert_eq!(
             picked(&view, cx),
-            [3, 2],
+            [4, 5],
             "Cmd+A left the folded rows alone"
         );
 
@@ -3053,6 +3244,7 @@ mod tests {
                 review_requested: page(vec![pr("a", 1), pr("a", 2)], 2, false),
                 authored: page(Vec::new(), 0, false),
                 involved: page(Vec::new(), 0, false),
+                viewer_login: "me".into(),
             });
             cx.notify();
         });
@@ -3077,6 +3269,7 @@ mod tests {
                 review_requested: page((1..=40).map(|n| pr("a", n)).collect(), 40, false),
                 authored: page(Vec::new(), 0, false),
                 involved: page(Vec::new(), 0, false),
+                viewer_login: "me".into(),
             });
             cx.notify();
         });
@@ -3103,6 +3296,7 @@ mod tests {
                     review_requested: many(count),
                     authored: page(Vec::new(), 0, false),
                     involved: page(Vec::new(), 0, false),
+                    viewer_login: "me".into(),
                 });
                 view.selection = super::Selection::default();
                 cx.notify();
@@ -3311,17 +3505,20 @@ mod tests {
         }
     }
 
-    /// To review holds a chain of branches 10 ← 11 ← 12 whose top, 13,
-    /// is in Involved, and two loose pull requests: 20 ready to merge and
-    /// 21 waiting. In the stack, 10 waits for a review, 11 is ready to
-    /// merge, and 12's checks fail.
+    /// Mine holds a chain of branches 10 ← 11 ← 12 whose top, 13, is in
+    /// Involved, and two loose pull requests: 20 ready to merge and 21
+    /// waiting. In the stack, 10 waits for a review, 11 is ready to merge,
+    /// and 12's checks fail. Nobody reviews any of them, and their author is
+    /// not the viewer, so Needs review lists those not approved (10, 12,
+    /// 13, 21) under No reviewer.
     fn stacked_inbox() -> Inbox {
         let failing = |pr: PrSummary| PrSummary {
             checks: Some(ChecksState::Failing),
             ..pr
         };
         Inbox {
-            review_requested: page(
+            review_requested: page(Vec::new(), 0, false),
+            authored: page(
                 vec![
                     failing(on(pr("a", 12), "b", "c", 250)),
                     ready(on(pr("a", 20), "main", "x", 100)),
@@ -3332,8 +3529,8 @@ mod tests {
                 5,
                 false,
             ),
-            authored: page(Vec::new(), 0, false),
             involved: page(vec![on(pr("a", 13), "c", "d", 1)], 1, false),
+            viewer_login: "me".into(),
         }
     }
 
@@ -3351,7 +3548,8 @@ mod tests {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
         load(&view, stacked_inbox(), cx);
-        assert_eq!(active(&view, cx), Some(ReviewTab::ToReview));
+        click(cx, "reviews-tab-Mine");
+        assert_eq!(active(&view, cx), Some(ReviewTab::Mine));
 
         // The stack sits in Ready to merge, where 11 is, at the place of its
         // first row in GitHub's order (12), with its rows base first.
@@ -3377,7 +3575,7 @@ mod tests {
         assert_eq!(lines, [vec![10, 11, 12], vec![20]]);
         // 13 is in the stack but not in this tab.
         assert_eq!(summary.as_deref(), Some("3 of 4 shown · 1 check failing"));
-        assert_eq!(counts, [5, 0, 1, 6], "the tabs still count pull requests");
+        assert_eq!(counts, [4, 5, 1, 6], "the tabs still count pull requests");
 
         // Folded, the stack's rows are not on screen; a click opens it.
         assert!(bounds(cx, "reviews-stack-a-repo-pr10").is_some());
@@ -3390,6 +3588,13 @@ mod tests {
         // In Involved, 13 alone is a plain row.
         click(cx, "reviews-tab-Involved");
         assert!(bounds(cx, "pr-row-PR_13").is_some());
+
+        // In Needs review the stack is one line too, with the rows of it
+        // that wait on a review (11 is approved), before 21.
+        click(cx, "reviews-tab-Needs review");
+        assert_eq!(numbers(&view, cx), [vec![10, 12, 13, 21]]);
+        assert!(bounds(cx, "reviews-stack-a-repo-pr10").is_some());
+        assert!(bounds(cx, "pr-row-PR_12").is_none(), "folded");
     }
 
     #[gpui_kit::test]
@@ -3397,6 +3602,7 @@ mod tests {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
         load(&view, stacked_inbox(), cx);
+        click(cx, "reviews-tab-Mine");
         // Smallest first: 20 (100) comes before the stack's smallest (11, 200).
         click(cx, "reviews-sort-changes");
         assert_eq!(numbers(&view, cx), [vec![20, 10, 11, 12], vec![21]]);
@@ -3410,6 +3616,7 @@ mod tests {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
         load(&view, stacked_inbox(), cx);
+        click(cx, "reviews-tab-Mine");
 
         click(cx, "reviews-select-stack-a-repo-pr10");
         assert_eq!(picked(&view, cx), [10, 11, 12]);
@@ -3426,6 +3633,7 @@ mod tests {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
         load(&view, stacked_inbox(), cx);
+        click(cx, "reviews-tab-Mine");
         let step = |cx: &mut VisualTestContext| {
             view.update_in(cx, |view, window, cx| view.move_cursor(true, window, cx));
             spot(&view, cx)
@@ -3456,6 +3664,7 @@ mod tests {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
         load(&view, stacked_inbox(), cx);
+        click(cx, "reviews-tab-Mine");
         click(cx, "pr-select-PR_21");
         let at = bounds(cx, "reviews-select-stack-a-repo-pr10").expect("the stack's box");
         cx.simulate_click(at.center(), Modifiers::shift());
@@ -3487,6 +3696,7 @@ mod tests {
             review_requested: page(vec![layer(7), layer(8), pr("a", 9)], 3, false),
             authored: page(Vec::new(), 0, false),
             involved: page(Vec::new(), 0, false),
+            viewer_login: "me".into(),
         };
         load(&view, inbox, cx);
         assert_eq!(numbers(&view, cx), [vec![7, 8, 9]]);
