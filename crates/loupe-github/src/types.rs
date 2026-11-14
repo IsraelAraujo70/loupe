@@ -385,6 +385,10 @@ pub struct PullRequestDetail {
     pub pending_review: Option<PendingReview>,
     pub viewer_login: String,
     pub viewer_can_update: bool,
+    /// The stack this pull request is part of; `None` outside a stack.
+    /// Defaulted so details cached before this field still load.
+    #[serde(default)]
+    pub stack: Option<crate::PrStack>,
 }
 
 /// One edit of a pull request's description.

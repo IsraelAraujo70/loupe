@@ -1287,6 +1287,7 @@ mod tests {
             pending_review: None,
             viewer_login: "bruno".into(),
             viewer_can_update: true,
+            stack: None,
         }
     }
 

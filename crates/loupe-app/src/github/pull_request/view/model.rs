@@ -3,7 +3,7 @@
 
 use loupe_github::{
     CheckRun, CheckStatus, ChecksState, MergeMethod, MergeStateStatus, Mergeable, PrState,
-    PullRequestDetail, ReviewDecision, ReviewEvent, ReviewerState, TimelineItem,
+    PullRequestDetail, ReviewDecision, ReviewEvent, ReviewerState, StackEntry, TimelineItem,
 };
 
 use crate::github::pull_request::checks::format_duration;
@@ -523,6 +523,53 @@ pub(super) fn merge_confirm_text(number: u64, base_ref: &str, method: MergeMetho
     )
 }
 
+/// What merging a stacked pull request takes along: GitHub merges the open
+/// pull requests under it too, into the stack's base.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct StackMerge<'a> {
+    pub base_ref: &'a str,
+    /// Every pull request the merge lands, base first, this one last.
+    pub entries: Vec<&'a StackEntry>,
+}
+
+/// The stack merge of `detail`, or `None` when merging it lands it alone:
+/// outside a stack, at its base, or with nothing open under it.
+pub(super) fn stack_merge(detail: &PullRequestDetail) -> Option<StackMerge<'_>> {
+    let stack = detail.stack.as_ref()?;
+    let mut entries = stack.open_below(detail.pr.number);
+    if entries.is_empty() {
+        return None;
+    }
+    entries.extend(stack.entry(detail.pr.number));
+    Some(StackMerge {
+        base_ref: &stack.base_ref,
+        entries,
+    })
+}
+
+pub(super) fn stack_merge_confirm_text(
+    count: usize,
+    base_ref: &str,
+    method: MergeMethod,
+) -> String {
+    format!(
+        "This merges {count} pull requests into {base_ref} with {}:",
+        method_label(method)
+    )
+}
+
+/// What a stack entry's row warns about, in the order the row shows them.
+pub(super) fn stack_entry_problems(entry: &StackEntry) -> Vec<&'static str> {
+    let mut problems = Vec::new();
+    if entry.has_conflicts() {
+        problems.push("Conflicts");
+    }
+    if entry.changes_requested() {
+        problems.push("Changes requested");
+    }
+    problems
+}
+
 pub(super) fn pending_comments_label(count: u32) -> String {
     match count {
         0 => "No pending comments".into(),
@@ -576,9 +623,9 @@ pub(super) fn review_blocker(
 mod tests {
     use chrono::{DateTime, Utc};
     use loupe_github::{
-        Actor, CheckRun, CheckStatus, Checks, MergeMethod, MergeStateStatus, Mergeable,
-        PendingReview, PrRef, PrState, PullRequestDetail, RepoRef, ReviewDecision, ReviewEvent,
-        Reviewer, ReviewerKind, ReviewerState,
+        Actor, CheckRun, CheckStatus, Checks, ChecksState, MergeMethod, MergeStateStatus,
+        Mergeable, PendingReview, PrRef, PrStack, PrState, PullRequestDetail, RepoRef,
+        ReviewDecision, ReviewEvent, Reviewer, ReviewerKind, ReviewerState, StackEntry,
     };
 
     use super::{
@@ -586,6 +633,7 @@ mod tests {
         approvals, available_actions, can_approve, check_groups, check_outcome, check_tally,
         checks_open_at_first, discard_confirm_text, head_label, merge_button_label,
         merge_confirm_text, merge_status, pending_comments_label, resolve_method, review_blocker,
+        stack_entry_problems, stack_merge, stack_merge_confirm_text,
     };
 
     fn actor(login: &str) -> Actor {
@@ -637,6 +685,7 @@ mod tests {
             pending_review: None,
             viewer_login: "bruno".into(),
             viewer_can_update: true,
+            stack: None,
         }
     }
 
@@ -939,6 +988,80 @@ mod tests {
         assert_eq!(
             merge_confirm_text(12, "main", MergeMethod::Squash),
             "Merge #12 into main with squash?"
+        );
+    }
+
+    fn stack_entry(position: u32, number: u64, state: PrState) -> StackEntry {
+        StackEntry {
+            position,
+            number,
+            title: format!("Layer {position}"),
+            state,
+            is_draft: false,
+            checks: Some(ChecksState::Passing),
+            mergeable: Mergeable::Mergeable,
+            review_decision: None,
+        }
+    }
+
+    fn stacked(number: u64, entries: Vec<StackEntry>) -> PullRequestDetail {
+        let mut detail = detail();
+        detail.pr.number = number;
+        detail.base_ref = "layer-below".into();
+        detail.stack = Some(PrStack::new(7, "stack-base".into(), entries));
+        detail
+    }
+
+    fn numbers(merge: &super::StackMerge) -> Vec<u64> {
+        merge.entries.iter().map(|entry| entry.number).collect()
+    }
+
+    #[test]
+    fn merging_the_top_of_a_stack_lists_every_pull_request_it_lands_base_first() {
+        let detail = stacked(
+            12,
+            vec![
+                stack_entry(3, 12, PrState::Open),
+                stack_entry(1, 21, PrState::Open),
+                stack_entry(2, 9, PrState::Open),
+            ],
+        );
+        let merge = stack_merge(&detail).expect("a stack merge");
+        assert_eq!(numbers(&merge), vec![21, 9, 12]);
+        assert_eq!(merge.base_ref, "stack-base");
+        assert_eq!(
+            stack_merge_confirm_text(merge.entries.len(), merge.base_ref, MergeMethod::Squash),
+            "This merges 3 pull requests into stack-base with squash:"
+        );
+    }
+
+    #[test]
+    fn a_merged_layer_is_not_listed_and_a_lone_merge_keeps_todays_confirmation() {
+        let entries = vec![
+            stack_entry(1, 21, PrState::Merged),
+            stack_entry(2, 9, PrState::Open),
+            stack_entry(3, 12, PrState::Open),
+        ];
+        let top = stacked(12, entries.clone());
+        assert_eq!(
+            numbers(&stack_merge(&top).expect("a stack merge")),
+            vec![9, 12]
+        );
+        // The lowest open layer merges alone, and so does a pull request
+        // outside any stack.
+        assert_eq!(stack_merge(&stacked(9, entries)), None);
+        assert_eq!(stack_merge(&detail()), None);
+    }
+
+    #[test]
+    fn a_stack_entry_warns_about_conflicts_and_requested_changes() {
+        let mut entry = stack_entry(1, 10, PrState::Open);
+        assert!(stack_entry_problems(&entry).is_empty());
+        entry.mergeable = Mergeable::Conflicting;
+        entry.review_decision = Some(ReviewDecision::ChangesRequested);
+        assert_eq!(
+            stack_entry_problems(&entry),
+            vec!["Conflicts", "Changes requested"]
         );
     }
 
