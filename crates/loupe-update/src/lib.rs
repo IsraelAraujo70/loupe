@@ -199,14 +199,19 @@ pub fn prepare(token: &str, release: &Release, target: &Path) -> Result<PathBuf>
 }
 
 /// Starts a helper that waits for this process to exit, replaces the installation,
-/// and restarts it. Keeps the previous version for rollback on launch failure.
-pub fn install(stage: &Path, target: &Path) -> Result<()> {
+/// and restarts it. The helper keeps the previous version until the new one calls
+/// [`confirm_start`]; if the new one exits first, the helper puts the previous
+/// version back, writes `tag` to `notice` (see [`rolled_back`]), and restarts it.
+pub fn install(stage: &Path, target: &Path, tag: &str, notice: &Path) -> Result<()> {
     let source = stage.join(if cfg!(target_os = "macos") {
         "Loupe.app"
     } else {
         "download"
     });
     ensure!(source.exists(), "Staged update is missing");
+    if let Some(dir) = notice.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let script = stage.join("install.sh");
     fs::write(&script, include_str!("install.sh"))?;
     Command::new("/bin/sh")
@@ -216,11 +221,67 @@ pub fn install(stage: &Path, target: &Path) -> Result<()> {
         .arg(stage)
         .arg(source)
         .arg(std::env::consts::OS)
+        .arg(tag)
+        .arg(notice)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+/// Tells a waiting install helper that this freshly installed version started
+/// well, so it drops the previous version. Call it once the first screen is drawn.
+/// Returns whether an install was waiting; without one it does nothing.
+pub fn confirm_start(executable: &Path) -> Result<bool> {
+    let stage = install_target(executable)?
+        .parent()
+        .context("Missing install directory")?
+        .join(".loupe-update");
+    // Only the helper creates `previous`, after the old version quit; a download
+    // still being staged by this process has none.
+    if !stage.join("previous").exists() && !stage.join("healthy").exists() {
+        return Ok(false);
+    }
+    if helper_alive(&stage) {
+        fs::write(stage.join("healthy"), b"")?;
+        return Ok(true);
+    }
+    // The helper died mid-install (logout, reboot) or an older helper raced this
+    // write. This version has drawn its first screen, so keep it and free the
+    // stage, which would otherwise block every later update.
+    fs::remove_dir_all(&stage)?;
+    Ok(false)
+}
+
+fn helper_alive(stage: &Path) -> bool {
+    let Ok(pid) = fs::read_to_string(stage.join("helper")) else {
+        return false;
+    };
+    let pid = pid.trim();
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", pid])
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+/// The release tag the helper rolled back because it exited before it finished
+/// starting, as recorded in `notice` by [`install`]. A later install through the
+/// helper clears it; a tag no newer than `current` is stale and ignored.
+pub fn rolled_back(notice: &Path, current: &str) -> Option<String> {
+    let tag = fs::read_to_string(notice).ok()?;
+    let tag = tag.trim();
+    // A test tag such as v0.1.1-rc.1 counts as its stable triple.
+    let base = |version: &str| stable(version.split('-').next().unwrap_or(version));
+    let newer = match (base(tag), base(current)) {
+        (Some(rejected), Some(running)) => {
+            rejected > running || (rejected == running && tag.trim_start_matches('v') != current)
+        }
+        _ => false,
+    };
+    newer.then(|| tag.to_owned())
 }
 
 #[cfg(test)]
@@ -237,70 +298,196 @@ mod tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod install_tests {
-    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
-    #[test]
-    fn replacement_restarts_and_rolls_back_a_failed_launch() {
-        for fail in [false, true] {
+    use super::{confirm_start, rolled_back};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        process::{Child, Command},
+        time::{Duration, Instant},
+    };
+
+    const OLD: &str = "old";
+
+    /// An installed `loupe` that records "old" when started, a staged replacement
+    /// running `new_body` (given the line that records "new"), a stale rollback notice, and the helper started on them.
+    struct Install {
+        root: PathBuf,
+        target: PathBuf,
+        stage: PathBuf,
+        marker: PathBuf,
+        notice: PathBuf,
+        helper: Child,
+    }
+
+    impl Install {
+        fn start(name: &str, new_body: fn(mark_new: &str) -> String) -> Install {
             let root =
-                std::env::temp_dir().join(format!("loupe-install-{}-{fail}", std::process::id()));
-            fs::create_dir(&root).unwrap();
-            let stage = root.join("stage");
-            fs::create_dir(&stage).unwrap();
+                std::env::temp_dir().join(format!("loupe-install-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let stage = root.join(".loupe-update");
+            fs::create_dir_all(&stage).unwrap();
             let target = root.join("loupe");
             let source = stage.join("download");
             let marker = root.join("started");
-            // `echo > file` creates the file before it writes, so a reader polling for the
-            // file can see it empty. Rename into place so the marker appears complete.
+            let notice = root.join("data").join("update-rolled-back");
+            // `echo > file` creates the file before it writes, so a reader polling for
+            // the file can see it empty. Rename into place so it appears complete.
             let mark = |text: &str| {
                 format!(
                     "echo {text} > '{0}.tmp' && mv '{0}.tmp' '{0}'",
                     marker.display()
                 )
             };
-            let old = format!("#!/bin/sh\n{}\n", mark("old"));
-            fs::write(&target, &old).unwrap();
-            let new = if fail {
-                "#!/bin/sh\nexit 1\n".into()
-            } else {
-                format!("#!/bin/sh\n{}\nexec sleep 5\n", mark("new"))
-            };
-            fs::write(&source, &new).unwrap();
+            fs::write(&target, format!("#!/bin/sh\n{}\n", mark(OLD))).unwrap();
+            fs::write(&source, format!("#!/bin/sh\n{}\n", new_body(&mark("new")))).unwrap();
             for path in [&source, &target] {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
             }
-            let script = root.join("install.sh");
+            fs::create_dir_all(notice.parent().unwrap()).unwrap();
+            fs::write(&notice, "v0.0.1\n").unwrap();
+            let script = stage.join("install.sh");
             fs::write(&script, include_str!("install.sh")).unwrap();
-            let status = Command::new("sh")
+            let helper = Command::new("sh")
                 .arg(script)
                 .arg("99999999")
                 .arg(&target)
                 .arg(&stage)
                 .arg(&source)
                 .arg("linux")
-                .status()
+                .arg("v9.9.9")
+                .arg(&notice)
+                .spawn()
                 .unwrap();
-            assert_eq!(status.success(), !fail);
-            // The restored version is started asynchronously by the helper.
-            for _ in 0..50 {
-                if marker.exists() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            Install {
+                root,
+                target,
+                stage,
+                marker,
+                notice,
+                helper,
             }
-            assert_eq!(
-                fs::read_to_string(&marker).unwrap().trim(),
-                if fail { "old" } else { "new" }
-            );
-            assert_eq!(
-                fs::read_to_string(target).unwrap(),
-                if fail { old } else { new }
-            );
-            assert!(
-                !stage.exists(),
-                "successful install or rollback must allow another update"
-            );
-            fs::create_dir(&stage).expect("the next update can stage again");
-            fs::remove_dir_all(root).unwrap();
         }
+
+        fn started(&self) -> String {
+            wait_for(&self.marker);
+            fs::read_to_string(&self.marker).unwrap().trim().to_owned()
+        }
+
+        /// The helper's result, the version left installed and started, and the
+        /// rollback notice.
+        fn finish(mut self) -> (bool, String, Option<String>) {
+            let ok = self.helper.wait().unwrap().success();
+            // The restored version is started asynchronously by the helper.
+            let started = self.started();
+            assert!(
+                !self.stage.exists(),
+                "a finished install or rollback must allow another update"
+            );
+            fs::create_dir(&self.stage).expect("the next update can stage again");
+            let installed = fs::read_to_string(&self.target).unwrap();
+            assert!(installed.contains(&format!("echo {started} ")));
+            let notice = rolled_back(&self.notice, "0.0.1");
+            fs::remove_dir_all(&self.root).unwrap();
+            (ok, started, notice)
+        }
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_version_that_confirms_its_start_stays_installed() {
+        let mut install = Install::start("healthy", |mark_new| format!("{mark_new}\nexec sleep 5"));
+        assert_eq!(install.started(), "new");
+        fs::remove_file(&install.marker).unwrap();
+        // What the app does once its first frame is drawn.
+        assert!(confirm_start(&install.target).unwrap());
+        // The helper is done once it accepts the new version; nothing restarts.
+        assert!(install.helper.wait().unwrap().success());
+        assert!(!install.stage.exists());
+        assert!(
+            fs::read_to_string(&install.target)
+                .unwrap()
+                .contains("echo new ")
+        );
+        assert_eq!(
+            rolled_back(&install.notice, "0.0.1"),
+            None,
+            "a good install clears the notice"
+        );
+        fs::remove_dir_all(&install.root).unwrap();
+    }
+
+    #[test]
+    fn a_version_that_fails_to_launch_is_rolled_back() {
+        let install = Install::start("exit", |_| "exit 1".into());
+        assert_eq!(install.finish(), (false, OLD.into(), Some("v9.9.9".into())));
+    }
+
+    #[test]
+    fn a_version_that_crashes_after_it_starts_is_rolled_back() {
+        // Runs past the three seconds the helper used to wait, then crashes without
+        // confirming its start.
+        let install = Install::start("crash", |mark_new| {
+            format!("{mark_new}\nsleep 4\nkill -SEGV $$")
+        });
+        assert_eq!(install.started(), "new");
+        fs::remove_file(&install.marker).unwrap();
+        assert_eq!(install.finish(), (false, OLD.into(), Some("v9.9.9".into())));
+    }
+
+    #[test]
+    fn a_rolled_back_tag_no_newer_than_the_running_version_is_stale() {
+        let notice = std::env::temp_dir().join(format!("loupe-notice-{}", std::process::id()));
+        fs::write(&notice, "v0.1.10\n").unwrap();
+        assert_eq!(rolled_back(&notice, "0.1.9").as_deref(), Some("v0.1.10"));
+        assert_eq!(rolled_back(&notice, "0.1.10"), None);
+        assert_eq!(rolled_back(&notice, "0.1.11"), None);
+        fs::write(&notice, "v0.1.1-rc.1\n").unwrap();
+        assert_eq!(
+            rolled_back(&notice, "0.1.0").as_deref(),
+            Some("v0.1.1-rc.1")
+        );
+        assert_eq!(rolled_back(&notice, "0.1.1"), Some("v0.1.1-rc.1".into()));
+        assert_eq!(rolled_back(&notice, "0.1.1-rc.1"), None);
+        assert_eq!(rolled_back(&notice, "0.1.2"), None);
+        fs::remove_file(&notice).unwrap();
+        assert_eq!(rolled_back(&notice, "0.1.9"), None);
+    }
+
+    #[test]
+    fn confirming_without_a_waiting_install_does_nothing() {
+        let root = std::env::temp_dir().join(format!("loupe-confirm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let stage = root.join(".loupe-update");
+        fs::create_dir_all(&stage).unwrap();
+        let target = root.join("loupe");
+        // A download this process is still staging.
+        assert!(!confirm_start(&target).unwrap());
+        assert!(!stage.join("healthy").exists());
+        fs::remove_dir_all(&stage).unwrap();
+        assert!(!confirm_start(&target).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stage_whose_helper_died_is_cleared_and_the_new_version_kept() {
+        let root = std::env::temp_dir().join(format!("loupe-orphan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let stage = root.join(".loupe-update");
+        fs::create_dir_all(stage.join("previous")).unwrap();
+        let target = root.join("loupe");
+        fs::write(&target, "new").unwrap();
+        // A pid no process has: the helper was killed before the first frame.
+        fs::write(stage.join("helper"), "99999999\n").unwrap();
+        assert!(!confirm_start(&target).unwrap());
+        assert!(!stage.exists(), "the next update can stage again");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -7,8 +7,8 @@
 //! `Checking` a quiet splash, `Disconnected`/`Failed` the full-window
 //! `settings::sign_in_view`, `Connected` the frame. The frame splits into
 //! panes (`panes::Panes`), each with its own tabs; each tab has its own
-//! history with back and forward (`tabs::Tabs`). The panes and their tabs
-//! are saved in `Settings` and come back after a restart. It observes the `Services`
+//! history with back and forward (`tabs::Tabs`), and a pane's tabs can be
+//! grouped. The panes, their tabs, and their groups are saved in `Settings` and come back after a restart. It observes the `Services`
 //! global and rebuilds every page when the GitHub client changes, since
 //! GitHub views read it once when they load. Linear and T3 views follow their
 //! own clients, so connecting those keeps every page and its drafts. It
@@ -25,6 +25,7 @@ mod panes;
 pub mod router;
 mod sidebar;
 mod tab_bar;
+mod tab_groups;
 mod tabs;
 mod workspace_menu;
 
@@ -57,6 +58,7 @@ use crate::shell::item_menu::Command;
 use crate::shell::panes::{Node, Pane, PaneId, Panes, Zone};
 use crate::shell::tab_bar::DraggedTab;
 use crate::shell::tabs::Page;
+use crate::shell::tabs::Tabs;
 use crate::store::{self, Settings, SplitAxis};
 use crate::theme::{scale, tokens};
 use crate::ui::WindowDragArea as _;
@@ -535,6 +537,52 @@ impl Workspace {
         self.panes.move_tab(dragged.pane, dragged.tab, pane, index);
         self.save_tabs(cx);
         cx.notify();
+    }
+
+    /// A tab dropped on the name of group `group` of `pane`: it joins the
+    /// group, at its end.
+    fn drop_on_group(
+        &mut self,
+        dragged: &DraggedTab,
+        pane: PaneId,
+        group: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_drag = None;
+        self.panes
+            .move_into_group(dragged.pane, dragged.tab, pane, group);
+        self.save_tabs(cx);
+        cx.notify();
+    }
+
+    /// Runs `edit` on the tabs of `pane`, and saves them when it says it
+    /// changed something.
+    fn edit_tabs(
+        &mut self,
+        pane: PaneId,
+        edit: impl FnOnce(&mut Tabs<AnyView>) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tabs) = self.panes.tabs_mut(pane) else {
+            return;
+        };
+        if edit(tabs) {
+            self.save_tabs(cx);
+            cx.notify();
+        }
+    }
+
+    /// Runs `edit` on the tabs of the pane that holds tab `tab`, with the
+    /// tab's index there.
+    fn edit_tab(
+        &mut self,
+        tab: u64,
+        edit: impl FnOnce(&mut Tabs<AnyView>, usize) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((pane, index)) = self.panes.locate(tab) {
+            self.edit_tabs(pane, |tabs| edit(tabs, index), cx);
+        }
     }
 
     /// The zone of `pane`'s page under the pointer, if the pointer is on it.
@@ -1190,7 +1238,7 @@ mod tests {
     use crate::route::Route;
     use crate::services::{Accounts, Connection, Services};
     use crate::shell::actions::{ActivateTab1, CloseTab, NewTab, SplitDown, SplitRight};
-    use crate::store::{PaneLayout, Settings, SplitAxis};
+    use crate::store::{PaneLayout, SavedTabGroup, Settings, SplitAxis, TabGroupColor};
 
     /// The real window: GitHub signed in with no client, so nothing loads
     /// from the network, on one tab showing Reviews.
@@ -1593,6 +1641,7 @@ mod tests {
         PaneLayout::Pane {
             tabs: tabs.to_vec(),
             active: 0,
+            groups: Vec::new(),
         }
     }
 
@@ -1667,8 +1716,92 @@ mod tests {
             PaneLayout::Pane {
                 tabs: vec![Route::Notifications, Route::LinearMyIssues, Route::Inbox],
                 active: 2,
+                groups: Vec::new(),
             },
             "the dragged tab takes the place of the one it is dropped on, and stays active"
+        );
+    }
+
+    /// The saved groups of the window's one pane, as (first, len, collapsed).
+    fn saved_groups(cx: &mut VisualTestContext) -> Vec<(usize, usize, bool)> {
+        let PaneLayout::Pane { groups, .. } = saved_panes(cx).0 else {
+            panic!("one pane")
+        };
+        groups
+            .iter()
+            .map(|group| (group.first, group.len, group.collapsed))
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn a_group_s_name_collapses_it_and_takes_dropped_tabs(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        // Tabs 1 and 2, opened in the background: Inbox, Notifications,
+        // My issues.
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        click(
+            cx,
+            "sidebar-my-issues",
+            MouseButton::Middle,
+            Modifiers::none(),
+        );
+        // What "Add to new group…" does once the name is confirmed.
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(
+                1,
+                |tabs, index| tabs.new_group(index, "Review").is_some(),
+                cx,
+            )
+        });
+        assert_eq!(saved_groups(cx), [(1, 1, false)]);
+
+        let start = center(cx, "tab-2");
+        let end = center(cx, "tab-group-0-0");
+        drag(cx, start, end);
+        assert_eq!(
+            saved_groups(cx),
+            [(1, 2, false)],
+            "a tab dropped on a group's name joins the group"
+        );
+
+        click(cx, "tab-0", MouseButton::Left, Modifiers::none());
+        click(cx, "tab-group-0-0", MouseButton::Left, Modifiers::none());
+        assert_eq!(saved_groups(cx), [(1, 2, true)]);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("tab-1").is_none() && cx.debug_bounds("tab-2").is_none(),
+            "a collapsed group hides its tabs"
+        );
+        assert!(cx.debug_bounds("tab-0").is_some());
+
+        click(cx, "tab-group-0-0", MouseButton::Left, Modifiers::none());
+        assert_eq!(saved_groups(cx), [(1, 2, false)]);
+        assert!(
+            cx.debug_bounds("tab-1").is_some(),
+            "and expanding shows them"
+        );
+
+        let start = center(cx, "tab-1");
+        let end = center(cx, "tab-0");
+        drag(cx, start, end);
+        assert_eq!(
+            saved_panes(cx).0,
+            PaneLayout::Pane {
+                tabs: vec![Route::Notifications, Route::Inbox, Route::LinearMyIssues],
+                active: 0,
+                groups: vec![SavedTabGroup {
+                    name: "Review".into(),
+                    color: TabGroupColor::Grey,
+                    collapsed: false,
+                    first: 2,
+                    len: 1,
+                }],
+            },
+            "a tab dropped on a tab outside the group leaves it"
         );
     }
 
