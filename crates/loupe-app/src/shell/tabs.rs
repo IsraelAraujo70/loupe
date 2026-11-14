@@ -1,8 +1,22 @@
 //! The tab model: each tab has its own history with back and forward, and
 //! each pane keeps its tabs in order with one active. Generic over the view
 //! type so the rules are tested without GPUI.
+//!
+//! Tabs can be grouped, as in Chrome: a group has a name and a color, its
+//! tabs sit next to each other, and it can collapse to hide them. A group
+//! with no tab left is gone, and the open tab is never in a collapsed group.
 
 use crate::route::Route;
+use crate::store::{SavedTabGroup, TabGroupColor};
+
+/// A named, colored group of tabs in one pane.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct TabGroup {
+    pub id: u64,
+    pub name: String,
+    pub color: TabGroupColor,
+    pub collapsed: bool,
+}
 
 pub(super) struct Page<V> {
     pub route: Route,
@@ -13,6 +27,8 @@ pub(super) struct Page<V> {
 /// history, which a new navigation drops, as in a browser.
 pub(super) struct Tab<V> {
     pub id: u64,
+    /// The [`TabGroup`] of its pane the tab is in, if any.
+    pub group: Option<u64>,
     history: Vec<Page<V>>,
     index: usize,
 }
@@ -21,6 +37,7 @@ impl<V> Tab<V> {
     pub fn new(id: u64, page: Page<V>) -> Self {
         Self {
             id,
+            group: None,
             history: vec![page],
             index: 0,
         }
@@ -82,19 +99,25 @@ pub(super) struct Tabs<V> {
     /// The active tab's id and the tab last opened in the background from
     /// it, so the next one lands after it.
     last_background: Option<(u64, u64)>,
+    groups: Vec<TabGroup>,
+    next_group: u64,
 }
 
 impl<V> Tabs<V> {
-    /// The tabs `tabs` with the one at `active` (clamped) on screen.
-    /// `tabs` is not empty.
+    /// The tabs `tabs` with the one at `active` (clamped) on screen, in no
+    /// group. `tabs` is not empty.
     pub fn new(tabs: Vec<Tab<V>>, active: usize) -> Self {
         debug_assert!(!tabs.is_empty(), "a pane has at least one tab");
         let active = active.min(tabs.len().saturating_sub(1));
-        Self {
+        let mut tabs = Self {
             tabs,
             active,
             last_background: None,
-        }
+            groups: Vec::new(),
+            next_group: 0,
+        };
+        tabs.tidy();
+        tabs
     }
 
     pub fn len(&self) -> usize {
@@ -125,11 +148,14 @@ impl<V> Tabs<V> {
         self.tabs.iter_mut()
     }
 
-    /// Opens `tab` right after the active one and activates it.
+    /// Opens `tab` right after the active one, in its group, and activates
+    /// it.
     pub fn open(&mut self, tab: Tab<V>) {
         let at = self.active + 1;
-        self.tabs.insert(at, tab);
+        let group = self.active().group;
+        self.place(at, tab, group);
         self.active = at;
+        self.tidy();
     }
 
     /// Opens `tab` without leaving the active one, as a browser's middle
@@ -137,20 +163,66 @@ impl<V> Tabs<V> {
     /// they were opened, right after it.
     pub fn open_in_background(&mut self, tab: Tab<V>) {
         let from = self.active().id;
+        // The last one counts only while it still follows the active tab in
+        // the same group; once moved elsewhere, a new run starts.
+        let group = self.active().group;
         let after = match self.last_background {
-            Some((active, last)) if active == from => self.index_of(last),
+            Some((active, last)) if active == from => self
+                .index_of(last)
+                .filter(|&ix| ix > self.active && self.tabs[ix].group == group),
             _ => None,
         };
         let at = after.unwrap_or(self.active) + 1;
         self.last_background = Some((from, tab.id));
-        self.tabs.insert(at, tab);
+        let active = self.active().id;
+        self.place(at, tab, group);
+        self.active = self.index_of(active).unwrap_or(0);
+        self.tidy();
     }
 
-    /// Puts `tab` at `index` (clamped to the end) and activates it.
-    pub fn insert(&mut self, index: usize, tab: Tab<V>) {
+    /// Puts `tab` at `index` (clamped to the end), in `group` when it lands
+    /// next to one of that group's tabs, and activates it.
+    pub fn insert(&mut self, index: usize, tab: Tab<V>, group: Option<u64>) {
         let at = index.min(self.tabs.len());
-        self.tabs.insert(at, tab);
+        self.place(at, tab, group);
         self.active = at;
+        self.tidy();
+    }
+
+    /// Moves the tab at `from` to `to` (clamped), in `group` as [`Self::insert`]
+    /// decides, and opens it. Nothing else changes on the way: a group that
+    /// loses the tab only for the move, or a collapsed group next to it,
+    /// stays as it is. False when the tab stays where it was, in its group.
+    pub fn move_within(&mut self, from: usize, to: usize, group: Option<u64>) -> bool {
+        if from >= self.tabs.len() {
+            return false;
+        }
+        let to = to.min(self.tabs.len() - 1);
+        let before = self.tabs[from].group;
+        if from == to && before == group {
+            self.select(from);
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        self.place(to, tab, group);
+        self.active = to;
+        self.tidy();
+        from != to || self.tabs[to].group != before
+    }
+
+    /// Inserts `tab` at `at` and gives it a group: the one it lands inside,
+    /// whatever `wanted` says, so a group's tabs stay next to each other;
+    /// else `wanted` when a neighbor is in it; else none.
+    fn place(&mut self, at: usize, mut tab: Tab<V>, wanted: Option<u64>) {
+        let before = at.checked_sub(1).and_then(|ix| self.tabs.get(ix));
+        let before = before.and_then(|tab| tab.group);
+        let after = self.tabs.get(at).and_then(|tab| tab.group);
+        tab.group = match (before, after) {
+            (Some(left), Some(right)) if left == right => Some(left),
+            _ if wanted.is_some() && (before == wanted || after == wanted) => wanted,
+            _ => None,
+        };
+        self.tabs.insert(at, tab);
     }
 
     /// Takes the tab at `index` out, even the last one, which leaves the
@@ -160,10 +232,15 @@ impl<V> Tabs<V> {
         if index >= self.tabs.len() {
             return None;
         }
+        let was_open = index == self.active;
         let tab = self.tabs.remove(index);
         if (index < self.active || self.active >= self.tabs.len()) && self.active > 0 {
             self.active -= 1;
         }
+        if was_open {
+            self.leave_hidden();
+        }
+        self.tidy();
         Some(tab)
     }
 
@@ -176,18 +253,28 @@ impl<V> Tabs<V> {
         self.remove(index).is_some()
     }
 
+    /// Selects the tab at `index`, expanding its group if it is collapsed.
     pub fn select(&mut self, index: usize) {
         self.active = index.min(self.tabs.len() - 1);
+        self.tidy();
     }
 
     pub fn select_last(&mut self) {
-        self.active = self.tabs.len() - 1;
+        self.select(self.tabs.len() - 1);
     }
 
-    /// The next tab, wrapping around; `step` is 1 or -1.
+    /// The next tab that is not hidden in a collapsed group, wrapping
+    /// around; `step` is 1 or -1.
     pub fn cycle(&mut self, step: isize) {
         let len = self.tabs.len() as isize;
-        self.active = (self.active as isize + step).rem_euclid(len) as usize;
+        let mut index = self.active as isize;
+        for _ in 0..len {
+            index = (index + step).rem_euclid(len);
+            if !self.is_hidden(index as usize) {
+                break;
+            }
+        }
+        self.active = index as usize;
     }
 
     pub fn index_of(&self, id: u64) -> Option<usize> {
@@ -201,6 +288,244 @@ impl<V> Tabs<V> {
             .map(|tab| tab.current().route.clone())
             .collect()
     }
+
+    pub fn groups(&self) -> &[TabGroup] {
+        &self.groups
+    }
+
+    pub fn group(&self, id: u64) -> Option<&TabGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    /// The group of the tab at `index`, if any.
+    pub fn group_at(&self, index: usize) -> Option<u64> {
+        self.tabs.get(index).and_then(|tab| tab.group)
+    }
+
+    /// Whether the tab at `index` is hidden in a collapsed group.
+    pub fn is_hidden(&self, index: usize) -> bool {
+        self.group_at(index)
+            .and_then(|id| self.group(id))
+            .is_some_and(|group| group.collapsed)
+    }
+
+    /// How many tabs group `id` has.
+    pub fn group_len(&self, id: u64) -> usize {
+        self.tabs.iter().filter(|tab| tab.group == Some(id)).count()
+    }
+
+    /// Puts the tab at `index` in a new group named `name`, in the first
+    /// color no other group of the pane has. A tab taken from the middle of
+    /// another group moves to just after it. Returns the new group's id.
+    pub fn new_group(&mut self, index: usize, name: &str) -> Option<u64> {
+        if index >= self.tabs.len() {
+            return None;
+        }
+        let used: Vec<TabGroupColor> = self.groups.iter().map(|group| group.color).collect();
+        let color = TabGroupColor::ALL
+            .into_iter()
+            .find(|color| !used.contains(color))
+            .unwrap_or(TabGroupColor::ALL[self.groups.len() % TabGroupColor::ALL.len()]);
+        let id = self.next_group;
+        self.next_group += 1;
+        self.groups.push(TabGroup {
+            id,
+            name: name.to_owned(),
+            color,
+            collapsed: false,
+        });
+        self.regroup(index, Some(id));
+        Some(id)
+    }
+
+    /// Moves the tab at `index` to the end of group `group`.
+    pub fn add_to_group(&mut self, index: usize, group: u64) -> bool {
+        if self.group(group).is_none() || self.group_at(index) == Some(group) {
+            return false;
+        }
+        self.regroup(index, Some(group))
+    }
+
+    /// Takes the tab at `index` out of its group, to just after the group.
+    pub fn remove_from_group(&mut self, index: usize) -> bool {
+        if self.group_at(index).is_none() {
+            return false;
+        }
+        self.regroup(index, None)
+    }
+
+    /// Moves the tab at `index` into `group`, after the group's last tab, or
+    /// out of every group, after the one it leaves. A tab that joins a new
+    /// group from no group stays where it is. The active tab stays active.
+    fn regroup(&mut self, index: usize, group: Option<u64>) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+        let active = self.active().id;
+        let mut tab = self.tabs.remove(index);
+        let left = tab.group;
+        tab.group = None;
+        let last_of = |tabs: &[Tab<V>], id: Option<u64>| {
+            let id = id?;
+            tabs.iter().rposition(|tab| tab.group == Some(id))
+        };
+        let at = last_of(&self.tabs, group)
+            .or_else(|| last_of(&self.tabs, left))
+            .map_or(index, |last| last + 1);
+        self.tabs.insert(at, tab);
+        self.tabs[at].group = group;
+        self.active = self.index_of(active).unwrap_or(0);
+        self.tidy();
+        true
+    }
+
+    /// Ungroups the tabs of group `id`, which stay where they are.
+    pub fn ungroup(&mut self, id: u64) -> bool {
+        if self.group(id).is_none() {
+            return false;
+        }
+        for tab in &mut self.tabs {
+            if tab.group == Some(id) {
+                tab.group = None;
+            }
+        }
+        self.tidy();
+        true
+    }
+
+    pub fn rename_group(&mut self, id: u64, name: &str) -> bool {
+        match self.groups.iter_mut().find(|group| group.id == id) {
+            Some(group) if group.name != name => {
+                group.name = name.to_owned();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_group_color(&mut self, id: u64, color: TabGroupColor) -> bool {
+        match self.groups.iter_mut().find(|group| group.id == id) {
+            Some(group) if group.color != color => {
+                group.color = color;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Collapses group `id` or expands it. Collapsing the group of the open
+    /// tab opens the nearest tab outside it; when every other tab is hidden
+    /// too, the group stays open and this returns false.
+    pub fn toggle_group(&mut self, id: u64) -> bool {
+        let Some(at) = self.groups.iter().position(|group| group.id == id) else {
+            return false;
+        };
+        if self.groups[at].collapsed {
+            self.groups[at].collapsed = false;
+            return true;
+        }
+        self.groups[at].collapsed = true;
+        if self.active().group == Some(id) {
+            match self.nearest_shown(self.active) {
+                Some(index) => self.active = index,
+                None => {
+                    self.groups[at].collapsed = false;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The tab nearest `index` that is not hidden, after it first.
+    fn nearest_shown(&self, index: usize) -> Option<usize> {
+        let after = (index + 1..self.tabs.len()).find(|&ix| !self.is_hidden(ix));
+        after.or_else(|| (0..index).rev().find(|&ix| !self.is_hidden(ix)))
+    }
+
+    /// When the active tab is hidden after a close, opens the nearest shown
+    /// tab instead; [`Self::tidy`] expands the group if there is none.
+    fn leave_hidden(&mut self) {
+        if self.active < self.tabs.len()
+            && self.is_hidden(self.active)
+            && let Some(index) = self.nearest_shown(self.active)
+        {
+            self.active = index;
+        }
+    }
+
+    /// Restores the groups `saved` for these tabs. A group whose tabs are out
+    /// of range or already in another group is dropped.
+    pub fn restore_groups(&mut self, saved: &[SavedTabGroup]) {
+        for group in saved {
+            let range = group.first..group.first.saturating_add(group.len);
+            if group.len == 0
+                || range.end > self.tabs.len()
+                || self.tabs[range.clone()]
+                    .iter()
+                    .any(|tab| tab.group.is_some())
+            {
+                continue;
+            }
+            let id = self.next_group;
+            self.next_group += 1;
+            self.groups.push(TabGroup {
+                id,
+                name: group.name.clone(),
+                color: group.color,
+                collapsed: group.collapsed,
+            });
+            for tab in &mut self.tabs[range] {
+                tab.group = Some(id);
+            }
+        }
+        self.tidy();
+    }
+
+    /// The groups to save, in the order they appear.
+    pub fn saved_groups(&self) -> Vec<SavedTabGroup> {
+        let mut saved: Vec<SavedTabGroup> = self
+            .groups
+            .iter()
+            .filter_map(|group| {
+                let first = self
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.group == Some(group.id))?;
+                Some(SavedTabGroup {
+                    name: group.name.clone(),
+                    color: group.color,
+                    collapsed: group.collapsed,
+                    first,
+                    len: self.group_len(group.id),
+                })
+            })
+            .collect();
+        saved.sort_by_key(|group| group.first);
+        saved
+    }
+
+    /// Drops groups no tab is in and tabs' links to groups that are gone,
+    /// and expands the open tab's group.
+    fn tidy(&mut self) {
+        let groups = &self.groups;
+        for tab in &mut self.tabs {
+            if tab
+                .group
+                .is_some_and(|id| !groups.iter().any(|group| group.id == id))
+            {
+                tab.group = None;
+            }
+        }
+        let tabs = &self.tabs;
+        self.groups
+            .retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
+        if let Some(open) = self.tabs.get(self.active).and_then(|tab| tab.group)
+            && let Some(group) = self.groups.iter_mut().find(|group| group.id == open)
+        {
+            group.collapsed = false;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +534,7 @@ mod tests {
 
     use super::{Page, Tab, Tabs};
     use crate::route::Route;
+    use crate::store::{SavedTabGroup, TabGroupColor};
 
     thread_local! {
         static NEXT_ID: Cell<u64> = const { Cell::new(0) };
@@ -331,5 +657,264 @@ mod tests {
         tabs.select(0);
         tabs.select_last();
         assert_eq!(tabs.active_index(), 2);
+    }
+
+    /// The tabs of a pane as names, each with its group's name after a `:`,
+    /// checking on the way that every group's tabs sit next to each other.
+    fn names(tabs: &Tabs<()>) -> Vec<String> {
+        let mut seen: Vec<u64> = Vec::new();
+        let mut previous = None;
+        tabs.iter()
+            .map(|tab| {
+                if let Some(group) = tab.group
+                    && previous != Some(group)
+                {
+                    assert!(!seen.contains(&group), "group {group} is split in two");
+                    seen.push(group);
+                }
+                previous = tab.group;
+                let name = match &tab.current().route {
+                    Route::LinearIssue { identifier } => identifier.clone(),
+                    route => route.label().to_string(),
+                };
+                match tab.group.and_then(|id| tabs.group(id)) {
+                    Some(group) => format!("{name}:{}", group.name),
+                    None => name,
+                }
+            })
+            .collect()
+    }
+
+    fn five_tabs() -> Tabs<()> {
+        Tabs::new(
+            ["A", "B", "C", "D", "E"]
+                .into_iter()
+                .map(|name| tab(issue(name)))
+                .collect(),
+            0,
+        )
+    }
+
+    #[test]
+    fn a_group_keeps_its_tabs_together() {
+        let mut tabs = five_tabs();
+        let review = tabs.new_group(1, "Review").expect("B is a tab");
+        assert_eq!(tabs.group(review).unwrap().color, TabGroupColor::Grey);
+        assert_eq!(names(&tabs), ["A", "B:Review", "C", "D", "E"]);
+
+        assert!(tabs.add_to_group(3, review));
+        assert_eq!(
+            names(&tabs),
+            ["A", "B:Review", "D:Review", "C", "E"],
+            "a tab added to a group moves to its end"
+        );
+        assert_eq!(tabs.active_index(), 0, "the open tab stays open");
+
+        let later = tabs.new_group(1, "Later").unwrap();
+        assert_eq!(
+            names(&tabs),
+            ["A", "D:Review", "B:Later", "C", "E"],
+            "a tab taken out of the middle of a group goes after it"
+        );
+        assert_eq!(
+            tabs.group(later).unwrap().color,
+            TabGroupColor::Blue,
+            "a new group takes a color no other group has"
+        );
+
+        tabs.select(1);
+        tabs.open(tab(issue("F")));
+        assert_eq!(
+            names(&tabs),
+            ["A", "D:Review", "F:Review", "B:Later", "C", "E"],
+            "a tab opened from a grouped tab joins its group"
+        );
+        tabs.open_in_background(tab(issue("G")));
+        assert_eq!(names(&tabs)[3], "G:Review");
+
+        let f = tabs.index_of(tabs.active().id).unwrap();
+        assert!(tabs.remove_from_group(f));
+        assert_eq!(
+            names(&tabs),
+            ["A", "D:Review", "G:Review", "F", "B:Later", "C", "E"],
+            "a tab taken out of a group goes after it"
+        );
+        assert_eq!(names(&tabs)[tabs.active_index()], "F");
+
+        tabs.insert(2, tab(issue("H")), None);
+        assert_eq!(
+            names(&tabs)[2],
+            "H:Review",
+            "a tab put inside a group joins it"
+        );
+        tabs.insert(1, tab(issue("I")), None);
+        assert_eq!(
+            names(&tabs)[1],
+            "I",
+            "a tab put at a group's edge needs to ask"
+        );
+    }
+
+    #[test]
+    fn a_group_with_no_tab_left_is_gone() {
+        let mut tabs = five_tabs();
+        let review = tabs.new_group(4, "Review").unwrap();
+        assert!(tabs.close(4));
+        assert!(tabs.group(review).is_none());
+        assert!(tabs.groups().is_empty());
+
+        let review = tabs.new_group(0, "Review").unwrap();
+        tabs.add_to_group(1, review);
+        assert!(tabs.ungroup(review));
+        assert_eq!(names(&tabs), ["A", "B", "C", "D"]);
+        assert!(tabs.groups().is_empty());
+
+        let review = tabs.new_group(2, "Review").unwrap();
+        assert!(tabs.remove_from_group(2));
+        assert!(
+            tabs.group(review).is_none(),
+            "nor when its last tab leaves it"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_group_hides_its_tabs_but_never_the_open_one() {
+        let mut tabs = five_tabs();
+        let review = tabs.new_group(1, "Review").unwrap();
+        tabs.add_to_group(2, review);
+        assert!(tabs.toggle_group(review));
+        assert!(tabs.group(review).unwrap().collapsed);
+        assert!(tabs.is_hidden(1) && tabs.is_hidden(2) && !tabs.is_hidden(0));
+
+        tabs.cycle(1);
+        assert_eq!(tabs.active_index(), 3, "Ctrl+Tab skips the hidden tabs");
+        tabs.cycle(-1);
+        assert_eq!(tabs.active_index(), 0);
+
+        tabs.select(2);
+        assert!(
+            !tabs.group(review).unwrap().collapsed,
+            "opening a hidden tab expands its group"
+        );
+
+        assert!(tabs.toggle_group(review));
+        assert_eq!(
+            tabs.active_index(),
+            3,
+            "collapsing the open tab's group opens the next tab outside it"
+        );
+
+        tabs.toggle_group(review);
+        tabs.select(0);
+        tabs.toggle_group(review);
+        assert!(tabs.close(0));
+        assert_eq!(
+            names(&tabs)[tabs.active_index()],
+            "D",
+            "closing the open tab skips the hidden ones"
+        );
+
+        let mut only = Tabs::new(vec![tab(issue("A")), tab(issue("B"))], 0);
+        let all = only.new_group(0, "All").unwrap();
+        only.add_to_group(1, all);
+        assert!(
+            !only.toggle_group(all),
+            "a group with every tab of the pane stays open"
+        );
+        assert!(!only.group(all).unwrap().collapsed);
+    }
+
+    #[test]
+    fn a_tab_dropped_on_itself_changes_nothing() {
+        let mut tabs = five_tabs();
+        let solo = tabs.new_group(1, "Solo").unwrap();
+        assert!(!tabs.move_within(1, 1, Some(solo)));
+        assert_eq!(
+            names(&tabs),
+            ["A", "B:Solo", "C", "D", "E"],
+            "a group of one tab keeps it"
+        );
+        assert_eq!(tabs.active_index(), 1);
+
+        let mut tabs = five_tabs();
+        let hidden = tabs.new_group(1, "Hidden").unwrap();
+        for _ in 0..3 {
+            tabs.add_to_group(2, hidden);
+        }
+        tabs.toggle_group(hidden);
+        tabs.select(0);
+        assert!(!tabs.move_within(0, 0, None));
+        assert!(
+            tabs.group(hidden).unwrap().collapsed,
+            "the only tab on show dropped on itself leaves the group collapsed"
+        );
+    }
+
+    #[test]
+    fn a_background_tab_never_lands_in_a_group_it_was_not_opened_from() {
+        let mut tabs = Tabs::new(vec![tab(issue("A")), tab(issue("B"))], 0);
+        tabs.open_in_background(tab(issue("X")));
+        let other = tabs.new_group(1, "Other").unwrap();
+        tabs.add_to_group(2, other);
+        tabs.toggle_group(other);
+        tabs.open_in_background(tab(issue("Y")));
+        assert_eq!(
+            names(&tabs),
+            ["A", "Y", "X:Other", "B:Other"],
+            "once X moved to another group, Y starts a new run after A"
+        );
+        assert!(!tabs.is_hidden(1));
+    }
+
+    #[test]
+    fn groups_come_back_as_saved() {
+        let mut tabs = five_tabs();
+        // Made right to left, saved left to right.
+        let later = tabs.new_group(4, "Later").unwrap();
+        tabs.toggle_group(later);
+        let review = tabs.new_group(1, "Review").unwrap();
+        tabs.add_to_group(2, review);
+        tabs.set_group_color(review, TabGroupColor::Purple);
+        let saved = tabs.saved_groups();
+        assert_eq!(
+            saved,
+            [
+                SavedTabGroup {
+                    name: "Review".into(),
+                    color: TabGroupColor::Purple,
+                    collapsed: false,
+                    first: 1,
+                    len: 2,
+                },
+                SavedTabGroup {
+                    name: "Later".into(),
+                    color: TabGroupColor::Grey,
+                    collapsed: true,
+                    first: 4,
+                    len: 1,
+                },
+            ]
+        );
+
+        let mut restored = five_tabs();
+        let mut broken = saved.clone();
+        broken.push(SavedTabGroup {
+            first: 2,
+            ..saved[1].clone()
+        });
+        broken.push(SavedTabGroup {
+            first: 9,
+            ..saved[1].clone()
+        });
+        restored.restore_groups(&broken);
+        assert_eq!(
+            restored.saved_groups(),
+            saved,
+            "a saved group over another one or past the end is dropped"
+        );
+        assert_eq!(
+            names(&restored),
+            ["A", "B:Review", "C:Review", "D", "E:Later"]
+        );
     }
 }
