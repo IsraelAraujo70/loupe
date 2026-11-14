@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Actor, ChecksState, Error, GitHub, Inbox, Label, Mergeable, Page, PrListFilter, PrRef, PrState,
-    PrSummary, RepoRef, RepoSummary, Result, ReviewDecision,
+    PrSummary, RepoRef, RepoSummary, Result, ReviewDecision, ReviewRequest,
 };
 
 const REPO_PR_PAGE_SIZE: u32 = 30;
@@ -42,8 +42,8 @@ fragment PrRow on PullRequest {
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   labels(first: 20) { nodes { id name color } }
   assignees(first: 10) { nodes { login avatarUrl } }
-  reviewRequests(first: 10) { nodes { requestedReviewer { ... on User { login avatarUrl } } } }
-  latestReviews(first: 20) { nodes { state author { login avatarUrl } } }
+  reviewRequests(first: 10) { nodes { requestedReviewer { __typename ... on User { login avatarUrl } ... on Team { combinedSlug } } } }
+  latestReviews(first: 20) { nodes { state author { __typename login avatarUrl } } }
 }
 fragment PrPage on SearchResultItemConnection {
   issueCount
@@ -70,6 +70,7 @@ fragment RepoRow on Repository {
 
 const INBOX_QUERY: &str = concat!(
     "query Inbox($reviewRequested: String!, $authored: String!, $involved: String!) {
+  viewer { login }
   reviewRequested: search(type: ISSUE, first: 100, query: $reviewRequested) { ...PrPage }
   authored: search(type: ISSUE, first: 100, query: $authored) { ...PrPage }
   involved: search(type: ISSUE, first: 100, query: $involved) { ...PrPage }
@@ -295,6 +296,7 @@ struct SearchData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InboxData {
+    viewer: WireLogin,
     review_requested: WireConnection,
     authored: WireConnection,
     involved: WireConnection,
@@ -306,6 +308,7 @@ impl InboxData {
             review_requested: self.review_requested.into_page()?,
             authored: self.authored.into_page()?,
             involved: self.involved.into_page()?,
+            viewer_login: self.viewer.login,
         })
     }
 }
@@ -437,14 +440,35 @@ impl<T> WireList<T> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireReviewRequest {
-    /// `None` for a deleted reviewer; a team or bot decodes to `None` too,
-    /// since only the user fragment selects fields.
+    /// `None` for a deleted reviewer. A user or a team (`RequestedReviewer`
+    /// selects only theirs); a bot, a mannequin, or an enterprise team
+    /// comes with no field but its type.
     requested_reviewer: Option<Value>,
+}
+
+/// A requested reviewer as a user with their actor, or a team; `None` for
+/// any other kind.
+fn requested_reviewer(value: Value) -> Option<(ReviewRequest, Option<WireActor>)> {
+    if value.get("__typename").and_then(Value::as_str) == Some("Team") {
+        let slug = value.get("combinedSlug")?.as_str()?.to_owned();
+        return Some((ReviewRequest::Team(slug), None));
+    }
+    let user: WireActor = serde_json::from_value(value).ok()?;
+    Some((ReviewRequest::User(user.login.clone()), Some(user)))
+}
+
+/// A review's author: `Actor` with its concrete type, to tell bots apart.
+#[derive(Deserialize)]
+struct WireReviewAuthor {
+    #[serde(rename = "__typename", default)]
+    typename: String,
+    #[serde(flatten)]
+    actor: WireActor,
 }
 
 #[derive(Deserialize)]
 struct WireReview {
-    author: Option<WireActor>,
+    author: Option<WireReviewAuthor>,
     /// `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, …
     #[serde(default)]
     state: Option<String>,
@@ -519,12 +543,24 @@ impl WirePullRequest {
             avatar_url: wire.avatar_url,
         };
         let mut reviewers: Vec<Actor> = Vec::new();
-        let requested = self
+        let mut review_requests: Vec<ReviewRequest> = Vec::new();
+        let mut requested: Vec<WireActor> = Vec::new();
+        for (request, user) in self
             .review_requests
             .into_items()
             .filter_map(|request| request.requested_reviewer)
-            .filter_map(|reviewer| serde_json::from_value::<WireActor>(reviewer).ok());
+            .filter_map(requested_reviewer)
+        {
+            review_requests.push(request);
+            requested.extend(user);
+        }
         let latest: Vec<WireReview> = self.latest_reviews.into_items().collect();
+        let reviewed_by: Vec<String> = latest
+            .iter()
+            .filter_map(|review| review.author.as_ref())
+            .filter(|author| author.typename != "Bot")
+            .map(|author| author.actor.login.clone())
+            .collect();
         // GitHub sends no decision where the branch requires no review; the
         // reviewers' latest reviews still say whether it was approved.
         let decision = self
@@ -532,8 +568,10 @@ impl WirePullRequest {
             .as_deref()
             .and_then(review_decision)
             .or_else(|| decision_from_reviews(&latest));
-        let reviewed = latest.into_iter().filter_map(|review| review.author);
-        for reviewer in requested.chain(reviewed).map(actor) {
+        let reviewed = latest
+            .into_iter()
+            .filter_map(|review| review.author.map(|author| author.actor));
+        for reviewer in requested.into_iter().chain(reviewed).map(actor) {
             if reviewers.iter().all(|known| known.login != reviewer.login) {
                 reviewers.push(reviewer);
             }
@@ -580,6 +618,8 @@ impl WirePullRequest {
                 Some("CONFLICTING") => Mergeable::Conflicting,
                 _ => Mergeable::Unknown,
             },
+            review_requests,
+            reviewed_by,
         }
     }
 }
@@ -651,7 +691,8 @@ mod tests {
     use super::{DOCUMENTS, repositories_from_nodes};
     use super::{InboxData, SearchData, ViewerRepositoriesData, repo_search_query, with_pr_type};
     use crate::{
-        Actor, ChecksState, Error, Mergeable, PrListFilter, PrRef, PrState, RepoRef, ReviewDecision,
+        Actor, ChecksState, Error, Mergeable, PrListFilter, PrRef, PrState, RepoRef,
+        ReviewDecision, ReviewRequest,
     };
 
     fn pr_node(number: u64) -> Value {
@@ -676,13 +717,15 @@ mod tests {
             "labels": { "nodes": [{ "id": "LA_1", "name": "bug", "color": "d73a4a" }] },
             "assignees": { "nodes": [{ "login": "bo", "avatarUrl": "https://avatars.example/bo" }] },
             "reviewRequests": { "nodes": [
-                { "requestedReviewer": { "login": "cy", "avatarUrl": "https://avatars.example/cy" } },
-                { "requestedReviewer": {} },
+                { "requestedReviewer": { "__typename": "User", "login": "cy", "avatarUrl": "https://avatars.example/cy" } },
+                { "requestedReviewer": { "__typename": "Team", "combinedSlug": "acme/web" } },
+                { "requestedReviewer": { "__typename": "Bot" } },
                 { "requestedReviewer": null }
             ] },
             "latestReviews": { "nodes": [
-                { "author": { "login": "di", "avatarUrl": "https://avatars.example/di" } },
-                { "author": { "login": "cy", "avatarUrl": "https://avatars.example/cy" } },
+                { "author": { "__typename": "User", "login": "di", "avatarUrl": "https://avatars.example/di" } },
+                { "author": { "__typename": "User", "login": "cy", "avatarUrl": "https://avatars.example/cy" } },
+                { "author": { "__typename": "Bot", "login": "lint-bot", "avatarUrl": "https://avatars.example/bot" } },
                 { "author": null }
             ] }
         })
@@ -761,9 +804,18 @@ mod tests {
         assert_eq!(logins(&first.assignees), ["bo"]);
         assert_eq!(
             logins(&first.reviewers),
-            ["cy", "di"],
+            ["cy", "di", "lint-bot"],
             "requested first, reviewed next, teams and repeats left out"
         );
+        assert_eq!(
+            first.review_requests,
+            [
+                ReviewRequest::User("cy".into()),
+                ReviewRequest::Team("acme/web".into())
+            ],
+            "users and teams still asked; the bot and the deleted reviewer left out"
+        );
+        assert_eq!(first.reviewed_by, ["di", "cy"], "people only, no bot");
 
         let second = &page.items[1];
         assert_eq!(second.state, PrState::Merged);
@@ -869,6 +921,7 @@ mod tests {
     #[test]
     fn parses_the_three_inbox_searches() {
         let data: InboxData = serde_json::from_value(json!({
+            "viewer": { "login": "ana" },
             "reviewRequested": connection(vec![pr_node(1)], false),
             "authored": connection(vec![pr_node(2), pr_node(3)], true),
             "involved": connection(vec![], false),
@@ -879,6 +932,7 @@ mod tests {
         assert_eq!(inbox.authored.items.len(), 2);
         assert!(inbox.authored.next_cursor.is_some());
         assert!(inbox.involved.items.is_empty());
+        assert_eq!(inbox.viewer_login, "ana");
     }
 
     #[test]

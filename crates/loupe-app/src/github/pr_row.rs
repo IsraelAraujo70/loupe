@@ -525,6 +525,8 @@ mod tests {
                 assignees: Vec::new(),
                 reviewers: Vec::new(),
                 mergeable: loupe_github::Mergeable::Unknown,
+                review_requests: Vec::new(),
+                reviewed_by: Vec::new(),
             };
             let picks = self.picks.clone();
             let parent_clicks = self.parent_clicks.clone();

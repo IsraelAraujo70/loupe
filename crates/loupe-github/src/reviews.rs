@@ -4,15 +4,17 @@
 //! the pull requests the inbox already loaded, so the tabs and their counts
 //! always agree with what the screen lists. A view that names repositories
 //! can also list every open pull request in them (the All tab). Inside a
-//! tab, pull requests group by their next step ([`next_step`]). Views live
-//! in a JSON file the app owns, never on GitHub.
+//! tab, pull requests group by their next step ([`next_step`]), except in
+//! Needs review, where they group by why they wait on a review
+//! ([`needs_review`]). Views live in a JSON file the app owns, never on
+//! GitHub.
 
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ChecksState, Mergeable, PrState, PrSummary, ReviewDecision};
+use crate::{ChecksState, Mergeable, PrState, PrSummary, ReviewDecision, ReviewRequest};
 
 /// The file format version [`save`] writes.
 pub const VIEWS_VERSION: u32 = 1;
@@ -326,8 +328,10 @@ pub fn all_open_query(clauses: &[Clause]) -> Option<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ReviewTab {
-    /// `review-requested:@me`.
-    ToReview,
+    /// Open pull requests that wait on a review, in the groups of
+    /// [`needs_review`]. Views saved before it was renamed say `toReview`.
+    #[serde(alias = "toReview")]
+    NeedsReview,
     /// `author:@me`.
     Mine,
     /// `involves:@me`, minus the two above.
@@ -339,7 +343,7 @@ pub enum ReviewTab {
 
 impl ReviewTab {
     pub const ALL: [ReviewTab; 4] = [
-        ReviewTab::ToReview,
+        ReviewTab::NeedsReview,
         ReviewTab::Mine,
         ReviewTab::Involved,
         ReviewTab::All,
@@ -347,7 +351,7 @@ impl ReviewTab {
 
     pub fn label(self) -> &'static str {
         match self {
-            ReviewTab::ToReview => "To review",
+            ReviewTab::NeedsReview => "Needs review",
             ReviewTab::Mine => "Mine",
             ReviewTab::Involved => "Involved",
             ReviewTab::All => "All",
@@ -414,6 +418,93 @@ pub fn next_step(pr: &PrSummary) -> NextStep {
         NextStep::WaitingForReview
     } else {
         NextStep::Draft
+    }
+}
+
+/// Why a pull request waits on a review: the groups of the Needs review
+/// tab, in the order they are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NeedsReview {
+    /// You were asked to review it, yourself or through a team of yours.
+    RequestedFromYou,
+    /// Nobody was asked to review it and nobody has.
+    NoReviewer,
+    /// Your own pull request.
+    Yours,
+}
+
+impl NeedsReview {
+    pub const ALL: [NeedsReview; 3] = [
+        NeedsReview::RequestedFromYou,
+        NeedsReview::NoReviewer,
+        NeedsReview::Yours,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NeedsReview::RequestedFromYou => "Requested from you",
+            NeedsReview::NoReviewer => "No reviewer",
+            NeedsReview::Yours => "Yours",
+        }
+    }
+}
+
+/// The Needs review group `pr` belongs to, or `None` when it stays out of
+/// the tab. `viewer` is your login; `asked_of_you` says whether GitHub lists
+/// `pr` under `review-requested:@me`, which also covers a request to a team
+/// of yours.
+///
+/// Only an open pull request that is not a draft and not approved waits on
+/// a review. Then, in this order:
+/// 1. Yours: you wrote it. You cannot review it yourself, so it waits on
+///    someone else's review even when nobody was asked.
+/// 2. Requested from you: you were asked, yourself or through a team.
+/// 3. No reviewer: no user or team is asked, and nobody but its author has
+///    reviewed it. Bots do not count as reviewers.
+///
+/// Any other pull request has a reviewer who is not you, and stays out.
+pub fn needs_review(pr: &PrSummary, viewer: &str, asked_of_you: bool) -> Option<NeedsReview> {
+    if pr.state != PrState::Open
+        || pr.is_draft
+        || pr.review_decision == Some(ReviewDecision::Approved)
+    {
+        return None;
+    }
+    let author = pr.author.as_ref().map(|author| author.login.as_str());
+    let is_viewer = |login: &str| !viewer.is_empty() && login.eq_ignore_ascii_case(viewer);
+    if author.is_some_and(is_viewer) {
+        return Some(NeedsReview::Yours);
+    }
+    let asked_personally = pr
+        .review_requests
+        .iter()
+        .any(|request| matches!(request, ReviewRequest::User(login) if is_viewer(login)));
+    if asked_of_you || asked_personally {
+        return Some(NeedsReview::RequestedFromYou);
+    }
+    let reviewed_by_others = pr
+        .reviewed_by
+        .iter()
+        .any(|login| author.is_none_or(|author| !login.eq_ignore_ascii_case(author)));
+    (pr.review_requests.is_empty() && !reviewed_by_others).then_some(NeedsReview::NoReviewer)
+}
+
+/// One group a tab lists: by next step, or in Needs review by why it waits
+/// on a review. A saved view keeps the folded ones by their names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReviewGroup {
+    Step(NextStep),
+    NeedsReview(NeedsReview),
+}
+
+impl ReviewGroup {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewGroup::Step(step) => step.label(),
+            ReviewGroup::NeedsReview(group) => group.label(),
+        }
     }
 }
 
@@ -573,7 +664,7 @@ pub struct SavedView {
     pub tab: Option<ReviewTab>,
     /// The groups folded in every tab.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub collapsed: Vec<NextStep>,
+    pub collapsed: Vec<ReviewGroup>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -658,7 +749,7 @@ impl ViewsFile {
     pub fn set_collapsed(
         &mut self,
         id: &str,
-        collapsed: Vec<NextStep>,
+        collapsed: Vec<ReviewGroup>,
         now: DateTime<Utc>,
     ) -> bool {
         self.edit(id, now, |view| view.collapsed = collapsed)
@@ -737,12 +828,13 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        Clause, Field, Loaded, NextStep, Op, ReviewTab, Sort, SortDir, SortKey, ViewsFile,
-        all_open_query, cycle_sort, describe, load, matches, next_step, options, save, set_op,
-        sort_rows, toggle_value,
+        Clause, Field, Loaded, NeedsReview, NextStep, Op, ReviewGroup, ReviewTab, Sort, SortDir,
+        SortKey, ViewsFile, all_open_query, cycle_sort, describe, load, matches, needs_review,
+        next_step, options, save, set_op, sort_rows, toggle_value,
     };
     use crate::{
         Actor, ChecksState, Label, Mergeable, PrRef, PrState, PrSummary, RepoRef, ReviewDecision,
+        ReviewRequest,
     };
 
     fn actor(login: &str) -> Actor {
@@ -774,6 +866,8 @@ mod tests {
             assignees: Vec::new(),
             reviewers: Vec::new(),
             mergeable: Mergeable::Unknown,
+            review_requests: Vec::new(),
+            reviewed_by: Vec::new(),
         }
     }
 
@@ -1088,7 +1182,11 @@ mod tests {
         });
         assert!(file.set_sort(&id, largest, now));
         assert!(file.set_tab(&id, Some(ReviewTab::Mine), now));
-        assert!(file.set_collapsed(&id, vec![NextStep::Draft], now));
+        let folded = vec![
+            ReviewGroup::Step(NextStep::Draft),
+            ReviewGroup::NeedsReview(NeedsReview::NoReviewer),
+        ];
+        assert!(file.set_collapsed(&id, folded.clone(), now));
         save(&path, &file).unwrap();
 
         let Loaded::Read(read) = load(&path) else {
@@ -1100,7 +1198,7 @@ mod tests {
         assert_eq!(read.views[0].all_open, Some(false));
         assert_eq!(read.views[0].sort, largest);
         assert_eq!(read.views[0].tab, Some(ReviewTab::Mine));
-        assert_eq!(read.views[0].collapsed, [NextStep::Draft]);
+        assert_eq!(read.views[0].collapsed, folded);
 
         std::fs::write(&path, b"{ not json").unwrap();
         assert!(matches!(load(&path), Loaded::Recovered { .. }));
@@ -1115,6 +1213,24 @@ mod tests {
         let file: ViewsFile = serde_json::from_str(json).unwrap();
         assert_eq!(file.views[0].tab, None);
         assert!(file.views[0].collapsed.is_empty());
+    }
+
+    #[test]
+    fn a_view_saved_on_to_review_opens_on_needs_review_and_keeps_its_folds() {
+        let json = r#"{"version":1,"views":[{"id":"rv_1","name":"Old","filters":[],
+            "tab":"toReview","collapsed":["draft","readyToMerge"],
+            "createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z"}]}"#;
+        let file: ViewsFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.views[0].tab, Some(ReviewTab::NeedsReview));
+        assert_eq!(
+            file.views[0].collapsed,
+            [
+                ReviewGroup::Step(NextStep::Draft),
+                ReviewGroup::Step(NextStep::ReadyToMerge)
+            ]
+        );
+        let saved = serde_json::to_string(&file).unwrap();
+        assert!(saved.contains(r#""tab":"needsReview""#), "{saved}");
     }
 
     /// A pull request with these facts and nothing else.
@@ -1215,5 +1331,223 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A pull request by `author` with these review facts, open unless
+    /// `state` says otherwise.
+    fn asked(
+        author: Option<&str>,
+        requests: &[ReviewRequest],
+        reviewed_by: &[&str],
+        draft: bool,
+        review: Option<ReviewDecision>,
+    ) -> PrSummary {
+        PrSummary {
+            author: author.map(actor),
+            review_requests: requests.to_vec(),
+            reviewed_by: reviewed_by
+                .iter()
+                .map(|login| (*login).to_owned())
+                .collect(),
+            is_draft: draft,
+            review_decision: review,
+            ..pr("a", "b", 1)
+        }
+    }
+
+    #[test]
+    fn each_pull_request_waiting_on_a_review_lands_in_one_needs_review_group() {
+        use NeedsReview::{NoReviewer, RequestedFromYou, Yours};
+        use ReviewDecision::{Approved, ChangesRequested, ReviewRequired};
+        let me = "IsraelAraujo70";
+        let user = |login: &str| ReviewRequest::User(login.to_owned());
+        let team = |slug: &str| ReviewRequest::Team(slug.to_owned());
+        // (author, requests, reviewed by, GitHub says asked of you, draft,
+        // review decision) → group.
+        let cases: Vec<(&str, PrSummary, bool, Option<NeedsReview>)> = vec![
+            (
+                "asked of you by name",
+                asked(Some("ana"), &[user(me)], &[], false, None),
+                true,
+                Some(RequestedFromYou),
+            ),
+            (
+                "asked of you by name, the login in another case",
+                asked(Some("ana"), &[user("israelaraujo70")], &[], false, None),
+                false,
+                Some(RequestedFromYou),
+            ),
+            (
+                "asked of a team of yours",
+                asked(Some("ana"), &[team("acme/web")], &[], false, None),
+                true,
+                Some(RequestedFromYou),
+            ),
+            (
+                "asked of you and of someone else",
+                asked(Some("ana"), &[user("bo"), user(me)], &[], false, None),
+                true,
+                Some(RequestedFromYou),
+            ),
+            (
+                "asked of you again after changes were requested",
+                asked(
+                    Some("ana"),
+                    &[user(me)],
+                    &["bo"],
+                    false,
+                    Some(ChangesRequested),
+                ),
+                true,
+                Some(RequestedFromYou),
+            ),
+            (
+                "nobody asked, nobody reviewed",
+                asked(Some("ana"), &[], &[], false, None),
+                false,
+                Some(NoReviewer),
+            ),
+            (
+                "nobody asked, a review is required",
+                asked(Some("ana"), &[], &[], false, Some(ReviewRequired)),
+                false,
+                Some(NoReviewer),
+            ),
+            (
+                "nobody asked, only its author replied in a review",
+                asked(Some("ana"), &[], &["ana"], false, None),
+                false,
+                Some(NoReviewer),
+            ),
+            (
+                "nobody asked, deleted author",
+                asked(None, &[], &[], false, None),
+                false,
+                Some(NoReviewer),
+            ),
+            (
+                "yours, asked of someone",
+                asked(Some(me), &[user("bo")], &[], false, None),
+                false,
+                Some(Yours),
+            ),
+            (
+                "yours, asked of a team",
+                asked(
+                    Some(me),
+                    &[team("acme/web")],
+                    &[],
+                    false,
+                    Some(ReviewRequired),
+                ),
+                false,
+                Some(Yours),
+            ),
+            (
+                "yours, nobody asked",
+                asked(Some(me), &[], &[], false, None),
+                false,
+                Some(Yours),
+            ),
+            (
+                "yours, with changes requested",
+                asked(Some(me), &[], &["bo"], false, Some(ChangesRequested)),
+                false,
+                Some(Yours),
+            ),
+            (
+                "yours, listed under review-requested through a team",
+                asked(Some(me), &[team("acme/web")], &[], false, None),
+                true,
+                Some(Yours),
+            ),
+            (
+                "asked of someone else",
+                asked(Some("ana"), &[user("bo")], &[], false, None),
+                false,
+                None,
+            ),
+            (
+                "asked of a team that is not yours",
+                asked(Some("ana"), &[team("acme/api")], &[], false, None),
+                false,
+                None,
+            ),
+            (
+                "reviewed by someone else, nobody asked now",
+                asked(Some("ana"), &[], &["bo"], false, Some(ChangesRequested)),
+                false,
+                None,
+            ),
+            (
+                "reviewed by you, nobody asked now",
+                asked(Some("ana"), &[], &[me], false, None),
+                false,
+                None,
+            ),
+            (
+                "a draft asked of you",
+                asked(Some("ana"), &[user(me)], &[], true, None),
+                true,
+                None,
+            ),
+            (
+                "your draft",
+                asked(Some(me), &[], &[], true, None),
+                false,
+                None,
+            ),
+            (
+                "a draft nobody reviews",
+                asked(Some("ana"), &[], &[], true, None),
+                false,
+                None,
+            ),
+            (
+                "approved and asked of you",
+                asked(Some("ana"), &[user(me)], &["bo"], false, Some(Approved)),
+                true,
+                None,
+            ),
+            (
+                "yours, approved",
+                asked(Some(me), &[], &["bo"], false, Some(Approved)),
+                false,
+                None,
+            ),
+            (
+                "approved with nobody asked",
+                asked(Some("ana"), &[], &[], false, Some(Approved)),
+                false,
+                None,
+            ),
+            (
+                "closed, asked of you",
+                PrSummary {
+                    state: PrState::Closed,
+                    ..asked(Some("ana"), &[user(me)], &[], false, None)
+                },
+                true,
+                None,
+            ),
+            (
+                "merged, yours",
+                PrSummary {
+                    state: PrState::Merged,
+                    ..asked(Some(me), &[], &[], false, None)
+                },
+                false,
+                None,
+            ),
+        ];
+        for (name, pr, asked_of_you, group) in &cases {
+            assert_eq!(needs_review(pr, me, *asked_of_you), *group, "{name}");
+        }
+
+        // Without your login (a stored copy from before it was read),
+        // nothing is yours and only GitHub's word asks it of you.
+        let mine = asked(Some(me), &[user(me)], &[], false, None);
+        assert_eq!(needs_review(&mine, "", false), None);
+        assert_eq!(needs_review(&mine, "", true), Some(RequestedFromYou));
     }
 }

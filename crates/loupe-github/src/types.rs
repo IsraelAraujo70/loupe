@@ -40,6 +40,16 @@ pub enum ReviewDecision {
     ReviewRequired,
 }
 
+/// A review someone asked for and that has not come in since. GitHub drops
+/// the request once the reviewer submits a review.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewRequest {
+    /// A user, by login.
+    User(String),
+    /// A team, by `org/slug`.
+    Team(String),
+}
+
 /// One pull request as a list row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrSummary {
@@ -67,6 +77,14 @@ pub struct PrSummary {
     pub reviewers: Vec<Actor>,
     /// `Unknown` while GitHub has not computed it yet.
     pub mergeable: Mergeable,
+    /// Reviews still asked for, from users and teams. Requests to bots are
+    /// left out.
+    #[serde(default)]
+    pub review_requests: Vec<ReviewRequest>,
+    /// Logins of the users whose latest review is on the pull request, the
+    /// author included when they replied in a review. Bots are left out.
+    #[serde(default)]
+    pub reviewed_by: Vec<String>,
 }
 
 /// One page of a connection. `next_cursor` is `Some` while more pages exist.
@@ -86,6 +104,9 @@ pub struct Inbox {
     pub authored: Page<PrSummary>,
     /// `is:open is:pr involves:@me -author:@me -review-requested:@me`
     pub involved: Page<PrSummary>,
+    /// The signed-in user's login; empty in a copy stored before it was read.
+    #[serde(default)]
+    pub viewer_login: String,
 }
 
 /// Which pull requests a repository list shows.
