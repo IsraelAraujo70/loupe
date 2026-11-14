@@ -210,15 +210,28 @@ fn landing_line(trailing: bool, color: Hsla) -> Div {
     }
 }
 
-/// Lets the tab at `index` of `pane` (or the name that leads it) take a
-/// dragged group: it follows the pointer while the group's own row is
-/// dragged over, and moves the group on a drop.
+/// What a dragged group is over in its row: the tab at `index`, or the
+/// name of the group that tab starts (`label`). A name and its first tab
+/// share the index, so `label` keeps them apart: the one the pointer left
+/// must not forget the one it is on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct GroupTarget {
+    pub pane: PaneId,
+    pub index: usize,
+    pub label: bool,
+}
+
+/// Lets the tab at `index` of `pane`, or with `label` the name that leads
+/// it, take a dragged group: it follows the pointer while the group's own
+/// row is dragged over, and moves the group on a drop.
 fn takes_groups<E: InteractiveElement>(
     element: E,
     pane: PaneId,
     index: usize,
+    label: bool,
     cx: &mut Context<Workspace>,
 ) -> E {
+    let target = GroupTarget { pane, index, label };
     element
         .on_drag_move(
             cx.listener(move |this, event: &DragMoveEvent<DraggedGroup>, _, cx| {
@@ -226,7 +239,7 @@ fn takes_groups<E: InteractiveElement>(
                     return;
                 }
                 let over = event.bounds.contains(&event.event.position);
-                this.hover_group_drop(pane, index, over, cx);
+                this.hover_group_drop(target, over, cx);
             }),
         )
         .on_drop(cx.listener(move |this, dragged: &DraggedGroup, _, cx| {
@@ -307,7 +320,7 @@ fn group_label(
             .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
                 this.drop_on_group(dragged, pane, id, cx)
             }));
-    takes_groups(label, pane, first, cx)
+    takes_groups(label, pane, first, true, cx)
         .child(div().min_w_0().truncate().child(name.clone()))
         .when(collapsed, |label| {
             label.child(div().flex_none().opacity(0.8).child(hidden.to_string()))
@@ -617,7 +630,7 @@ fn tabs(
                         .rounded_full()
                         .bg(color)
                 }));
-            let element = takes_groups(element, pane_id, index, cx);
+            let element = takes_groups(element, pane_id, index, false, cx);
             let workspace = workspace.clone();
             let in_group = tab.group;
             let other_groups: Vec<(u64, SharedString)> = groups

@@ -86,9 +86,9 @@ pub struct Workspace {
     /// The group being dragged by its name, set when its drag starts; like
     /// `tab_drag`, it counts only while GPUI still has a drag.
     group_drag: Option<DraggedGroup>,
-    /// The tab under the pointer, as its pane and index, while a group is
-    /// dragged over its own row: where the group would land.
-    group_drop: Option<(PaneId, usize)>,
+    /// The tab or group name under the pointer, while a group is dragged
+    /// over its own row: where the group would land.
+    group_drop: Option<tab_bar::GroupTarget>,
     /// Where each pane's page was drawn in the last frame, for the drop
     /// zones and for paging the active pane.
     pane_bounds: Rc<RefCell<HashMap<PaneId, Bounds<Pixels>>>>,
@@ -610,8 +610,8 @@ impl Workspace {
         let drag = self.group_drag.as_ref().filter(|_| cx.has_active_drag())?;
         let onto = self
             .group_drop
-            .filter(|(pane, _)| *pane == drag.pane)
-            .map(|(_, index)| index);
+            .filter(|target| target.pane == drag.pane)
+            .map(|target| target.index);
         Some(tab_bar::GroupLift {
             pane: drag.pane,
             group: drag.group,
@@ -620,10 +620,14 @@ impl Workspace {
     }
 
     /// Follows the pointer while a group is dragged: `over` says whether it
-    /// is on the tab at `index` of `pane`, which then is where the group
-    /// would land.
-    fn hover_group_drop(&mut self, pane: PaneId, index: usize, over: bool, cx: &mut Context<Self>) {
-        let target = Some((pane, index));
+    /// is on `target`, which then is where the group would land.
+    fn hover_group_drop(
+        &mut self,
+        target: tab_bar::GroupTarget,
+        over: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let target = Some(target);
         if over && self.group_drop != target {
             self.group_drop = target;
             cx.notify();
@@ -2013,6 +2017,79 @@ mod tests {
                 pinned: 0,
             },
             "the name brings every tab of its group, in order, and the open tab stays open"
+        );
+    }
+
+    /// While a group is held over another group's name, that name is where
+    /// it lands, so its line shows; the name and the group's first tab share
+    /// an index, and leaving one must not forget the other.
+    #[gpui_kit::test]
+    fn a_group_held_over_another_group_s_name_shows_where_it_lands(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        click(cx, "sidebar-inbox", MouseButton::Middle, Modifiers::none());
+        click(
+            cx,
+            "sidebar-my-issues",
+            MouseButton::Middle,
+            Modifiers::none(),
+        );
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(1, |tabs, index| tabs.new_group(index, "A").is_some(), cx);
+            this.edit_tab(2, |tabs, index| tabs.new_group(index, "B").is_some(), cx);
+        });
+        let none = Modifiers::none();
+        let start = center(cx, "tab-group-0-1");
+        let over = center(cx, "tab-group-0-0");
+        dispatch(
+            cx,
+            MouseMoveEvent {
+                position: start,
+                pressed_button: None,
+                modifiers: none,
+            }
+            .to_platform_input(),
+        );
+        dispatch(
+            cx,
+            MouseDownEvent {
+                position: start,
+                button: MouseButton::Left,
+                modifiers: none,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+        );
+        for step in 1..=10 {
+            dispatch(
+                cx,
+                MouseMoveEvent {
+                    position: start + (over - start) * (step as f32 / 10.),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: none,
+                }
+                .to_platform_input(),
+            );
+        }
+        let onto = workspace.update_in(cx, |this, _, cx| {
+            this.group_lift(cx).and_then(|lift| lift.onto)
+        });
+        assert_eq!(onto, Some(1), "held over A's name, B lands before A");
+        dispatch(
+            cx,
+            MouseUpEvent {
+                position: over,
+                button: MouseButton::Left,
+                modifiers: none,
+                click_count: 1,
+            }
+            .to_platform_input(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            saved_group_names(cx),
+            [("B".into(), 1, 1), ("A".into(), 2, 1)]
         );
     }
 
