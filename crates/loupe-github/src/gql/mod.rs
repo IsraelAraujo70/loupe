@@ -4,6 +4,7 @@
 mod mutations;
 mod pull_request;
 mod reads;
+mod stack;
 
 pub(crate) fn documents() -> Vec<(&'static str, &'static str)> {
     let mut all = vec![("viewer", crate::client::VIEWER_QUERY)];
