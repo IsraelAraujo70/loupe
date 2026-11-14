@@ -55,7 +55,7 @@ const TAB_MAX_WIDTH: f32 = 220.;
 /// characters; past it the row scrolls.
 const TAB_MIN_WIDTH: f32 = 128.;
 /// A pinned tab is as wide as its icon and name, up to this.
-const PINNED_TAB_MAX_WIDTH: f32 = 96.;
+const PINNED_TAB_MAX_WIDTH: f32 = 112.;
 /// A pane's own row of tabs, once the window is split.
 const STRIP_HEIGHT: f32 = 36.;
 
@@ -73,6 +73,15 @@ pub(super) fn route_icon(route: &Route) -> IconName {
         Route::LinearViews { .. } => IconName::Layers,
         Route::LinearIssue { .. } => IconName::CircleDot,
         Route::Settings => IconName::Settings,
+    }
+}
+
+/// The short name a pinned tab shows: a repository by its name alone, since
+/// its owner is what a narrow tab would show otherwise.
+fn pinned_label(route: &Route) -> String {
+    match route {
+        Route::Repo(repo) => repo.name.clone(),
+        route => route.label(),
     }
 }
 
@@ -336,6 +345,11 @@ fn tabs(
             let icon = route_icon(route);
             let selected = index == active;
             let pinned = tab.pinned;
+            let shown_label: SharedString = if pinned {
+                pinned_label(route).into()
+            } else {
+                label.clone()
+            };
             let id = tab.id;
             let group = SharedString::from(format!("tab-{id}"));
             // A tab dropped here takes this one's place: from the left in
@@ -442,7 +456,7 @@ fn tabs(
                         muted
                     },
                 ))
-                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                .child(div().flex_1().min_w_0().truncate().child(shown_label))
                 .when(!pinned, |tab| {
                     tab.child(
                         div()

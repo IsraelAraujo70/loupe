@@ -1841,7 +1841,7 @@ mod tests {
             f32::from(cx.debug_bounds(selector).expect("on screen").size.width)
         };
         assert!(
-            width(cx, "tab-0") <= 96. && width(cx, "tab-1") >= 128.,
+            width(cx, "tab-0") <= 112. && width(cx, "tab-1") >= 128.,
             "a pinned tab is narrower than the others"
         );
 
