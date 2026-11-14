@@ -46,9 +46,9 @@ pub(crate) fn projects(t3: &T3) -> Result<Vec<Project>> {
     Ok(wire.into_projects())
 }
 
-pub(crate) fn review_facts(t3: &T3, models: &[&str]) -> Result<ReviewFacts> {
+pub(crate) fn review_facts(t3: &T3) -> Result<ReviewFacts> {
     let shell: ShellWire = get(t3, "/api/orchestration/shell", Auth::Orchestration)?;
-    Ok(wire::review_facts(shell, models))
+    Ok(wire::review_facts(shell))
 }
 
 #[derive(Clone, Copy)]
