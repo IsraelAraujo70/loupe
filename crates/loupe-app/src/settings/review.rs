@@ -808,7 +808,8 @@ impl SettingsView {
                                 (more.clone(), more.clone(), more.clone());
                             let this_delete = this.clone();
                             menu.item(
-                                PopupMenuItem::new("Start the dialog on it")
+                                PopupMenuItem::new("Make default")
+                                    .icon(IconName::Star)
                                     .checked(is_default)
                                     .on_click(move |_, _, cx| {
                                         store::update_settings(cx, |settings| {
@@ -818,6 +819,7 @@ impl SettingsView {
                             )
                             .item(
                                 PopupMenuItem::new("Use for risky pull requests")
+                                    .icon(IconName::Shield)
                                     .checked(is_risk)
                                     .on_click(move |_, _, cx| {
                                         store::update_settings(cx, |settings| {
@@ -986,6 +988,8 @@ impl SettingsView {
                             Button::new("t3-prompt-effort")
                                 .outline()
                                 .small()
+                                // As tall as the model selector beside it.
+                                .h_8()
                                 .label(effort_label.clone())
                                 .dropdown_caret(true)
                                 .accessibility_label(format!("Effort: {effort_label}"))
