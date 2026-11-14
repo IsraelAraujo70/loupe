@@ -60,6 +60,12 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut("Lists", "Clear the selection", || {
         Box::new(crate::github::ClearReviewsSelection)
     }),
+    shortcut("Lists", "Open the stack under the cursor", || {
+        Box::new(crate::github::OpenStack)
+    }),
+    shortcut("Lists", "Fold the stack under the cursor", || {
+        Box::new(crate::github::CloseStack)
+    }),
     shortcut("Lists", "Filter Reviews", || {
         Box::new(crate::github::OpenReviewsFilter)
     }),

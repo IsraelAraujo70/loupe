@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Actor, ChecksState, Error, GitHub, Inbox, Label, Mergeable, Page, PrListFilter, PrRef, PrState,
-    PrSummary, RepoRef, RepoSummary, Result, ReviewDecision,
+    PrSummary, RepoRef, RepoSummary, Result, ReviewDecision, StackMember, StackSummary,
 };
 
 const REPO_PR_PAGE_SIZE: u32 = 30;
@@ -34,6 +34,8 @@ fragment PrRow on PullRequest {
   additions
   deletions
   headRefName
+  baseRefName
+  isCrossRepository
   repository { owner { login } name }
   author { login avatarUrl }
   comments { totalCount }
@@ -44,6 +46,10 @@ fragment PrRow on PullRequest {
   assignees(first: 10) { nodes { login avatarUrl } }
   reviewRequests(first: 10) { nodes { requestedReviewer { ... on User { login avatarUrl } } } }
   latestReviews(first: 20) { nodes { state author { login avatarUrl } } }
+  stack {
+    number
+    entries(first: 50) { nodes { position pullRequest { number title state } } }
+  }
 }
 fragment PrPage on SearchResultItemConnection {
   issueCount
@@ -410,6 +416,8 @@ struct WirePullRequest {
     additions: u32,
     deletions: u32,
     head_ref_name: String,
+    base_ref_name: String,
+    is_cross_repository: bool,
     repository: WireRepoRef,
     author: Option<WireActor>,
     comments: WireCount,
@@ -420,6 +428,52 @@ struct WirePullRequest {
     assignees: WireList<WireActor>,
     review_requests: WireList<WireReviewRequest>,
     latest_reviews: WireList<WireReview>,
+    /// Null outside a stack.
+    #[serde(default)]
+    stack: Option<WireRowStack>,
+}
+
+#[derive(Deserialize)]
+struct WireRowStack {
+    number: u64,
+    entries: WireList<WireRowStackEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireRowStackEntry {
+    position: u32,
+    /// Null when the viewer cannot see the pull request.
+    pull_request: Option<WireRowStackPull>,
+}
+
+#[derive(Deserialize)]
+struct WireRowStackPull {
+    number: u64,
+    title: String,
+    state: WirePrState,
+}
+
+impl WireRowStack {
+    fn into_summary(self) -> StackSummary {
+        let mut open: Vec<StackMember> = self
+            .entries
+            .into_items()
+            .filter_map(|entry| {
+                let pr = entry.pull_request?;
+                matches!(pr.state, WirePrState::Open).then_some(StackMember {
+                    position: entry.position,
+                    number: pr.number,
+                    title: pr.title,
+                })
+            })
+            .collect();
+        open.sort_by_key(|member| member.position);
+        StackSummary {
+            number: self.number,
+            open,
+        }
+    }
 }
 
 /// A connection read only for its first page of nodes.
@@ -564,6 +618,9 @@ impl WirePullRequest {
             checks,
             review_decision: decision,
             head_ref: self.head_ref_name,
+            base_ref: self.base_ref_name,
+            cross_repository: self.is_cross_repository,
+            stack: self.stack.map(WireRowStack::into_summary),
             labels: self
                 .labels
                 .into_items()
@@ -667,6 +724,8 @@ mod tests {
             "additions": 12,
             "deletions": 3,
             "headRefName": "feat/diff",
+            "baseRefName": "main",
+            "isCrossRepository": false,
             "repository": { "owner": { "login": "acme" }, "name": "web" },
             "author": { "login": "ana", "avatarUrl": "https://avatars.example/ana" },
             "comments": { "totalCount": 4 },
@@ -702,6 +761,47 @@ mod tests {
     fn page_from(search: Value) -> crate::Result<crate::Page<crate::PrSummary>> {
         let data: SearchData = serde_json::from_value(json!({ "search": search })).unwrap();
         data.search.into_page()
+    }
+
+    #[test]
+    fn a_row_reads_its_base_its_fork_and_the_open_layers_of_its_stack() {
+        let mut stacked = pr_node(31);
+        stacked["baseRefName"] = json!("layer-a");
+        stacked["stack"] = json!({
+            "number": 4,
+            "entries": { "nodes": [
+                { "position": 3, "pullRequest": { "number": 32, "title": "Layer C", "state": "OPEN" } },
+                { "position": 1, "pullRequest": { "number": 29, "title": "Layer A", "state": "MERGED" } },
+                { "position": 2, "pullRequest": { "number": 31, "title": "Layer B", "state": "OPEN" } },
+                { "position": 4, "pullRequest": null },
+                null
+            ] }
+        });
+        let mut fork = pr_node(40);
+        fork["isCrossRepository"] = json!(true);
+        fork["stack"] = Value::Null;
+
+        let page = page_from(connection(vec![stacked, fork, pr_node(41)], false)).unwrap();
+
+        let stacked = &page.items[0];
+        assert_eq!(
+            (stacked.base_ref.as_str(), stacked.cross_repository),
+            ("layer-a", false)
+        );
+        let stack = stacked.stack.as_ref().expect("a stack");
+        assert_eq!(stack.number, 4);
+        let open: Vec<(u32, u64, &str)> = stack
+            .open
+            .iter()
+            .map(|member| (member.position, member.number, member.title.as_str()))
+            .collect();
+        assert_eq!(open, vec![(2, 31, "Layer B"), (3, 32, "Layer C")]);
+        assert!(page.items[1].cross_repository);
+        assert_eq!(page.items[1].stack, None);
+        assert_eq!(
+            page.items[2].stack, None,
+            "a node without the field is outside a stack"
+        );
     }
 
     #[test]

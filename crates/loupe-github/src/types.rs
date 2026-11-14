@@ -60,6 +60,16 @@ pub struct PrSummary {
     pub checks: Option<ChecksState>,
     pub review_decision: Option<ReviewDecision>,
     pub head_ref: String,
+    /// The branch it merges into. Empty in a copy stored before Loupe read it.
+    #[serde(default)]
+    pub base_ref: String,
+    /// The head branch is in a fork, so no other pull request of the
+    /// repository can be based on it.
+    #[serde(default)]
+    pub cross_repository: bool,
+    /// The GitHub stack it is part of; `None` outside one.
+    #[serde(default)]
+    pub stack: Option<crate::StackSummary>,
     pub labels: Vec<Label>,
     pub assignees: Vec<Actor>,
     /// Users asked to review, then users who reviewed, each once. Team
