@@ -1128,6 +1128,7 @@ mod tests {
                     collapsed: false,
                     first: 1,
                     len: 1,
+                    sync: None,
                 }],
                 pinned: 0,
             },

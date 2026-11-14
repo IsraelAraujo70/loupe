@@ -398,7 +398,7 @@ pub struct InboxView {
     /// "Mark as read" in flight.
     marking: Option<Task<()>>,
     /// "Keep in sync with the view" under "Open as group <view>"; off until
-    /// the user ticks it.
+    /// the user ticks it, and off again once the group opens.
     keep_in_sync: bool,
     /// Whether the last frame showed the selection bar.
     bar_shown: bool,
@@ -1115,7 +1115,11 @@ impl InboxView {
     }
 
     fn delete_view(&mut self, id: &str, cx: &mut Context<Self>) {
-        match views_store::update(cx, |views| views.delete(id)) {
+        let result = views_store::update(cx, |views| views.delete(id));
+        if result.is_ok() {
+            group_sync::now(None, cx);
+        }
+        match result {
             Ok(_) if self.page.view_id.as_deref() == Some(id) => self.switch_view(None, cx),
             Ok(_) => cx.notify(),
             Err(message) => self.report(Some(message), cx),
@@ -1380,6 +1384,7 @@ impl InboxView {
                                         let Some(pick) = this.view_pick(cx) else {
                                             return;
                                         };
+                                        this.keep_in_sync = false;
                                         this.open_picked(Bulk::Group(pick), false, window, cx)
                                     })
                                     .ok();
