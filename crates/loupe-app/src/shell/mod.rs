@@ -488,25 +488,9 @@ impl Workspace {
     fn open_tab(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
         let page = self.page(route, window, cx);
         let tab = self.panes.tab(page);
-        self.add_tab(tab, true, cx);
+        self.panes.active_mut().open(tab);
         self.save_tabs(cx);
         cx.notify();
-    }
-
-    /// Adds a new tab to the active pane, on screen when `activate`. With
-    /// Settings' grouping by repository on, it joins its repository's
-    /// group, or no group when its page has no repository; otherwise it
-    /// opens in the active tab's group.
-    fn add_tab(&mut self, tab: Tab<AnyView>, activate: bool, cx: &mut Context<Self>) {
-        let by_repo = Settings::get(cx).group_tabs_by_repo;
-        let pane = self.panes.active_mut();
-        if by_repo {
-            pane.open_in_repo_group(tab, activate);
-        } else if activate {
-            pane.open(tab);
-        } else {
-            pane.open_in_background(tab);
-        }
     }
 
     fn open_in_group(
@@ -541,14 +525,8 @@ impl Workspace {
     fn open_beside(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
         let page = self.page(route, window, cx);
         let tab = self.panes.tab(page);
-        let repo = tab.current().route.repo().map(|repo| repo.name.clone());
         let pane = self.panes.active_pane();
         self.panes.split(pane, Zone::Right, tab);
-        if Settings::get(cx).group_tabs_by_repo
-            && let Some(repo) = repo
-        {
-            self.panes.active_mut().new_group(0, &repo);
-        }
         self.save_tabs(cx);
         cx.notify();
     }
@@ -600,7 +578,7 @@ impl Workspace {
     fn open_background_tab(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
         let page = self.page(route, window, cx);
         let tab = self.panes.tab(page);
-        self.add_tab(tab, false, cx);
+        self.panes.active_mut().open_in_background(tab);
         self.save_tabs(cx);
         cx.notify();
     }
@@ -1516,7 +1494,6 @@ mod tests {
     use crate::services::{Accounts, Connection, Services};
     use crate::shell::actions::{ActivateTab1, CloseTab, NewTab, SplitDown, SplitRight};
     use crate::store::{self, PaneLayout, SavedTabGroup, Settings, SplitAxis, TabGroupColor};
-    use loupe_github::{PrRef, RepoRef};
 
     /// The real window: GitHub signed in with no client, so nothing loads
     /// from the network, on one tab showing Reviews.
@@ -2446,65 +2423,6 @@ mod tests {
         );
     }
 
-    /// With grouping by repository on, a pull request followed from a pinned
-    /// tab opens the way every new tab does: after the pinned tab, in its
-    /// repository's group.
-    #[gpui_kit::test]
-    fn a_link_from_a_pinned_tab_joins_its_repository_s_group(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_workspace(cx);
-        let cx = &mut VisualTestContext::from_window(handle, cx);
-        workspace.update_in(cx, |this, _, cx| {
-            this.edit_tab(0, |tabs, index| tabs.pin(index), cx)
-        });
-        cx.update(|_, cx| {
-            store::update_settings(cx, |settings| settings.group_tabs_by_repo = true)
-        });
-        let pr = |number| Route::PullRequest(PrRef::new(RepoRef::new("octo", "app"), number));
-        cx.update(|window, cx| super::navigate(pr(7), window, cx));
-        cx.run_until_parked();
-        let saved = |cx: &mut VisualTestContext| match saved_panes(cx).0 {
-            PaneLayout::Pane {
-                tabs,
-                active,
-                groups,
-                pinned,
-            } => (
-                tabs,
-                active,
-                pinned,
-                groups
-                    .into_iter()
-                    .map(|group| (group.name, group.first, group.len))
-                    .collect::<Vec<_>>(),
-            ),
-            split => panic!("expected one pane, got {split:?}"),
-        };
-        assert_eq!(
-            saved(cx),
-            (
-                vec![Route::Inbox, pr(7)],
-                1,
-                1,
-                vec![("app".to_string(), 1, 1)]
-            ),
-            "the pull request opens after the pinned tab, in a new group named after its repository"
-        );
-
-        click(cx, "tab-0", MouseButton::Left, Modifiers::none());
-        cx.update(|window, cx| super::navigate(pr(8), window, cx));
-        cx.run_until_parked();
-        assert_eq!(
-            saved(cx),
-            (
-                vec![Route::Inbox, pr(7), pr(8)],
-                2,
-                1,
-                vec![("app".to_string(), 1, 2)]
-            ),
-            "the next one joins the same group"
-        );
-    }
-
     /// A pinned tab that changes its own filter through its route (the
     /// branch of a repository's runs) stays on its page; another
     /// repository's runs open in a new tab.
@@ -2558,63 +2476,71 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn new_tabs_join_their_repository_s_group_only_with_the_setting_on(cx: &mut TestAppContext) {
-        let (handle, _) = open_workspace(cx);
+    fn opening_pull_requests_makes_no_group(cx: &mut TestAppContext) {
+        use loupe_github::{PrRef, RepoRef};
+
+        let (handle, workspace) = open_workspace(cx);
         let cx = &mut VisualTestContext::from_window(handle, cx);
         let pr = |repo: &str, number| {
             Route::PullRequest(PrRef::new(RepoRef::new("octocat", repo), number))
         };
-        let open = |cx: &mut VisualTestContext, route: Route| {
+        // In the background, as a middle click opens them, and on screen, as
+        // a link from outside Loupe does.
+        for route in [pr("loupe", 1), pr("site", 2)] {
             cx.update(|window, cx| super::open_in_new_tab(route, window, cx));
             cx.run_until_parked();
+        }
+        workspace.update_in(cx, |this, window, cx| {
+            this.reveal(pr("loupe", 3), window, cx)
+        });
+        cx.run_until_parked();
+        let PaneLayout::Pane { tabs, groups, .. } = saved_panes(cx).0 else {
+            panic!("one pane");
         };
-
-        open(cx, pr("loupe", 1));
-        open(cx, Route::LinearMyIssues);
-        assert_eq!(
-            saved_panes(cx),
-            (
-                one_pane(&[Route::Inbox, pr("loupe", 1), Route::LinearMyIssues]),
-                0
-            ),
-            "off by default: no group is made, as before the setting"
+        assert_eq!(tabs.len(), 4, "each pull request opened a tab");
+        assert!(
+            groups.is_empty(),
+            "no tab joined a group of its own: {groups:?}"
         );
 
-        cx.update(|_, cx| {
-            store::update_settings(cx, |settings| settings.group_tabs_by_repo = true)
+        // A group named after a repository, made by hand, takes no other
+        // tab of that repository, and opening to the side makes no group.
+        let first = workspace.read_with(cx, |this, _| {
+            this.panes
+                .active()
+                .iter()
+                .find(|tab| tab.current().route == pr("loupe", 1))
+                .expect("loupe#1 is open")
+                .id
         });
-        open(cx, pr("loupe", 2));
-        open(cx, pr("site", 3));
-        open(cx, Route::Notifications);
-        assert_eq!(
-            cx.update(|_, cx| Settings::get(cx).single_pane_tabs()),
-            (
-                vec![
-                    Route::Inbox,
-                    pr("loupe", 1),
-                    Route::LinearMyIssues,
-                    pr("loupe", 2),
-                    pr("site", 3),
-                    Route::Notifications,
-                ],
-                0
+        workspace.update_in(cx, |this, _, cx| {
+            this.edit_tab(
+                first,
+                |tabs, index| tabs.new_group(index, "loupe").is_some(),
+                cx,
             )
-        );
-        assert_eq!(
-            saved_group_names(cx),
-            [("loupe".into(), 3, 1), ("site".into(), 4, 1)],
-            "on: each new pull request tab is in its repository's group, other tabs in none"
-        );
-
-        cx.update(|_, cx| {
-            store::update_settings(cx, |settings| settings.group_tabs_by_repo = false)
         });
-        open(cx, pr("loupe", 4));
+        cx.update(|window, cx| super::open_in_new_tab(pr("loupe", 4), window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| super::open_side_by_side(pr("loupe", 5), window, cx));
+        cx.run_until_parked();
+        let layout = saved_panes(cx).0;
+        let PaneLayout::Split { first, second, .. } = &layout else {
+            panic!("two panes, got {layout:?}");
+        };
+        let groups = |pane: &PaneLayout| match pane {
+            PaneLayout::Pane { groups, .. } => groups
+                .iter()
+                .map(|group| (group.name.clone(), group.len))
+                .collect::<Vec<_>>(),
+            split => panic!("expected a pane, got {split:?}"),
+        };
         assert_eq!(
-            saved_group_names(cx),
-            [("loupe".into(), 3, 1), ("site".into(), 4, 1)],
-            "turning it off keeps the groups and makes no new one"
+            groups(first),
+            [("loupe".to_owned(), 1)],
+            "the hand-made group keeps only its own tab"
         );
+        assert!(groups(second).is_empty(), "the new pane has no group");
     }
 
     #[gpui_kit::test]
