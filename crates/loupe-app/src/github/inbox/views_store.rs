@@ -11,6 +11,8 @@ struct SavedViews {
     file: ViewsFile,
     /// Why the file on disk could not be used, until the user sees it once.
     warning: Option<SharedString>,
+    /// Whether the file on disk could not be used this run.
+    recovered: bool,
 }
 
 impl Global for SavedViews {}
@@ -21,7 +23,7 @@ fn path() -> PathBuf {
 
 fn saved(cx: &mut App) -> &mut SavedViews {
     if !cx.has_global::<SavedViews>() {
-        let (file, warning) = match reviews::load(&path()) {
+        let (file, warning): (ViewsFile, Option<SharedString>) = match reviews::load(&path()) {
             Loaded::Read(file) => (file, None),
             Loaded::Missing => (ViewsFile::default(), None),
             Loaded::Recovered { reason } => (
@@ -34,7 +36,12 @@ fn saved(cx: &mut App) -> &mut SavedViews {
                 ),
             ),
         };
-        cx.set_global(SavedViews { file, warning });
+        let recovered = warning.is_some();
+        cx.set_global(SavedViews {
+            file,
+            warning,
+            recovered,
+        });
     }
     cx.global_mut::<SavedViews>()
 }
@@ -48,6 +55,12 @@ pub fn snapshot(cx: &mut App) -> ViewsFile {
 /// For reads that have no `&mut App`, such as a tab's title.
 pub fn loaded(cx: &App) -> Option<&ViewsFile> {
     cx.try_global::<SavedViews>().map(|saved| &saved.file)
+}
+
+/// Whether the views come from the user's file (or there was none yet),
+/// not from an empty set that stands in for a file that could not be used.
+pub fn readable(cx: &mut App) -> bool {
+    !saved(cx).recovered
 }
 
 /// The load warning, once.

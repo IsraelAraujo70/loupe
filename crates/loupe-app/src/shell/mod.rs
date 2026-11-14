@@ -318,19 +318,23 @@ pub fn synced_groups(cx: &App) -> Vec<SyncedGroup> {
         .collect()
 }
 
-/// Brings `group` in line with `list`, what its saved view lists now
+/// Brings `group` in line with `list`, what its saved view lists now;
+/// `complete` is false when GitHub returned only part of it
 /// ([`panes::Panes::sync_group`]).
 pub fn sync_group(
     group: GroupRef,
     list: Vec<loupe_github::PrRef>,
+    complete: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
     with_workspace(cx, |workspace, cx| {
-        let changed = workspace.panes.sync_group(group, &list, |route| Page {
-            view: router::build(route, window, cx),
-            route: route.clone(),
-        });
+        let changed = workspace
+            .panes
+            .sync_group(group, &list, complete, |route| Page {
+                view: router::build(route, window, cx),
+                route: route.clone(),
+            });
         if changed {
             workspace.save_tabs(cx);
             cx.notify();

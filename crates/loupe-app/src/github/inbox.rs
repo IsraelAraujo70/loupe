@@ -216,20 +216,47 @@ fn uses_all_open(tab: ReviewTab) -> bool {
     matches!(tab, ReviewTab::All | ReviewTab::NeedsReview)
 }
 
-/// The pull requests `tab` lists under `filters`, in GitHub's order, with
-/// `all_open` the view's "All open" results: what a tab group kept in sync
-/// with a saved view follows.
+/// What a tab group kept in sync with a saved view follows: the pull
+/// requests a tab lists, in GitHub's order, and whether GitHub sent every
+/// page they come from.
+#[derive(Clone, Debug, PartialEq)]
+struct ViewList {
+    rows: Vec<PrRef>,
+    complete: bool,
+}
+
+/// Whether `page` holds its whole search.
+fn whole(page: &Page<PrSummary>) -> bool {
+    page.next_cursor.is_none() && page.items.len() >= page.total_count as usize
+}
+
+/// What `tab` lists under `filters`, with `all_open` the view's "All open"
+/// results.
 fn view_rows(
     inbox: &Inbox,
     all_open: Option<&Page<PrSummary>>,
     filters: &[Clause],
     tab: ReviewTab,
-) -> Vec<PrRef> {
-    tabs_shown(inbox, all_open, filters)
+) -> ViewList {
+    let rows = tabs_shown(inbox, all_open, filters)
         .into_iter()
         .find(|(shown_tab, _)| *shown_tab == tab)
         .map(|(_, rows)| rows.items.iter().map(|pr| pr.pr.clone()).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let mut sources = match tab {
+        ReviewTab::Mine => vec![&inbox.authored],
+        ReviewTab::Involved => vec![&inbox.involved],
+        ReviewTab::NeedsReview | ReviewTab::All => {
+            vec![&inbox.review_requested, &inbox.authored, &inbox.involved]
+        }
+    };
+    if uses_all_open(tab) {
+        sources.extend(all_open);
+    }
+    ViewList {
+        rows,
+        complete: sources.into_iter().all(whole),
+    }
 }
 
 /// What a Reviews page and its tab are called with view `view_id` open:
@@ -1399,21 +1426,29 @@ impl InboxView {
     /// What a group kept in sync with the saved view on screen starts from:
     /// the view, the open tab, and what that tab lists under the view's
     /// saved filters.
+    /// `None` while the view has unsaved changes or its "All open" results
+    /// have not loaded, since the rows on screen are then not what the
+    /// group would follow.
     fn view_sync(&self, cx: &mut App) -> Option<ViewSync> {
         let id = self.page.view_id.clone()?;
         let inbox = self.inbox.value()?;
         let tab = self.current_tab()?;
         let views = views_store::snapshot(cx);
+        if self.page.is_dirty(&views) {
+            return None;
+        }
         let view = views.get(&id)?;
-        let all_open = (uses_all_open(tab) && view.all_open.unwrap_or(true))
+        let all_open = match (uses_all_open(tab) && view.all_open.unwrap_or(true))
             .then(|| reviews::all_open_query(&view.filters))
             .flatten()
-            .and_then(|query| self.all_open.get(&query))
-            .and_then(Loadable::value);
+        {
+            Some(query) => Some(self.all_open.get(&query).and_then(Loadable::value)?),
+            None => None,
+        };
         Some(ViewSync {
             view: id,
             tab,
-            seen: view_rows(inbox, all_open, &view.filters, tab),
+            seen: view_rows(inbox, all_open, &view.filters, tab).rows,
         })
     }
 
@@ -1422,6 +1457,7 @@ impl InboxView {
     fn group_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.weak_entity();
         let view_name = self.view_group_name(cx);
+        let can_sync = view_name.is_some() && self.view_sync(cx).is_some();
         Button::new("reviews-selection-group")
             .debug_selector(|| "reviews-selection-group".into())
             .outline()
@@ -1459,7 +1495,11 @@ impl InboxView {
                                 },
                             )
                         };
-                        menu.item(open).item(keep_in_sync_item(view.clone()))
+                        let menu = menu.item(open);
+                        match can_sync {
+                            true => menu.item(keep_in_sync_item(view.clone())),
+                            false => menu,
+                        }
                     }
                     None => menu,
                 };
@@ -2512,7 +2552,7 @@ mod tests {
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
 
-    fn pr(owner: &str, number: u64) -> PrSummary {
+    pub(super) fn pr(owner: &str, number: u64) -> PrSummary {
         let at = Utc::now();
         PrSummary {
             id: format!("PR_{number}"),
@@ -3541,6 +3581,12 @@ mod tests {
             vec![1, 2, 3, 6, 4, 5],
             "every row of the tab, in GitHub's order"
         );
+
+        // With unsaved changes the rows on screen are not the view's.
+        view.update(cx, |view, cx| {
+            view.edit_draft(|clauses| *clauses = org("a"), cx)
+        });
+        assert_eq!(view.update(cx, |view, cx| view.view_sync(cx)), None);
     }
 
     #[test]

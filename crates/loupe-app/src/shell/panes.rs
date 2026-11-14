@@ -685,12 +685,15 @@ impl<V> Panes<V> {
     /// [`Self::open_in_group`] does, unless it is the open tab of another
     /// pane; the group's tab of one that left the list closes. No pane's
     /// open tab is ever closed or switched. `list` is then what the group
-    /// has seen. Returns whether anything changed; false when the group is
-    /// gone or not kept in sync.
+    /// has seen. A list that is not `complete` (GitHub returned only part
+    /// of a search) says nothing about what left: it only opens, and what
+    /// it holds joins what the group has seen. Returns whether anything
+    /// changed; false when the group is gone or not kept in sync.
     pub fn sync_group(
         &mut self,
         group: GroupRef,
         list: &[PrRef],
+        complete: bool,
         page: impl FnMut(&Route) -> Page<V>,
     ) -> bool {
         let Some(sync) = self
@@ -722,7 +725,7 @@ impl<V> Panes<V> {
         let left: Vec<Route> = sync
             .seen
             .iter()
-            .filter(|pr| !list.contains(pr))
+            .filter(|pr| complete && !list.contains(pr))
             .map(|pr| Route::PullRequest(pr.clone()))
             .collect();
         let mut changed = !added.is_empty()
@@ -746,10 +749,14 @@ impl<V> Panes<V> {
                 changed |= self.close(pane, index);
             }
         }
-        let seen = ViewSync {
-            seen: list.to_vec(),
-            ..sync
+        let seen = if complete {
+            list.to_vec()
+        } else {
+            let mut seen = sync.seen.clone();
+            seen.extend(list.iter().filter(|pr| !sync.seen.contains(pr)).cloned());
+            seen
         };
+        let seen = ViewSync { seen, ..sync };
         if let Some(tabs) = self.tabs_mut(group.pane) {
             changed |= tabs.set_group_sync(group.group, Some(seen));
         }
@@ -1303,7 +1310,7 @@ mod tests {
         };
         // #2, #3, and #8 left the view; #5, #6, and #7 joined it.
         let list: Vec<PrRef> = [1, 4, 5, 6, 7].into_iter().map(number).collect();
-        assert!(panes.sync_group(target, &list, page));
+        assert!(panes.sync_group(target, &list, true, page));
         let mut synced = group("Ready", TabGroupColor::Green, 1, 4);
         synced.sync = Some(kept(&[1, 4, 5, 6, 7]));
         assert_eq!(
@@ -1335,8 +1342,43 @@ mod tests {
              stays the other pane's open tab"
         );
         assert!(
-            !panes.sync_group(target, &list, page),
+            !panes.sync_group(target, &list, true, page),
             "the same list changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_partial_list_opens_what_joined_and_closes_nothing() {
+        let mut ready = group("Ready", TabGroupColor::Green, 1, 2);
+        ready.sync = Some(kept(&[1, 2]));
+        let mut panes = restore(
+            &PaneLayout::Pane {
+                tabs: vec![Route::Inbox, pr(1), pr(2)],
+                active: 0,
+                groups: vec![ready],
+                pinned: 0,
+            },
+            0,
+        );
+        let target = GroupRef {
+            pane: panes.active_pane(),
+            group: panes.active().groups()[0].id,
+        };
+        // GitHub sent only part of the search: #2 is missing from it, not
+        // gone from the view.
+        let part: Vec<PrRef> = [1, 3].into_iter().map(number).collect();
+        assert!(panes.sync_group(target, &part, false, page));
+        let mut synced = group("Ready", TabGroupColor::Green, 1, 3);
+        synced.sync = Some(kept(&[1, 2, 3]));
+        assert_eq!(
+            panes.layout().0,
+            PaneLayout::Pane {
+                tabs: vec![Route::Inbox, pr(1), pr(2), pr(3)],
+                active: 0,
+                groups: vec![synced],
+                pinned: 0,
+            },
+            "#3 opens, #2 stays, and both count as seen"
         );
     }
 
@@ -1356,12 +1398,15 @@ mod tests {
         };
         let plain = panes.open_in_group(target, &[pr(2)], page).unwrap();
         let next: Vec<PrRef> = [3].into_iter().map(number).collect();
-        assert!(!panes.sync_group(plain, &next, page), "not kept in sync");
+        assert!(
+            !panes.sync_group(plain, &next, true, page),
+            "not kept in sync"
+        );
         assert!(panes.find(&pr(3)).is_none());
 
         let tabs = panes.active_mut();
         assert!(tabs.set_group_sync(synced.group, None), "Stop syncing");
-        assert!(!panes.sync_group(synced, &next, page));
+        assert!(!panes.sync_group(synced, &next, true, page));
         assert_eq!(
             panes.active().routes(),
             vec![Route::Inbox, pr(2), pr(1)],

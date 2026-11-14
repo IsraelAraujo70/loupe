@@ -4,7 +4,8 @@
 //! the pull requests its view lists now on the tab it was opened from; the
 //! shell opens the new ones and closes the ones that left
 //! ([`shell::sync_group`]). A group whose view is gone stops syncing and
-//! keeps its tabs.
+//! keeps its tabs. One sync runs at a time: a new one cancels the one in
+//! flight, so an older answer never lands after a newer one.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use gpui_kit::{AnyWindowHandle, App, AppContext as _, Global, Task, Window};
 use loupe_github::reviews::{self, ReviewTab, SavedView};
 use loupe_github::{Inbox, Page, PrSummary};
 
-use super::{uses_all_open, view_rows, views_store};
+use super::{ViewList, uses_all_open, view_rows, views_store};
 use crate::services::{self, Services};
 use crate::shell::{self, SyncedGroup};
 
@@ -23,7 +24,7 @@ const SYNC_EVERY: Duration = Duration::from_secs(120);
 struct GroupSync {
     window: AnyWindowHandle,
     _every: Task<()>,
-    /// The sync a Reviews load or a save asked for; a newer one replaces it.
+    /// The sync in flight; a newer one replaces it, which cancels it.
     _now: Option<Task<()>>,
 }
 
@@ -35,7 +36,7 @@ pub fn start(window: &mut Window, cx: &mut App) {
     let every = cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(SYNC_EVERY).await;
-            cx.update(|cx| run(handle, None, cx)).await;
+            cx.update(|cx| now(None, cx));
         }
     });
     cx.set_global(GroupSync {
@@ -63,7 +64,26 @@ fn all_open_query(view: &SavedView, tab: ReviewTab) -> Option<String> {
         .flatten()
 }
 
+/// What a group on `tab` of `view` follows now, from `inbox` and the "All
+/// open" `pages` that loaded; `None` when the search it needs failed, since
+/// a list without it would close the tabs that came from it.
+fn list_for(
+    inbox: &Inbox,
+    pages: &HashMap<String, Page<PrSummary>>,
+    view: &SavedView,
+    tab: ReviewTab,
+) -> Option<ViewList> {
+    let all_open = match all_open_query(view, tab) {
+        Some(query) => Some(pages.get(&query)?),
+        None => None,
+    };
+    Some(view_rows(inbox, all_open, &view.filters, tab))
+}
+
 fn run(window: AnyWindowHandle, inbox: Option<Inbox>, cx: &mut App) -> Task<()> {
+    // Views read from a file that could not be used are not the user's:
+    // their absence stops nothing.
+    let readable = views_store::readable(cx);
     let views = views_store::snapshot(cx);
     let mut live: Vec<(SyncedGroup, SavedView)> = Vec::new();
     for group in shell::synced_groups(cx) {
@@ -72,7 +92,8 @@ fn run(window: AnyWindowHandle, inbox: Option<Inbox>, cx: &mut App) -> Task<()> 
                 let view = view.clone();
                 live.push((group, view));
             }
-            None => shell::stop_syncing(group.group, cx),
+            None if readable => shell::stop_syncing(group.group, cx),
+            None => {}
         }
     }
     if live.is_empty() {
@@ -108,17 +129,91 @@ fn run(window: AnyWindowHandle, inbox: Option<Inbox>, cx: &mut App) -> Task<()> 
         };
         cx.update_window(window, |_, window, cx| {
             for (group, view) in live {
-                let all_open = match all_open_query(&view, group.sync.tab) {
-                    Some(query) => match pages.get(&query) {
-                        Some(page) => Some(page),
-                        None => continue,
-                    },
-                    None => None,
-                };
-                let list = view_rows(&inbox, all_open, &view.filters, group.sync.tab);
-                shell::sync_group(group.group, list, window, cx);
+                if let Some(list) = list_for(&inbox, &pages, &view, group.sync.tab) {
+                    shell::sync_group(group.group, list.rows, list.complete, window, cx);
+                }
             }
         })
         .ok();
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use chrono::Utc;
+    use loupe_github::reviews::{Clause, Field, Op, ReviewTab, SavedView};
+    use loupe_github::{Inbox, Page, PrRef, PrSummary, RepoRef};
+
+    use super::list_for;
+
+    fn pr(number: u64) -> PrSummary {
+        PrSummary {
+            pr: PrRef::new(RepoRef::new("acme", "web"), number),
+            ..super::super::tests::pr("acme", number)
+        }
+    }
+
+    fn page(numbers: &[u64], total: u32, more: bool) -> Page<PrSummary> {
+        Page {
+            items: numbers.iter().copied().map(pr).collect(),
+            total_count: total,
+            next_cursor: more.then(|| "next".into()),
+        }
+    }
+
+    fn view() -> SavedView {
+        SavedView {
+            id: "rv_1".into(),
+            name: "Web".into(),
+            filters: vec![Clause {
+                field: Field::Repo,
+                op: Op::In,
+                values: vec!["acme/web".into()],
+            }],
+            all_open: None,
+            sort: None,
+            tab: None,
+            collapsed: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn numbers(rows: &[PrRef]) -> Vec<u64> {
+        rows.iter().map(|pr| pr.number).collect()
+    }
+
+    #[test]
+    fn a_failed_all_open_search_syncs_nothing_and_a_partial_one_closes_nothing() {
+        let inbox = Inbox {
+            review_requested: page(&[], 0, false),
+            authored: page(&[1], 1, false),
+            involved: page(&[], 0, false),
+            viewer_login: "me".into(),
+        };
+        let view = view();
+        let query = loupe_github::reviews::all_open_query(&view.filters).unwrap();
+        let none = HashMap::new();
+        assert_eq!(
+            list_for(&inbox, &none, &view, ReviewTab::All),
+            None,
+            "All needs the view's search"
+        );
+        let mine = list_for(&inbox, &none, &view, ReviewTab::Mine).unwrap();
+        assert_eq!((numbers(&mine.rows), mine.complete), (vec![1], true));
+
+        let whole = HashMap::from([(query.clone(), page(&[1, 2], 2, false))]);
+        let all = list_for(&inbox, &whole, &view, ReviewTab::All).unwrap();
+        assert_eq!((numbers(&all.rows), all.complete), (vec![1, 2], true));
+
+        let part = HashMap::from([(query, page(&[1, 2], 180, true))]);
+        let all = list_for(&inbox, &part, &view, ReviewTab::All).unwrap();
+        assert_eq!(
+            (numbers(&all.rows), all.complete),
+            (vec![1, 2], false),
+            "GitHub sent part of the search"
+        );
+    }
 }
