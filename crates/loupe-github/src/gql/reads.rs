@@ -1,5 +1,7 @@
 //! Search-backed lists: the inbox, repository PR lists, and repositories.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -127,6 +129,30 @@ const REPOSITORY_LABELS_QUERY: &str = "query RepositoryLabels($owner: String!, $
 const ALL_OPEN_PAGE_SIZE: u32 = 50;
 const MAX_ALL_OPEN_PAGES: usize = 10;
 
+/// Branches counted per request by [`GitHub::open_pull_requests_by_base`].
+const BASES_PER_REQUEST: usize = 50;
+
+/// One field per branch asking how many open pull requests target it, with
+/// the repository and the branch as variables, never spliced into the text.
+pub(crate) fn open_by_base_query(count: usize) -> String {
+    let variables: Vec<String> = (0..count)
+        .map(|at| format!("$o{at}: String!, $n{at}: String!, $b{at}: String!"))
+        .collect();
+    let fields: Vec<String> = (0..count)
+        .map(|at| {
+            format!(
+                "  b{at}: repository(owner: $o{at}, name: $n{at}) {{ \
+                 pullRequests(baseRefName: $b{at}, states: OPEN) {{ totalCount }} }}"
+            )
+        })
+        .collect();
+    format!(
+        "query OpenPullRequestsByBase({}) {{\n{}\n}}",
+        variables.join(", "),
+        fields.join("\n")
+    )
+}
+
 /// Pages of labels read at most; GitHub repositories rarely have more than a
 /// few dozen.
 const MAX_LABEL_PAGES: usize = 5;
@@ -249,6 +275,34 @@ impl GitHub {
         Ok(labels)
     }
 
+    /// How many open pull requests target each `(repository, branch)` of
+    /// `bases`, in the same order; `None` for a repository GitHub did not
+    /// return. A pull request is stacked on another only when it is the one
+    /// open pull request on that one's head branch, which the loaded pages
+    /// alone cannot tell: a long-lived branch (`staging`) has others.
+    pub fn open_pull_requests_by_base(
+        &self,
+        bases: &[(RepoRef, String)],
+    ) -> Result<Vec<Option<u32>>> {
+        let mut counts = Vec::with_capacity(bases.len());
+        for chunk in bases.chunks(BASES_PER_REQUEST) {
+            let mut variables = serde_json::Map::new();
+            for (at, (repo, branch)) in chunk.iter().enumerate() {
+                variables.insert(format!("o{at}"), json!(repo.owner));
+                variables.insert(format!("n{at}"), json!(repo.name));
+                variables.insert(format!("b{at}"), json!(branch));
+            }
+            let data: HashMap<String, Option<WireBaseCount>> =
+                self.graphql(&open_by_base_query(chunk.len()), Value::Object(variables))?;
+            counts.extend((0..chunk.len()).map(|at| {
+                data.get(&format!("b{at}"))
+                    .and_then(Option::as_ref)
+                    .map(|repo| repo.pull_requests.total_count)
+            }));
+        }
+        Ok(counts)
+    }
+
     /// Repository search (GitHub search syntax), up to 20 results.
     pub fn search_repositories(&self, query: &str) -> Result<Vec<RepoSummary>> {
         let data: SearchData =
@@ -291,6 +345,12 @@ fn repo_search_query(repo: &RepoRef, filter: PrListFilter, text: Option<&str>) -
     }
     query.push_str(" sort:updated-desc");
     query
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireBaseCount {
+    pull_requests: WireCount,
 }
 
 #[derive(Deserialize)]

@@ -14,5 +14,10 @@ pub(crate) fn documents() -> Vec<(&'static str, &'static str)> {
     all.extend_from_slice(crate::rest::DOCUMENTS);
     all.extend_from_slice(crate::suggestion::DOCUMENTS);
     all.extend_from_slice(crate::workflow::DOCUMENTS);
+    // Built per call; two fields stand for any count.
+    all.push((
+        "open_pull_requests_by_base",
+        Box::leak(reads::open_by_base_query(2).into_boxed_str()),
+    ));
     all
 }

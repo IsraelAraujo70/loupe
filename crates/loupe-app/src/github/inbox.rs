@@ -30,12 +30,12 @@ use loupe_github::reviews::{
     self, Clause, NextStep, Op, ReviewTab, Sort, SortDir, SortKey, ViewsFile,
 };
 use loupe_github::{
-    Inbox, Notification as GitHubNotification, NotificationSubject, Page, PrRef, PrSummary,
+    Inbox, Notification as GitHubNotification, NotificationSubject, Page, PrRef, PrSummary, RepoRef,
 };
 
 use self::filter_menu::{FilterMenu, FilterOptions};
 use self::selection::{CONFIRM_ABOVE, Selection};
-use self::stacks::{Stack, StackKey, Stacks};
+use self::stacks::{OpenByBase, Stack, StackKey, Stacks};
 use super::common::{self, Loadable};
 use super::pr_row::{
     AgeFrom, Lanes, OnSelect, OnSort, ROW_GROUP, RowSelect, SelectGesture, StackPlace, StackRow,
@@ -243,7 +243,7 @@ fn grouped<'a>(
                 let mut members: Vec<&PrSummary> = rows
                     .iter()
                     .copied()
-                    .filter(|row| stack.place(&row.pr).is_some())
+                    .filter(|row| stacks.of(&row.pr).map(|of| &of.key) == Some(&stack.key))
                     .collect();
                 members.sort_by_key(|row| stack.place(&row.pr));
                 lines.push(Line::Stack {
@@ -369,6 +369,10 @@ pub struct InboxView {
     /// stands while no tab was picked or saved (`PageState::tab`), so a
     /// refresh never switches tabs under the user. Never saved with a view.
     opened_on: Option<ReviewTab>,
+    /// Open pull requests per base branch, as GitHub last counted them for
+    /// the branch chains ([`Stacks::build`]).
+    open_by_base: OpenByBase,
+    _bases: Option<Task<()>>,
     _load: Option<Task<()>>,
     _checks: Subscription,
 }
@@ -436,6 +440,8 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             bar_shown: false,
             mark_note: None,
             opened_on: None,
+            open_by_base: OpenByBase::new(),
+            _bases: None,
             _load: None,
             _checks: checks,
         };
@@ -536,11 +542,12 @@ impl InboxView {
         self._load = Some(common::run(
             cx,
             |gh| gh.inbox(),
-            move |view, result, _| {
+            move |view, result, cx| {
                 if let (Some(key), Ok(value)) = (&key, &result) {
                     crate::cache::put(key, value);
                 }
                 view.inbox.finish(result);
+                view.count_bases(cx);
             },
         ));
         self.load_all_open(true, cx);
@@ -568,11 +575,12 @@ impl InboxView {
         let task = common::run(
             cx,
             move |gh| gh.search_all_pull_requests(&search),
-            move |view: &mut InboxView, result, _| {
+            move |view: &mut InboxView, result, cx| {
                 if let (Some(key), Ok(value)) = (&key, &result) {
                     crate::cache::put(key, value);
                 }
                 view.all_open.entry(query).or_default().finish(result);
+                view.count_bases(cx);
             },
         );
         self.all_open_loads.insert(slot, task);
@@ -619,17 +627,73 @@ impl InboxView {
         Some(self.active_tab(&self.tab_lists(inbox)))
     }
 
-    /// The stacks among every pull request the page loaded, whatever the
-    /// filters and the tab.
-    fn stacks(&self, inbox: &Inbox) -> Stacks {
+    /// Every pull request the page loaded, whatever the filters and the
+    /// tab; one listed in two tabs comes twice.
+    fn loaded<'a>(&'a self, inbox: &'a Inbox) -> impl Iterator<Item = &'a PrSummary> {
         let all_open = self.all_open_state().and_then(Loadable::value);
-        Stacks::build(
-            INBOX_TABS
-                .iter()
-                .filter_map(|&tab| tab_page(tab, inbox))
-                .chain(all_open)
-                .flat_map(|page| page.items.iter()),
-        )
+        INBOX_TABS
+            .iter()
+            .filter_map(|&tab| tab_page(tab, inbox))
+            .chain(all_open)
+            .flat_map(|page| page.items.iter())
+    }
+
+    /// The stacks among every pull request the page loaded.
+    fn stacks(&self, inbox: &Inbox) -> Stacks {
+        Stacks::build(self.loaded(inbox), &self.open_by_base)
+    }
+
+    /// Asks GitHub how many open pull requests target each branch a loaded
+    /// pull request is based on and another one has as head, so a chain of
+    /// branches joins only pull requests that are one stack. The last
+    /// counts, and a stored copy, stand until the answer comes.
+    fn count_bases(&mut self, cx: &mut Context<Self>) {
+        let Some(inbox) = self.inbox.value() else {
+            return;
+        };
+        let bases = stacks::bases_to_count(self.loaded(inbox));
+        if bases.is_empty() {
+            return;
+        }
+        let key = crate::cache::github_key(cx, "reviews/open-by-base");
+        if self.open_by_base.is_empty()
+            && let Some(stored) = key
+                .as_deref()
+                .and_then(crate::cache::get::<Vec<(RepoRef, String, u32)>>)
+        {
+            self.open_by_base = stored
+                .into_iter()
+                .map(|(repo, branch, count)| ((repo, branch), count))
+                .collect();
+        }
+        self._bases = Some(common::run(
+            cx,
+            move |gh| {
+                let counts = gh.open_pull_requests_by_base(&bases)?;
+                Ok(bases
+                    .into_iter()
+                    .zip(counts)
+                    .filter_map(|((repo, branch), count)| Some((repo, branch, count?)))
+                    .collect::<Vec<_>>())
+            },
+            move |view: &mut InboxView, result, _| {
+                let Ok(counts) = result else {
+                    return;
+                };
+                for (repo, branch, count) in &counts {
+                    view.open_by_base
+                        .insert((repo.clone(), branch.clone()), *count);
+                }
+                if let Some(key) = &key {
+                    let stored: Vec<(RepoRef, String, u32)> = view
+                        .open_by_base
+                        .iter()
+                        .map(|((repo, branch), count)| (repo.clone(), branch.clone(), *count))
+                        .collect();
+                    crate::cache::put(key, &stored);
+                }
+            },
+        ));
     }
 
     /// The open tab's groups, each sorted on its own: a sort never moves a
@@ -1014,6 +1078,17 @@ impl InboxView {
         Rc::new(move |pr, gesture, _, cx| {
             view.update(cx, |this, cx| this.pick(pr, gesture, cx)).ok();
         })
+    }
+
+    /// A stack's box, or a Shift+click on its row: Shift extends the
+    /// selection over the whole stack, else its rows toggle as one.
+    fn pick_stack(&mut self, rows: &[PrRef], shift: bool, cx: &mut Context<Self>) {
+        if shift {
+            self.selection.extend_over(&self.rows_shown(), rows);
+            self.selection_changed(cx);
+        } else {
+            self.toggle_rows(rows, cx);
+        }
     }
 
     /// Picks every row of `rows`, one group's, or drops them all when every
@@ -1809,9 +1884,13 @@ impl InboxView {
             all_picked,
             showing,
             format!("Select every pull request in the stack {}", stack.name),
-            move |_, cx| {
-                view.update(cx, |this, cx| this.toggle_rows(&members, cx))
-                    .ok();
+            {
+                let members = members.clone();
+                move |window, cx| {
+                    let shift = window.modifiers().shift;
+                    view.update(cx, |this, cx| this.pick_stack(&members, shift, cx))
+                        .ok();
+                }
             },
         );
         let key = stack.key.clone();
@@ -1828,7 +1907,13 @@ impl InboxView {
             Some(lead),
             cx,
         )
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_stack(&key, cx)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if window.modifiers().shift {
+                this.pick_stack(&members, true, cx);
+            } else {
+                this.toggle_stack(&key, cx);
+            }
+        }))
         .into_any_element()
     }
 
@@ -2393,8 +2478,24 @@ mod tests {
         }
     }
 
+    /// Loads `inbox`, with the open pull requests per base branch GitHub
+    /// would count if the inbox held every one.
     fn load(view: &Entity<InboxView>, inbox: Inbox, cx: &mut VisualTestContext) {
         view.update(cx, |view, cx| {
+            let mut counts = super::OpenByBase::new();
+            let mut seen: Vec<PrRef> = Vec::new();
+            for pr in [&inbox.review_requested, &inbox.authored, &inbox.involved]
+                .into_iter()
+                .flat_map(|page| page.items.iter())
+            {
+                if !seen.contains(&pr.pr) {
+                    seen.push(pr.pr.clone());
+                    *counts
+                        .entry((pr.pr.repo.clone(), pr.base_ref.clone()))
+                        .or_default() += 1;
+                }
+            }
+            view.open_by_base = counts;
             view.inbox = Loadable::Loaded(inbox);
             cx.notify();
         });
