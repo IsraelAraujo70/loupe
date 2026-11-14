@@ -6,7 +6,7 @@
 //! sibling takes the space. The window always has one pane.
 
 use crate::route::Route;
-use crate::store::{PaneLayout, SplitAxis};
+use crate::store::{ClosedTabGroup, PaneLayout, SplitAxis};
 
 use super::tabs::{Page, Tab, Tabs};
 
@@ -598,6 +598,23 @@ impl<V> Panes<V> {
         tabs.insert(after, moved, Some(group));
         self.active = to;
         true
+    }
+
+    /// Closes every tab of group `group` of `pane` and returns the group as
+    /// it was. A pane left with no tab closes, and its neighbor takes the
+    /// space; the window's only pane is never emptied (`None`), so its
+    /// owner opens another tab first.
+    pub fn close_group(&mut self, pane: PaneId, group: u64) -> Option<ClosedTabGroup> {
+        let only_pane = self.pane_count() == 1;
+        let tabs = self.tabs_mut(pane)?;
+        if only_pane && tabs.group_len(group) == tabs.len() {
+            return None;
+        }
+        let closed = tabs.close_group(group)?;
+        if tabs.is_empty() {
+            self.remove_pane(pane);
+        }
+        Some(closed)
     }
 
     /// Drops tab `tab` of pane `from` on `zone` of pane `to`: into `to` for
