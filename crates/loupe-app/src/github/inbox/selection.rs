@@ -19,11 +19,6 @@ impl Selection {
         self.picked.contains(pr)
     }
 
-    /// The last row clicked, which a Shift+click extends from.
-    pub(super) fn anchor(&self) -> Option<&PrRef> {
-        self.anchor.as_ref()
-    }
-
     /// Picks `pr`, or drops it if it was picked; it becomes the anchor.
     pub(super) fn toggle(&mut self, pr: &PrRef) {
         match self.picked.iter().position(|picked| picked == pr) {
@@ -56,7 +51,7 @@ impl Selection {
         self.anchor = Some(pr.clone());
     }
 
-    /// Picks every row of `rows`, one section's.
+    /// Picks every row of `rows`, one group's or the whole tab's.
     pub(super) fn select_all(&mut self, rows: &[PrRef]) {
         for row in rows {
             if !self.picked.contains(row) {
@@ -140,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn a_section_selects_and_deselects_as_a_whole() {
+    fn a_group_selects_and_deselects_as_a_whole() {
         let (first, second) = (rows(&[1, 2]), rows(&[3, 4]));
         let all: Vec<PrRef> = first.iter().chain(&second).cloned().collect();
         let mut selection = Selection::default();
@@ -151,6 +146,6 @@ mod tests {
         assert_eq!(numbers(&selection.in_order(&all)), [1]);
         selection.clear();
         assert!(selection.in_order(&all).is_empty());
-        assert_eq!(selection.anchor(), None);
+        assert_eq!(selection, Selection::default(), "the anchor goes too");
     }
 }
