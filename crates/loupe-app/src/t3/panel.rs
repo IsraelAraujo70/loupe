@@ -148,9 +148,9 @@ impl LinkedThreads {
     }
 
     /// Works out whether the review button is shown, and whether it works:
-    /// the token may start agents, a T3 project tracks the repository, and
-    /// a provider serves the models. The changed files say whether the pull
-    /// request is risky.
+    /// the token may start agents and a T3 project tracks the repository.
+    /// The server's providers say which review prompts can run, and the
+    /// changed files whether the pull request is risky.
     fn reload_review(&mut self, cx: &mut Context<Self>) {
         self.review_load = None;
         if self.context.author.is_none() || self.context.is_own() {
@@ -177,7 +177,8 @@ impl LinkedThreads {
                     return Ok(Readiness::Unavailable(review::OPERATE_HINT.to_owned()));
                 }
                 let projects = t3.projects()?;
-                let facts = t3.review_facts(&review::MODELS)?;
+                let facts = t3.review_facts()?;
+                let providers = t3.providers()?;
                 // Without the file list the labels alone decide the risk.
                 let files: Vec<String> = github
                     .and_then(|github| github.pull_request_files(&context.pr).ok())
@@ -186,7 +187,7 @@ impl LinkedThreads {
                     .map(|file| file.path)
                     .collect();
                 Ok(review::assess(
-                    &context, session, &projects, &facts, &files, &settings,
+                    &context, session, &projects, &facts, providers, &files, &settings,
                 ))
             };
             check().unwrap_or_else(|error| {

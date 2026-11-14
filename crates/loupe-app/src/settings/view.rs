@@ -121,7 +121,7 @@ impl SettingsView {
             ),
         ];
         subscriptions.extend(review_subscriptions);
-        Self {
+        let mut view = Self {
             focus: cx.focus_handle(),
             search,
             scroll: ScrollHandle::new(),
@@ -138,7 +138,9 @@ impl SettingsView {
             appearance,
             review,
             _subscriptions: subscriptions,
-        }
+        };
+        view.load_providers(window, cx);
+        view
     }
 
     /// The section being read among `shown`, from where the page has
@@ -450,7 +452,11 @@ impl SettingsView {
             Item::ReviewPrompt => self
                 .review_prompt_card(entry, colors, cx)
                 .into_any_element(),
+            Item::ReviewPrompts => self
+                .review_prompts_card(entry, colors, cx)
+                .into_any_element(),
             Item::RiskCheck => self.risk_check_row(entry, colors, cx),
+            Item::RiskPrompt => self.risk_prompt_row(entry, colors, cx),
             Item::RiskList(list) => self.risk_list_row(entry, list, colors, cx),
             Item::Shortcut(index) => shortcut_row(index, colors, cx),
             Item::Version => row(message(

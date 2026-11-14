@@ -1,0 +1,116 @@
+{
+  "cwd": "/srv/example",
+  "keybindings": [],
+  "issues": [],
+  "availableEditors": [],
+  "providers": [
+    {
+      "instanceId": "claudeAgent",
+      "driver": "claudeAgent",
+      "displayName": "Claude",
+      "enabled": false,
+      "installed": false,
+      "version": null,
+      "status": "disabled",
+      "auth": { "status": "unknown" },
+      "checkedAt": "2026-11-13T23:43:15.125Z",
+      "message": "Claude is disabled in T3 Code settings.",
+      "models": [
+        {
+          "slug": "claude-opus-5-5",
+          "name": "Claude Opus 5.5",
+          "isCustom": false,
+          "isDefault": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Effort",
+                "type": "select",
+                "options": [
+                  { "id": "low", "label": "Low" },
+                  { "id": "medium", "label": "Medium", "isDefault": true },
+                  { "id": "high", "label": "High" }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "slug": "claude-fable-5-2",
+          "name": "Claude Fable 5.2",
+          "isCustom": false,
+          "capabilities": null
+        }
+      ],
+      "slashCommands": [],
+      "skills": []
+    },
+    {
+      "instanceId": "claude_pool",
+      "driver": "claudeAgent",
+      "displayName": "Claude Pool",
+      "continuation": { "groupKey": "claude:home" },
+      "showInteractionModeToggle": true,
+      "reportsContextWindow": true,
+      "enabled": true,
+      "installed": true,
+      "version": "2.1.319",
+      "status": "ready",
+      "auth": { "status": "authenticated" },
+      "checkedAt": "2026-11-13T23:43:15.125Z",
+      "models": [
+        {
+          "slug": "claude-opus-5-5",
+          "name": "Claude Opus 5.5",
+          "isCustom": false,
+          "isDefault": true,
+          "capabilities": {
+            "optionDescriptors": [
+              {
+                "id": "effort",
+                "label": "Effort",
+                "type": "select",
+                "options": [
+                  { "id": "low", "label": "Low" },
+                  { "id": "medium", "label": "Medium", "isDefault": true },
+                  { "id": "high", "label": "High" },
+                  { "id": "xhigh", "label": "Extra high" },
+                  { "id": "max", "label": "Max" }
+                ]
+              },
+              { "id": "fastMode", "label": "Fast mode", "type": "boolean" }
+            ]
+          }
+        },
+        {
+          "slug": "claude-haiku-4-5",
+          "name": "Claude Haiku 4.5",
+          "isCustom": false,
+          "isLegacy": true,
+          "capabilities": {
+            "optionDescriptors": [
+              { "id": "thinking", "label": "Thinking", "type": "boolean", "currentValue": true }
+            ]
+          }
+        }
+      ],
+      "slashCommands": [],
+      "skills": []
+    },
+    {
+      "instanceId": "codex",
+      "driver": "codex",
+      "enabled": true,
+      "installed": false,
+      "version": null,
+      "status": "warning",
+      "auth": { "status": "unknown" },
+      "checkedAt": "2026-11-13T23:43:15.125Z",
+      "models": [],
+      "slashCommands": [],
+      "skills": []
+    }
+  ],
+  "observability": {}
+}

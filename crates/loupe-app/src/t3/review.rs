@@ -3,9 +3,9 @@
 //! template and the risk rules of Settings > T3 Code. Pure, so every rule
 //! here is tested without a server.
 
-use std::collections::HashMap;
-
-use loupe_t3::{ModelChoice, Project, PullRequestKey, ReviewFacts, Session};
+use loupe_t3::{
+    ModelChoice, Project, Provider, ProviderModel, PullRequestKey, ReviewFacts, Session,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::links::PrLinkContext;
@@ -18,37 +18,6 @@ pub const OPERATE_HINT: &str = "Review with T3 Code starts an agent, so it needs
 pub(super) const CONNECT_HINT: &str = "Connect T3 Code in Settings to start a review.";
 pub(super) const REJECTED_HINT: &str = "T3 rejected the token. Check it in Settings.";
 
-const OPUS: &str = "claude-opus-5-5";
-const FABLE: &str = "claude-fable-5-2";
-/// The models a review runs on, for `T3::review_facts`.
-pub(super) const MODELS: [&str; 2] = [OPUS, FABLE];
-
-/// Who reviews: the general review, or the general review plus the security
-/// review of the `revisar-seguranca` skill.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Reviewer {
-    General,
-    GeneralAndSecurity,
-}
-
-impl Reviewer {
-    pub(super) const ALL: [Reviewer; 2] = [Reviewer::General, Reviewer::GeneralAndSecurity];
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Reviewer::General => "General (Opus)",
-            Reviewer::GeneralAndSecurity => "General + security (Fable)",
-        }
-    }
-
-    fn model(self) -> (&'static str, &'static str) {
-        match self {
-            Reviewer::General => (OPUS, "high"),
-            Reviewer::GeneralAndSecurity => (FABLE, "medium"),
-        }
-    }
-}
-
 /// Where a review of this pull request would run, once every check passed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Plan {
@@ -56,8 +25,8 @@ pub(super) struct Plan {
     pub project_title: String,
     /// The worktree's new branch, one no thread of the project holds.
     pub branch: String,
-    /// The provider instance for each reviewer's model.
-    instances: HashMap<&'static str, String>,
+    /// The server's provider instances and the models each offers.
+    pub providers: Vec<Provider>,
     /// Why the pull request is risky: its risk labels and the changed files
     /// that touch auth, secrets, permissions, money, uploads or personal
     /// data. Empty for an ordinary pull request.
@@ -65,22 +34,9 @@ pub(super) struct Plan {
 }
 
 impl Plan {
-    /// The reviewer the dialog starts with: security for a risky pull request.
-    pub(super) fn default_reviewer(&self) -> Reviewer {
-        if self.risk.is_empty() {
-            Reviewer::General
-        } else {
-            Reviewer::GeneralAndSecurity
-        }
-    }
-
-    pub(super) fn model(&self, reviewer: Reviewer) -> ModelChoice {
-        let (model, effort) = reviewer.model();
-        ModelChoice {
-            instance_id: self.instances[model].clone(),
-            model: model.to_owned(),
-            effort: Some(effort.to_owned()),
-        }
+    /// The model `prompt` runs on, or why the server cannot run it.
+    pub(super) fn model(&self, prompt: &ReviewPrompt) -> Result<ModelChoice, String> {
+        model_choice(&self.providers, prompt)
     }
 }
 
@@ -94,12 +50,14 @@ pub(super) enum Readiness {
 }
 
 /// Whether the pull request can get a review thread, from what the server and
-/// GitHub answered. `files` are the changed paths.
+/// GitHub answered. `files` are the changed paths. A prompt whose model the
+/// server cannot run does not disable the button: the dialog names it.
 pub(super) fn assess(
     context: &PrLinkContext,
     session: Session,
     projects: &[Project],
     facts: &ReviewFacts,
+    providers: Vec<Provider>,
     files: &[String],
     settings: &ReviewSettings,
 ) -> Readiness {
@@ -113,26 +71,6 @@ pub(super) fn assess(
             "No T3 project tracks {repository}. Add the repository to T3 Code first."
         ));
     };
-    // Both models are Claude's, so one provider instance serves the other
-    // when only one of them has run yet.
-    let found = |model: &str| {
-        facts
-            .instances
-            .get(model)
-            .filter(|id| !id.is_empty())
-            .cloned()
-    };
-    let Some(any) = found(OPUS).or_else(|| found(FABLE)) else {
-        return Readiness::Unavailable(
-            "No T3 thread has run Claude Opus or Fable yet, so Loupe cannot tell which \
-             provider serves them."
-                .to_owned(),
-        );
-    };
-    let instances = [OPUS, FABLE]
-        .into_iter()
-        .map(|model| (model, found(model).unwrap_or_else(|| any.clone())))
-        .collect();
     let taken = facts
         .branches
         .get(&project.id)
@@ -142,9 +80,113 @@ pub(super) fn assess(
         project_id: project.id.clone(),
         project_title: project.title.clone(),
         branch: branch(context, taken),
-        instances,
+        providers,
         risk: risk(settings, &context.labels, files),
     })
+}
+
+/// The model a prompt runs on: its provider instance, or else the first one
+/// that can run threads and offers the model, with the prompt's effort.
+/// `Err` says why the server cannot run it: the provider is gone or off,
+/// it does not offer the model, or the model has no such effort.
+pub fn model_choice(providers: &[Provider], prompt: &ReviewPrompt) -> Result<ModelChoice, String> {
+    fn offered<'a>(provider: &'a Provider, slug: &str) -> Option<&'a ProviderModel> {
+        provider.models.iter().find(|model| model.slug == slug)
+    }
+    let offered = |provider| offered(provider, &prompt.model);
+    let (provider, model) = match &prompt.provider {
+        Some(id) => {
+            let Some(provider) = providers
+                .iter()
+                .find(|provider| provider.instance_id == *id)
+            else {
+                return Err(format!("The T3 server has no provider {id}."));
+            };
+            if let Some(why) = &provider.unavailable {
+                return Err(why.clone());
+            }
+            let Some(model) = offered(provider) else {
+                return Err(format!(
+                    "{} does not offer {}.",
+                    provider.name, prompt.model
+                ));
+            };
+            (provider, model)
+        }
+        None => {
+            let ready = providers
+                .iter()
+                .filter(|provider| provider.unavailable.is_none())
+                .find_map(|provider| offered(provider).map(|model| (provider, model)));
+            match ready {
+                Some(found) => found,
+                None => {
+                    let off = providers
+                        .iter()
+                        .find(|provider| offered(provider).is_some())
+                        .and_then(|provider| provider.unavailable.clone());
+                    return Err(match off {
+                        Some(why) => format!(
+                            "No provider that can run threads offers {}. {why}",
+                            prompt.model
+                        ),
+                        None => format!("No provider of the T3 server offers {}.", prompt.model),
+                    });
+                }
+            }
+        }
+    };
+    if let Some(effort) = &prompt.effort
+        && !model.efforts.iter().any(|offered| offered.id == *effort)
+    {
+        return Err(if model.efforts.is_empty() {
+            format!(
+                "{} on {} takes no effort setting, and the prompt asks for {effort}.",
+                model.name, provider.name
+            )
+        } else {
+            format!(
+                "{} on {} has no {effort} effort.",
+                model.name, provider.name
+            )
+        });
+    }
+    Ok(ModelChoice {
+        instance_id: provider.instance_id.clone(),
+        model: model.slug.clone(),
+        effort: prompt.effort.clone(),
+    })
+}
+
+/// What a prompt runs on, as the dialog and Settings name it: "Claude Opus
+/// 5.5 · High · Claude Pool", from the names the server gives.
+pub fn model_summary(providers: &[Provider], choice: &ModelChoice) -> String {
+    let provider = providers
+        .iter()
+        .find(|provider| provider.instance_id == choice.instance_id);
+    let model = provider.and_then(|provider| {
+        provider
+            .models
+            .iter()
+            .find(|model| model.slug == choice.model)
+    });
+    let effort = choice.effort.as_ref().map(|id| {
+        model
+            .and_then(|model| model.efforts.iter().find(|effort| effort.id == *id))
+            .map_or_else(|| id.clone(), |effort| effort.label.clone())
+    });
+    [
+        Some(model.map_or_else(|| choice.model.clone(), |model| model.name.clone())),
+        effort,
+        Some(provider.map_or_else(
+            || choice.instance_id.clone(),
+            |provider| provider.name.clone(),
+        )),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 /// A disabled state that needs no server: the head lives on a fork, which a
@@ -158,16 +200,23 @@ pub(super) fn precheck(context: &PrLinkContext) -> Option<Readiness> {
     })
 }
 
-/// The review settings of Settings > T3 Code: the request template and the
-/// rules that mark a pull request risky. `None` is Loupe's default, so a user
-/// who never edited a setting gets the default of each new version.
+/// The review settings of Settings > T3 Code: the request template, the
+/// named review prompts, and the rules that mark a pull request risky.
+/// `None` is Loupe's default, so a user who never edited a setting gets the
+/// default of each new version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewSettings {
     /// The request template, with the `{variables}` of [`VARIABLES`].
     pub prompt: Option<String>,
+    /// The review prompts, in the dialog's order.
+    pub prompts: Option<Vec<ReviewPrompt>>,
+    /// The id of the prompt the dialog starts on.
+    pub default_prompt: Option<String>,
+    /// The id of the prompt a risky pull request starts on.
+    pub risk_prompt: Option<String>,
     /// Off: no pull request is risky, and every review starts on the
-    /// general reviewer.
+    /// default prompt.
     pub risk_check: bool,
     pub risk_labels: Option<Vec<String>>,
     pub risk_words: Option<Vec<String>>,
@@ -178,12 +227,66 @@ impl Default for ReviewSettings {
     fn default() -> Self {
         ReviewSettings {
             prompt: None,
+            prompts: None,
+            default_prompt: None,
+            risk_prompt: None,
             risk_check: true,
             risk_labels: None,
             risk_words: None,
             risk_exceptions: None,
         }
     }
+}
+
+/// A named review prompt: what the review asks for on top of the request
+/// template, and the model and effort its thread runs on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPrompt {
+    /// Names it to the default and risk choices; stays put through renames.
+    pub id: String,
+    pub name: String,
+    /// The template puts it where `{prompt}` is. It may use the template's
+    /// variables; empty adds nothing.
+    pub text: String,
+    /// The provider instance; `None` runs on the first one that can run
+    /// threads and offers the model.
+    #[serde(default)]
+    pub provider: Option<String>,
+    pub model: String,
+    /// `None` runs at the model's default effort.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+const GENERAL: &str = "general";
+const SECURITY: &str = "security";
+
+/// The security review's text. With `{risk}` it reads as the paragraph
+/// Loupe sent before prompts were settings.
+const SECURITY_TEXT: &str = "{risk}: além da revisão geral, faça a revisão de segurança \
+     seguindo a skill `revisar-seguranca`, quando o ambiente tiver essa skill.";
+
+/// The prompts a user who never edited them has: the general review on
+/// Opus, and the general plus the security review on Fable.
+pub fn default_prompts() -> Vec<ReviewPrompt> {
+    vec![
+        ReviewPrompt {
+            id: GENERAL.to_owned(),
+            name: "General".to_owned(),
+            text: String::new(),
+            provider: None,
+            model: "claude-opus-5-5".to_owned(),
+            effort: Some("high".to_owned()),
+        },
+        ReviewPrompt {
+            id: SECURITY.to_owned(),
+            name: "General + security".to_owned(),
+            text: SECURITY_TEXT.to_owned(),
+            provider: None,
+            model: "claude-fable-5-2".to_owned(),
+            effort: Some("medium".to_owned()),
+        },
+    ]
 }
 
 impl ReviewSettings {
@@ -196,6 +299,115 @@ impl ReviewSettings {
     /// default, so it follows Loupe's updates.
     pub fn set_prompt(&mut self, text: &str) {
         self.prompt = (text != DEFAULT_PROMPT).then(|| text.to_owned());
+    }
+
+    /// The review prompts, the user's or the default ones.
+    pub fn prompts(&self) -> Vec<ReviewPrompt> {
+        self.prompts.clone().unwrap_or_else(default_prompts)
+    }
+
+    /// Keeps `prompts`; the default prompts are kept as the default.
+    pub fn set_prompts(&mut self, prompts: Vec<ReviewPrompt>) {
+        self.prompts = (prompts != default_prompts()).then_some(prompts);
+    }
+
+    /// The id of the prompt the dialog starts on, as chosen.
+    pub fn default_prompt_id(&self) -> &str {
+        self.default_prompt.as_deref().unwrap_or(GENERAL)
+    }
+
+    /// The id of the prompt a risky pull request starts on, as chosen.
+    pub fn risk_prompt_id(&self) -> &str {
+        self.risk_prompt.as_deref().unwrap_or(SECURITY)
+    }
+
+    pub fn set_default_prompt(&mut self, id: &str) {
+        self.default_prompt = (id != GENERAL).then(|| id.to_owned());
+    }
+
+    pub fn set_risk_prompt(&mut self, id: &str) {
+        self.risk_prompt = (id != SECURITY).then(|| id.to_owned());
+    }
+
+    /// The index in `prompts()` of the prompt the dialog starts on: the
+    /// risk prompt for a risky pull request, else the default one. A choice
+    /// whose prompt is gone falls back to the default, then the first.
+    pub fn starting_index(&self, risky: bool) -> usize {
+        let prompts = self.prompts();
+        let find = |id: &str| prompts.iter().position(|prompt| prompt.id == id);
+        risky
+            .then(|| find(self.risk_prompt_id()))
+            .flatten()
+            .or_else(|| find(self.default_prompt_id()))
+            .unwrap_or(0)
+    }
+
+    /// Adds a prompt at the end, on the default prompt's model and effort,
+    /// and returns its id.
+    pub fn add_prompt(&mut self) -> String {
+        let mut prompts = self.prompts();
+        let id = (1..)
+            .map(|n| format!("prompt-{n}"))
+            .find(|id| !prompts.iter().any(|prompt| prompt.id == *id))
+            .unwrap_or_default();
+        let base = prompts
+            .get(self.starting_index(false))
+            .cloned()
+            .unwrap_or_else(|| default_prompts().remove(0));
+        prompts.push(ReviewPrompt {
+            id: id.clone(),
+            name: "New prompt".to_owned(),
+            text: String::new(),
+            ..base
+        });
+        self.set_prompts(prompts);
+        id
+    }
+
+    /// Changes the prompt with `id`, if there is one.
+    pub fn update_prompt(&mut self, id: &str, change: impl FnOnce(&mut ReviewPrompt)) {
+        let mut prompts = self.prompts();
+        if let Some(prompt) = prompts.iter_mut().find(|prompt| prompt.id == id) {
+            change(prompt);
+            self.set_prompts(prompts);
+        }
+    }
+
+    /// Moves the prompt with `id` one place earlier (`up`) or later.
+    pub fn move_prompt(&mut self, id: &str, up: bool) {
+        let mut prompts = self.prompts();
+        let Some(index) = prompts.iter().position(|prompt| prompt.id == id) else {
+            return;
+        };
+        let target = if up {
+            index.checked_sub(1)
+        } else {
+            Some(index + 1).filter(|next| *next < prompts.len())
+        };
+        if let Some(target) = target {
+            prompts.swap(index, target);
+            self.set_prompts(prompts);
+        }
+    }
+
+    /// Deletes the prompt with `id`, unless it is the last one. The default
+    /// choice moves to the first prompt left, and the risk choice to the
+    /// default prompt, so a new prompt never inherits a deleted one's role.
+    pub fn remove_prompt(&mut self, id: &str) {
+        let mut prompts = self.prompts();
+        if prompts.len() < 2 || !prompts.iter().any(|prompt| prompt.id == id) {
+            return;
+        }
+        prompts.retain(|prompt| prompt.id != id);
+        let first = prompts[0].id.clone();
+        self.set_prompts(prompts);
+        if self.default_prompt_id() == id {
+            self.set_default_prompt(&first);
+        }
+        if self.risk_prompt_id() == id {
+            let default = self.default_prompt_id().to_owned();
+            self.set_risk_prompt(&default);
+        }
     }
 
     /// The words of one risk list, the user's or the default.
@@ -415,12 +627,12 @@ Esta worktree parte do head atual de `origin/{head_branch}` (era `{short_sha}` q
 5. **Testes**: rode os specs que o PR toca (os pesados onde o AGENTS.md do repo mandar) e mostre que uma mutação relevante faz um teste falhar.
 6. **Escopo**: diga o que vazou para fora do que o PR pede.
 
-{security}
+{prompt}
 
 Não comente no PR, não aprove, não faça push nem merge. Termine com um texto pronto para o usuário postar como revisão, o veredito (aprovar, aprovar com ressalvas ou pedir mudanças) e um bloco json: {\"veredito\":\"...\",\"vermelhos\":<n>,\"amarelos\":<n>,\"nao_verificado\":\"...\"}.";
 
 /// The variables a template can use, each with what it stands for.
-pub const VARIABLES: [(&str, &str); 9] = [
+pub const VARIABLES: [(&str, &str); 10] = [
     ("number", "the pull request's number"),
     ("title", "its title"),
     ("author", "its author's login"),
@@ -430,33 +642,31 @@ pub const VARIABLES: [(&str, &str); 9] = [
     ("head_sha", "the head commit's SHA"),
     ("short_sha", "its first 8 characters"),
     (
-        "security",
-        "the security review request, when the reviewer includes it",
+        "prompt",
+        "the text of the review prompt picked in the dialog",
+    ),
+    (
+        "risk",
+        "why the review runs: the risk reasons, or that you asked for the security review",
     ),
 ];
 
+/// What templates written before review prompts called `{prompt}`.
+const OLD_PROMPT_VARIABLE: &str = "security";
+
 /// The review request the thread starts with: `template` with its
-/// variables filled for this pull request and reviewer. The user can edit
-/// it before sending.
+/// variables filled for this pull request, and `{prompt}` with the review
+/// prompt's text, filled the same way. The user can edit it before sending.
 pub(super) fn request(
     context: &PrLinkContext,
-    reviewer: Reviewer,
+    prompt: &str,
     risk: &[String],
     template: &str,
 ) -> String {
-    let security = match reviewer {
-        Reviewer::General => String::new(),
-        Reviewer::GeneralAndSecurity => {
-            let why = if risk.is_empty() {
-                "O usuário pediu também a revisão de segurança".to_owned()
-            } else {
-                format!("Este PR é de risco ({})", summary(risk))
-            };
-            format!(
-                "{why}: além da revisão geral, faça a revisão de segurança seguindo a skill \
-                 `revisar-seguranca`, quando o ambiente tiver essa skill."
-            )
-        }
+    let why = if risk.is_empty() {
+        "O usuário pediu também a revisão de segurança".to_owned()
+    } else {
+        format!("Este PR é de risco ({})", summary(risk))
     };
     let value = |name: &str| -> Option<String> {
         Some(match name {
@@ -468,17 +678,22 @@ pub(super) fn request(
             "head_branch" => context.head_ref.clone(),
             "head_sha" => context.head_oid.clone(),
             "short_sha" => context.head_oid.chars().take(8).collect(),
-            "security" => security.clone(),
+            "risk" => why.clone(),
+            "prompt" | OLD_PROMPT_VARIABLE => String::new(),
             _ => return None,
         })
     };
-    fill(template, value)
+    let prompt = fill(prompt, value);
+    fill(template, |name| match name {
+        "prompt" | OLD_PROMPT_VARIABLE => Some(prompt.clone()),
+        other => value(other),
+    })
 }
 
 /// `template` with each `{variable}` that `value` knows replaced in one
 /// pass, so a value that holds braces stays as it is. A paragraph that is
-/// only a variable with an empty value (`{security}` for the general
-/// review) is left out with its blank line. Other text in braces, such as
+/// only a variable with an empty value (`{prompt}` for a prompt with no
+/// text) is left out with its blank line. Other text in braces, such as
 /// JSON, stays as typed.
 fn fill(template: &str, value: impl Fn(&str) -> Option<String>) -> String {
     let only_empty = |paragraph: &str| {
@@ -518,7 +733,8 @@ fn fill(template: &str, value: impl Fn(&str) -> Option<String>) -> String {
 }
 
 /// The `{words}` of `template` that look like variables and are not one of
-/// [`VARIABLES`], each once, for Settings to point out.
+/// [`VARIABLES`], each once, for Settings to point out. `{security}`, which
+/// templates written before review prompts used for `{prompt}`, still is.
 pub fn unknown_variables(template: &str) -> Vec<String> {
     let mut unknown: Vec<String> = Vec::new();
     for piece in template.split('{').skip(1) {
@@ -527,7 +743,8 @@ pub fn unknown_variables(template: &str) -> Vec<String> {
         };
         let looks_like_one =
             !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        let known = VARIABLES.iter().any(|(variable, _)| *variable == name);
+        let known =
+            name == OLD_PROMPT_VARIABLE || VARIABLES.iter().any(|(variable, _)| *variable == name);
         if looks_like_one && !known && !unknown.iter().any(|seen| seen == name) {
             unknown.push(name.to_owned());
         }
@@ -555,11 +772,12 @@ mod tests {
     use std::collections::HashMap;
 
     use loupe_github::{PrRef, RepoRef};
-    use loupe_t3::{Project, ReviewFacts, Session};
+    use loupe_t3::{Effort, Project, Provider, ProviderModel, ReviewFacts, Session};
 
     use super::{
-        DEFAULT_PROMPT, OPERATE_HINT, Readiness, ReviewSettings, Reviewer, RiskList, assess,
-        branch, format_list, precheck, request, risk, thread_title, unknown_variables,
+        DEFAULT_PROMPT, OPERATE_HINT, Plan, Readiness, ReviewPrompt, ReviewSettings, RiskList,
+        assess, branch, default_prompts, format_list, model_choice, precheck, request, risk,
+        thread_title, unknown_variables,
     };
     use crate::links::PrLinkContext;
 
@@ -586,17 +804,87 @@ mod tests {
         }
     }
 
-    fn models(pairs: &[(&str, &str)]) -> ReviewFacts {
+    fn facts() -> ReviewFacts {
         ReviewFacts {
-            instances: pairs
-                .iter()
-                .map(|(model, instance)| ((*model).to_owned(), (*instance).to_owned()))
-                .collect(),
             branches: HashMap::new(),
         }
     }
 
+    fn model(slug: &str, efforts: &[&str]) -> ProviderModel {
+        ProviderModel {
+            slug: slug.into(),
+            name: format!("Model {slug}"),
+            efforts: efforts
+                .iter()
+                .map(|id| Effort {
+                    id: (*id).into(),
+                    label: (*id).into(),
+                    is_default: *id == "medium",
+                })
+                .collect(),
+        }
+    }
+
+    fn provider(id: &str, unavailable: Option<&str>, models: Vec<ProviderModel>) -> Provider {
+        Provider {
+            instance_id: id.into(),
+            name: format!("Provider {id}"),
+            unavailable: unavailable.map(str::to_owned),
+            models,
+        }
+    }
+
+    /// A server like a real one: the plain Claude instance is off, a pool
+    /// instance serves both default models.
+    fn providers() -> Vec<Provider> {
+        let claude = || {
+            vec![
+                model("claude-opus-5-5", &["low", "medium", "high"]),
+                model("claude-fable-5-2", &["low", "medium", "high"]),
+                model("claude-haiku-4-5", &[]),
+            ]
+        };
+        vec![
+            provider("claudeAgent", Some("Claude is off."), claude()),
+            provider("pool", None, claude()),
+            provider("codex", None, vec![model("gpt-6", &["low", "high"])]),
+        ]
+    }
+
+    fn prompt(provider: Option<&str>, model: &str, effort: Option<&str>) -> ReviewPrompt {
+        ReviewPrompt {
+            id: "p".into(),
+            name: "P".into(),
+            text: String::new(),
+            provider: provider.map(str::to_owned),
+            model: model.into(),
+            effort: effort.map(str::to_owned),
+        }
+    }
+
     const OPERATE: Session = Session { can_operate: true };
+
+    fn ready(files: &[&str], settings: &ReviewSettings) -> Plan {
+        let files: Vec<String> = files.iter().map(|path| (*path).to_owned()).collect();
+        match assess(
+            &context(),
+            OPERATE,
+            &[project("p", "github.com/hooli-inc/hooli-api")],
+            &facts(),
+            providers(),
+            &files,
+            settings,
+        ) {
+            Readiness::Ready(plan) => plan,
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    /// The name of the prompt the dialog starts on for `plan`.
+    fn starts_on(plan: &Plan, settings: &ReviewSettings) -> String {
+        let index = settings.starting_index(!plan.risk.is_empty());
+        settings.prompts()[index].name.clone()
+    }
 
     #[test]
     fn the_button_is_only_for_someone_elses_pull_request() {
@@ -614,7 +902,8 @@ mod tests {
             &context(),
             Session { can_operate: false },
             &[project("p", "github.com/hooli-inc/hooli-api")],
-            &models(&[("claude-opus-5-5", "pool")]),
+            &facts(),
+            providers(),
             &[],
             &ReviewSettings::default(),
         );
@@ -627,7 +916,8 @@ mod tests {
             &context(),
             OPERATE,
             &[project("p", "github.com/hooli-inc/hooli-web")],
-            &models(&[("claude-opus-5-5", "pool")]),
+            &facts(),
+            providers(),
             &[],
             &ReviewSettings::default(),
         );
@@ -649,29 +939,95 @@ mod tests {
             &context(),
             OPERATE,
             &projects,
-            &models(&[("claude-opus-5-5", "pool")]),
+            &facts(),
+            providers(),
             &[],
             &ReviewSettings::default(),
         ) else {
             panic!("expected Ready");
         };
         assert_eq!(plan.project_id, "api");
-        // Fable runs on the instance Opus ran on until a Fable thread exists.
-        assert_eq!(plan.model(Reviewer::GeneralAndSecurity).instance_id, "pool");
+    }
+
+    #[test]
+    fn the_default_prompts_run_where_the_server_offers_their_models() {
+        let [general, security] = <[ReviewPrompt; 2]>::try_from(default_prompts()).unwrap();
+        let plan = ready(&[], &ReviewSettings::default());
+        let opus = plan.model(&general).unwrap();
         assert_eq!(
-            plan.model(Reviewer::General).model,
-            "claude-opus-5-5".to_owned()
+            (
+                opus.instance_id.as_str(),
+                opus.model.as_str(),
+                opus.effort.as_deref()
+            ),
+            ("pool", "claude-opus-5-5", Some("high")),
+            "the first provider that can run threads, not the one that is off"
         );
-        let fable = plan.model(Reviewer::GeneralAndSecurity);
+        let fable = plan.model(&security).unwrap();
         assert_eq!(
-            (fable.model.as_str(), fable.effort.as_deref()),
-            ("claude-fable-5-2", Some("medium"))
+            (
+                fable.instance_id.as_str(),
+                fable.model.as_str(),
+                fable.effort.as_deref()
+            ),
+            ("pool", "claude-fable-5-2", Some("medium"))
+        );
+        assert_eq!(
+            model_choice(&providers(), &prompt(Some("codex"), "gpt-6", None))
+                .unwrap()
+                .instance_id,
+            "codex",
+            "a chosen provider is the one used"
+        );
+    }
+
+    #[test]
+    fn a_prompt_the_server_cannot_run_says_why() {
+        let reason = |prompt: ReviewPrompt| model_choice(&providers(), &prompt).unwrap_err();
+        assert_eq!(
+            reason(prompt(Some("gone"), "claude-opus-5-5", None)),
+            "The T3 server has no provider gone."
+        );
+        assert_eq!(
+            reason(prompt(Some("claudeAgent"), "claude-opus-5-5", None)),
+            "Claude is off.",
+            "a provider that is off says so in the server's words"
+        );
+        assert_eq!(
+            reason(prompt(Some("codex"), "claude-opus-5-5", None)),
+            "Provider codex does not offer claude-opus-5-5."
+        );
+        assert_eq!(
+            reason(prompt(None, "claude-sonnet-9", None)),
+            "No provider of the T3 server offers claude-sonnet-9."
+        );
+        assert_eq!(
+            reason(prompt(Some("codex"), "gpt-6", Some("medium"))),
+            "Model gpt-6 on Provider codex has no medium effort."
+        );
+        assert_eq!(
+            reason(prompt(None, "claude-haiku-4-5", Some("high"))),
+            "Model claude-haiku-4-5 on Provider pool takes no effort setting, and the prompt \
+             asks for high."
+        );
+        let only_off = vec![provider(
+            "claudeAgent",
+            Some("Claude is off."),
+            vec![model("claude-opus-5-5", &[])],
+        )];
+        assert_eq!(
+            model_choice(&only_off, &prompt(None, "claude-opus-5-5", None)).unwrap_err(),
+            "No provider that can run threads offers claude-opus-5-5. Claude is off."
+        );
+        assert!(
+            model_choice(&providers(), &prompt(None, "claude-haiku-4-5", None)).is_ok(),
+            "no effort runs at the model's default"
         );
     }
 
     #[test]
     fn the_branch_is_one_no_thread_of_the_project_holds() {
-        let mut facts = models(&[("claude-opus-5-5", "pool")]);
+        let mut facts = facts();
         facts.branches.insert(
             "api".into(),
             vec!["review/pr-374".into(), "feat/other".into()],
@@ -688,25 +1044,13 @@ mod tests {
             OPERATE,
             &projects,
             &facts,
+            providers(),
             &[],
             &ReviewSettings::default(),
         ) else {
             panic!("expected Ready");
         };
         assert_eq!(plan.branch, "review/pr-374-2");
-    }
-
-    #[test]
-    fn no_claude_thread_yet_means_no_known_provider() {
-        let readiness = assess(
-            &context(),
-            OPERATE,
-            &[project("p", "github.com/hooli-inc/hooli-api")],
-            &models(&[]),
-            &[],
-            &ReviewSettings::default(),
-        );
-        assert!(matches!(readiness, Readiness::Unavailable(_)));
     }
 
     #[test]
@@ -763,33 +1107,117 @@ mod tests {
 
     #[test]
     fn a_risky_pull_request_starts_on_the_security_review() {
-        let ready_with = |files: &[&str], settings: &ReviewSettings| {
-            let files: Vec<String> = files.iter().map(|path| (*path).to_owned()).collect();
-            match assess(
-                &context(),
-                OPERATE,
-                &[project("p", "github.com/hooli-inc/hooli-api")],
-                &models(&[("claude-opus-5-5", "pool")]),
-                &files,
-                settings,
-            ) {
-                Readiness::Ready(plan) => plan,
-                other => panic!("expected Ready, got {other:?}"),
-            }
-        };
-        let ready = |files: &[&str]| ready_with(files, &ReviewSettings::default());
-        assert_eq!(ready(&["README.md"]).default_reviewer(), Reviewer::General);
+        let defaults = ReviewSettings::default();
         assert_eq!(
-            ready(&["src/auth/session.ts"]).default_reviewer(),
-            Reviewer::GeneralAndSecurity
+            starts_on(&ready(&["README.md"], &defaults), &defaults),
+            "General"
+        );
+        assert_eq!(
+            starts_on(&ready(&["src/auth/session.ts"], &defaults), &defaults),
+            "General + security"
         );
         let off = ReviewSettings {
             risk_check: false,
             ..ReviewSettings::default()
         };
-        let plan = ready_with(&["src/auth/session.ts"], &off);
+        let plan = ready(&["src/auth/session.ts"], &off);
         assert!(plan.risk.is_empty(), "{:?}", plan.risk);
-        assert_eq!(plan.default_reviewer(), Reviewer::General);
+        assert_eq!(starts_on(&plan, &off), "General");
+    }
+
+    #[test]
+    fn the_dialog_starts_on_the_prompts_the_user_chose() {
+        let mut settings = ReviewSettings::default();
+        let deep = settings.add_prompt();
+        settings.update_prompt(&deep, |prompt| prompt.name = "Deep".into());
+        let quick = settings.add_prompt();
+        settings.update_prompt(&quick, |prompt| prompt.name = "Quick".into());
+        settings.set_default_prompt(&quick);
+        settings.set_risk_prompt(&deep);
+        assert_eq!(
+            starts_on(&ready(&["README.md"], &settings), &settings),
+            "Quick"
+        );
+        assert_eq!(
+            starts_on(&ready(&["src/auth/session.ts"], &settings), &settings),
+            "Deep",
+            "a risky pull request starts on the prompt chosen for risk"
+        );
+
+        settings.remove_prompt(&deep);
+        assert_eq!(
+            starts_on(&ready(&["src/auth/session.ts"], &settings), &settings),
+            "Quick",
+            "with the risk prompt gone, a risky pull request starts on the default one"
+        );
+        let again = settings.add_prompt();
+        assert_eq!(again, "prompt-1", "the deleted prompt's id is free again");
+        assert_eq!(
+            starts_on(&ready(&["src/auth/session.ts"], &settings), &settings),
+            "Quick",
+            "a new prompt does not inherit the deleted one's role"
+        );
+        settings.remove_prompt(&quick);
+        assert_eq!(
+            settings.default_prompt_id(),
+            "general",
+            "the default moves to the first prompt left"
+        );
+    }
+
+    #[test]
+    fn prompts_are_added_edited_reordered_and_deleted() {
+        let mut settings = ReviewSettings::default();
+        let names = |settings: &ReviewSettings| {
+            settings
+                .prompts()
+                .into_iter()
+                .map(|prompt| prompt.name)
+                .collect::<Vec<_>>()
+        };
+        let id = settings.add_prompt();
+        let added = settings.prompts().pop().unwrap();
+        assert_eq!(
+            (
+                added.name.as_str(),
+                added.model.as_str(),
+                added.effort.as_deref()
+            ),
+            ("New prompt", "claude-opus-5-5", Some("high")),
+            "a new prompt starts on the default prompt's model"
+        );
+        settings.update_prompt(&id, |prompt| {
+            prompt.name = "Performance".into();
+            prompt.text = "Look for slow queries.".into();
+            prompt.provider = Some("codex".into());
+            prompt.model = "gpt-6".into();
+            prompt.effort = None;
+        });
+        assert_eq!(
+            names(&settings),
+            ["General", "General + security", "Performance"]
+        );
+        settings.move_prompt(&id, true);
+        settings.move_prompt(&id, true);
+        settings.move_prompt(&id, true);
+        assert_eq!(
+            names(&settings),
+            ["Performance", "General", "General + security"]
+        );
+        settings.move_prompt("security", false);
+        assert_eq!(
+            names(&settings),
+            ["Performance", "General", "General + security"]
+        );
+        settings.remove_prompt("general");
+        settings.remove_prompt("security");
+        assert_eq!(names(&settings), ["Performance"]);
+        settings.remove_prompt(&id);
+        assert_eq!(names(&settings), ["Performance"], "the last prompt stays");
+
+        let saved = serde_json::to_string(&settings).unwrap();
+        let read: ReviewSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(read, settings, "the prompts survive a restart");
     }
 
     #[test]
@@ -846,6 +1274,22 @@ mod tests {
         );
         settings.set_list(RiskList::Words, "auth,\n auth , ,Auth, pix");
         assert_eq!(settings.list(RiskList::Words), ["auth", "pix"]);
+
+        settings.update_prompt("general", |prompt| prompt.name = "Mine".into());
+        assert!(settings.prompts.is_some());
+        settings.update_prompt("general", |prompt| prompt.name = "General".into());
+        assert_eq!(
+            settings.prompts, None,
+            "prompts edited back are the default"
+        );
+        settings.set_default_prompt("security");
+        settings.set_default_prompt("general");
+        settings.set_risk_prompt("general");
+        settings.set_risk_prompt("security");
+        assert_eq!(
+            (&settings.default_prompt, &settings.risk_prompt),
+            (&None, &None)
+        );
     }
 
     #[test]
@@ -856,6 +1300,11 @@ mod tests {
         let settings: crate::store::Settings =
             serde_json::from_str(r#"{"t3_server_url":"https://t3.example"}"#).expect("parse");
         assert_eq!(settings.t3_review, ReviewSettings::default());
+        let older: ReviewSettings =
+            serde_json::from_str(r#"{"prompt":"Review it.\n\n{security}","risk_check":false}"#)
+                .expect("parse a file from before review prompts");
+        assert_eq!(older.prompts(), default_prompts());
+        assert!(!older.risk_check);
     }
 
     #[test]
@@ -863,7 +1312,7 @@ mod tests {
         let template = "#{number} {title} by {author}\n{url} {repository} {head_branch} \
                         {head_sha} {short_sha}\n{\"json\":1} {unknown} {}";
         assert_eq!(
-            request(&context(), Reviewer::General, &[], template),
+            request(&context(), "", &[], template),
             "#374 feat: trusted CA roots by octocat\n\
              https://github.com/hooli-inc/hooli-api/pull/374 hooli-inc/hooli-api \
              feature/eng-261-p1 4914142cdeadbeef 4914142c\n{\"json\":1} {unknown} {}"
@@ -871,31 +1320,41 @@ mod tests {
         assert_eq!(unknown_variables(template), ["unknown"]);
         assert!(unknown_variables(DEFAULT_PROMPT).is_empty());
         assert_eq!(unknown_variables("{titel} {titel} {number}"), ["titel"]);
+        assert!(
+            unknown_variables("{security} {prompt} {risk}").is_empty(),
+            "{{security}} from before review prompts is still known"
+        );
     }
 
     #[test]
-    fn the_security_paragraph_goes_where_the_template_puts_it() {
-        let template = "Review it.\n\n{security}\n\nThen stop.";
+    fn the_prompt_goes_where_the_template_puts_it() {
+        let template = "Review it.\n\n{prompt}\n\nThen stop.";
         assert_eq!(
-            request(&context(), Reviewer::General, &[], template),
+            request(&context(), "", &[], template),
             "Review it.\n\nThen stop.",
             "an empty paragraph leaves with its blank line"
         );
-        let text = request(&context(), Reviewer::GeneralAndSecurity, &[], template);
+        let security = &default_prompts()[1].text;
+        let text = request(&context(), security, &[], template);
         assert!(text.starts_with("Review it.\n\nO usuário pediu"), "{text}");
         assert!(text.ends_with("essa skill.\n\nThen stop."), "{text}");
-        let without = request(
-            &context(),
-            Reviewer::GeneralAndSecurity,
-            &[],
-            "Review #{number}.",
-        );
+        let without = request(&context(), security, &[], "Review #{number}.");
         assert_eq!(without, "Review #374.", "a template without it has none");
+        assert_eq!(
+            request(&context(), "Check {title}.", &[], "Old: {security}"),
+            "Old: Check feat: trusted CA roots.",
+            "a template from before review prompts still gets the prompt"
+        );
+        assert_eq!(
+            request(&context(), "Mine: {prompt}{url}", &[], "{prompt}"),
+            "Mine: https://github.com/hooli-inc/hooli-api/pull/374",
+            "a prompt's text is filled once and never holds itself"
+        );
     }
 
     #[test]
     fn the_request_asks_for_the_seven_points_of_the_review() {
-        let text = request(&context(), Reviewer::General, &[], DEFAULT_PROMPT);
+        let text = request(&context(), "", &[], DEFAULT_PROMPT);
         for part in [
             "PR #374 de hooli-inc/hooli-api, de `octocat`",
             "https://github.com/hooli-inc/hooli-api/pull/374",
@@ -922,24 +1381,15 @@ mod tests {
 
     #[test]
     fn the_security_review_follows_the_skill_and_says_why() {
+        let security = &default_prompts()[1].text;
         let reasons = vec!["label revisao:risco".to_owned(), "src/auth.ts".to_owned()];
-        let text = request(
-            &context(),
-            Reviewer::GeneralAndSecurity,
-            &reasons,
-            DEFAULT_PROMPT,
-        );
+        let text = request(&context(), security, &reasons, DEFAULT_PROMPT);
         assert!(text.contains("skill `revisar-seguranca`"), "{text}");
         assert!(
             text.contains("Este PR é de risco (`label revisao:risco`, `src/auth.ts`)"),
             "{text}"
         );
-        let asked = request(
-            &context(),
-            Reviewer::GeneralAndSecurity,
-            &[],
-            DEFAULT_PROMPT,
-        );
+        let asked = request(&context(), security, &[], DEFAULT_PROMPT);
         assert!(asked.contains("O usuário pediu também a revisão de segurança"));
     }
 
@@ -974,7 +1424,7 @@ mod tests {
 mod golden {
     use loupe_github::{PrRef, RepoRef};
 
-    use super::{ReviewSettings, Reviewer, request};
+    use super::{ReviewSettings, default_prompts, request};
     use crate::links::PrLinkContext;
 
     fn context() -> PrLinkContext {
@@ -992,9 +1442,24 @@ mod golden {
         }
     }
 
+    /// The two reviewers Loupe had before prompts were settings, as the
+    /// default prompts they became.
+    #[derive(Clone, Copy)]
+    enum Reviewer {
+        General,
+        GeneralAndSecurity,
+    }
+
     /// The request the dialog writes with the default settings.
     fn default_request(context: &PrLinkContext, reviewer: Reviewer, risk: &[String]) -> String {
-        request(context, reviewer, risk, ReviewSettings::default().prompt())
+        let settings = ReviewSettings::default();
+        let prompts = settings.prompts();
+        let prompt = match reviewer {
+            Reviewer::General => &prompts[0],
+            Reviewer::GeneralAndSecurity => &prompts[1],
+        };
+        assert_eq!(prompts, default_prompts());
+        request(context, &prompt.text, risk, settings.prompt())
     }
 
     #[track_caller]
