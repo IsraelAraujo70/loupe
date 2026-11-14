@@ -303,11 +303,15 @@ fn readable_entries<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeO
         .collect())
 }
 
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
 /// The window's panes as saved: a pane's tabs, or a split of two layouts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PaneLayout {
-    /// One pane: the page of each tab in order, which one is active, and
-    /// the groups its tabs are in.
+    /// One pane: the page of each tab in order, which one is active, the
+    /// groups its tabs are in, and how many of its first tabs are pinned.
     Pane {
         tabs: Vec<crate::route::Route>,
         active: usize,
@@ -317,6 +321,8 @@ pub enum PaneLayout {
             deserialize_with = "readable_entries"
         )]
         groups: Vec<SavedTabGroup>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pinned: usize,
     },
     /// Two layouts along `axis`; `ratio` is the first one's share, 0 to 1.
     Split {
@@ -354,6 +360,7 @@ impl Settings {
             tabs: Vec::new(),
             active: 0,
             groups: Vec::new(),
+            pinned: 0,
         })
     }
 
@@ -447,6 +454,7 @@ impl Settings {
                 tabs,
                 active,
                 groups: Vec::new(),
+                pinned: 0,
             });
             settings.active_pane = 0;
         }
@@ -872,6 +880,7 @@ mod tests {
             tabs: vec![Route::Inbox, Route::Settings],
             active: 1,
             groups: Vec::new(),
+            pinned: 0,
         };
         assert_eq!(older.pane_layout(), tabs);
         // Any other change saves the file before a tab moves.
@@ -893,6 +902,7 @@ mod tests {
                 tabs: vec![Route::Inbox],
                 active: 0,
                 groups: Vec::new(),
+                pinned: 0,
             }),
             second: Box::new(PaneLayout::Pane {
                 tabs: vec![Route::Notifications, Route::Settings],
@@ -901,9 +911,10 @@ mod tests {
                     name: "Review".into(),
                     color: TabGroupColor::Green,
                     collapsed: true,
-                    first: 0,
+                    first: 1,
                     len: 1,
                 }],
+                pinned: 1,
             }),
         };
         let settings = Settings {
@@ -939,6 +950,7 @@ mod tests {
                     first: 0,
                     len: 1,
                 }],
+                pinned: 0,
             },
             "an unknown color reads as grey, and an unreadable group is dropped"
         );
@@ -952,6 +964,7 @@ mod tests {
                 tabs: vec![Route::Inbox],
                 active: 0,
                 groups: Vec::new(),
+                pinned: 0,
             }
         );
     }
@@ -1040,6 +1053,7 @@ mod tests {
                         first: 0,
                         len: 1,
                     }],
+                    pinned: 0,
                 }),
                 ..Settings::default()
             };
