@@ -192,13 +192,92 @@ pub enum SplitAxis {
     Vertical,
 }
 
+/// The colors a group of tabs can take, as Chrome offers them. Each one is
+/// a color the theme already has (see `tab_bar::group_fill`), so a theme
+/// file needs no new slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TabGroupColor {
+    #[default]
+    Grey,
+    Blue,
+    Red,
+    Yellow,
+    Green,
+    Purple,
+}
+
+impl TabGroupColor {
+    pub const ALL: [TabGroupColor; 6] = [
+        TabGroupColor::Grey,
+        TabGroupColor::Blue,
+        TabGroupColor::Red,
+        TabGroupColor::Yellow,
+        TabGroupColor::Green,
+        TabGroupColor::Purple,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TabGroupColor::Grey => "Grey",
+            TabGroupColor::Blue => "Blue",
+            TabGroupColor::Red => "Red",
+            TabGroupColor::Yellow => "Yellow",
+            TabGroupColor::Green => "Green",
+            TabGroupColor::Purple => "Purple",
+        }
+    }
+}
+
+/// A group of tabs as saved: its tabs are the `len` tabs from `first` in
+/// its pane's list, since a group's tabs always sit next to each other.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedTabGroup {
+    #[serde(default)]
+    pub name: String,
+    /// A color this build does not know, from a newer one, reads as grey.
+    #[serde(default, deserialize_with = "color_or_grey")]
+    pub color: TabGroupColor,
+    #[serde(default)]
+    pub collapsed: bool,
+    pub first: usize,
+    pub len: usize,
+}
+
+fn color_or_grey<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<TabGroupColor, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// The saved groups that can be read; an entry that cannot is dropped,
+/// so it never costs the tabs and the rest of the settings.
+fn readable_groups<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<SavedTabGroup>, D::Error> {
+    let serde_json::Value::Array(values) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}
+
 /// The window's panes as saved: a pane's tabs, or a split of two layouts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PaneLayout {
-    /// One pane: the page of each tab in order, and which one is active.
+    /// One pane: the page of each tab in order, which one is active, and
+    /// the groups its tabs are in.
     Pane {
         tabs: Vec<crate::route::Route>,
         active: usize,
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "readable_groups"
+        )]
+        groups: Vec<SavedTabGroup>,
     },
     /// Two layouts along `axis`; `ratio` is the first one's share, 0 to 1.
     Split {
@@ -235,6 +314,7 @@ impl Settings {
         self.panes.clone().unwrap_or(PaneLayout::Pane {
             tabs: Vec::new(),
             active: 0,
+            groups: Vec::new(),
         })
     }
 
@@ -243,7 +323,7 @@ impl Settings {
     #[cfg(test)]
     pub fn single_pane_tabs(&self) -> (Vec<crate::route::Route>, usize) {
         match self.pane_layout() {
-            PaneLayout::Pane { tabs, active } => (tabs, active),
+            PaneLayout::Pane { tabs, active, .. } => (tabs, active),
             split => panic!("expected one pane, got {split:?}"),
         }
     }
@@ -317,7 +397,11 @@ impl Settings {
         let tabs = std::mem::take(&mut settings.open_tabs);
         let active = std::mem::take(&mut settings.active_tab);
         if settings.panes.is_none() && !tabs.is_empty() {
-            settings.panes = Some(PaneLayout::Pane { tabs, active });
+            settings.panes = Some(PaneLayout::Pane {
+                tabs,
+                active,
+                groups: Vec::new(),
+            });
             settings.active_pane = 0;
         }
         Some(settings)
@@ -614,7 +698,8 @@ mod tests {
 
     use super::{
         CommentBoxPlace, CommentOrder, Favorite, FileTreePosition, KEYCHAIN_SERVICE, PaneLayout,
-        Secret, SecretStore, Settings, SplitAxis, WorkspaceMapping, parse_github_target,
+        SavedTabGroup, Secret, SecretStore, Settings, SplitAxis, TabGroupColor, WorkspaceMapping,
+        parse_github_target,
     };
     use crate::route::Route;
 
@@ -740,6 +825,7 @@ mod tests {
         let tabs = PaneLayout::Pane {
             tabs: vec![Route::Inbox, Route::Settings],
             active: 1,
+            groups: Vec::new(),
         };
         assert_eq!(older.pane_layout(), tabs);
         // Any other change saves the file before a tab moves.
@@ -760,10 +846,18 @@ mod tests {
             first: Box::new(PaneLayout::Pane {
                 tabs: vec![Route::Inbox],
                 active: 0,
+                groups: Vec::new(),
             }),
             second: Box::new(PaneLayout::Pane {
                 tabs: vec![Route::Notifications, Route::Settings],
                 active: 1,
+                groups: vec![SavedTabGroup {
+                    name: "Review".into(),
+                    color: TabGroupColor::Green,
+                    collapsed: true,
+                    first: 0,
+                    len: 1,
+                }],
             }),
         };
         let settings = Settings {
@@ -779,6 +873,41 @@ mod tests {
         let loaded: Settings = serde_json::from_str(&saved).expect("saved settings load");
         assert_eq!(loaded.pane_layout(), split);
         assert_eq!(loaded.active_pane, 1);
+
+        let newer = Settings::parse(
+            br#"{"sidebar_collapsed": true, "panes": {"Pane": {"tabs": ["Inbox", "Settings"], "active": 0,
+                "groups": [{"name": "A", "color": "Orange", "first": 0, "len": 1},
+                           {"name": "B", "first": "one", "len": 1}]}}}"#,
+        )
+        .expect("groups from a newer build or a hand edit never cost the settings");
+        assert!(newer.sidebar_collapsed);
+        assert_eq!(
+            newer.pane_layout(),
+            PaneLayout::Pane {
+                tabs: vec![Route::Inbox, Route::Settings],
+                active: 0,
+                groups: vec![SavedTabGroup {
+                    name: "A".into(),
+                    color: TabGroupColor::Grey,
+                    collapsed: false,
+                    first: 0,
+                    len: 1,
+                }],
+            },
+            "an unknown color reads as grey, and an unreadable group is dropped"
+        );
+
+        let before_groups =
+            Settings::parse(br#"{"panes": {"Pane": {"tabs": ["Inbox"], "active": 0}}}"#)
+                .expect("a pane saved before tab groups loads");
+        assert_eq!(
+            before_groups.pane_layout(),
+            PaneLayout::Pane {
+                tabs: vec![Route::Inbox],
+                active: 0,
+                groups: Vec::new(),
+            }
+        );
     }
 
     #[test]
