@@ -224,6 +224,7 @@ impl<V> Node<V> {
                 tabs: pane.tabs.routes(),
                 active: pane.tabs.active_index(),
                 groups: pane.tabs.saved_groups(),
+                pinned: pane.tabs.pinned_len(),
             },
             Node::Split(split) => PaneLayout::Split {
                 axis: split.axis,
@@ -292,18 +293,22 @@ impl<V> Panes<V> {
                 tabs,
                 active,
                 groups,
+                pinned,
             } => {
                 if tabs.is_empty() {
                     return None;
                 }
                 let tabs = tabs
                     .iter()
-                    .map(|route| {
+                    .enumerate()
+                    .map(|(index, route)| {
                         let page = Page {
                             route: route.clone(),
                             view: build(route),
                         };
-                        self.tab(page)
+                        let mut tab = self.tab(page);
+                        tab.pinned = index < *pinned;
+                        tab
                     })
                     .collect();
                 let mut tabs = Tabs::new(tabs, *active);
@@ -576,9 +581,11 @@ impl<V> Panes<V> {
             self.active = to;
             return moved;
         }
-        let Some(moved) = self.take(from, tab) else {
+        let Some(mut moved) = self.take(from, tab) else {
             return false;
         };
+        // Joining a group unpins, as "Add to group" does.
+        moved.pinned = false;
         let tabs = self
             .tabs_mut(to)
             .expect("the target pane is a different one");
@@ -754,6 +761,7 @@ mod tests {
             tabs: tabs.to_vec(),
             active,
             groups: Vec::new(),
+            pinned: 0,
         }
     }
 
@@ -950,6 +958,25 @@ mod tests {
     }
 
     #[test]
+    fn pinned_tabs_come_back_as_saved() {
+        let saved = PaneLayout::Pane {
+            tabs: vec![Route::Inbox, Route::Notifications, issue("A"), issue("B")],
+            active: 2,
+            groups: vec![SavedTabGroup {
+                name: "Review".into(),
+                color: TabGroupColor::Grey,
+                collapsed: false,
+                first: 2,
+                len: 2,
+            }],
+            pinned: 2,
+        };
+        let panes = restore(&saved, 0);
+        assert_eq!(panes.layout(), (saved, 0));
+        assert_eq!(panes.active().pinned_len(), 2);
+    }
+
+    #[test]
     fn a_saved_empty_pane_is_dropped_and_ratios_stay_in_bounds() {
         let panes = restore(
             &PaneLayout::Split {
@@ -1020,6 +1047,7 @@ mod tests {
                     tabs: vec![Route::Inbox, pr(1), pr(2), issue("ENG-1")],
                     active: 0,
                     groups: vec![group("Review", TabGroupColor::Red, 1, 1)],
+                    pinned: 0,
                 }),
                 second: Box::new(pane(&[pr(5), issue("ENG-2")], 0)),
             },
@@ -1058,6 +1086,7 @@ mod tests {
                         ],
                         active: 0,
                         groups: vec![group("Review", TabGroupColor::Red, 1, 5)],
+                        pinned: 0,
                     }),
                     second: Box::new(pane(&[issue("ENG-2")], 0)),
                 },
@@ -1075,6 +1104,7 @@ mod tests {
                 tabs: vec![issue("ENG-1"), Route::Inbox, issue("ENG-2")],
                 active: 1,
                 groups: vec![group("Review", TabGroupColor::Grey, 0, 1)],
+                pinned: 0,
             },
             0,
         );
@@ -1105,6 +1135,7 @@ mod tests {
                     group("My view", TabGroupColor::Blue, 2, 1),
                     group("Ready", TabGroupColor::Pink, 3, 2),
                 ],
+                pinned: 0,
             },
             "a new group opens right after the open tab, in the color picked \
              or the first free one"
@@ -1114,6 +1145,36 @@ mod tests {
         assert!(
             panes.find(&pr(4)).is_none(),
             "nothing opens without the group"
+        );
+    }
+
+    #[test]
+    fn a_group_opened_from_a_pinned_tab_starts_after_the_pinned_ones() {
+        // Reviews and #1 are pinned.
+        let mut panes = restore(
+            &PaneLayout::Pane {
+                tabs: vec![Route::Inbox, pr(1), issue("ENG-1")],
+                active: 0,
+                groups: Vec::new(),
+                pinned: 2,
+            },
+            0,
+        );
+        let target = GroupTarget::New {
+            name: "Ready".into(),
+            color: None,
+        };
+        assert!(panes.open_in_group(target, &[pr(2), pr(1)], page).is_some());
+        assert_eq!(
+            panes.layout().0,
+            PaneLayout::Pane {
+                tabs: vec![Route::Inbox, pr(2), pr(1), issue("ENG-1")],
+                active: 0,
+                groups: vec![group("Ready", TabGroupColor::Grey, 1, 2)],
+                pinned: 1,
+            },
+            "the group lands after the pinned tabs, and a pinned pull request \
+             leaves the pins to join it"
         );
     }
 
@@ -1130,6 +1191,7 @@ mod tests {
                     first: 1,
                     len: 2,
                 }],
+                pinned: 0,
             },
             0,
         );
@@ -1202,6 +1264,7 @@ mod tests {
                 first: 0,
                 len: tabs.len(),
             }],
+            pinned: 0,
         };
         let mut panes = restore(
             &PaneLayout::Split {

@@ -278,11 +278,15 @@ fn readable_groups<'de, D: serde::Deserializer<'de>>(
         .collect())
 }
 
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
 /// The window's panes as saved: a pane's tabs, or a split of two layouts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PaneLayout {
-    /// One pane: the page of each tab in order, which one is active, and
-    /// the groups its tabs are in.
+    /// One pane: the page of each tab in order, which one is active, the
+    /// groups its tabs are in, and how many of its first tabs are pinned.
     Pane {
         tabs: Vec<crate::route::Route>,
         active: usize,
@@ -292,6 +296,8 @@ pub enum PaneLayout {
             deserialize_with = "readable_groups"
         )]
         groups: Vec<SavedTabGroup>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pinned: usize,
     },
     /// Two layouts along `axis`; `ratio` is the first one's share, 0 to 1.
     Split {
@@ -329,6 +335,7 @@ impl Settings {
             tabs: Vec::new(),
             active: 0,
             groups: Vec::new(),
+            pinned: 0,
         })
     }
 
@@ -415,6 +422,7 @@ impl Settings {
                 tabs,
                 active,
                 groups: Vec::new(),
+                pinned: 0,
             });
             settings.active_pane = 0;
         }
@@ -678,14 +686,13 @@ mod keychain {
 
 /// `~/Library/Application Support/Loupe` on macOS, `$XDG_CONFIG_HOME/loupe`
 /// (or `~/.config/loupe`) elsewhere. `LOUPE_DATA_DIR` overrides both.
+/// Under `cargo test`, a folder of the test's own; see [`test_data_dir`].
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LOUPE_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    // UI tests save tabs through `update_settings`; they must never write
-    // over the real settings.
     if cfg!(test) {
-        return std::env::temp_dir().join(format!("loupe-test-{}", std::process::id()));
+        return test_data_dir();
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     if cfg!(target_os = "macos") {
@@ -696,6 +703,35 @@ pub fn data_dir() -> PathBuf {
             .unwrap_or_else(|| home.join(".config"))
             .join("loupe")
     }
+}
+
+/// The data folder of the running test, made on first use and deleted when
+/// the test ends.
+///
+/// UI tests save settings, themes and views; they must never write over the
+/// real ones. libtest runs each test on its own thread, at the same time as
+/// others, so one folder per thread keeps one test from reading what another
+/// saved. One folder per process let two tests write `custom-theme.json` or
+/// `reviews-views.json` at once.
+fn test_data_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Folder(PathBuf);
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static FOLDER: Folder = Folder(std::env::temp_dir().join(format!(
+            "loupe-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+    }
+    FOLDER.with(|folder| folder.0.clone())
 }
 
 fn settings_path() -> PathBuf {
@@ -840,6 +876,7 @@ mod tests {
             tabs: vec![Route::Inbox, Route::Settings],
             active: 1,
             groups: Vec::new(),
+            pinned: 0,
         };
         assert_eq!(older.pane_layout(), tabs);
         // Any other change saves the file before a tab moves.
@@ -861,6 +898,7 @@ mod tests {
                 tabs: vec![Route::Inbox],
                 active: 0,
                 groups: Vec::new(),
+                pinned: 0,
             }),
             second: Box::new(PaneLayout::Pane {
                 tabs: vec![Route::Notifications, Route::Settings],
@@ -869,9 +907,10 @@ mod tests {
                     name: "Review".into(),
                     color: TabGroupColor::Green,
                     collapsed: true,
-                    first: 0,
+                    first: 1,
                     len: 1,
                 }],
+                pinned: 1,
             }),
         };
         let settings = Settings {
@@ -907,6 +946,7 @@ mod tests {
                     first: 0,
                     len: 1,
                 }],
+                pinned: 0,
             },
             "an unknown color reads as grey, and an unreadable group is dropped"
         );
@@ -920,6 +960,7 @@ mod tests {
                 tabs: vec![Route::Inbox],
                 active: 0,
                 groups: Vec::new(),
+                pinned: 0,
             }
         );
     }
@@ -961,6 +1002,7 @@ mod tests {
                         first: 0,
                         len: 1,
                     }],
+                    pinned: 0,
                 }),
                 ..Settings::default()
             };
