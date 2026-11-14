@@ -7,9 +7,10 @@
 mod dialogs;
 mod filter_menu;
 mod selection;
+mod stacks;
 mod views_store;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::Utc;
@@ -29,13 +30,17 @@ use loupe_github::reviews::{
     self, Clause, NextStep, Op, ReviewTab, Sort, SortDir, SortKey, ViewsFile,
 };
 use loupe_github::{
-    Inbox, Notification as GitHubNotification, NotificationSubject, Page, PrRef, PrSummary,
+    Inbox, Notification as GitHubNotification, NotificationSubject, Page, PrRef, PrSummary, RepoRef,
 };
 
 use self::filter_menu::{FilterMenu, FilterOptions};
 use self::selection::{CONFIRM_ABOVE, Selection};
+use self::stacks::{OpenByBase, Stack, StackKey, Stacks};
 use super::common::{self, Loadable};
-use super::pr_row::{AgeFrom, OnSelect, OnSort, RowSelect, SelectGesture, pr_row, select_box};
+use super::pr_row::{
+    AgeFrom, Lanes, OnSelect, OnSort, ROW_GROUP, RowSelect, SelectGesture, StackPlace, StackRow,
+    pr_row, select_box, stack_row,
+};
 use crate::route::Route;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::theme::scale;
@@ -50,7 +55,12 @@ gpui_kit::actions!(
         /// Cmd+A on the Reviews screen: pick every row of the open tab.
         SelectTabRows,
         /// Escape on the Reviews screen: drop the selection.
-        ClearReviewsSelection
+        ClearReviewsSelection,
+        /// Right arrow on the Reviews screen: open the stack under the cursor.
+        OpenStack,
+        /// Left arrow on the Reviews screen: fold the stack under the cursor,
+        /// or the one its row is in.
+        CloseStack
     ]
 );
 
@@ -165,38 +175,116 @@ fn first_with_rows(tabs: &[(ReviewTab, Shown<'_>)]) -> ReviewTab {
         .map_or(ReviewTab::ToReview, |(tab, _)| *tab)
 }
 
-/// One group of the open tab: its pull requests in their order on screen,
-/// and whether it is folded.
+/// One group of the open tab: its lines, its pull requests in their order
+/// on screen (a stack's under its row, folded or not), and whether it is
+/// folded.
 struct Group<'a> {
     step: NextStep,
     collapsed: bool,
+    lines: Vec<Line<'a>>,
     rows: Vec<&'a PrSummary>,
 }
 
+/// One line of a group: a pull request, or a stack with the rows of it the
+/// tab shows, base first.
+enum Line<'a> {
+    Pr(&'a PrSummary),
+    Stack {
+        stack: Stack,
+        rows: Vec<&'a PrSummary>,
+    },
+}
+
+impl<'a> Line<'a> {
+    fn rows(&self) -> &[&'a PrSummary] {
+        match self {
+            Line::Pr(pr) => std::slice::from_ref(pr),
+            Line::Stack { rows, .. } => rows,
+        }
+    }
+}
+
 /// `items` in their groups ([`reviews::next_step`]), in [`NextStep::ALL`]'s
-/// order, each sorted by `sort` on its own. A group with no pull request is
-/// left out.
+/// order, each sorted by `sort` on its own. A stack with two or more rows in
+/// `items` is one line, in the group of its most urgent row (the first
+/// group in that order), where the sort places its first row; its rows keep
+/// the stack's order. A group with no pull request is left out.
 fn grouped<'a>(
     items: &[&'a PrSummary],
     sort: Option<Sort>,
     collapsed: &[NextStep],
+    stacks: &Stacks,
 ) -> Vec<Group<'a>> {
+    let mut in_stack: HashMap<&StackKey, (usize, NextStep)> = HashMap::new();
+    for pr in items {
+        if let Some(stack) = stacks.of(&pr.pr) {
+            let (count, step) = in_stack.entry(&stack.key).or_insert((0, NextStep::Draft));
+            *count += 1;
+            *step = (*step).min(reviews::next_step(pr));
+        }
+    }
+    let stacked = |pr: &PrSummary| stacks.of(&pr.pr).filter(|stack| in_stack[&stack.key].0 > 1);
+    let step_of = |pr: &PrSummary| {
+        stacked(pr).map_or_else(|| reviews::next_step(pr), |stack| in_stack[&stack.key].1)
+    };
     NextStep::ALL
         .iter()
         .filter_map(|&step| {
             let mut rows: Vec<&PrSummary> = items
                 .iter()
                 .copied()
-                .filter(|pr| reviews::next_step(pr) == step)
+                .filter(|pr| step_of(pr) == step)
                 .collect();
             reviews::sort_rows(&mut rows, sort);
+            let mut lines: Vec<Line<'a>> = Vec::new();
+            for pr in &rows {
+                let Some(stack) = stacked(pr) else {
+                    lines.push(Line::Pr(pr));
+                    continue;
+                };
+                let placed = lines.iter().any(
+                    |line| matches!(line, Line::Stack { stack: known, .. } if known.key == stack.key),
+                );
+                if placed {
+                    continue;
+                }
+                let mut members: Vec<&PrSummary> = rows
+                    .iter()
+                    .copied()
+                    .filter(|row| stacks.of(&row.pr).map(|of| &of.key) == Some(&stack.key))
+                    .collect();
+                members.sort_by_key(|row| stack.place(&row.pr));
+                lines.push(Line::Stack {
+                    stack: stack.clone(),
+                    rows: members,
+                });
+            }
+            let rows: Vec<&PrSummary> = lines.iter().flat_map(Line::rows).copied().collect();
             (!rows.is_empty()).then(|| Group {
                 step,
                 collapsed: collapsed.contains(&step),
+                lines,
                 rows,
             })
         })
         .collect()
+}
+
+/// A line the keyboard cursor can stand on: a pull request's row or a
+/// stack's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Spot {
+    Pr(PrRef),
+    Stack(StackKey),
+}
+
+/// One group of the open tab as the list shows it: every pull request in
+/// order (those of a folded stack too), and the lines on screen.
+struct GroupShown {
+    step: NextStep,
+    collapsed: bool,
+    rows: Vec<PrRef>,
+    spots: Vec<Spot>,
 }
 
 /// The saved view on screen and the clauses and sort order edited on top of
@@ -263,9 +351,11 @@ pub struct InboxView {
     filter_open: bool,
     /// A failed save or an unreadable views file.
     notice: Option<SharedString>,
-    /// The pull request under the keyboard cursor (J and K, or the arrows).
-    /// Kept by reference, so a refresh that reorders the list keeps it.
-    cursor: Option<PrRef>,
+    /// The line under the keyboard cursor (J and K, or the arrows). Kept by
+    /// reference, so a refresh that reorders the list keeps it.
+    cursor: Option<Spot>,
+    /// The stacks opened on this page; every other one is folded.
+    expanded: HashSet<StackKey>,
     /// "All open" results by search, so going back to a view shows its
     /// rows without asking GitHub again; Refresh asks again.
     all_open: HashMap<String, Loadable<Page<PrSummary>>>,
@@ -287,6 +377,10 @@ pub struct InboxView {
     /// stands while no tab was picked or saved (`PageState::tab`), so a
     /// refresh never switches tabs under the user. Never saved with a view.
     opened_on: Option<ReviewTab>,
+    /// Open pull requests per base branch, as GitHub last counted them for
+    /// the branch chains ([`Stacks::build`]).
+    open_by_base: OpenByBase,
+    _bases: Option<Task<()>>,
     _load: Option<Task<()>>,
     _checks: Subscription,
 }
@@ -307,7 +401,7 @@ fn threads_of(notifications: &[GitHubNotification], prs: &[PrRef]) -> Vec<String
 /// screen in order: one step from `current`, staying at either end. With no
 /// cursor yet, or one whose pull request left the list, it starts at the
 /// first row going down and at the last going up.
-fn step_cursor(rows: &[PrRef], current: Option<&PrRef>, down: bool) -> Option<PrRef> {
+fn step_cursor<T: PartialEq + Clone>(rows: &[T], current: Option<&T>, down: bool) -> Option<T> {
     let last = rows.len().checked_sub(1)?;
     let at = current.and_then(|pr| rows.iter().position(|row| row == pr));
     let next = match (at, down) {
@@ -345,6 +439,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             filter_open: false,
             notice: views_store::take_warning(cx),
             cursor: None,
+            expanded: HashSet::new(),
             all_open: HashMap::new(),
             all_open_loads: HashMap::new(),
             selection: Selection::default(),
@@ -353,6 +448,8 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             bar_shown: false,
             mark_note: None,
             opened_on: None,
+            open_by_base: OpenByBase::new(),
+            _bases: None,
             _load: None,
             _checks: checks,
         };
@@ -463,11 +560,12 @@ impl InboxView {
         self._load = Some(common::run(
             cx,
             |gh| gh.inbox(),
-            move |view, result, _| {
+            move |view, result, cx| {
                 if let (Some(key), Ok(value)) = (&key, &result) {
                     crate::cache::put(key, value);
                 }
                 view.inbox.finish(result);
+                view.count_bases(cx);
             },
         ));
         self.load_all_open(true, cx);
@@ -495,11 +593,12 @@ impl InboxView {
         let task = common::run(
             cx,
             move |gh| gh.search_all_pull_requests(&search),
-            move |view: &mut InboxView, result, _| {
+            move |view: &mut InboxView, result, cx| {
                 if let (Some(key), Ok(value)) = (&key, &result) {
                     crate::cache::put(key, value);
                 }
                 view.all_open.entry(query).or_default().finish(result);
+                view.count_bases(cx);
             },
         );
         self.all_open_loads.insert(slot, task);
@@ -546,15 +645,135 @@ impl InboxView {
         Some(self.active_tab(&self.tab_lists(inbox)))
     }
 
+    /// Every pull request the page loaded, whatever the filters and the
+    /// tab; one listed in two tabs comes twice.
+    fn loaded<'a>(&'a self, inbox: &'a Inbox) -> impl Iterator<Item = &'a PrSummary> {
+        let all_open = self.all_open_state().and_then(Loadable::value);
+        INBOX_TABS
+            .iter()
+            .filter_map(|&tab| tab_page(tab, inbox))
+            .chain(all_open)
+            .flat_map(|page| page.items.iter())
+    }
+
+    /// The stacks among every pull request the page loaded.
+    fn stacks(&self, inbox: &Inbox) -> Stacks {
+        Stacks::build(self.loaded(inbox), &self.open_by_base)
+    }
+
+    /// Asks GitHub how many open pull requests target each branch a loaded
+    /// pull request is based on and another one has as head, so a chain of
+    /// branches joins only pull requests that are one stack. The last
+    /// counts, and a stored copy, stand until the answer comes.
+    fn count_bases(&mut self, cx: &mut Context<Self>) {
+        let Some(inbox) = self.inbox.value() else {
+            return;
+        };
+        let bases = stacks::bases_to_count(self.loaded(inbox));
+        if bases.is_empty() {
+            return;
+        }
+        let key = crate::cache::github_key(cx, "reviews/open-by-base");
+        if self.open_by_base.is_empty()
+            && let Some(stored) = key
+                .as_deref()
+                .and_then(crate::cache::get::<Vec<(RepoRef, String, u32)>>)
+        {
+            self.open_by_base = stored
+                .into_iter()
+                .map(|(repo, branch, count)| ((repo, branch), count))
+                .collect();
+        }
+        self._bases = Some(common::run(
+            cx,
+            move |gh| {
+                let counts = gh.open_pull_requests_by_base(&bases)?;
+                Ok(bases
+                    .into_iter()
+                    .zip(counts)
+                    .filter_map(|((repo, branch), count)| Some((repo, branch, count?)))
+                    .collect::<Vec<_>>())
+            },
+            move |view: &mut InboxView, result, _| {
+                let Ok(counts) = result else {
+                    return;
+                };
+                for (repo, branch, count) in &counts {
+                    view.open_by_base
+                        .insert((repo.clone(), branch.clone()), *count);
+                }
+                if let Some(key) = &key {
+                    let stored: Vec<(RepoRef, String, u32)> = view
+                        .open_by_base
+                        .iter()
+                        .map(|((repo, branch), count)| (repo.clone(), branch.clone(), *count))
+                        .collect();
+                    crate::cache::put(key, &stored);
+                }
+            },
+        ));
+    }
+
     /// The open tab's groups, each sorted on its own: a sort never moves a
     /// pull request into another group.
     fn groups<'a>(&'a self, inbox: &'a Inbox) -> Vec<Group<'a>> {
         let tabs = self.tab_lists(inbox);
         let active = self.active_tab(&tabs);
+        let stacks = self.stacks(inbox);
         tabs.into_iter()
             .find(|(tab, _)| *tab == active)
-            .map(|(_, shown)| grouped(&shown.items, self.page.sort, &self.page.collapsed))
+            .map(|(_, shown)| grouped(&shown.items, self.page.sort, &self.page.collapsed, &stacks))
             .unwrap_or_default()
+    }
+
+    /// Opens or folds a stack. Folding it brings the cursor from one of its
+    /// rows up to the stack's own.
+    fn toggle_stack(&mut self, key: &StackKey, cx: &mut Context<Self>) {
+        if self.expanded.remove(key) {
+            if let Some(Spot::Pr(pr)) = &self.cursor
+                && self.stack_of_row(pr).as_ref() == Some(key)
+            {
+                self.cursor = Some(Spot::Stack(key.clone()));
+            }
+        } else {
+            self.expanded.insert(key.clone());
+        }
+        cx.notify();
+    }
+
+    /// The stack whose line holds `pr` in the open tab, if any.
+    fn stack_of_row(&self, pr: &PrRef) -> Option<StackKey> {
+        let inbox = self.inbox.value()?;
+        self.groups(inbox).into_iter().find_map(|group| {
+            group.lines.into_iter().find_map(|line| match line {
+                Line::Stack { stack, rows } if rows.iter().any(|row| row.pr == *pr) => {
+                    Some(stack.key)
+                }
+                _ => None,
+            })
+        })
+    }
+
+    /// Right arrow: opens the folded stack under the cursor.
+    fn open_stack(&mut self, cx: &mut Context<Self>) {
+        match self.cursor.clone() {
+            Some(Spot::Stack(key)) if !self.expanded.contains(&key) => self.toggle_stack(&key, cx),
+            _ => cx.propagate(),
+        }
+    }
+
+    /// Left arrow: folds the open stack under the cursor, or the one whose
+    /// row the cursor is on.
+    fn close_stack(&mut self, cx: &mut Context<Self>) {
+        let key = match self.cursor.clone() {
+            Some(Spot::Stack(key)) => Some(key),
+            Some(Spot::Pr(pr)) => self.stack_of_row(&pr),
+            None => None,
+        };
+        match key.filter(|key| self.expanded.contains(key)) {
+            Some(key) => self.toggle_stack(&key, cx),
+            None => cx.propagate(),
+        }
     }
 
     /// Fixes the tab the page opened on once the results are fresh: a
@@ -619,8 +838,8 @@ impl InboxView {
         let rows: Vec<PrRef> = self
             .groups_shown()
             .into_iter()
-            .filter(|(group, _, _)| *group == step)
-            .flat_map(|(_, _, rows)| rows)
+            .filter(|group| group.step == step)
+            .flat_map(|group| group.rows)
             .collect();
         self.selection.deselect_all(&rows);
         self.selection_changed(cx);
@@ -796,9 +1015,8 @@ impl InboxView {
         cx.notify();
     }
 
-    /// The open tab's groups as the list shows them: each group's pull
-    /// requests in order, and whether it is folded.
-    fn groups_shown(&self) -> Vec<(NextStep, bool, Vec<PrRef>)> {
+    /// The open tab's groups as the list shows them.
+    fn groups_shown(&self) -> Vec<GroupShown> {
         let Some(inbox) = self.inbox.value() else {
             return Vec::new();
         };
@@ -810,17 +1028,35 @@ impl InboxView {
                     .iter()
                     .map(|summary| summary.pr.clone())
                     .collect();
-                (group.step, group.collapsed, rows)
+                let mut spots = Vec::new();
+                for line in &group.lines {
+                    match line {
+                        Line::Pr(summary) => spots.push(Spot::Pr(summary.pr.clone())),
+                        Line::Stack { stack, rows } => {
+                            spots.push(Spot::Stack(stack.key.clone()));
+                            if self.expanded.contains(&stack.key) {
+                                spots.extend(rows.iter().map(|row| Spot::Pr(row.pr.clone())));
+                            }
+                        }
+                    }
+                }
+                GroupShown {
+                    step: group.step,
+                    collapsed: group.collapsed,
+                    rows,
+                    spots,
+                }
             })
             .collect()
     }
 
-    /// The rows on screen, top to bottom: those of every unfolded group.
+    /// The pull requests on screen, top to bottom: those of every unfolded
+    /// group, a folded stack's included, since its row stands for them.
     fn rows_shown(&self) -> Vec<PrRef> {
         self.groups_shown()
             .into_iter()
-            .filter(|(_, collapsed, _)| !collapsed)
-            .flat_map(|(_, _, rows)| rows)
+            .filter(|group| !group.collapsed)
+            .flat_map(|group| group.rows)
             .collect()
     }
 
@@ -860,6 +1096,17 @@ impl InboxView {
         Rc::new(move |pr, gesture, _, cx| {
             view.update(cx, |this, cx| this.pick(pr, gesture, cx)).ok();
         })
+    }
+
+    /// A stack's box, or a Shift+click on its row: Shift extends the
+    /// selection over the whole stack, else its rows toggle as one.
+    fn pick_stack(&mut self, rows: &[PrRef], shift: bool, cx: &mut Context<Self>) {
+        if shift {
+            self.selection.extend_over(&self.rows_shown(), rows);
+            self.selection_changed(cx);
+        } else {
+            self.toggle_rows(rows, cx);
+        }
     }
 
     /// Picks every row of `rows`, one group's, or drops them all when every
@@ -972,11 +1219,15 @@ impl InboxView {
         cx.notify();
     }
 
-    /// Moves the keyboard cursor one row and scrolls it into view.
+    /// Moves the keyboard cursor one line and scrolls it into view.
     fn move_cursor(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         let groups = self.groups_shown();
-        let rows = self.rows_shown();
-        let Some(next) = step_cursor(&rows, self.cursor.as_ref(), down) else {
+        let spots: Vec<Spot> = groups
+            .iter()
+            .filter(|group| !group.collapsed)
+            .flat_map(|group| group.spots.iter().cloned())
+            .collect();
+        let Some(next) = step_cursor(&spots, self.cursor.as_ref(), down) else {
             return;
         };
         // The row's place in the scrolled content, from the fixed heights
@@ -990,17 +1241,17 @@ impl InboxView {
             rems(0.5).to_pixels(rem),
         );
         let mut top = pad;
-        for (_, collapsed, group) in &groups {
+        for group in &groups {
             top += heading;
-            if *collapsed {
+            if group.collapsed {
                 top += gap;
                 continue;
             }
-            if let Some(index) = group.iter().position(|pr| *pr == next) {
+            if let Some(index) = group.spots.iter().position(|spot| *spot == next) {
                 top += row * index as f32;
                 break;
             }
-            top += row * group.len() as f32 + gap;
+            top += row * group.spots.len() as f32 + gap;
         }
         let viewport = self.scroll.bounds().size.height;
         let mut offset = self.scroll.offset();
@@ -1015,15 +1266,18 @@ impl InboxView {
         cx.notify();
     }
 
-    /// Opens the pull request under the cursor in this tab. With no cursor
-    /// the key goes on to whoever handles it next.
+    /// Opens the pull request under the cursor in this tab, or opens or
+    /// folds the stack under it. With no cursor the key goes on to whoever
+    /// handles it next.
     fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let on_screen = self
-            .cursor
-            .as_ref()
-            .filter(|pr| self.rows_shown().contains(pr));
+        let on_screen = self.cursor.clone().filter(|cursor| {
+            self.groups_shown()
+                .iter()
+                .any(|group| !group.collapsed && group.spots.contains(cursor))
+        });
         match on_screen {
-            Some(pr) => crate::shell::navigate(Route::PullRequest(pr.clone()), window, cx),
+            Some(Spot::Pr(pr)) => crate::shell::navigate(Route::PullRequest(pr), window, cx),
+            Some(Spot::Stack(key)) => self.toggle_stack(&key, cx),
             None => cx.propagate(),
         }
     }
@@ -1588,29 +1842,107 @@ impl InboxView {
         });
         let heading = group_heading(step, group.collapsed, group.rows.len(), lead, cx)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(step, cx)));
-        let age_from = AgeFrom::for_sort(self.page.sort);
+        let lanes = Lanes {
+            repo: true,
+            author: shows_author(tab),
+            age_from: AgeFrom::for_sort(self.page.sort),
+        };
+        let row = |summary: &PrSummary, place: Option<StackPlace>, cx: &mut Context<Self>| {
+            pr_row(
+                summary,
+                lanes,
+                self.cursor.as_ref() == Some(&Spot::Pr(summary.pr.clone())),
+                Some(RowSelect {
+                    checked: self.selection.contains(&summary.pr),
+                    showing,
+                    on_select: on_select.clone(),
+                }),
+                place,
+                cx,
+            )
+            .into_any_element()
+        };
         let rows = (!group.collapsed).then(|| {
-            v_flex().children(group.rows.iter().map(|summary| {
-                pr_row(
-                    summary,
-                    true,
-                    shows_author(tab),
-                    self.cursor.as_ref() == Some(&summary.pr),
-                    Some(RowSelect {
-                        checked: self.selection.contains(&summary.pr),
-                        showing,
-                        on_select: on_select.clone(),
-                    }),
-                    age_from,
-                    cx,
-                )
-            }))
+            let mut elements: Vec<AnyElement> = Vec::new();
+            for line in &group.lines {
+                match line {
+                    Line::Pr(summary) => elements.push(row(summary, None, cx)),
+                    Line::Stack { stack, rows } => {
+                        let expanded = self.expanded.contains(&stack.key);
+                        elements.push(self.stack_line(stack, rows, lanes, showing, cx));
+                        if expanded {
+                            for (at, summary) in rows.iter().enumerate() {
+                                let place = StackPlace {
+                                    position: stack.place(&summary.pr).unwrap_or(at + 1),
+                                    total: stack.len(),
+                                    last: at + 1 == rows.len(),
+                                };
+                                elements.push(row(summary, Some(place), cx));
+                            }
+                        }
+                    }
+                }
+            }
+            v_flex().children(elements)
         });
         v_flex()
             .w_full()
             .child(heading)
             .children(rows)
             .into_any_element()
+    }
+
+    /// A stack's row: its box picks or drops every row of it the tab shows,
+    /// and a click opens or folds it.
+    fn stack_line(
+        &self,
+        stack: &Stack,
+        rows: &[&PrSummary],
+        lanes: Lanes,
+        showing: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = stack.key.element_id();
+        let members: Vec<PrRef> = rows.iter().map(|row| row.pr.clone()).collect();
+        let all_picked = members.iter().all(|pr| self.selection.contains(pr));
+        let view = cx.weak_entity();
+        let lead = select_box(
+            SharedString::from(format!("reviews-select-{id}")),
+            ROW_GROUP,
+            all_picked,
+            showing,
+            format!("Select every pull request in the stack {}", stack.name),
+            {
+                let members = members.clone();
+                move |window, cx| {
+                    let shift = window.modifiers().shift;
+                    view.update(cx, |this, cx| this.pick_stack(&members, shift, cx))
+                        .ok();
+                }
+            },
+        );
+        let key = stack.key.clone();
+        stack_row(
+            StackRow {
+                id: SharedString::from(format!("reviews-{id}")),
+                name: &stack.name,
+                rows,
+                total: stack.len(),
+                expanded: self.expanded.contains(&stack.key),
+            },
+            lanes,
+            self.cursor.as_ref() == Some(&Spot::Stack(stack.key.clone())),
+            Some(lead),
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if window.modifiers().shift {
+                this.pick_stack(&members, true, cx);
+            } else {
+                this.toggle_stack(&key, cx);
+            }
+        }))
+        .into_any_element()
     }
 
     /// "All open" while its first search runs or after it failed with
@@ -1672,7 +2004,8 @@ impl Render for InboxView {
                     .find(|(tab, _)| *tab == active)
                     .map(|(_, shown)| shown.items)
                     .unwrap_or_default();
-                let groups = grouped(&items, self.page.sort, &self.page.collapsed);
+                let stacks = self.stacks(inbox);
+                let groups = grouped(&items, self.page.sort, &self.page.collapsed, &stacks);
                 let showing = groups.iter().filter(|group| !group.collapsed).any(|group| {
                     group
                         .rows
@@ -1737,6 +2070,8 @@ impl Render for InboxView {
                 cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
             )
             .on_action(cx.listener(|this, _: &SelectTabRows, _, cx| this.select_tab(cx)))
+            .on_action(cx.listener(|this, _: &OpenStack, _, cx| this.open_stack(cx)))
+            .on_action(cx.listener(|this, _: &CloseStack, _, cx| this.close_stack(cx)))
             .on_action(cx.listener(|this, _: &ClearReviewsSelection, _, cx| {
                 // Picks hidden in a folded group do not hold the key.
                 if this.picked().is_empty() {
@@ -1829,7 +2164,7 @@ mod tests {
     use loupe_github::reviews::{NextStep, ReviewTab};
     use loupe_github::{ChecksState, ReviewDecision};
 
-    use super::{InboxView, PageState, build, shown, shown_all, step_cursor, title};
+    use super::{InboxView, PageState, Spot, build, shown, shown_all, step_cursor, title};
     use crate::github::common::Loadable;
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
@@ -1852,6 +2187,9 @@ mod tests {
             checks: None,
             review_decision: None,
             head_ref: String::new(),
+            base_ref: String::new(),
+            cross_repository: false,
+            stack: None,
             labels: Vec::new(),
             assignees: Vec::new(),
             reviewers: Vec::new(),
@@ -1889,7 +2227,7 @@ mod tests {
         // A cursor whose pull request left the list starts over.
         let gone = PrRef::new(RepoRef::new("a", "repo"), 9);
         assert_eq!(number(step_cursor(&rows, Some(&gone), true)), Some(1));
-        assert_eq!(step_cursor(&[], None, true), None);
+        assert_eq!(step_cursor::<PrRef>(&[], None, true), None);
     }
 
     #[test]
@@ -2194,7 +2532,7 @@ mod tests {
         view.read_with(cx, |view, _| {
             view.groups_shown()
                 .iter()
-                .map(|(_, _, rows)| rows.iter().map(|pr| pr.number).collect())
+                .map(|group| group.rows.iter().map(|pr| pr.number).collect())
                 .collect()
         })
     }
@@ -2222,8 +2560,24 @@ mod tests {
         }
     }
 
+    /// Loads `inbox`, with the open pull requests per base branch GitHub
+    /// would count if the inbox held every one.
     fn load(view: &Entity<InboxView>, inbox: Inbox, cx: &mut VisualTestContext) {
         view.update(cx, |view, cx| {
+            let mut counts = super::OpenByBase::new();
+            let mut seen: Vec<PrRef> = Vec::new();
+            for pr in [&inbox.review_requested, &inbox.authored, &inbox.involved]
+                .into_iter()
+                .flat_map(|page| page.items.iter())
+            {
+                if !seen.contains(&pr.pr) {
+                    seen.push(pr.pr.clone());
+                    *counts
+                        .entry((pr.pr.repo.clone(), pr.base_ref.clone()))
+                        .or_default() += 1;
+                }
+            }
+            view.open_by_base = counts;
             view.inbox = Loadable::Loaded(inbox);
             cx.notify();
         });
@@ -2253,7 +2607,10 @@ mod tests {
             .map(|_| {
                 view.update_in(cx, |view, window, cx| {
                     view.move_cursor(true, window, cx);
-                    view.cursor.as_ref().map(|pr| pr.number)
+                    view.cursor.as_ref().and_then(|spot| match spot {
+                        Spot::Pr(pr) => Some(pr.number),
+                        Spot::Stack(_) => None,
+                    })
                 })
                 .expect("a row under the cursor")
             })
@@ -2772,5 +3129,205 @@ mod tests {
         assert_eq!(page.sort, None);
         page.switch(&views, Some(&id));
         assert_eq!(page.sort.map(|sort| sort.key), Some(SortKey::Checks));
+    }
+
+    /// `pr` from branch `head` into `base`, with `lines` changed.
+    fn on(pr: PrSummary, base: &str, head: &str, lines: u32) -> PrSummary {
+        PrSummary {
+            base_ref: base.into(),
+            head_ref: head.into(),
+            additions: lines,
+            ..pr
+        }
+    }
+
+    /// To review holds a chain of branches 10 ← 11 ← 12 whose top, 13,
+    /// is in Involved, and two loose pull requests: 20 ready to merge and
+    /// 21 waiting. In the stack, 10 waits for a review, 11 is ready to
+    /// merge, and 12's checks fail.
+    fn stacked_inbox() -> Inbox {
+        let failing = |pr: PrSummary| PrSummary {
+            checks: Some(ChecksState::Failing),
+            ..pr
+        };
+        Inbox {
+            review_requested: page(
+                vec![
+                    failing(on(pr("a", 12), "b", "c", 250)),
+                    ready(on(pr("a", 20), "main", "x", 100)),
+                    on(pr("a", 10), "main", "a", 300),
+                    on(pr("a", 21), "main", "y", 1),
+                    ready(on(pr("a", 11), "a", "b", 200)),
+                ],
+                5,
+                false,
+            ),
+            authored: page(Vec::new(), 0, false),
+            involved: page(vec![on(pr("a", 13), "c", "d", 1)], 1, false),
+        }
+    }
+
+    fn spot(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> Option<String> {
+        view.read_with(cx, |view, _| {
+            view.cursor.as_ref().map(|spot| match spot {
+                Spot::Pr(pr) => pr.number.to_string(),
+                Spot::Stack(key) => key.element_id(),
+            })
+        })
+    }
+
+    #[gpui_kit::test]
+    fn a_stack_is_one_folded_line_in_the_group_of_its_most_urgent_row(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, stacked_inbox(), cx);
+        assert_eq!(active(&view, cx), Some(ReviewTab::ToReview));
+
+        // The stack sits in Ready to merge, where 11 is, at the place of its
+        // first row in GitHub's order (12), with its rows base first.
+        assert_eq!(numbers(&view, cx), [vec![10, 11, 12, 20], vec![21]]);
+        let (lines, summary, counts) = view.read_with(cx, |view, _| {
+            let inbox = view.inbox.value().expect("loaded");
+            let groups = view.groups(inbox);
+            let lines: Vec<Vec<u64>> = groups[0]
+                .lines
+                .iter()
+                .map(|line| line.rows().iter().map(|row| row.pr.number).collect())
+                .collect();
+            let summary = groups[0].lines.iter().find_map(|line| match line {
+                super::Line::Stack { stack, rows } => {
+                    Some(crate::github::pr_row::stack_summary(rows, stack.len()))
+                }
+                super::Line::Pr(_) => None,
+            });
+            let tabs = view.tab_lists(inbox);
+            let counts: Vec<usize> = tabs.iter().map(|(_, shown)| shown.count).collect();
+            (lines, summary, counts)
+        });
+        assert_eq!(lines, [vec![10, 11, 12], vec![20]]);
+        // 13 is in the stack but not in this tab.
+        assert_eq!(summary.as_deref(), Some("3 of 4 shown · 1 check failing"));
+        assert_eq!(counts, [5, 0, 1, 6], "the tabs still count pull requests");
+
+        // Folded, the stack's rows are not on screen; a click opens it.
+        assert!(bounds(cx, "reviews-stack-a-repo-pr10").is_some());
+        assert!(bounds(cx, "pr-row-PR_11").is_none());
+        click(cx, "reviews-stack-a-repo-pr10");
+        assert!(bounds(cx, "pr-row-PR_11").is_some());
+        click(cx, "reviews-stack-a-repo-pr10");
+        assert!(bounds(cx, "pr-row-PR_11").is_none());
+
+        // In Involved, 13 alone is a plain row.
+        click(cx, "reviews-tab-Involved");
+        assert!(bounds(cx, "pr-row-PR_13").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn a_sort_moves_the_stack_as_one_and_keeps_its_rows_in_stack_order(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, stacked_inbox(), cx);
+        // Smallest first: 20 (100) comes before the stack's smallest (11, 200).
+        click(cx, "reviews-sort-changes");
+        assert_eq!(numbers(&view, cx), [vec![20, 10, 11, 12], vec![21]]);
+        // Largest first: the stack's 10 (300) leads.
+        click(cx, "reviews-sort-changes");
+        assert_eq!(numbers(&view, cx), [vec![10, 11, 12, 20], vec![21]]);
+    }
+
+    #[gpui_kit::test]
+    fn a_folded_stack_is_picked_whole_by_its_box_and_by_cmd_a(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, stacked_inbox(), cx);
+
+        click(cx, "reviews-select-stack-a-repo-pr10");
+        assert_eq!(picked(&view, cx), [10, 11, 12]);
+        click(cx, "reviews-select-stack-a-repo-pr10");
+        assert!(picked(&view, cx).is_empty());
+
+        // Its row stands for its pull requests, so Cmd+A takes them.
+        view.update(cx, |view, cx| view.select_tab(cx));
+        assert_eq!(picked(&view, cx), [10, 11, 12, 20, 21]);
+    }
+
+    #[gpui_kit::test]
+    fn the_arrows_open_and_fold_the_stack_under_the_cursor(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, stacked_inbox(), cx);
+        let step = |cx: &mut VisualTestContext| {
+            view.update_in(cx, |view, window, cx| view.move_cursor(true, window, cx));
+            spot(&view, cx)
+        };
+        let stack = Some("stack-a-repo-pr10".to_owned());
+
+        assert_eq!(step(cx), stack, "the stack's own row comes first");
+        assert_eq!(
+            step(cx).as_deref(),
+            Some("20"),
+            "folded, J steps past its rows"
+        );
+        view.update_in(cx, |view, window, cx| view.move_cursor(false, window, cx));
+        view.update(cx, |view, cx| view.open_stack(cx));
+        assert_eq!(step(cx).as_deref(), Some("10"));
+        assert_eq!(step(cx).as_deref(), Some("11"));
+        // Left on a row inside folds the stack and brings the cursor up.
+        view.update(cx, |view, cx| view.close_stack(cx));
+        assert_eq!(spot(&view, cx), stack);
+        assert!(bounds(cx, "pr-row-PR_11").is_none());
+        // Enter on the stack's row opens it too.
+        view.update_in(cx, |view, window, cx| view.open_cursor(window, cx));
+        assert!(bounds(cx, "pr-row-PR_11").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn shift_on_a_stack_extends_the_selection_over_it(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, stacked_inbox(), cx);
+        click(cx, "pr-select-PR_21");
+        let at = bounds(cx, "reviews-select-stack-a-repo-pr10").expect("the stack's box");
+        cx.simulate_click(at.center(), Modifiers::shift());
+        assert_eq!(picked(&view, cx), [10, 11, 12, 20, 21]);
+    }
+
+    #[gpui_kit::test]
+    fn a_pull_request_that_left_a_github_stack_shows_once(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        // 7 and 8 were read while GitHub listed 9 in their stack; 9 itself
+        // was read after it left.
+        let layer = |number: u64| PrSummary {
+            stack: Some(loupe_github::StackSummary {
+                number: 2,
+                open: [7, 8, 9]
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &number)| loupe_github::StackMember {
+                        position: at as u32 + 1,
+                        number,
+                        title: format!("Layer {number}"),
+                    })
+                    .collect(),
+            }),
+            ..pr("a", number)
+        };
+        let inbox = Inbox {
+            review_requested: page(vec![layer(7), layer(8), pr("a", 9)], 3, false),
+            authored: page(Vec::new(), 0, false),
+            involved: page(Vec::new(), 0, false),
+        };
+        load(&view, inbox, cx);
+        assert_eq!(numbers(&view, cx), [vec![7, 8, 9]]);
+        let lines = view.read_with(cx, |view, _| {
+            let inbox = view.inbox.value().expect("loaded");
+            view.groups(inbox)[0]
+                .lines
+                .iter()
+                .map(|line| line.rows().iter().map(|row| row.pr.number).collect())
+                .collect::<Vec<Vec<u64>>>()
+        });
+        assert_eq!(lines, [vec![7, 8], vec![9]]);
     }
 }

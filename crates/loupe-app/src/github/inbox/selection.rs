@@ -51,6 +51,35 @@ impl Selection {
         self.anchor = Some(pr.clone());
     }
 
+    /// Picks every row of `rows` (the list in its order on screen) from the
+    /// anchor over all of `targets` (a stack's rows), and makes the target
+    /// farthest from the anchor the new one. With no anchor on the list, it
+    /// picks `targets` alone.
+    pub(super) fn extend_over(&mut self, rows: &[PrRef], targets: &[PrRef]) {
+        let places: Vec<usize> = targets
+            .iter()
+            .filter_map(|target| rows.iter().position(|row| row == target))
+            .collect();
+        let (Some(&first), Some(&last)) = (places.iter().min(), places.iter().max()) else {
+            return;
+        };
+        let anchor = self
+            .anchor
+            .as_ref()
+            .and_then(|anchor| rows.iter().position(|row| row == anchor));
+        let (from, to, far) = match anchor {
+            Some(at) if at > last => (first, at, first),
+            Some(at) => (at.min(first), last, last),
+            None => (first, last, last),
+        };
+        for row in &rows[from..=to] {
+            if !self.picked.contains(row) {
+                self.picked.push(row.clone());
+            }
+        }
+        self.anchor = Some(rows[far].clone());
+    }
+
     /// Picks every row of `rows`, one group's or the whole tab's.
     pub(super) fn select_all(&mut self, rows: &[PrRef]) {
         for row in rows {
@@ -147,5 +176,24 @@ mod tests {
         selection.clear();
         assert!(selection.in_order(&all).is_empty());
         assert_eq!(selection, Selection::default(), "the anchor goes too");
+    }
+
+    #[test]
+    fn shift_on_a_stack_extends_over_all_of_its_rows() {
+        let list = rows(&[1, 2, 3, 4, 5, 6]);
+        let stack = rows(&[4, 5]);
+        let mut selection = Selection::default();
+        selection.toggle(&list[1]);
+        selection.extend_over(&list, &stack);
+        assert_eq!(numbers(&selection.in_order(&list)), [2, 3, 4, 5]);
+        // From below, up over the stack to its first row.
+        let mut selection = Selection::default();
+        selection.toggle(&list[5]);
+        selection.extend_over(&list, &rows(&[2, 3]));
+        assert_eq!(numbers(&selection.in_order(&list)), [2, 3, 4, 5, 6]);
+        // With no anchor, the stack alone.
+        let mut selection = Selection::default();
+        selection.extend_over(&list, &stack);
+        assert_eq!(numbers(&selection.in_order(&list)), [4, 5]);
     }
 }

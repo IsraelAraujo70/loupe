@@ -136,6 +136,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", OpenSelected, Some(LIST_KEYS)),
         KeyBinding::new("o", OpenSelected, Some(LIST_KEYS)),
         KeyBinding::new("cmd-a", crate::github::SelectTabRows, Some(LIST_KEYS)),
+        KeyBinding::new("right", crate::github::OpenStack, Some(LIST_KEYS)),
+        KeyBinding::new("left", crate::github::CloseStack, Some(LIST_KEYS)),
         KeyBinding::new(
             "escape",
             crate::github::ClearReviewsSelection,

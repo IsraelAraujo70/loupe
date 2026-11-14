@@ -13,7 +13,7 @@ use gpui_kit::*;
 use loupe_github::{Page, PrListFilter, PrSummary, RepoRef, RepoSummary};
 
 use super::common::{self, LoadError, Loadable};
-use super::pr_row::{AgeFrom, pr_row};
+use super::pr_row::{AgeFrom, Lanes, pr_row};
 use crate::route::Route;
 use crate::shell::navigate;
 use crate::store::{Settings, update_settings};
@@ -256,14 +256,18 @@ impl Render for RepoView {
             Loadable::Loaded(page) | Loadable::Refreshing(page) => {
                 let page = page.clone();
                 let loading_more = matches!(self.more, Some(Ok(())));
-                let age = AgeFrom::Updated;
+                let lanes = Lanes {
+                    repo: false,
+                    author: true,
+                    age_from: AgeFrom::Updated,
+                };
                 v_flex()
                     .w_full()
                     .p_2()
                     .children(
                         page.items
                             .iter()
-                            .map(|summary| pr_row(summary, false, true, false, None, age, cx)),
+                            .map(|summary| pr_row(summary, lanes, false, None, None, cx)),
                     )
                     .when(page.next_cursor.is_some(), |column| {
                         column.child(
