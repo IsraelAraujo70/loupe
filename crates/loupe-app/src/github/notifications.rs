@@ -296,7 +296,7 @@ fn shown_unread(terms: &[Term], list: &[Notification]) -> Vec<String> {
 }
 
 /// Marks each thread read, a few at a time.
-fn mark_threads_read(gh: &GitHub, ids: &[String]) -> loupe_github::Result<()> {
+pub(super) fn mark_threads_read(gh: &GitHub, ids: &[String]) -> loupe_github::Result<()> {
     const WORKERS: usize = 6;
     let chunk = ids.len().div_ceil(WORKERS).max(1);
     std::thread::scope(|scope| {

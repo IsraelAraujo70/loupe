@@ -135,6 +135,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", SelectPrevious, Some(LIST_KEYS)),
         KeyBinding::new("enter", OpenSelected, Some(LIST_KEYS)),
         KeyBinding::new("o", OpenSelected, Some(LIST_KEYS)),
+        KeyBinding::new("cmd-a", crate::github::SelectSectionRows, Some(LIST_KEYS)),
+        KeyBinding::new(
+            "escape",
+            crate::github::ClearReviewsSelection,
+            Some(LIST_KEYS),
+        ),
         KeyBinding::new("/", FocusSettingsSearch, Some(SETTINGS_KEYS)),
         // The context menu of an issue or a pull request, on Linear's keys
         // where Linear has one. An issue's page binds S, P, A, and L itself.

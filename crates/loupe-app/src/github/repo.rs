@@ -263,7 +263,7 @@ impl Render for RepoView {
                     .children(
                         page.items
                             .iter()
-                            .map(|summary| pr_row(summary, false, true, false, age, cx)),
+                            .map(|summary| pr_row(summary, false, true, false, None, age, cx)),
                     )
                     .when(page.next_cursor.is_some(), |column| {
                         column.child(
