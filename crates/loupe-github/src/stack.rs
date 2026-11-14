@@ -38,6 +38,25 @@ pub struct StackEntry {
     pub review_decision: Option<ReviewDecision>,
 }
 
+/// The stack a listed pull request is part of, as light as a search can
+/// read for every row: which stack, and its open pull requests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackSummary {
+    /// The stack's number in its repository.
+    pub number: u64,
+    /// The open pull requests the viewer can see, base first.
+    pub open: Vec<StackMember>,
+}
+
+/// One open pull request of a [`StackSummary`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackMember {
+    /// 1 is the pull request closest to the stack's base.
+    pub position: u32,
+    pub number: u64,
+    pub title: String,
+}
+
 impl StackEntry {
     /// The head conflicts with its base.
     pub fn has_conflicts(&self) -> bool {
