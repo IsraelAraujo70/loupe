@@ -1905,24 +1905,35 @@ mod tests {
             .to_string()
     }
 
+    /// The tab's title, after checking the header draws the same one.
+    fn titles(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> String {
+        let title = tab_title(view, cx);
+        let selector: &'static str = format!("page-title:{title}").leak();
+        assert!(
+            bounds(cx, selector).is_some(),
+            "the header says {title:?} too"
+        );
+        title
+    }
+
     #[gpui_kit::test]
     fn the_tab_and_the_header_follow_the_open_view(cx: &mut TestAppContext) {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
-        assert_eq!(tab_title(&view, cx), "Reviews");
+        assert_eq!(titles(&view, cx), "Reviews");
         view.update(cx, |view, cx| view.save_as_new("Title follows", cx));
-        assert_eq!(tab_title(&view, cx), "Title follows");
+        assert_eq!(titles(&view, cx), "Title follows");
         let id = view
             .read_with(cx, |view, _| view.page.view_id.clone())
             .expect("the new view is open");
         view.update(cx, |view, cx| view.rename_view(&id, "Renamed", cx));
-        assert_eq!(tab_title(&view, cx), "Renamed", "a rename shows at once");
+        assert_eq!(titles(&view, cx), "Renamed", "a rename shows at once");
         view.update(cx, |view, cx| view.switch_view(None, cx));
-        assert_eq!(tab_title(&view, cx), "Reviews");
+        assert_eq!(titles(&view, cx), "Reviews");
         view.update(cx, |view, cx| view.switch_view(Some(&id), cx));
-        assert_eq!(tab_title(&view, cx), "Renamed");
+        assert_eq!(titles(&view, cx), "Renamed");
         view.update(cx, |view, cx| view.delete_view(&id, cx));
-        assert_eq!(tab_title(&view, cx), "Reviews");
+        assert_eq!(titles(&view, cx), "Reviews");
     }
 
     #[test]

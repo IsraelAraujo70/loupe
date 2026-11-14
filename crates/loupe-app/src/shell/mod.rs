@@ -2135,6 +2135,40 @@ mod tests {
             ["Mine", "Reviews"],
             "the tab on the saved view takes its name; the one on All does not"
         );
+        // The row of tabs draws the same names.
+        let ids: Vec<u64> = workspace.read_with(cx, |workspace, cx| {
+            workspace.open_tabs(cx).iter().map(|tab| tab.id).collect()
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        for (&id, name) in ids.iter().zip(["Mine", "Reviews"]) {
+            let selector: &'static str = format!("tab-{id}-label:{name}").leak();
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "tab {id} reads {name:?}"
+            );
+        }
+
+        // The palette's tab search finds the tab by its view's name.
+        cx.dispatch_action(crate::shell::actions::SearchTabs);
+        cx.run_until_parked();
+        cx.simulate_input("Mine");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let listed: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                let selector: &'static str = format!("palette-tab-{id}").leak();
+                cx.debug_bounds(selector).is_some()
+            })
+            .collect();
+        assert_eq!(listed, [ids[0]], "\"Mine\" finds the tab on that view");
     }
 
     /// With the pointer on no row, the item keys act on the page on screen:

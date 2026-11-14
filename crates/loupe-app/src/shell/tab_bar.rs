@@ -377,7 +377,15 @@ fn tabs(
                         muted
                     },
                 ))
-                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                .child({
+                    let shown = label.clone();
+                    div()
+                        .debug_selector(move || format!("tab-{id}-label:{shown}"))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(label.clone())
+                })
                 .child(
                     div()
                         .flex_none()
