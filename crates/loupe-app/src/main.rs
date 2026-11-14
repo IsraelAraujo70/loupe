@@ -67,6 +67,9 @@ fn main() {
             ..Default::default()
         };
         gpui_kit::open_window(options, cx, |window, cx| {
+            // Next-frame callbacks run before that frame draws: the inner one runs
+            // once the first screen is on the display.
+            window.on_next_frame(|window, _| window.on_next_frame(|_, _| updater::confirm_start()));
             cx.new(|cx| Workspace::new(Route::Inbox, window, cx))
         })
         .expect("open the main window");
