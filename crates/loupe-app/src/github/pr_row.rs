@@ -95,7 +95,12 @@ pub fn select_box(
             Checkbox::new(id)
                 .checked(checked)
                 .accessibility_label(label)
-                .on_click(move |_, window, cx| on_click(window, cx)),
+                .on_click(move |_, window, cx| {
+                    // The box sits inside a row that opens its pull request
+                    // on a click; picking must not open it too.
+                    cx.stop_propagation();
+                    on_click(window, cx)
+                }),
         )
 }
 
@@ -471,4 +476,121 @@ pub fn pr_row(
                 .child(age),
         );
     with_item_menu(row, item)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use chrono::Utc;
+    use gpui_kit::{
+        App, AppContext as _, Context, InteractiveElement as _, IntoElement, Modifiers,
+        ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, TestAppContext,
+        VisualTestContext, Window, div, px,
+    };
+    use loupe_github::{PrRef, PrState, PrSummary, RepoRef};
+
+    use super::{AgeFrom, RowSelect, SelectGesture, pr_row};
+    use crate::store::Settings;
+
+    type Picks = Rc<RefCell<Vec<SelectGesture>>>;
+
+    /// One pickable row inside a parent that counts the clicks reaching it.
+    struct Harness {
+        picks: Picks,
+        parent_clicks: Rc<RefCell<usize>>,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let at = Utc::now();
+            let summary = PrSummary {
+                id: "PR_1".into(),
+                pr: PrRef::new(RepoRef::new("a", "repo"), 1),
+                title: "A title".into(),
+                url: String::new(),
+                state: PrState::Open,
+                is_draft: false,
+                author: None,
+                created_at: at,
+                updated_at: at,
+                comment_count: 0,
+                additions: 0,
+                deletions: 0,
+                checks: None,
+                review_decision: None,
+                head_ref: String::new(),
+                labels: Vec::new(),
+                assignees: Vec::new(),
+                reviewers: Vec::new(),
+                mergeable: loupe_github::Mergeable::Unknown,
+            };
+            let picks = self.picks.clone();
+            let parent_clicks = self.parent_clicks.clone();
+            div()
+                .id("parent")
+                .w(px(1000.))
+                .on_click(move |_, _, _| *parent_clicks.borrow_mut() += 1)
+                .child(pr_row(
+                    &summary,
+                    true,
+                    true,
+                    false,
+                    Some(RowSelect {
+                        checked: false,
+                        showing: true,
+                        on_select: Rc::new(move |_, gesture, _, _| {
+                            picks.borrow_mut().push(gesture)
+                        }),
+                    }),
+                    AgeFrom::Updated,
+                    cx,
+                ))
+        }
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str, modifiers: Modifiers) {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let at = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(at.center(), modifiers);
+    }
+
+    /// The checkbox picks without the click reaching the row, which would
+    /// open the pull request; a Shift+click on the row picks a range.
+    #[gpui_kit::test]
+    fn the_checkbox_picks_without_opening_the_row(cx: &mut TestAppContext) {
+        let picks: Picks = Rc::default();
+        let parent_clicks = Rc::new(RefCell::new(0));
+        let (handle, _) = cx.update(|cx: &mut App| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(Settings::default());
+            let (picks, parent_clicks) = (picks.clone(), parent_clicks.clone());
+            gpui_kit::open_window(Default::default(), cx, move |_, cx| {
+                cx.new(|_| Harness {
+                    picks,
+                    parent_clicks,
+                })
+            })
+            .expect("open a window")
+        });
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+
+        click(cx, "pr-select-PR_1", Modifiers::none());
+        assert_eq!(*picks.borrow(), [SelectGesture::Toggle]);
+        assert_eq!(*parent_clicks.borrow(), 0, "the click stopped at the box");
+        click(cx, "pr-select-PR_1", Modifiers::shift());
+        assert_eq!(picks.borrow().last(), Some(&SelectGesture::Range));
+        assert_eq!(*parent_clicks.borrow(), 0);
+
+        // A click on the row itself goes on to it.
+        click(cx, "pr-row-PR_1", Modifiers::shift());
+        assert_eq!(picks.borrow().len(), 3);
+        assert_eq!(picks.borrow().last(), Some(&SelectGesture::Range));
+        assert_eq!(*parent_clicks.borrow(), 1);
+    }
 }

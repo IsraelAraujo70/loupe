@@ -250,6 +250,8 @@ pub struct InboxView {
     confirm: Option<Bulk>,
     /// "Mark as read" in flight.
     marking: Option<Task<()>>,
+    /// Whether the last frame showed the selection bar.
+    bar_shown: bool,
     /// What the last "Mark as read" did, or why it failed (`true`).
     mark_note: Option<(SharedString, bool)>,
     _load: Option<Task<()>>,
@@ -314,6 +316,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             selection: Selection::default(),
             confirm: None,
             marking: None,
+            bar_shown: false,
             mark_note: None,
             _load: None,
             _checks: checks,
@@ -1157,7 +1160,7 @@ impl InboxView {
         if count == 0 {
             return None;
         }
-        let muted = cx.theme().muted_foreground;
+        let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
         let action = |id: &'static str, icon: IconName, label: &'static str| {
             Button::new(id)
                 .debug_selector(move || id.into())
@@ -1166,22 +1169,15 @@ impl InboxView {
                 .icon(icon)
                 .label(label)
         };
-        let bar = ui::toolbar()
-            .debug_selector(|| "reviews-selection-bar".into())
-            .child(
-                div()
-                    .flex_none()
-                    .text_sm()
-                    .mr_1()
-                    .child(format!("{count} selected")),
-            );
-        let bar = match self.confirm {
+        let controls = h_flex().gap_2().items_center();
+        let controls = match self.confirm {
             Some(bulk) => {
                 let question = match bulk {
                     Bulk::Tabs => format!("Open {count} pull requests in new tabs?"),
                     Bulk::Browser => format!("Open {count} pull requests on GitHub?"),
                 };
-                bar.child(div().text_sm().text_color(muted).child(question))
+                controls
+                    .child(div().text_sm().text_color(muted).child(question))
                     .child(
                         Button::new("reviews-selection-cancel")
                             .ghost()
@@ -1203,7 +1199,7 @@ impl InboxView {
                             })),
                     )
             }
-            None => bar
+            None => controls
                 .child(
                     action(
                         "reviews-selection-tabs",
@@ -1237,17 +1233,27 @@ impl InboxView {
                         .on_click(cx.listener(|this, _, _, cx| this.mark_picked_read(cx))),
                 ),
         };
-        let danger = cx.theme().danger;
+        let note = self.mark_note.clone().map(|(text, failed)| {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(scale::meta())
+                .text_color(if failed { danger } else { muted })
+                .child(text)
+        });
         Some(
-            bar.child(div().flex_1())
-                .children(self.mark_note.clone().map(|(text, failed)| {
+            ui::toolbar()
+                .debug_selector(|| "reviews-selection-bar".into())
+                .child(
                     div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(scale::meta())
-                        .text_color(if failed { danger } else { muted })
-                        .child(text)
-                }))
+                        .flex_none()
+                        .text_sm()
+                        .mr_1()
+                        .child(format!("{count} selected")),
+                )
+                .child(controls)
+                .child(div().flex_1())
+                .children(note)
                 .child(
                     ui::icon_button(
                         "reviews-selection-clear",
@@ -1406,6 +1412,17 @@ impl Render for InboxView {
         if crate::shell::page_may_take_focus(window, cx) {
             self.focus.focus(window, cx);
         }
+        let selection_bar = self.selection_bar(cx);
+        if selection_bar.is_some() != self.bar_shown {
+            // The bar pushes the list down by its height; scrolling as far
+            // keeps every row under the pointer, so the next click lands on
+            // the row it aimed at. A list too short to scroll moves once.
+            self.bar_shown = selection_bar.is_some();
+            let height = scale::toolbar_height().to_pixels(window.rem_size());
+            let mut offset = self.scroll.offset();
+            offset.y = (offset.y + if self.bar_shown { -height } else { height }).min(px(0.));
+            self.scroll.set_offset(offset);
+        }
         let body = match &self.inbox {
             Loadable::Failed(error) => {
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
@@ -1471,7 +1488,7 @@ impl Render for InboxView {
             .child(self.header(cx))
             .children(self.filter_bar(cx))
             .children(self.notice(cx))
-            .children(self.selection_bar(cx))
+            .children(selection_bar)
             .child(
                 div()
                     .id("inbox")
@@ -1853,6 +1870,29 @@ mod tests {
             view.switch_view(None, cx);
         });
         assert!(picked(&view, cx).is_empty(), "another view clears it");
+    }
+
+    #[gpui_kit::test]
+    fn the_bar_leaves_the_rows_under_the_pointer(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        view.update(cx, |view, cx| {
+            view.inbox = Loadable::Loaded(Inbox {
+                review_requested: page((1..=40).map(|n| pr("a", n)).collect(), 40, false),
+                authored: page(Vec::new(), 0, false),
+                involved: page(Vec::new(), 0, false),
+            });
+            cx.notify();
+        });
+        let row = bounds(cx, "pr-row-PR_2").expect("row 2");
+        click(cx, "pr-select-PR_1");
+        assert!(bounds(cx, "reviews-selection-bar").is_some());
+        assert_eq!(bounds(cx, "pr-row-PR_2"), Some(row), "the bar moved no row");
+        click(cx, "pr-select-PR_2");
+        assert_eq!(picked(&view, cx), [1, 2], "the second click hit row 2");
+        view.update(cx, |view, cx| view.clear_selection(cx));
+        assert_eq!(bounds(cx, "reviews-selection-bar"), None);
+        assert_eq!(bounds(cx, "pr-row-PR_2"), Some(row), "nor did its leaving");
     }
 
     #[gpui_kit::test]
