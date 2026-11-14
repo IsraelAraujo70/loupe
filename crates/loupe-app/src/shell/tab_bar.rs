@@ -16,9 +16,11 @@
 //!
 //! Grouped tabs follow their group's name, a colored pill, and carry a line
 //! of its color. A click on the name collapses or expands the group; its
-//! right-click menu renames, recolors, or ungroups it. A tab joins a group
-//! from its own right-click menu, or when it is dropped on the group's name
-//! or on one of its tabs; dropped on a tab outside every group, it leaves.
+//! right-click menu renames, recolors, ungroups, or closes it. A tab joins a
+//! group from its own right-click menu, or when it is dropped on the group's
+//! name or on one of its tabs; dropped on a tab outside every group, it
+//! leaves. The name drags the whole group along its row, never into another
+//! group. A right click on + lists the closed groups to reopen.
 //!
 //! Pinned tabs ("Pin tab" in a tab's right-click menu) come first, narrower,
 //! with their icon and a short name and no close button; the whole name is
@@ -37,7 +39,7 @@ use super::panes::{Pane, PaneId, Zone};
 use super::tab_groups;
 use super::tabs::TabGroup;
 use crate::route::Route;
-use crate::store::TabGroupColor;
+use crate::store::{ClosedTabGroup, TabGroupColor};
 use crate::theme::scale::dp;
 use crate::theme::tokens;
 use crate::ui::{self, WindowDragArea as _};
@@ -125,56 +127,205 @@ impl Render for DraggedTab {
     }
 }
 
-/// The name of group `group` of `pane`, before its first tab. `hidden` is
-/// how many tabs it hides while collapsed.
+/// A group while it is dragged by its name: where it comes from, and the
+/// floating copy of its name under the pointer.
+#[derive(Clone)]
+pub(super) struct DraggedGroup {
+    pub pane: PaneId,
+    pub group: u64,
+    name: SharedString,
+    color: TabGroupColor,
+}
+
+impl Render for DraggedGroup {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .h(px(22.))
+            .max_w(dp(TAB_MAX_WIDTH))
+            .px_2()
+            .items_center()
+            .rounded(cx.theme().radius)
+            .bg(tokens::tab_group(self.color))
+            .shadow_lg()
+            .text_color(tokens::on_accent())
+            .text_size(rems(12. / 16.))
+            .font_weight(FontWeight::MEDIUM)
+            .child(div().min_w_0().truncate().child(self.name.clone()))
+    }
+}
+
+/// The group being dragged by its name, and the tab of its row under the
+/// pointer (`onto`), whose place it would take if dropped now.
+#[derive(Clone, Copy)]
+pub(super) struct GroupLift {
+    pub pane: PaneId,
+    pub group: u64,
+    pub onto: Option<usize>,
+}
+
+/// What shows where a dragged group would land: a group's name or a tab
+/// (by index), and the side of it the line is on.
+#[derive(Clone, Copy, PartialEq)]
+enum Landing {
+    Label(u64, bool),
+    Tab(usize, bool),
+}
+
+/// Where the line goes for `lift` over `tabs`: before the tab or the group
+/// the dragged group would go before, or after the one it would follow.
+fn landing(tabs: &super::tabs::Tabs<AnyView>, lift: GroupLift) -> Option<Landing> {
+    let to = tabs.group_drop_at(lift.group, Some(lift.onto?))?;
+    let first = tabs.iter().position(|tab| tab.group == Some(lift.group))?;
+    if to < first {
+        // `to` starts what the group goes before: a group's first tab, whose
+        // name leads it, or a tab outside every group.
+        return Some(match tabs.group_at(to) {
+            Some(group) => Landing::Label(group, false),
+            None => Landing::Tab(to, false),
+        });
+    }
+    let last = to - 1;
+    Some(match tabs.group_at(last) {
+        Some(group) if tabs.group(group).is_some_and(|group| group.collapsed) => {
+            Landing::Label(group, true)
+        }
+        _ => Landing::Tab(last, true),
+    })
+}
+
+/// The 2 px accent line that shows where a dragged tab or group lands, on
+/// the leading or (`trailing`) trailing side of its parent.
+fn landing_line(trailing: bool, color: Hsla) -> Div {
+    let line = div()
+        .absolute()
+        .top_1()
+        .bottom_1()
+        .w(px(2.))
+        .rounded_full()
+        .bg(color);
+    if trailing {
+        line.right(px(-3.))
+    } else {
+        line.left(px(-3.))
+    }
+}
+
+/// What a dragged group is over in its row: the tab at `index`, or the
+/// name of the group that tab starts (`label`). A name and its first tab
+/// share the index, so `label` keeps them apart: the one the pointer left
+/// must not forget the one it is on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct GroupTarget {
+    pub pane: PaneId,
+    pub index: usize,
+    pub label: bool,
+}
+
+/// Lets the tab at `index` of `pane`, or with `label` the name that leads
+/// it, take a dragged group: it follows the pointer while the group's own
+/// row is dragged over, and moves the group on a drop.
+fn takes_groups<E: InteractiveElement>(
+    element: E,
+    pane: PaneId,
+    index: usize,
+    label: bool,
+    cx: &mut Context<Workspace>,
+) -> E {
+    let target = GroupTarget { pane, index, label };
+    element
+        .on_drag_move(
+            cx.listener(move |this, event: &DragMoveEvent<DraggedGroup>, _, cx| {
+                if event.drag(cx).pane != pane {
+                    return;
+                }
+                let over = event.bounds.contains(&event.event.position);
+                this.hover_group_drop(target, over, cx);
+            }),
+        )
+        .on_drop(cx.listener(move |this, dragged: &DraggedGroup, _, cx| {
+            this.drop_group(dragged, pane, Some(index), cx)
+        }))
+}
+
+/// The name of group `group` of `pane`, before its first tab, at `first`.
+/// `hidden` is how many tabs it hides while collapsed; `lifted` fades it
+/// while it is dragged; `line` is the side a dragged group's landing line
+/// is on, if it lands next to this one.
 fn group_label(
     pane: PaneId,
     group: &TabGroup,
+    first: usize,
     hidden: usize,
+    lifted: bool,
+    line: Option<bool>,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let id = group.id;
     let fill = tokens::tab_group(group.color);
     let on_fill = tokens::on_accent();
     let ring = cx.theme().foreground;
+    let accent = cx.theme().ring;
     let name: SharedString = group.name.clone().into();
     let collapsed = group.collapsed;
     let color = group.color;
     let workspace = cx.entity().downgrade();
     let state = if collapsed { "collapsed" } else { "expanded" };
-    h_flex()
-        .id(("tab-group", id))
-        .debug_selector(move || format!("tab-group-{pane}-{id}"))
-        .role(Role::Button)
-        .aria_label(format!("{name} group, {state}"))
-        .aria_expanded(!collapsed)
-        .flex_none()
-        .h(px(22.))
-        .max_w(dp(TAB_MAX_WIDTH))
-        .px_2()
-        .gap_1()
-        .items_center()
-        .rounded(cx.theme().radius)
-        .bg(fill)
-        .border_1()
-        .border_color(transparent_black())
-        .text_color(on_fill)
-        .text_size(rems(12. / 16.))
-        .font_weight(FontWeight::MEDIUM)
-        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-        .on_click(
-            cx.listener(move |this, _, _, cx| {
+    let dragged = DraggedGroup {
+        pane,
+        group: id,
+        name: name.clone(),
+        color,
+    };
+    let on_drag = {
+        let workspace = workspace.clone();
+        move |dragged: &DraggedGroup, _: Point<Pixels>, _: &mut Window, cx: &mut App| {
+            let started = dragged.clone();
+            workspace
+                .update(cx, |this, cx| {
+                    this.group_drag = Some(started);
+                    cx.notify();
+                })
+                .ok();
+            cx.new(|_| dragged.clone())
+        }
+    };
+    let label =
+        h_flex()
+            .id(("tab-group", id))
+            .debug_selector(move || format!("tab-group-{pane}-{id}"))
+            .role(Role::Button)
+            .aria_label(format!("{name} group, {state}"))
+            .aria_expanded(!collapsed)
+            .relative()
+            .flex_none()
+            .h(px(22.))
+            .max_w(dp(TAB_MAX_WIDTH))
+            .px_2()
+            .gap_1()
+            .items_center()
+            .rounded(cx.theme().radius)
+            .bg(fill)
+            .border_1()
+            .border_color(transparent_black())
+            .text_color(on_fill)
+            .text_size(rems(12. / 16.))
+            .font_weight(FontWeight::MEDIUM)
+            .when(lifted, |label| label.opacity(0.5))
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .on_click(cx.listener(move |this, _, _, cx| {
                 this.edit_tabs(pane, |tabs| tabs.toggle_group(id), cx)
-            }),
-        )
-        .drag_over::<DraggedTab>(move |style, _, _, _| style.border_color(ring))
-        .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
-            this.drop_on_group(dragged, pane, id, cx)
-        }))
+            }))
+            .on_drag(dragged, on_drag)
+            .drag_over::<DraggedTab>(move |style, _, _, _| style.border_color(ring))
+            .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
+                this.drop_on_group(dragged, pane, id, cx)
+            }));
+    takes_groups(label, pane, first, true, cx)
         .child(div().min_w_0().truncate().child(name.clone()))
         .when(collapsed, |label| {
             label.child(div().flex_none().opacity(0.8).child(hidden.to_string()))
         })
+        .children(line.map(|trailing| landing_line(trailing, accent)))
         .context_menu(move |menu, window, cx| {
             let rename = {
                 let workspace = workspace.clone();
@@ -207,6 +358,14 @@ fn group_label(
                         .ok();
                 })
             };
+            let close = {
+                let workspace = workspace.clone();
+                PopupMenuItem::new("Close group").on_click(move |_, window, cx| {
+                    workspace
+                        .update(cx, |this, cx| this.close_group(pane, id, window, cx))
+                        .ok();
+                })
+            };
             let workspace = workspace.clone();
             menu.item(rename)
                 .submenu("Color", window, cx, move |submenu, _, _| {
@@ -233,6 +392,7 @@ fn group_label(
                 })
                 .separator()
                 .item(ungroup)
+                .item(close)
         })
         .into_any_element()
 }
@@ -241,11 +401,13 @@ fn group_label(
 /// tabs a collapsed group hides; and the open tab's place among them.
 /// `emphasized` is false for the selected tab of a pane that is not the
 /// active one, which then keeps its fill but not its color. `lifted` is the
-/// pane and the tab being dragged, if any.
+/// pane and the tab being dragged, if any; `group_lift` the group being
+/// dragged by its name.
 fn tabs(
     pane: &Pane<AnyView>,
     emphasized: bool,
     lifted: Option<(PaneId, u64)>,
+    group_lift: Option<GroupLift>,
     cx: &mut Context<Workspace>,
 ) -> (Vec<AnyElement>, usize) {
     let theme = cx.theme();
@@ -264,6 +426,9 @@ fn tabs(
         .and_then(|index| pane.tabs.iter().nth(index))
         .map(|tab| tab.pinned);
     let workspace = cx.entity().downgrade();
+    let group_lift = group_lift.filter(|lift| lift.pane == pane_id);
+    let lifted_group = group_lift.map(|lift| lift.group);
+    let landing = group_lift.and_then(|lift| landing(&pane.tabs, lift));
     let groups: Vec<(u64, SharedString)> = pane
         .tabs
         .groups()
@@ -279,7 +444,12 @@ fn tabs(
             && previous_group != Some(group.id)
         {
             let hidden = pane.tabs.group_len(group.id);
-            items.push(group_label(pane_id, group, hidden, cx));
+            let line = match landing {
+                Some(Landing::Label(id, trailing)) if id == group.id => Some(trailing),
+                _ => None,
+            };
+            let lifted = lifted_group == Some(group.id);
+            items.push(group_label(pane_id, group, index, hidden, lifted, line, cx));
         }
         previous_group = tab.group;
         if pane.tabs.is_hidden(index) {
@@ -390,7 +560,11 @@ fn tabs(
                     tab.text_color(muted)
                         .hover(|style| style.bg(tokens::glass_hover()))
                 })
-                .when(lifted_index == Some(index), |tab| tab.opacity(0.5))
+                .when(
+                    lifted_index == Some(index)
+                        || (lifted_group.is_some() && tab.group == lifted_group),
+                    |tab| tab.opacity(0.5),
+                )
                 // A press on a tab is the tab's, not the window's to move.
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                 .on_click(cx.listener(move |this, _, _, cx| this.select_tab_id(id, cx)))
@@ -440,6 +614,12 @@ fn tabs(
                     )
                 })
                 .children(landing_line)
+                .children(match landing {
+                    Some(Landing::Tab(at, trailing)) if at == index => {
+                        Some(self::landing_line(trailing, ring))
+                    }
+                    _ => None,
+                })
                 .children(line_color.map(|color| {
                     div()
                         .absolute()
@@ -450,6 +630,7 @@ fn tabs(
                         .rounded_full()
                         .bg(color)
                 }));
+            let element = takes_groups(element, pane_id, index, false, cx);
             let workspace = workspace.clone();
             let in_group = tab.group;
             let other_groups: Vec<(u64, SharedString)> = groups
@@ -588,10 +769,11 @@ fn tab_list(
     label: SharedString,
     emphasized: bool,
     lifted: Option<(PaneId, u64)>,
+    group_lift: Option<GroupLift>,
     cx: &mut Context<Workspace>,
 ) -> Stateful<Div> {
     let pane_id = pane.id;
-    let (items, open_child) = tabs(pane, emphasized, lifted, cx);
+    let (items, open_child) = tabs(pane, emphasized, lifted, group_lift, cx);
     // `open_child` counts the groups' names and leaves out hidden tabs.
     row.follow(pane.tabs.active().id, open_child);
     h_flex()
@@ -612,6 +794,62 @@ fn tab_list(
         .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
             this.drop_on_row(dragged, pane_id, None, cx)
         }))
+        .on_drop(cx.listener(move |this, dragged: &DraggedGroup, _, cx| {
+            this.drop_group(dragged, pane_id, None, cx)
+        }))
+}
+
+/// The new-tab button. A right click lists the closed groups, the latest
+/// first, each with its color, to reopen in the active pane.
+fn new_tab_button(closed: &[ClosedTabGroup], cx: &mut Context<Workspace>) -> AnyElement {
+    let button = div()
+        .id("new-tab-slot")
+        .flex_none()
+        .debug_selector(|| "new-tab".into())
+        .child(
+            ui::icon_button("new-tab", IconName::Plus, "New tab (⌘T)")
+                .small()
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
+        );
+    if closed.is_empty() {
+        return button.into_any_element();
+    }
+    let closed = closed.to_vec();
+    let workspace = cx.entity().downgrade();
+    button
+        .context_menu(move |menu, _, _| {
+            closed
+                .iter()
+                .enumerate()
+                .fold(menu, |menu, (index, group)| {
+                    let label: SharedString = format!("Reopen group {}", group.name).into();
+                    let fill = tokens::tab_group(group.color);
+                    let shown = label.clone();
+                    let workspace = workspace.clone();
+                    let group = group.clone();
+                    menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            // The stock row names only text items; this one draws
+                            // the group's color, so its content carries the name.
+                            h_flex()
+                                .id(("reopen-group", index))
+                                .debug_selector(move || format!("reopen-group-{index}"))
+                                .role(Role::Group)
+                                .aria_label(shown.clone())
+                                .gap_2()
+                                .items_center()
+                                .child(div().flex_none().size_2().rounded_full().bg(fill))
+                                .child(shown.clone())
+                        })
+                        .on_click(move |_, window, cx| {
+                            workspace
+                                .update(cx, |this, cx| this.reopen_group(&group, window, cx))
+                                .ok();
+                        }),
+                    )
+                })
+        })
+        .into_any_element()
 }
 
 /// The top bar. With one pane it holds that pane's tabs.
@@ -619,11 +857,13 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
     let active = workspace.panes.active().active();
     let (can_back, can_forward) = (active.can_go_back(), active.can_go_forward());
     let lifted = workspace.lifted_tab(cx);
+    let group_lift = workspace.group_lift(cx);
     let single = (workspace.panes.pane_count() == 1).then(|| workspace.panes.panes()[0]);
     let tab_list = single.map(|pane| {
         let row = workspace.tab_row(pane.id);
-        tab_list(pane, &row, "Tabs".into(), true, lifted, cx).ml_1()
+        tab_list(pane, &row, "Tabs".into(), true, lifted, group_lift, cx).ml_1()
     });
+    let closed = crate::store::Settings::get(cx).closed_tab_groups.clone();
     let end_drop = single.map(|pane| pane.id);
     h_flex()
         .id("top-bar")
@@ -653,13 +893,7 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(GoForward), cx)),
         )
         .children(tab_list)
-        .child(
-            div().flex_none().debug_selector(|| "new-tab".into()).child(
-                ui::icon_button("new-tab", IconName::Plus, "New tab (⌘T)")
-                    .small()
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
-            ),
-        )
+        .child(new_tab_button(&closed, cx))
         // Apart from the tabs, at the bar's trailing edge. A tab dropped
         // here goes after the last one.
         .child(
@@ -671,6 +905,11 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
                     end.on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
                         this.drop_on_row(dragged, pane_id, None, cx)
                     }))
+                    .on_drop(cx.listener(
+                        move |this, dragged: &DraggedGroup, _, cx| {
+                            this.drop_group(dragged, pane_id, None, cx)
+                        },
+                    ))
                 }),
         )
         .child(crate::updater::render(cx))
@@ -685,6 +924,7 @@ pub(super) fn pane_strip(
     number: usize,
     active: bool,
     lifted: Option<(PaneId, u64)>,
+    group_lift: Option<GroupLift>,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let pane_id = pane.id;
@@ -694,6 +934,7 @@ pub(super) fn pane_strip(
         format!("Pane {number} tabs").into(),
         active,
         lifted,
+        group_lift,
         cx,
     )
     .flex_1();
