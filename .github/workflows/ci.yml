@@ -44,9 +44,13 @@ jobs:
 
   app-tests:
     # The `loupe-app` tests, headless: GPUI's test platform needs its system
-    # libraries to link but no display. Same Boat runner as the Release Linux
-    # build, which left the GitHub-hosted runner for its flaky apt mirror.
-    runs-on: boat-large
+    # libraries to link but no display. Branch protection requires this job
+    # name. GitHub-hosted runner since #100: the Boat runner (`boat-large`)
+    # has a daily start limit, and when it ran out PRs lost this required
+    # check. To go back to Boat, set `runs-on: boat-large` here and on the
+    # Release `linux` job. Measured on ubuntu-24.04 with no Rust cache (#101):
+    # 8-11 min, so 45 min leaves room for a slow runner or apt retries.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
