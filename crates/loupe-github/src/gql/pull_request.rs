@@ -6,6 +6,8 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use super::stack::{WireStack, stack_fragment};
+
 use crate::{
     ActionsJob, Actor, BodyEdit, CheckRun, CheckStatus, Checks, ChecksState, Commit, Error, GitHub,
     IssueComment, Label, MergeMethod, MergeStateStatus, Mergeable, PendingReview, PrRef, PrState,
@@ -193,12 +195,14 @@ query PullRequestDetail($owner: String!, $name: String!, $number: Int!) {
       pendingReviews: reviews(states: PENDING, first: 5) {
         nodes { id viewerDidAuthor comments { totalCount } }
       }
+      stack { ...StackFields }
     }
   }
 }
 "#,
     timeline_page_fragment!(),
-    threads_page_fragment!()
+    threads_page_fragment!(),
+    stack_fragment!()
 );
 
 const TIMELINE_PAGE_QUERY: &str = concat!(
@@ -556,6 +560,7 @@ struct WirePullRequest {
     timeline_items: Connection<WireTimelineNode>,
     review_threads: Connection<WireThread>,
     pending_reviews: Connection<WirePendingReview>,
+    stack: Option<WireStack>,
 }
 
 /// The description's edits, newest first. GitHub lists the original text as
@@ -952,6 +957,7 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
         pending_review,
         viewer_login: data.viewer.login,
         viewer_can_update: wire.viewer_can_update,
+        stack: wire.stack.map(WireStack::into_stack),
     };
     Ok(FirstPage {
         detail,

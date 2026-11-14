@@ -289,6 +289,11 @@ pub mod tokens {
         indent_guide => indent_guide,
         indent_guide_active => indent_guide_active,
     }
+
+    /// The fill of a tab group's name and line.
+    pub fn tab_group(color: crate::store::TabGroupColor) -> Hsla {
+        active().palette.tab_group(color).0
+    }
 }
 
 /// The theme's base font size at 100%: one `rem`. It is gpui-component's
