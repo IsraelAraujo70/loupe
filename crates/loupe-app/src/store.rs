@@ -168,11 +168,6 @@ pub struct Settings {
     /// Which pane was active, counting the panes in reading order: left
     /// before right, top before bottom.
     pub active_pane: usize,
-    /// Whether a new tab of a GitHub repository's page joins the tab group
-    /// named after the repository, made on the spot, and a new tab without
-    /// a repository opens outside every group. Off by default; turning it
-    /// off keeps the groups there are.
-    pub group_tabs_by_repo: bool,
     /// The groups of tabs closed with "Close group", the latest first, at
     /// most [`CLOSED_TAB_GROUPS_KEPT`]; the new-tab button's menu reopens
     /// them.
@@ -1111,6 +1106,38 @@ mod tests {
             };
             assert_eq!(groups[0].color, color, "{} comes back", color.label());
         }
+    }
+
+    #[test]
+    fn settings_saved_with_grouping_by_repository_still_load_with_their_groups() {
+        // Saved by a build that had "Group tabs by repository automatically"
+        // on, with a group it made.
+        let saved = br#"{"sidebar_collapsed": true, "group_tabs_by_repo": true,
+            "panes": {"Pane": {"tabs": ["Inbox", "Notifications"], "active": 1,
+                "groups": [{"name": "loupe", "color": "Blue", "first": 1, "len": 1}]}}}"#;
+        let settings = Settings::parse(saved).expect("the file loads");
+        assert!(settings.sidebar_collapsed, "the other settings are kept");
+        assert_eq!(
+            settings.pane_layout(),
+            PaneLayout::Pane {
+                tabs: vec![Route::Inbox, Route::Notifications],
+                active: 1,
+                groups: vec![SavedTabGroup {
+                    name: "loupe".into(),
+                    color: TabGroupColor::Blue,
+                    collapsed: false,
+                    first: 1,
+                    len: 1,
+                }],
+                pinned: 0,
+            },
+            "the group the option made stays, as a plain group"
+        );
+        let resaved = serde_json::to_string(&settings).expect("settings serialize");
+        assert!(
+            !resaved.contains("group_tabs_by_repo"),
+            "the next save drops the old field"
+        );
     }
 
     #[test]

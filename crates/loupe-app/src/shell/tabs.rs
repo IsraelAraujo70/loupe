@@ -195,56 +195,6 @@ impl<V> Tabs<V> {
         self.tidy();
     }
 
-    /// Opens `tab` the way grouping by repository does: a tab whose page
-    /// belongs to a GitHub repository ([`Route::repo`]) joins the group named
-    /// after the repository, after its last tab, and the group is made on
-    /// the spot when the pane has none by that name; any other tab opens
-    /// outside every group, after the active tab, or after the group the
-    /// active tab is in. `activate` puts it on screen; otherwise the active
-    /// tab stays and, as with [`Self::open_in_background`], tabs opened this
-    /// way from the same tab follow one another.
-    pub fn open_in_repo_group(&mut self, tab: Tab<V>, activate: bool) {
-        let from = self.active().id;
-        let id = tab.id;
-        let repo = tab.current().route.repo().map(|repo| repo.name.clone());
-        let existing = repo.as_deref().and_then(|name| {
-            let group = self.groups.iter().find(|group| group.name == name)?;
-            Some(group.id)
-        });
-        match existing {
-            Some(group) => {
-                let last = self.end_of_group(group);
-                self.place(last + 1, tab, Some(group));
-            }
-            None => {
-                let last_background = match self.last_background {
-                    Some((active, last)) if !activate && active == from => {
-                        self.index_of(last).filter(|&ix| ix > self.active)
-                    }
-                    _ => None,
-                };
-                let after = last_background.unwrap_or(self.active);
-                let at = match self.tabs[after].group {
-                    Some(group) => self.end_of_group(group),
-                    None => after,
-                };
-                self.place(at + 1, tab, None);
-                self.active = self.index_of(from).unwrap_or(0);
-                if let Some(name) = repo
-                    && let Some(index) = self.index_of(id)
-                {
-                    self.new_group(index, &name);
-                }
-            }
-        }
-        if !activate {
-            self.last_background = Some((from, id));
-        }
-        let shown = if activate { id } else { from };
-        self.active = self.index_of(shown).unwrap_or(0);
-        self.tidy();
-    }
-
     /// The index of group `id`'s last tab; 0 when it has none.
     fn end_of_group(&self, id: u64) -> usize {
         self.tabs
@@ -850,7 +800,6 @@ mod tests {
     use super::{Page, Tab, Tabs};
     use crate::route::Route;
     use crate::store::{ClosedTabGroup, SavedTabGroup, TabGroupColor};
-    use loupe_github::{PrRef, RepoRef};
 
     thread_local! {
         static NEXT_ID: Cell<u64> = const { Cell::new(0) };
@@ -1323,26 +1272,6 @@ mod tests {
     }
 
     #[test]
-    fn grouping_by_repository_keeps_the_pinned_tabs_first() {
-        use loupe_github::{PrRef, RepoRef};
-
-        let pr = |number| Route::PullRequest(PrRef::new(RepoRef::new("octo", "app"), number));
-        let mut tabs = five_tabs();
-        tabs.pin(0);
-        tabs.select(0);
-        tabs.open_in_repo_group(tab(pr(1)), true);
-        assert_eq!(
-            pinned_names(&tabs)[..3],
-            ["A*", "app#1:app", "B"],
-            "a tab opened from a pinned tab lands after it, in its repository's group"
-        );
-        tabs.select(0);
-        tabs.open_in_repo_group(tab(pr(2)), false);
-        assert_eq!(pinned_names(&tabs)[..3], ["A*", "app#1:app", "app#2:app"]);
-        assert_eq!(tabs.active_index(), 0, "the pinned tab stays open");
-    }
-
-    #[test]
     fn pinned_tabs_come_back_first_and_no_group_takes_them() {
         let mut saved: Vec<Tab<()>> = ["A", "B", "C"]
             .into_iter()
@@ -1579,91 +1508,6 @@ mod tests {
         assert_eq!(
             names(&restored),
             ["A", "B:Review", "C:Review", "D", "E:Later"]
-        );
-    }
-
-    fn pr(owner: &str, repo: &str, number: u64) -> Route {
-        Route::PullRequest(PrRef::new(RepoRef::new(owner, repo), number))
-    }
-
-    #[test]
-    fn grouping_by_repo_puts_each_new_tab_in_its_repository_s_group() {
-        let mut tabs = one_tab();
-        tabs.open_in_repo_group(tab(pr("octo", "loupe", 1)), true);
-        tabs.open_in_repo_group(tab(pr("octo", "site", 2)), true);
-        tabs.open_in_repo_group(tab(Route::Repo(RepoRef::new("octo", "loupe"))), true);
-        assert_eq!(
-            names(&tabs),
-            [
-                "Reviews",
-                "loupe#1:loupe",
-                "octo/loupe:loupe",
-                "site#2:site"
-            ],
-            "a group is made on the spot, and a later tab joins it at its end"
-        );
-        assert_eq!(tabs.active_index(), 2, "the new tab is on screen");
-        assert_ne!(
-            tabs.groups()[0].color,
-            tabs.groups()[1].color,
-            "each repository's group gets its own color"
-        );
-
-        tabs.open_in_repo_group(tab(issue("ENG-1")), true);
-        tabs.open_in_repo_group(tab(Route::Notifications), false);
-        assert_eq!(
-            names(&tabs),
-            [
-                "Reviews",
-                "loupe#1:loupe",
-                "octo/loupe:loupe",
-                "ENG-1",
-                "Inbox",
-                "site#2:site"
-            ],
-            "a tab without a repository opens outside every group, even from a grouped tab"
-        );
-        assert_eq!(
-            tabs.active_index(),
-            3,
-            "a background tab leaves the active one"
-        );
-    }
-
-    #[test]
-    fn grouping_by_repo_keeps_background_tabs_in_order_and_hand_made_groups() {
-        let mut tabs = one_tab();
-        tabs.new_group(0, "Mine");
-        tabs.open_in_repo_group(tab(pr("octo", "loupe", 1)), false);
-        tabs.open_in_repo_group(tab(issue("ENG-1")), false);
-        tabs.open_in_repo_group(tab(issue("ENG-2")), false);
-        tabs.open_in_repo_group(tab(pr("octo", "loupe", 2)), false);
-        assert_eq!(
-            names(&tabs),
-            [
-                "Reviews:Mine",
-                "loupe#1:loupe",
-                "loupe#2:loupe",
-                "ENG-1",
-                "ENG-2"
-            ],
-            "the hand-made group keeps only its own tab, and background tabs keep their order"
-        );
-        assert_eq!(tabs.active_index(), 0);
-
-        assert!(tabs.remove_from_group(1), "take loupe#1 out by hand");
-        tabs.open_in_repo_group(tab(pr("octo", "loupe", 3)), true);
-        assert_eq!(
-            names(&tabs),
-            [
-                "Reviews:Mine",
-                "loupe#2:loupe",
-                "loupe#3:loupe",
-                "loupe#1",
-                "ENG-1",
-                "ENG-2"
-            ],
-            "a tab taken out of its repository's group by hand stays out"
         );
     }
 }
