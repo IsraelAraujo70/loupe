@@ -6,7 +6,7 @@
 //! sibling takes the space. The window always has one pane.
 
 use crate::route::Route;
-use crate::store::{PaneLayout, SplitAxis};
+use crate::store::{ClosedTabGroup, PaneLayout, SplitAxis};
 
 use super::tabs::{Page, Tab, Tabs};
 use super::{GroupRef, GroupTarget};
@@ -70,6 +70,8 @@ pub(super) struct Pane<V> {
 pub(super) struct OpenTab {
     pub id: u64,
     pub route: Route,
+    /// The title its tab shows.
+    pub label: String,
     /// Its pane's place in reading order, from 0.
     pub pane: usize,
     /// The open tab of the active pane: the one the keys act on.
@@ -435,8 +437,9 @@ impl<V> Panes<V> {
     }
 
     /// Every tab of every pane: the panes in reading order, each pane's
-    /// tabs in the order of its row.
-    pub fn open_tabs(&self) -> Vec<OpenTab> {
+    /// tabs in the order of its row, each titled by `label`.
+    pub fn open_tabs(&self, label: impl Fn(&Page<V>) -> String) -> Vec<OpenTab> {
+        let label = &label;
         self.panes()
             .into_iter()
             .enumerate()
@@ -445,6 +448,7 @@ impl<V> Panes<V> {
                 pane.tabs.iter().map(move |tab| OpenTab {
                     id: tab.id,
                     route: tab.current().route.clone(),
+                    label: label(tab.current()),
                     pane: place,
                     current: current == Some(tab.id),
                 })
@@ -668,6 +672,23 @@ impl<V> Panes<V> {
         group.map(|group| GroupRef { pane, group })
     }
 
+    /// Closes every tab of group `group` of `pane` and returns the group as
+    /// it was. A pane left with no tab closes, and its neighbor takes the
+    /// space; the window's only pane is never emptied (`None`), so its
+    /// owner opens another tab first.
+    pub fn close_group(&mut self, pane: PaneId, group: u64) -> Option<ClosedTabGroup> {
+        let only_pane = self.pane_count() == 1;
+        let tabs = self.tabs_mut(pane)?;
+        if only_pane && tabs.group_len(group) == tabs.len() {
+            return None;
+        }
+        let closed = tabs.close_group(group)?;
+        if tabs.is_empty() {
+            self.remove_pane(pane);
+        }
+        Some(closed)
+    }
+
     /// Drops tab `tab` of pane `from` on `zone` of pane `to`: into `to` for
     /// the middle, else into a new pane on that side of `to`, which becomes
     /// the active one. False when [`Self::can_drop`] says nothing changes.
@@ -790,7 +811,7 @@ mod tests {
         };
         let panes = restore(&layout, 1);
         let listed: Vec<(Route, usize, bool)> = panes
-            .open_tabs()
+            .open_tabs(|page| page.route.label())
             .into_iter()
             .map(
                 |OpenTab {
@@ -811,7 +832,11 @@ mod tests {
             ],
             "only the active pane's open tab is the current one"
         );
-        let ids: Vec<u64> = panes.open_tabs().iter().map(|tab| tab.id).collect();
+        let ids: Vec<u64> = panes
+            .open_tabs(|page| page.route.label())
+            .iter()
+            .map(|tab| tab.id)
+            .collect();
         let mut unique = ids.clone();
         unique.dedup();
         assert_eq!(ids, unique, "each tab is listed once, under its own id");

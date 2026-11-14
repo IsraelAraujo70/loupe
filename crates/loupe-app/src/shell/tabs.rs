@@ -12,7 +12,7 @@
 //! keeps a pinned tab among the pinned ones and any other tab after them.
 
 use crate::route::Route;
-use crate::store::{SavedTabGroup, TabGroupColor};
+use crate::store::{ClosedTabGroup, SavedTabGroup, TabGroupColor};
 
 /// A named, colored group of tabs in one pane.
 #[derive(Clone, Debug, PartialEq)]
@@ -562,6 +562,135 @@ impl<V> Tabs<V> {
         true
     }
 
+    /// The index of group `id`'s first tab and of the tab after its last.
+    fn group_range(&self, id: u64) -> Option<(usize, usize)> {
+        let first = self.tabs.iter().position(|tab| tab.group == Some(id))?;
+        Some((first, first + self.group_len(id)))
+    }
+
+    /// What moves aside when a group is dropped on the tab at `index`: its
+    /// whole group, or only the tab outside every group. As a range.
+    fn unit_at(&self, index: usize) -> (usize, usize) {
+        self.group_at(index)
+            .and_then(|id| self.group_range(id))
+            .unwrap_or((index, index + 1))
+    }
+
+    /// The nearest place to `at` (clamped to the end) where a whole group
+    /// can go: never among the pinned tabs, which it follows, nor inside
+    /// another group, whose end it moves to.
+    fn group_slot(&self, at: usize) -> usize {
+        let at = at.clamp(self.pinned_len(), self.tabs.len());
+        match at.checked_sub(1).and_then(|before| self.group_at(before)) {
+            Some(left) if self.group_at(at) == Some(left) => self.end_of_group(left) + 1,
+            _ => at,
+        }
+    }
+
+    /// Where group `id` lands when dropped on the tab at `onto`: it takes
+    /// the place of what that tab belongs to (the tab, or its whole group),
+    /// after it when the group comes from its left, else before it; `None`,
+    /// or an index past the end, is after the last tab. Dropped on a pinned
+    /// tab, it goes right after the pinned tabs. The index, among the tabs
+    /// as they are now, that the group goes before; `None` when it would not
+    /// move.
+    pub fn group_drop_at(&self, id: u64, onto: Option<usize>) -> Option<usize> {
+        let (first, end) = self.group_range(id)?;
+        let to = match onto.filter(|&index| index < self.tabs.len()) {
+            None => self.tabs.len(),
+            Some(index) if (first..end).contains(&index) => return None,
+            Some(index) => {
+                let (start, stop) = self.unit_at(index);
+                let to = if start >= end { stop } else { start };
+                to.max(self.pinned_len())
+            }
+        };
+        (to != first && to != end).then_some(to)
+    }
+
+    /// Moves group `id`, every tab of it in order, where
+    /// [`Self::group_drop_at`] says. The other tabs keep their order and the
+    /// open tab stays open. False when nothing moved.
+    pub fn move_group(&mut self, id: u64, onto: Option<usize>) -> bool {
+        let (Some(to), Some((first, end))) = (self.group_drop_at(id, onto), self.group_range(id))
+        else {
+            return false;
+        };
+        let active = self.active().id;
+        let moved: Vec<Tab<V>> = self.tabs.drain(first..end).collect();
+        let at = if to > first { to - moved.len() } else { to };
+        let at = self.group_slot(at);
+        self.tabs.splice(at..at, moved);
+        self.active = self.index_of(active).unwrap_or(0);
+        self.tidy();
+        at != first
+    }
+
+    /// Closes every tab of group `id` and returns the group as it was, for
+    /// reopening. When the open tab was in it, the tab after the group
+    /// opens, or else the one before it. A group holding every tab of the
+    /// pane leaves it empty, for its owner to fill or drop.
+    pub fn close_group(&mut self, id: u64) -> Option<ClosedTabGroup> {
+        let group = self.group(id)?.clone();
+        let (first, end) = self.group_range(id)?;
+        let active = self.active().id;
+        let closed: Vec<Tab<V>> = self.tabs.drain(first..end).collect();
+        self.active = match self.index_of(active) {
+            Some(index) => index,
+            None if self.tabs.is_empty() => 0,
+            None => {
+                let next = first.min(self.tabs.len() - 1);
+                if self.is_hidden(next) {
+                    self.nearest_shown(next).unwrap_or(next)
+                } else {
+                    next
+                }
+            }
+        };
+        self.tidy();
+        Some(ClosedTabGroup {
+            name: group.name,
+            color: group.color,
+            tabs: closed
+                .iter()
+                .map(|tab| tab.current().route.clone())
+                .collect(),
+            position: first,
+        })
+    }
+
+    /// Puts `tabs` back, in order, as an expanded group named `name` in
+    /// `color`, from `at` (the end when past it; a group it would fall
+    /// inside keeps it after its end), and opens its first tab. Returns the
+    /// group's id; `None` when `tabs` is empty.
+    pub fn insert_group(
+        &mut self,
+        at: usize,
+        name: &str,
+        color: TabGroupColor,
+        mut tabs: Vec<Tab<V>>,
+    ) -> Option<u64> {
+        if tabs.is_empty() {
+            return None;
+        }
+        let id = self.next_group;
+        self.next_group += 1;
+        self.groups.push(TabGroup {
+            id,
+            name: name.to_owned(),
+            color,
+            collapsed: false,
+        });
+        for tab in &mut tabs {
+            tab.group = Some(id);
+        }
+        let at = self.group_slot(at);
+        self.tabs.splice(at..at, tabs);
+        self.active = at;
+        self.tidy();
+        Some(id)
+    }
+
     pub fn rename_group(&mut self, id: u64, name: &str) -> bool {
         match self.groups.iter_mut().find(|group| group.id == id) {
             Some(group) if group.name != name => {
@@ -703,7 +832,7 @@ mod tests {
 
     use super::{Page, Tab, Tabs};
     use crate::route::Route;
-    use crate::store::{SavedTabGroup, TabGroupColor};
+    use crate::store::{ClosedTabGroup, SavedTabGroup, TabGroupColor};
     use loupe_github::{PrRef, RepoRef};
 
     thread_local! {
@@ -1217,6 +1346,167 @@ mod tests {
         assert!(
             tabs.groups().is_empty(),
             "a saved group over a pinned tab is dropped"
+        );
+    }
+
+    fn six_tabs_two_groups() -> (Tabs<()>, u64, u64) {
+        let mut tabs = Tabs::new(
+            ["A", "B", "C", "D", "E", "F"]
+                .into_iter()
+                .map(|name| tab(issue(name)))
+                .collect(),
+            0,
+        );
+        let review = tabs.new_group(1, "Review").unwrap();
+        tabs.add_to_group(2, review);
+        let later = tabs.new_group(4, "Later").unwrap();
+        tabs.add_to_group(5, later);
+        assert_eq!(
+            names(&tabs),
+            ["A", "B:Review", "C:Review", "D", "E:Later", "F:Later"]
+        );
+        (tabs, review, later)
+    }
+
+    #[test]
+    fn dragging_a_group_moves_all_its_tabs_and_keeps_the_others_in_order() {
+        let (mut tabs, review, later) = six_tabs_two_groups();
+        tabs.select(3);
+        assert!(tabs.move_group(review, Some(3)));
+        assert_eq!(
+            names(&tabs),
+            ["A", "D", "B:Review", "C:Review", "E:Later", "F:Later"],
+            "dropped on a tab to its right, the group goes after it"
+        );
+        assert!(tabs.move_group(review, Some(4)));
+        assert_eq!(
+            names(&tabs),
+            ["A", "D", "E:Later", "F:Later", "B:Review", "C:Review"],
+            "dropped on another group's tab, it goes past that whole group"
+        );
+        assert!(tabs.move_group(review, Some(0)));
+        assert_eq!(
+            names(&tabs),
+            ["B:Review", "C:Review", "A", "D", "E:Later", "F:Later"],
+            "dropped on a tab to its left, it goes before it"
+        );
+        assert_eq!(
+            names(&tabs)[tabs.active_index()],
+            "D",
+            "the open tab stays open"
+        );
+        assert!(!tabs.move_group(review, Some(1)), "onto itself, it stays");
+        assert!(!tabs.move_group(later, None), "the last group stays last");
+        assert!(tabs.move_group(review, None));
+        assert_eq!(
+            names(&tabs),
+            ["A", "D", "E:Later", "F:Later", "B:Review", "C:Review"],
+            "dropped after the last tab, it goes to the end"
+        );
+
+        tabs.toggle_group(later);
+        assert!(tabs.move_group(later, Some(0)));
+        assert_eq!(
+            names(&tabs),
+            ["E:Later", "F:Later", "A", "D", "B:Review", "C:Review"]
+        );
+        assert!(
+            tabs.group(later).unwrap().collapsed,
+            "a collapsed group moves collapsed"
+        );
+    }
+
+    #[test]
+    fn a_group_lands_before_or_after_what_it_is_dropped_on() {
+        let (tabs, review, later) = six_tabs_two_groups();
+        assert_eq!(tabs.group_drop_at(review, Some(3)), Some(4), "after D");
+        assert_eq!(tabs.group_drop_at(review, Some(5)), Some(6), "after Later");
+        assert_eq!(tabs.group_drop_at(later, Some(1)), Some(1), "before Review");
+        assert_eq!(tabs.group_drop_at(later, Some(0)), Some(0), "before A");
+        assert_eq!(tabs.group_drop_at(review, Some(2)), None, "on itself");
+        assert_eq!(tabs.group_drop_at(later, None), None, "already last");
+    }
+
+    #[test]
+    fn closing_and_reopening_a_group_gives_back_its_tabs_name_and_color_in_place() {
+        let (mut tabs, review, _) = six_tabs_two_groups();
+        tabs.set_group_color(review, TabGroupColor::Purple);
+        tabs.select(2);
+        let closed = tabs.close_group(review).expect("Review is a group");
+        assert_eq!(
+            closed,
+            ClosedTabGroup {
+                name: "Review".into(),
+                color: TabGroupColor::Purple,
+                tabs: vec![issue("B"), issue("C")],
+                position: 1,
+            }
+        );
+        assert_eq!(names(&tabs), ["A", "D", "E:Later", "F:Later"]);
+        assert_eq!(
+            names(&tabs)[tabs.active_index()],
+            "D",
+            "closing the open tab's group opens the tab after it"
+        );
+
+        let reopened: Vec<Tab<()>> = closed.tabs.iter().cloned().map(tab).collect();
+        let id = tabs
+            .insert_group(closed.position, &closed.name, closed.color, reopened)
+            .unwrap();
+        assert_eq!(
+            names(&tabs),
+            ["A", "B:Review", "C:Review", "D", "E:Later", "F:Later"],
+            "the same tabs, in the same order, in the same place"
+        );
+        assert_eq!(tabs.group(id).unwrap().color, TabGroupColor::Purple);
+        assert_eq!(names(&tabs)[tabs.active_index()], "B:Review");
+
+        let (mut tabs, review, later) = six_tabs_two_groups();
+        let closed = tabs.close_group(review).unwrap();
+        tabs.move_group(later, Some(0));
+        assert_eq!(names(&tabs), ["E:Later", "F:Later", "A", "D"]);
+        let reopened: Vec<Tab<()>> = closed.tabs.iter().cloned().map(tab).collect();
+        tabs.insert_group(closed.position, &closed.name, closed.color, reopened);
+        assert_eq!(
+            names(&tabs),
+            ["E:Later", "F:Later", "B:Review", "C:Review", "A", "D"],
+            "a place now inside another group moves to that group's end"
+        );
+        let reopened = vec![tab(issue("G"))];
+        tabs.insert_group(99, "Gone", TabGroupColor::Grey, reopened);
+        assert_eq!(
+            names(&tabs).last().unwrap(),
+            "G:Gone",
+            "a place past the end is the end"
+        );
+    }
+
+    #[test]
+    fn a_group_never_moves_or_reopens_among_the_pinned_tabs() {
+        let (mut tabs, review, later) = six_tabs_two_groups();
+        tabs.pin(0);
+        tabs.pin(3);
+        assert_eq!(
+            pinned_names(&tabs),
+            ["A*", "D*", "B:Review", "C:Review", "E:Later", "F:Later"]
+        );
+        assert_eq!(
+            tabs.group_drop_at(review, Some(0)),
+            None,
+            "a group right after the pinned tabs stays there"
+        );
+        assert!(tabs.move_group(later, Some(0)));
+        assert_eq!(
+            pinned_names(&tabs),
+            ["A*", "D*", "E:Later", "F:Later", "B:Review", "C:Review"],
+            "dropped on a pinned tab, a group goes right after the pinned tabs"
+        );
+
+        tabs.insert_group(1, "Early", TabGroupColor::Grey, vec![tab(issue("G"))]);
+        assert_eq!(
+            pinned_names(&tabs)[..3],
+            ["A*", "D*", "G:Early"],
+            "a group reopened where the pinned tabs now are goes after them"
         );
     }
 

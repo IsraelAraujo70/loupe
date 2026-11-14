@@ -150,6 +150,14 @@ fn shown_all<'a>(
     }
 }
 
+/// What a Reviews page and its tab are called with view `view_id` open:
+/// the saved view's name, or "Reviews" on All (or when the view is gone).
+fn title(view_id: Option<&str>, views: &ViewsFile) -> SharedString {
+    view_id
+        .and_then(|id| views.get(id))
+        .map_or_else(|| "Reviews".into(), |view| view.name.clone().into())
+}
+
 /// The first tab with a row to show, in the tab row's order; To review when
 /// every tab is empty.
 fn first_with_rows(tabs: &[(ReviewTab, Shown<'_>)]) -> ReviewTab {
@@ -474,6 +482,16 @@ fn chip(
 }
 
 impl InboxView {
+    /// The page's title, which its tab shows too: the open saved view's
+    /// name, or "Reviews" on All.
+    pub fn title(&self, cx: &App) -> SharedString {
+        let none = ViewsFile::default();
+        title(
+            self.page.view_id.as_deref(),
+            views_store::loaded(cx).unwrap_or(&none),
+        )
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         let key = crate::cache::github_key(cx, "reviews");
         if self.inbox.value().is_none()
@@ -1140,7 +1158,7 @@ impl InboxView {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.inbox.is_busy();
-        let header = ui::page_header("Reviews").icon(IconName::GitPullRequest);
+        let header = ui::page_header(self.title(cx)).icon(IconName::GitPullRequest);
         let waiting = self.inbox.value().map_or(0, |inbox| {
             shown(&inbox.review_requested, &self.page.draft).count
         });
@@ -1929,7 +1947,7 @@ fn group_heading(
 mod tests {
     use chrono::Utc;
     use gpui_kit::{
-        Bounds, Entity, InputEvent as _, Modifiers, MouseMoveEvent, Pixels, PlatformInput,
+        AnyView, Bounds, Entity, InputEvent as _, Modifiers, MouseMoveEvent, Pixels, PlatformInput,
         ScrollDelta, ScrollEvent, TestAppContext, VisualTestContext, WindowBounds, WindowOptions,
         point, px, size,
     };
@@ -1939,7 +1957,7 @@ mod tests {
     use loupe_github::reviews::{NextStep, ReviewTab};
     use loupe_github::{ChecksState, ReviewDecision};
 
-    use super::{InboxView, PageState, build, shown, shown_all, step_cursor};
+    use super::{InboxView, PageState, build, shown, shown_all, step_cursor, title};
     use crate::github::common::Loadable;
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
@@ -2000,6 +2018,60 @@ mod tests {
         let gone = PrRef::new(RepoRef::new("a", "repo"), 9);
         assert_eq!(number(step_cursor(&rows, Some(&gone), true)), Some(1));
         assert_eq!(step_cursor(&[], None, true), None);
+    }
+
+    #[test]
+    fn the_title_is_the_open_saved_view_or_reviews() {
+        let mut views = ViewsFile::default();
+        let mine = views.create("My PRs", Vec::new(), Utc::now());
+        assert_eq!(title(Some(&mine), &views), "My PRs");
+        assert_eq!(title(None, &views), "Reviews", "All is Reviews");
+        assert_eq!(
+            title(Some("deleted"), &views),
+            "Reviews",
+            "a view that is gone"
+        );
+        views.rename(&mine, "Mine", Utc::now());
+        assert_eq!(title(Some(&mine), &views), "Mine");
+    }
+
+    /// The title the shell gives the page's tab.
+    fn tab_title(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> String {
+        let any: AnyView = view.clone().into();
+        cx.update(|_, cx| crate::github::inbox_title(&any, cx))
+            .expect("a Reviews page has a title")
+            .to_string()
+    }
+
+    /// The tab's title, after checking the header draws the same one.
+    fn titles(view: &Entity<InboxView>, cx: &mut VisualTestContext) -> String {
+        let title = tab_title(view, cx);
+        let selector: &'static str = format!("page-title:{title}").leak();
+        assert!(
+            bounds(cx, selector).is_some(),
+            "the header says {title:?} too"
+        );
+        title
+    }
+
+    #[gpui_kit::test]
+    fn the_tab_and_the_header_follow_the_open_view(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        assert_eq!(titles(&view, cx), "Reviews");
+        view.update(cx, |view, cx| view.save_as_new("Title follows", cx));
+        assert_eq!(titles(&view, cx), "Title follows");
+        let id = view
+            .read_with(cx, |view, _| view.page.view_id.clone())
+            .expect("the new view is open");
+        view.update(cx, |view, cx| view.rename_view(&id, "Renamed", cx));
+        assert_eq!(titles(&view, cx), "Renamed", "a rename shows at once");
+        view.update(cx, |view, cx| view.switch_view(None, cx));
+        assert_eq!(titles(&view, cx), "Reviews");
+        view.update(cx, |view, cx| view.switch_view(Some(&id), cx));
+        assert_eq!(titles(&view, cx), "Renamed");
+        view.update(cx, |view, cx| view.delete_view(&id, cx));
+        assert_eq!(titles(&view, cx), "Reviews");
     }
 
     #[test]
