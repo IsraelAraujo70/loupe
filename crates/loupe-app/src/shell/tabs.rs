@@ -5,6 +5,11 @@
 //! Tabs can be grouped, as in Chrome: a group has a name and a color, its
 //! tabs sit next to each other, and it can collapse to hide them. A group
 //! with no tab left is gone, and the open tab is never in a collapsed group.
+//!
+//! Tabs can be pinned, as in Chrome: the pinned tabs come first in their
+//! pane, are never in a group, and a page they open goes to a new tab after
+//! them (the shell's `push`). Every insertion goes through `place`, which
+//! keeps a pinned tab among the pinned ones and any other tab after them.
 
 use crate::route::Route;
 use crate::store::{SavedTabGroup, TabGroupColor};
@@ -27,8 +32,12 @@ pub(super) struct Page<V> {
 /// history, which a new navigation drops, as in a browser.
 pub(super) struct Tab<V> {
     pub id: u64,
-    /// The [`TabGroup`] of its pane the tab is in, if any.
+    /// The [`TabGroup`] of its pane the tab is in, if any. Always `None`
+    /// while the tab is pinned.
     pub group: Option<u64>,
+    /// Pinned tabs sit before the others and keep showing their page: a
+    /// link followed in one opens in a new tab.
+    pub pinned: bool,
     history: Vec<Page<V>>,
     index: usize,
 }
@@ -38,6 +47,7 @@ impl<V> Tab<V> {
         Self {
             id,
             group: None,
+            pinned: false,
             history: vec![page],
             index: 0,
         }
@@ -105,10 +115,14 @@ pub(super) struct Tabs<V> {
 
 impl<V> Tabs<V> {
     /// The tabs `tabs` with the one at `active` (clamped) on screen, in no
-    /// group. `tabs` is not empty.
-    pub fn new(tabs: Vec<Tab<V>>, active: usize) -> Self {
+    /// group. Pinned tabs move ahead of the others, each side keeping its
+    /// order. `tabs` is not empty.
+    pub fn new(mut tabs: Vec<Tab<V>>, active: usize) -> Self {
         debug_assert!(!tabs.is_empty(), "a pane has at least one tab");
         let active = active.min(tabs.len().saturating_sub(1));
+        let active_id = tabs[active].id;
+        tabs.sort_by_key(|tab| !tab.pinned);
+        let active = tabs.iter().position(|tab| tab.id == active_id).unwrap_or(0);
         let mut tabs = Self {
             tabs,
             active,
@@ -149,12 +163,11 @@ impl<V> Tabs<V> {
     }
 
     /// Opens `tab` right after the active one, in its group, and activates
-    /// it.
+    /// it. From a pinned tab it lands right after the pinned tabs.
     pub fn open(&mut self, tab: Tab<V>) {
         let at = self.active + 1;
         let group = self.active().group;
-        self.place(at, tab, group);
-        self.active = at;
+        self.active = self.place(at, tab, group);
         self.tidy();
     }
 
@@ -180,12 +193,70 @@ impl<V> Tabs<V> {
         self.tidy();
     }
 
-    /// Puts `tab` at `index` (clamped to the end), in `group` when it lands
-    /// next to one of that group's tabs, and activates it.
+    /// Opens `tab` the way grouping by repository does: a tab whose page
+    /// belongs to a GitHub repository ([`Route::repo`]) joins the group named
+    /// after the repository, after its last tab, and the group is made on
+    /// the spot when the pane has none by that name; any other tab opens
+    /// outside every group, after the active tab, or after the group the
+    /// active tab is in. `activate` puts it on screen; otherwise the active
+    /// tab stays and, as with [`Self::open_in_background`], tabs opened this
+    /// way from the same tab follow one another.
+    pub fn open_in_repo_group(&mut self, tab: Tab<V>, activate: bool) {
+        let from = self.active().id;
+        let id = tab.id;
+        let repo = tab.current().route.repo().map(|repo| repo.name.clone());
+        let existing = repo.as_deref().and_then(|name| {
+            let group = self.groups.iter().find(|group| group.name == name)?;
+            Some(group.id)
+        });
+        match existing {
+            Some(group) => {
+                let last = self.end_of_group(group);
+                self.place(last + 1, tab, Some(group));
+            }
+            None => {
+                let last_background = match self.last_background {
+                    Some((active, last)) if !activate && active == from => {
+                        self.index_of(last).filter(|&ix| ix > self.active)
+                    }
+                    _ => None,
+                };
+                let after = last_background.unwrap_or(self.active);
+                let at = match self.tabs[after].group {
+                    Some(group) => self.end_of_group(group),
+                    None => after,
+                };
+                self.place(at + 1, tab, None);
+                self.active = self.index_of(from).unwrap_or(0);
+                if let Some(name) = repo
+                    && let Some(index) = self.index_of(id)
+                {
+                    self.new_group(index, &name);
+                }
+            }
+        }
+        if !activate {
+            self.last_background = Some((from, id));
+        }
+        let shown = if activate { id } else { from };
+        self.active = self.index_of(shown).unwrap_or(0);
+        self.tidy();
+    }
+
+    /// The index of group `id`'s last tab; 0 when it has none.
+    fn end_of_group(&self, id: u64) -> usize {
+        self.tabs
+            .iter()
+            .rposition(|tab| tab.group == Some(id))
+            .unwrap_or(0)
+    }
+
+    /// Puts `tab` at `index` (clamped to the end, and to its side of the
+    /// pinned tabs), in `group` when it lands next to one of that group's
+    /// tabs, and activates it.
     pub fn insert(&mut self, index: usize, tab: Tab<V>, group: Option<u64>) {
         let at = index.min(self.tabs.len());
-        self.place(at, tab, group);
-        self.active = at;
+        self.active = self.place(at, tab, group);
         self.tidy();
     }
 
@@ -204,25 +275,66 @@ impl<V> Tabs<V> {
             return false;
         }
         let tab = self.tabs.remove(from);
-        self.place(to, tab, group);
+        let to = self.place(to, tab, group);
         self.active = to;
         self.tidy();
         from != to || self.tabs[to].group != before
     }
 
+    /// How many tabs are pinned: the first ones of the pane.
+    pub fn pinned_len(&self) -> usize {
+        self.tabs.iter().take_while(|tab| tab.pinned).count()
+    }
+
     /// Inserts `tab` at `at` and gives it a group: the one it lands inside,
     /// whatever `wanted` says, so a group's tabs stay next to each other;
-    /// else `wanted` when a neighbor is in it; else none.
-    fn place(&mut self, at: usize, mut tab: Tab<V>, wanted: Option<u64>) {
+    /// else `wanted` when a neighbor is in it; else none. A pinned tab
+    /// lands among the pinned tabs, in no group; any other tab after them.
+    /// Returns where the tab landed.
+    fn place(&mut self, at: usize, mut tab: Tab<V>, wanted: Option<u64>) -> usize {
+        let pinned = self.pinned_len();
+        let at = if tab.pinned {
+            at.min(pinned)
+        } else {
+            at.clamp(pinned, self.tabs.len())
+        };
         let before = at.checked_sub(1).and_then(|ix| self.tabs.get(ix));
         let before = before.and_then(|tab| tab.group);
         let after = self.tabs.get(at).and_then(|tab| tab.group);
         tab.group = match (before, after) {
+            _ if tab.pinned => None,
             (Some(left), Some(right)) if left == right => Some(left),
             _ if wanted.is_some() && (before == wanted || after == wanted) => wanted,
             _ => None,
         };
         self.tabs.insert(at, tab);
+        at
+    }
+
+    /// Pins the tab at `index`: it leaves its group and goes after the
+    /// pinned tabs. The active tab stays active.
+    pub fn pin(&mut self, index: usize) -> bool {
+        self.set_pinned(index, true)
+    }
+
+    /// Unpins the tab at `index`: it goes right after the pinned tabs, in
+    /// no group. The active tab stays active.
+    pub fn unpin(&mut self, index: usize) -> bool {
+        self.set_pinned(index, false)
+    }
+
+    fn set_pinned(&mut self, index: usize, pinned: bool) -> bool {
+        if self.tabs.get(index).is_none_or(|tab| tab.pinned == pinned) {
+            return false;
+        }
+        let active = self.active().id;
+        let mut tab = self.tabs.remove(index);
+        tab.pinned = pinned;
+        let at = self.pinned_len();
+        self.place(at, tab, None);
+        self.active = self.index_of(active).unwrap_or(0);
+        self.tidy();
+        true
     }
 
     /// Takes the tab at `index` out, even the last one, which leaves the
@@ -356,7 +468,8 @@ impl<V> Tabs<V> {
 
     /// Moves the tab at `index` into `group`, after the group's last tab, or
     /// out of every group, after the one it leaves. A tab that joins a new
-    /// group from no group stays where it is. The active tab stays active.
+    /// group from no group stays where it is; a pinned one is unpinned and
+    /// goes right after the pinned tabs. The active tab stays active.
     fn regroup(&mut self, index: usize, group: Option<u64>) -> bool {
         if index >= self.tabs.len() {
             return false;
@@ -365,6 +478,9 @@ impl<V> Tabs<V> {
         let mut tab = self.tabs.remove(index);
         let left = tab.group;
         tab.group = None;
+        if group.is_some() {
+            tab.pinned = false;
+        }
         let last_of = |tabs: &[Tab<V>], id: Option<u64>| {
             let id = id?;
             tabs.iter().rposition(|tab| tab.group == Some(id))
@@ -372,6 +488,12 @@ impl<V> Tabs<V> {
         let at = last_of(&self.tabs, group)
             .or_else(|| last_of(&self.tabs, left))
             .map_or(index, |last| last + 1);
+        let pinned = self.pinned_len();
+        let at = if tab.pinned {
+            at.min(pinned)
+        } else {
+            at.max(pinned)
+        };
         self.tabs.insert(at, tab);
         self.tabs[at].group = group;
         self.active = self.index_of(active).unwrap_or(0);
@@ -455,7 +577,7 @@ impl<V> Tabs<V> {
     }
 
     /// Restores the groups `saved` for these tabs. A group whose tabs are out
-    /// of range or already in another group is dropped.
+    /// of range, pinned, or already in another group is dropped.
     pub fn restore_groups(&mut self, saved: &[SavedTabGroup]) {
         for group in saved {
             let range = group.first..group.first.saturating_add(group.len);
@@ -463,7 +585,7 @@ impl<V> Tabs<V> {
                 || range.end > self.tabs.len()
                 || self.tabs[range.clone()]
                     .iter()
-                    .any(|tab| tab.group.is_some())
+                    .any(|tab| tab.group.is_some() || tab.pinned)
             {
                 continue;
             }
@@ -535,6 +657,7 @@ mod tests {
     use super::{Page, Tab, Tabs};
     use crate::route::Route;
     use crate::store::{SavedTabGroup, TabGroupColor};
+    use loupe_github::{PrRef, RepoRef};
 
     thread_local! {
         static NEXT_ID: Cell<u64> = const { Cell::new(0) };
@@ -866,6 +989,190 @@ mod tests {
         assert!(!tabs.is_hidden(1));
     }
 
+    /// The tabs as names, a pinned one with a `*` after it, checking on the
+    /// way that the pinned tabs come first and are in no group.
+    fn pinned_names(tabs: &Tabs<()>) -> Vec<String> {
+        let pinned = tabs.pinned_len();
+        assert!(
+            tabs.iter().skip(pinned).all(|tab| !tab.pinned),
+            "the pinned tabs come first"
+        );
+        assert!(
+            tabs.iter().take(pinned).all(|tab| tab.group.is_none()),
+            "a pinned tab is in no group"
+        );
+        names(tabs)
+            .into_iter()
+            .zip(tabs.iter())
+            .map(|(name, tab)| if tab.pinned { format!("{name}*") } else { name })
+            .collect()
+    }
+
+    #[test]
+    fn pinning_moves_a_tab_after_the_pinned_ones_and_unpinning_right_after_them() {
+        let mut tabs = five_tabs();
+        tabs.select(3);
+        assert!(tabs.pin(2));
+        assert_eq!(pinned_names(&tabs), ["C*", "A", "B", "D", "E"]);
+        assert!(tabs.pin(4));
+        assert_eq!(
+            pinned_names(&tabs),
+            ["C*", "E*", "A", "B", "D"],
+            "pinned tabs keep the order they were pinned in"
+        );
+        assert_eq!(
+            names(&tabs)[tabs.active_index()],
+            "D",
+            "the open tab stays open"
+        );
+        assert!(!tabs.pin(1), "a pinned tab pins once");
+
+        assert!(tabs.unpin(0));
+        assert_eq!(
+            pinned_names(&tabs),
+            ["E*", "C", "A", "B", "D"],
+            "an unpinned tab goes right after the pinned ones"
+        );
+        assert!(!tabs.unpin(1));
+    }
+
+    #[test]
+    fn a_page_opened_from_a_pinned_tab_lands_after_the_pinned_tabs() {
+        let mut tabs = five_tabs();
+        tabs.pin(0);
+        tabs.pin(1);
+        tabs.select(0);
+        tabs.open(tab(issue("F")));
+        assert_eq!(pinned_names(&tabs), ["A*", "B*", "F", "C", "D", "E"]);
+        assert_eq!(tabs.active_index(), 2, "the new tab is open");
+        assert_eq!(
+            tabs.iter().next().unwrap().current().route,
+            issue("A"),
+            "the pinned tab keeps its page"
+        );
+
+        tabs.select(1);
+        tabs.open(tab(issue("G")));
+        assert_eq!(
+            pinned_names(&tabs)[2],
+            "G",
+            "each one lands right after the pinned tabs"
+        );
+
+        tabs.select(0);
+        tabs.open_in_background(tab(issue("H")));
+        tabs.open_in_background(tab(issue("I")));
+        assert_eq!(
+            tabs.active_index(),
+            0,
+            "a background tab leaves the pinned tab open"
+        );
+        assert_eq!(
+            pinned_names(&tabs),
+            ["A*", "B*", "H", "I", "G", "F", "C", "D", "E"]
+        );
+    }
+
+    #[test]
+    fn pinned_tabs_and_groups_stay_apart() {
+        let mut tabs = five_tabs();
+        let review = tabs.new_group(0, "Review").unwrap();
+        tabs.add_to_group(1, review);
+        assert!(tabs.pin(1));
+        assert_eq!(
+            pinned_names(&tabs),
+            ["B*", "A:Review", "C", "D", "E"],
+            "a pinned tab leaves its group"
+        );
+
+        tabs.select(0);
+        tabs.open(tab(issue("F")));
+        assert_eq!(
+            pinned_names(&tabs)[1],
+            "F",
+            "a tab opened from a pinned tab joins no group, even next to one"
+        );
+
+        assert!(tabs.add_to_group(0, review));
+        assert_eq!(
+            pinned_names(&tabs),
+            ["F", "A:Review", "B:Review", "C", "D", "E"],
+            "adding a pinned tab to a group unpins it"
+        );
+        tabs.pin(5);
+        tabs.new_group(0, "Later").unwrap();
+        assert_eq!(
+            pinned_names(&tabs),
+            ["E:Later", "F", "A:Review", "B:Review", "C", "D"],
+            "so does a new group"
+        );
+
+        tabs.pin(5);
+        tabs.pin(5);
+        assert_eq!(
+            pinned_names(&tabs),
+            ["D*", "C*", "E:Later", "F", "A:Review", "B:Review"]
+        );
+        assert!(tabs.move_within(5, 0, None));
+        assert_eq!(
+            pinned_names(&tabs)[2],
+            "B",
+            "a tab dragged onto the pinned tabs stops after them"
+        );
+        assert!(tabs.move_within(0, 5, tabs.group_at(5)));
+        assert_eq!(
+            pinned_names(&tabs)[..2],
+            ["C*", "D*"],
+            "a pinned tab dragged past them stays pinned, at their end"
+        );
+        tabs.insert(0, tab(issue("G")), None);
+        assert_eq!(pinned_names(&tabs)[2], "G");
+    }
+
+    #[test]
+    fn grouping_by_repository_keeps_the_pinned_tabs_first() {
+        use loupe_github::{PrRef, RepoRef};
+
+        let pr = |number| Route::PullRequest(PrRef::new(RepoRef::new("octo", "app"), number));
+        let mut tabs = five_tabs();
+        tabs.pin(0);
+        tabs.select(0);
+        tabs.open_in_repo_group(tab(pr(1)), true);
+        assert_eq!(
+            pinned_names(&tabs)[..3],
+            ["A*", "app#1:app", "B"],
+            "a tab opened from a pinned tab lands after it, in its repository's group"
+        );
+        tabs.select(0);
+        tabs.open_in_repo_group(tab(pr(2)), false);
+        assert_eq!(pinned_names(&tabs)[..3], ["A*", "app#1:app", "app#2:app"]);
+        assert_eq!(tabs.active_index(), 0, "the pinned tab stays open");
+    }
+
+    #[test]
+    fn pinned_tabs_come_back_first_and_no_group_takes_them() {
+        let mut saved: Vec<Tab<()>> = ["A", "B", "C"]
+            .into_iter()
+            .map(|name| tab(issue(name)))
+            .collect();
+        saved[2].pinned = true;
+        let mut tabs = Tabs::new(saved, 2);
+        assert_eq!(pinned_names(&tabs), ["C*", "A", "B"]);
+        assert_eq!(tabs.active_index(), 0, "the active tab is the same tab");
+
+        tabs.restore_groups(&[SavedTabGroup {
+            name: "Over".into(),
+            color: TabGroupColor::Grey,
+            collapsed: false,
+            first: 0,
+            len: 2,
+        }]);
+        assert!(
+            tabs.groups().is_empty(),
+            "a saved group over a pinned tab is dropped"
+        );
+    }
+
     #[test]
     fn groups_come_back_as_saved() {
         let mut tabs = five_tabs();
@@ -915,6 +1222,91 @@ mod tests {
         assert_eq!(
             names(&restored),
             ["A", "B:Review", "C:Review", "D", "E:Later"]
+        );
+    }
+
+    fn pr(owner: &str, repo: &str, number: u64) -> Route {
+        Route::PullRequest(PrRef::new(RepoRef::new(owner, repo), number))
+    }
+
+    #[test]
+    fn grouping_by_repo_puts_each_new_tab_in_its_repository_s_group() {
+        let mut tabs = one_tab();
+        tabs.open_in_repo_group(tab(pr("octo", "loupe", 1)), true);
+        tabs.open_in_repo_group(tab(pr("octo", "site", 2)), true);
+        tabs.open_in_repo_group(tab(Route::Repo(RepoRef::new("octo", "loupe"))), true);
+        assert_eq!(
+            names(&tabs),
+            [
+                "Reviews",
+                "loupe#1:loupe",
+                "octo/loupe:loupe",
+                "site#2:site"
+            ],
+            "a group is made on the spot, and a later tab joins it at its end"
+        );
+        assert_eq!(tabs.active_index(), 2, "the new tab is on screen");
+        assert_ne!(
+            tabs.groups()[0].color,
+            tabs.groups()[1].color,
+            "each repository's group gets its own color"
+        );
+
+        tabs.open_in_repo_group(tab(issue("ENG-1")), true);
+        tabs.open_in_repo_group(tab(Route::Notifications), false);
+        assert_eq!(
+            names(&tabs),
+            [
+                "Reviews",
+                "loupe#1:loupe",
+                "octo/loupe:loupe",
+                "ENG-1",
+                "Inbox",
+                "site#2:site"
+            ],
+            "a tab without a repository opens outside every group, even from a grouped tab"
+        );
+        assert_eq!(
+            tabs.active_index(),
+            3,
+            "a background tab leaves the active one"
+        );
+    }
+
+    #[test]
+    fn grouping_by_repo_keeps_background_tabs_in_order_and_hand_made_groups() {
+        let mut tabs = one_tab();
+        tabs.new_group(0, "Mine");
+        tabs.open_in_repo_group(tab(pr("octo", "loupe", 1)), false);
+        tabs.open_in_repo_group(tab(issue("ENG-1")), false);
+        tabs.open_in_repo_group(tab(issue("ENG-2")), false);
+        tabs.open_in_repo_group(tab(pr("octo", "loupe", 2)), false);
+        assert_eq!(
+            names(&tabs),
+            [
+                "Reviews:Mine",
+                "loupe#1:loupe",
+                "loupe#2:loupe",
+                "ENG-1",
+                "ENG-2"
+            ],
+            "the hand-made group keeps only its own tab, and background tabs keep their order"
+        );
+        assert_eq!(tabs.active_index(), 0);
+
+        assert!(tabs.remove_from_group(1), "take loupe#1 out by hand");
+        tabs.open_in_repo_group(tab(pr("octo", "loupe", 3)), true);
+        assert_eq!(
+            names(&tabs),
+            [
+                "Reviews:Mine",
+                "loupe#2:loupe",
+                "loupe#3:loupe",
+                "loupe#1",
+                "ENG-1",
+                "ENG-2"
+            ],
+            "a tab taken out of its repository's group by hand stays out"
         );
     }
 }

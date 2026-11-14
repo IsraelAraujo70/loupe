@@ -97,6 +97,7 @@ impl Section {
         match self {
             Section::General => {
                 settings.sidebar_collapsed = defaults.sidebar_collapsed;
+                settings.group_tabs_by_repo = defaults.group_tabs_by_repo;
                 settings.notification_filter = defaults.notification_filter;
             }
             Section::Appearance => {
@@ -128,6 +129,7 @@ impl Section {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     SidebarIcons,
+    GroupTabsByRepo,
     InboxFilter,
     ColorScheme,
     Themes,
@@ -203,6 +205,14 @@ pub fn entries() -> Vec<Entry> {
             "Sidebar as icons",
             "Shrink the sidebar to a rail of icons. Cmd+B switches it.",
             "collapse rail compact",
+        ),
+        entry(
+            GroupTabsByRepo,
+            S::General,
+            "",
+            "Group tabs by repository automatically",
+            "A new pull request or repository tab joins a group named after its repository. Turning this off keeps the groups.",
+            "tab groups auto repo",
         ),
         entry(
             InboxFilter,
@@ -540,6 +550,7 @@ mod tests {
     fn changed() -> Settings {
         Settings {
             sidebar_collapsed: true,
+            group_tabs_by_repo: true,
             notification_filter: vec!["org:acme".into()],
             zoom: Zoom::from(125),
             sidebar_width: Some(300.),
@@ -581,6 +592,7 @@ mod tests {
         );
         assert_eq!(settings.zoom, Zoom::from(125), "Appearance is untouched");
         assert!(settings.sidebar_collapsed, "General is untouched");
+        assert!(settings.group_tabs_by_repo, "General is untouched");
         assert_eq!(
             settings.t3_server_url.as_deref(),
             Some("https://t3.example")
@@ -594,6 +606,7 @@ mod tests {
 
         Section::General.restore_defaults(&mut settings);
         assert!(!settings.sidebar_collapsed);
+        assert!(!settings.group_tabs_by_repo);
         assert!(settings.notification_filter.is_empty());
         assert_eq!(settings.watched_repos.len(), 1);
         assert!(!settings.t3_review.risk_check, "T3 Code is untouched");
