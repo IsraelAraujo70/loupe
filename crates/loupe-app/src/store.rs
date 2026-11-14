@@ -718,14 +718,13 @@ mod keychain {
 
 /// `~/Library/Application Support/Loupe` on macOS, `$XDG_CONFIG_HOME/loupe`
 /// (or `~/.config/loupe`) elsewhere. `LOUPE_DATA_DIR` overrides both.
+/// Under `cargo test`, a folder of the test's own; see [`test_data_dir`].
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LOUPE_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    // UI tests save tabs through `update_settings`; they must never write
-    // over the real settings.
     if cfg!(test) {
-        return std::env::temp_dir().join(format!("loupe-test-{}", std::process::id()));
+        return test_data_dir();
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     if cfg!(target_os = "macos") {
@@ -736,6 +735,35 @@ pub fn data_dir() -> PathBuf {
             .unwrap_or_else(|| home.join(".config"))
             .join("loupe")
     }
+}
+
+/// The data folder of the running test, made on first use and deleted when
+/// the test ends.
+///
+/// UI tests save settings, themes and views; they must never write over the
+/// real ones. libtest runs each test on its own thread, at the same time as
+/// others, so one folder per thread keeps one test from reading what another
+/// saved. One folder per process let two tests write `custom-theme.json` or
+/// `reviews-views.json` at once.
+fn test_data_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Folder(PathBuf);
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static FOLDER: Folder = Folder(std::env::temp_dir().join(format!(
+            "loupe-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+    }
+    FOLDER.with(|folder| folder.0.clone())
 }
 
 fn settings_path() -> PathBuf {
