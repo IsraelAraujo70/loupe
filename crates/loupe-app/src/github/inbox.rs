@@ -1693,7 +1693,17 @@ impl InboxView {
                         .loading(self.marking.is_some())
                         .disabled(self.marking.is_some())
                         .on_click(cx.listener(|this, _, _, cx| this.mark_picked_read(cx))),
-                ),
+                )
+                .child({
+                    let t3 = crate::services::Services::get(cx).t3.is_some();
+                    action("reviews-selection-t3", IconName::Bot, "Review with T3 Code")
+                        .when(!t3, |button| {
+                            button.disabled(true).tooltip(crate::t3::CONNECT_HINT)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            crate::t3::review_pull_requests(this.picked(), window, cx)
+                        }))
+                }),
         };
         let note = self.mark_note.clone().map(|(text, failed)| {
             div()
@@ -2894,6 +2904,30 @@ mod tests {
             view.switch_view(None, cx);
         });
         assert!(picked(&view, cx).is_empty(), "another view clears it");
+    }
+
+    #[gpui_kit::test]
+    fn the_bar_offers_a_t3_review_of_the_picked_pull_requests(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        view.update(cx, |view, cx| {
+            view.inbox = Loadable::Loaded(Inbox {
+                review_requested: page(vec![pr("a", 1), pr("a", 2)], 2, false),
+                authored: page(Vec::new(), 0, false),
+                involved: page(Vec::new(), 0, false),
+            });
+            cx.notify();
+        });
+        assert_eq!(bounds(cx, "reviews-selection-t3"), None);
+        click(cx, "pr-select-PR_2");
+        click(cx, "pr-select-PR_1");
+        assert!(
+            bounds(cx, "reviews-selection-t3").is_some(),
+            "the bar offers Review with T3 Code"
+        );
+        // Without T3 it is disabled and says why; the selection stays.
+        click(cx, "reviews-selection-t3");
+        assert_eq!(picked(&view, cx), [1, 2]);
     }
 
     #[gpui_kit::test]

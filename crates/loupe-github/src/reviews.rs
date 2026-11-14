@@ -717,12 +717,16 @@ pub fn load(path: &Path) -> Loaded {
 }
 
 /// Writes the views file atomically (a temporary file renamed over it).
+/// Each write has its own temporary file, so two writers at once never
+/// rename each other's bytes or lose the rename.
 pub fn save(path: &Path, file: &ViewsFile) -> std::io::Result<()> {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
+    temporary.push(format!(".{}.{write}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(&ViewsFile {
         version: VIEWS_VERSION,
         views: file.views.clone(),
@@ -1067,6 +1071,38 @@ mod tests {
             up(SortKey::Checks).map(Sort::describe),
             Some("Failing first")
         );
+    }
+
+    #[test]
+    fn saves_at_the_same_time_all_land_and_leave_a_whole_file() {
+        let dir = std::env::temp_dir().join(format!("loupe-reviews-race-{}", std::process::id()));
+        let path = dir.join("reviews-views.json");
+        let mut file = ViewsFile::default();
+        file.create(
+            "Hooli",
+            vec![clause(Field::Org, Op::In, &["hooli-inc"])],
+            Utc::now(),
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        save(&path, &file).expect("every save lands");
+                    }
+                });
+            }
+        });
+        let Loaded::Read(read) = load(&path) else {
+            panic!("the file reads back whole")
+        };
+        assert_eq!(read.views.len(), 1);
+        assert_eq!(read.views[0].id, file.views[0].id);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["reviews-views.json"], "no temporary file is left");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
