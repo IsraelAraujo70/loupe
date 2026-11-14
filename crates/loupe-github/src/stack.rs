@@ -30,7 +30,6 @@ pub struct StackEntry {
     pub position: u32,
     pub number: u64,
     pub title: String,
-    pub url: String,
     pub state: PrState,
     pub is_draft: bool,
     /// The head commit's rolled-up checks; `None` when it has none.
@@ -96,7 +95,6 @@ mod tests {
             position,
             number,
             title: format!("Layer {position}"),
-            url: format!("https://github.com/acme/web/pull/{number}"),
             state,
             is_draft: false,
             checks: Some(ChecksState::Passing),
@@ -111,19 +109,20 @@ mod tests {
 
     #[test]
     fn the_top_takes_every_open_pull_request_under_it_base_first() {
-        // Entries arrive out of order, as nothing in GraphQL promises one.
+        // Entries arrive out of order, as nothing in GraphQL promises one,
+        // and a layer added later has a higher number than the ones above it.
         let stack = PrStack::new(
             3,
             "main".into(),
             vec![
-                entry(3, 103, PrState::Open),
-                entry(1, 101, PrState::Open),
-                entry(4, 104, PrState::Open),
-                entry(2, 102, PrState::Open),
+                entry(3, 131, PrState::Open),
+                entry(1, 120, PrState::Open),
+                entry(4, 99, PrState::Open),
+                entry(2, 105, PrState::Open),
             ],
         );
-        assert_eq!(numbers(stack.open_below(103)), vec![101, 102]);
-        assert_eq!(numbers(stack.open_below(104)), vec![101, 102, 103]);
+        assert_eq!(numbers(stack.open_below(131)), vec![120, 105]);
+        assert_eq!(numbers(stack.open_below(99)), vec![120, 105, 131]);
     }
 
     #[test]
@@ -132,14 +131,14 @@ mod tests {
             3,
             "main".into(),
             vec![
-                entry(1, 101, PrState::Merged),
-                entry(2, 102, PrState::Closed),
-                entry(3, 103, PrState::Open),
-                entry(4, 104, PrState::Open),
+                entry(1, 120, PrState::Merged),
+                entry(2, 105, PrState::Closed),
+                entry(3, 131, PrState::Open),
+                entry(4, 99, PrState::Open),
             ],
         );
-        assert_eq!(numbers(stack.open_below(104)), vec![103]);
-        assert!(stack.open_below(103).is_empty());
+        assert_eq!(numbers(stack.open_below(99)), vec![131]);
+        assert!(stack.open_below(131).is_empty());
     }
 
     #[test]
@@ -147,9 +146,9 @@ mod tests {
         let stack = PrStack::new(
             3,
             "main".into(),
-            vec![entry(1, 101, PrState::Open), entry(2, 102, PrState::Open)],
+            vec![entry(1, 120, PrState::Open), entry(2, 105, PrState::Open)],
         );
-        assert!(stack.open_below(101).is_empty());
+        assert!(stack.open_below(120).is_empty());
         assert!(stack.open_below(999).is_empty());
     }
 

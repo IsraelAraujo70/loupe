@@ -21,7 +21,6 @@ fragment StackFields on PullRequestStack {
       pullRequest {
         number
         title
-        url
         state
         isDraft
         mergeable
@@ -72,7 +71,6 @@ struct WireEntry {
 struct WirePullRequest {
     number: u64,
     title: String,
-    url: String,
     state: String,
     is_draft: bool,
     mergeable: String,
@@ -115,7 +113,6 @@ impl WireStack {
                     position: entry.position,
                     number: pr.number,
                     title: pr.title,
-                    url: pr.url,
                     state: match pr.state.as_str() {
                         "MERGED" => PrState::Merged,
                         "CLOSED" => PrState::Closed,
@@ -163,13 +160,13 @@ mod tests {
             "baseRefName": "release",
             "entries": { "nodes": [
                 { "position": 2, "pullRequest": {
-                    "number": 35, "title": "Layer B", "url": "https://github.com/acme/web/pull/35",
+                    "number": 35, "title": "Layer B",
                     "state": "OPEN", "isDraft": true, "mergeable": "CONFLICTING",
                     "reviewDecision": "CHANGES_REQUESTED",
                     "commits": { "nodes": [ { "commit": { "statusCheckRollup": { "state": "ERROR" } } } ] }
                 } },
                 { "position": 1, "pullRequest": {
-                    "number": 34, "title": "Layer A", "url": "https://github.com/acme/web/pull/34",
+                    "number": 34, "title": "Layer A",
                     "state": "MERGED", "isDraft": false, "mergeable": "UNKNOWN",
                     "reviewDecision": null,
                     "commits": { "nodes": [ { "commit": { "statusCheckRollup": null } } ] }

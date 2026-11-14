@@ -996,7 +996,6 @@ mod tests {
             position,
             number,
             title: format!("Layer {position}"),
-            url: format!("https://github.com/acme/app/pull/{number}"),
             state,
             is_draft: false,
             checks: Some(ChecksState::Passing),
@@ -1023,12 +1022,12 @@ mod tests {
             12,
             vec![
                 stack_entry(3, 12, PrState::Open),
-                stack_entry(1, 10, PrState::Open),
-                stack_entry(2, 11, PrState::Open),
+                stack_entry(1, 21, PrState::Open),
+                stack_entry(2, 9, PrState::Open),
             ],
         );
         let merge = stack_merge(&detail).expect("a stack merge");
-        assert_eq!(numbers(&merge), vec![10, 11, 12]);
+        assert_eq!(numbers(&merge), vec![21, 9, 12]);
         assert_eq!(merge.base_ref, "stack-base");
         assert_eq!(
             stack_merge_confirm_text(merge.entries.len(), merge.base_ref, MergeMethod::Squash),
@@ -1039,18 +1038,18 @@ mod tests {
     #[test]
     fn a_merged_layer_is_not_listed_and_a_lone_merge_keeps_todays_confirmation() {
         let entries = vec![
-            stack_entry(1, 10, PrState::Merged),
-            stack_entry(2, 11, PrState::Open),
+            stack_entry(1, 21, PrState::Merged),
+            stack_entry(2, 9, PrState::Open),
             stack_entry(3, 12, PrState::Open),
         ];
         let top = stacked(12, entries.clone());
         assert_eq!(
             numbers(&stack_merge(&top).expect("a stack merge")),
-            vec![11, 12]
+            vec![9, 12]
         );
         // The lowest open layer merges alone, and so does a pull request
         // outside any stack.
-        assert_eq!(stack_merge(&stacked(11, entries)), None);
+        assert_eq!(stack_merge(&stacked(9, entries)), None);
         assert_eq!(stack_merge(&detail()), None);
     }
 

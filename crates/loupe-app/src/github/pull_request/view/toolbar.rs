@@ -595,9 +595,10 @@ fn render_stack_entry(entry: &StackEntry, cx: &App) -> impl IntoElement {
     let problems = stack_entry_problems(entry);
     let checks = entry.checks.map_or("No checks", widgets::checks_label);
     let mut name = format!(
-        "#{} {}, {}",
+        "#{} {}, {}, {}",
         entry.number,
         entry.title,
+        widgets::state_label(entry.state, entry.is_draft).to_lowercase(),
         checks.to_lowercase()
     );
     for problem in &problems {
@@ -612,10 +613,14 @@ fn render_stack_entry(entry: &StackEntry, cx: &App) -> impl IntoElement {
         .gap_2()
         .items_center()
         .child(widgets::state_icon(entry.state, entry.is_draft))
+        // As in a list row, the number ends on one edge however many digits
+        // it has, so the titles line up.
         .child(
-            div()
+            h_flex()
                 .flex_none()
-                .text_size(scale::body())
+                .w_10()
+                .justify_end()
+                .text_size(scale::meta())
                 .text_color(muted)
                 .child(format!("#{}", entry.number)),
         )
