@@ -238,6 +238,7 @@ impl GitHub {
         accept: &str,
     ) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!("{REST_URL}{path}");
+        let started = std::time::Instant::now();
         let sent = match method {
             RestMethod::Get => self.authorize(self.agent.get(&url), accept).call(),
             RestMethod::Patch => self.authorize(self.agent.patch(&url), accept).send_empty(),
@@ -247,7 +248,14 @@ impl GitHub {
             }
             RestMethod::Put(None) => self.authorize(self.agent.put(&url), accept).send_empty(),
         };
-        sent.map_err(|error| Error::Transport(error.to_string()))
+        let response = sent.map_err(|error| Error::Transport(error.to_string()))?;
+        self.trace(
+            &format!("rest:{}", crate::client::path_shape(path)),
+            response.status().as_u16(),
+            started,
+            response.headers(),
+        );
+        Ok(response)
     }
 
     /// A GET that sends `etag` as `If-None-Match`. GitHub answers 304 when
@@ -263,9 +271,16 @@ impl GitHub {
         if let Some(etag) = etag {
             request = request.header("If-None-Match", etag);
         }
+        let started = std::time::Instant::now();
         let response = request
             .call()
             .map_err(|error| Error::Transport(error.to_string()))?;
+        self.trace(
+            &format!("rest:{}", crate::client::path_shape(path)),
+            response.status().as_u16(),
+            started,
+            response.headers(),
+        );
         if response.status().as_u16() == 304 {
             self.record_rate(response.headers());
             return Ok(Conditional::NotModified);
