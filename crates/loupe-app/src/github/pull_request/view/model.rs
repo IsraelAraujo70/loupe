@@ -620,7 +620,7 @@ pub(super) fn review_blocker(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use chrono::{DateTime, Utc};
     use loupe_github::{
         Actor, CheckRun, CheckStatus, Checks, ChecksState, MergeMethod, MergeStateStatus,
@@ -647,7 +647,7 @@ mod tests {
         DateTime::<Utc>::from_timestamp(0, 0).unwrap()
     }
 
-    fn detail() -> PullRequestDetail {
+    pub(in crate::github::pull_request::view) fn detail() -> PullRequestDetail {
         PullRequestDetail {
             id: "PR_1".into(),
             pr: PrRef::new(RepoRef::new("acme", "app"), 12),

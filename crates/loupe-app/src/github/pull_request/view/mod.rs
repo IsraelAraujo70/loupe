@@ -176,6 +176,9 @@ pub struct PullRequestView {
     /// When that poll last went out; `None` right after a load.
     pr_polled_at: Option<Instant>,
     pr_poll_task: Option<Task<()>>,
+    /// Runs while the header's Copy link button says "Copied", and puts its
+    /// label back when it ends.
+    link_copied: Option<Task<()>>,
     _ticker: Task<()>,
 }
 
@@ -251,6 +254,7 @@ impl PullRequestView {
             pr_etag: None,
             pr_polled_at: None,
             pr_poll_task: None,
+            link_copied: None,
             _ticker: ticker,
         };
         let page = cx.entity_id();

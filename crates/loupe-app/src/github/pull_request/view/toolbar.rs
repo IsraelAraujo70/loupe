@@ -167,6 +167,7 @@ impl PullRequestView {
         let this = cx.entity().downgrade();
         let title = detail.title.clone();
         let repo = detail.pr.repo.clone();
+        let (url, reference) = (detail.url.clone(), detail.pr.to_string());
         ui::outline_icon_button("pr-more", IconName::Ellipsis, "More actions")
             .loading(self.detail.is_busy())
             .disabled(self.write.is_busy())
@@ -189,6 +190,16 @@ impl PullRequestView {
                     )
                 } else {
                     menu
+                };
+                let menu = {
+                    let (url, reference) = (url.clone(), reference.clone());
+                    menu.item(
+                        PopupMenuItem::new("Copy link")
+                            .icon(IconName::Link)
+                            .on_click(move |_, window, cx| {
+                                crate::shell::item_menu::copy_link(&url, &reference, window, cx)
+                            }),
+                    )
                 };
                 let menu = {
                     let repo = repo.clone();
