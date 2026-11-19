@@ -238,6 +238,7 @@ impl GitHub {
         accept: &str,
     ) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!("{REST_URL}{path}");
+        let started = std::time::Instant::now();
         let sent = match method {
             RestMethod::Get => self.authorize(self.agent.get(&url), accept).call(),
             RestMethod::Patch => self.authorize(self.agent.patch(&url), accept).send_empty(),
@@ -247,7 +248,14 @@ impl GitHub {
             }
             RestMethod::Put(None) => self.authorize(self.agent.put(&url), accept).send_empty(),
         };
-        sent.map_err(|error| Error::Transport(error.to_string()))
+        let response = sent.map_err(|error| Error::Transport(error.to_string()))?;
+        self.trace(
+            &format!("rest:{}", crate::client::path_shape(path)),
+            response.status().as_u16(),
+            started,
+            response.headers(),
+        );
+        Ok(response)
     }
 
     /// A GET that sends `etag` as `If-None-Match`. GitHub answers 304 when
@@ -263,9 +271,16 @@ impl GitHub {
         if let Some(etag) = etag {
             request = request.header("If-None-Match", etag);
         }
+        let started = std::time::Instant::now();
         let response = request
             .call()
             .map_err(|error| Error::Transport(error.to_string()))?;
+        self.trace(
+            &format!("rest:{}", crate::client::path_shape(path)),
+            response.status().as_u16(),
+            started,
+            response.headers(),
+        );
         if response.status().as_u16() == 304 {
             self.record_rate(response.headers());
             return Ok(Conditional::NotModified);
@@ -335,6 +350,22 @@ impl GitHub {
         Ok(ChecksPoll::of(sha, seen, runs, statuses))
     }
 
+    /// Whether pull request `pr` changed since `etag` was taken: its title,
+    /// state, labels, assignees, comments, or the time it was last updated
+    /// (a push, a review, or a comment moves it). It asks for the pull
+    /// request's issue: `pulls/{n}` carries the repositories, whose
+    /// counters move with any activity there. A 304 costs no rate limit.
+    pub fn poll_pull_request(&self, pr: &PrRef, etag: Option<&str>) -> Result<PullRequestPoll> {
+        let path = format!(
+            "/repos/{}/{}/issues/{}",
+            pr.repo.owner, pr.repo.name, pr.number
+        );
+        Ok(match self.conditional_get(&path, etag)? {
+            Conditional::NotModified => PullRequestPoll::Unchanged,
+            Conditional::Modified(etag) => PullRequestPoll::Changed(etag),
+        })
+    }
+
     pub(crate) fn authorize<B>(
         &self,
         request: RequestBuilder<B>,
@@ -397,6 +428,16 @@ impl ChecksPoll {
             }),
         }
     }
+}
+
+/// The answer of [`GitHub::poll_pull_request`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PullRequestPoll {
+    /// GitHub answered 304.
+    Unchanged,
+    /// The pull request changed, or there was no ETag to compare with; the
+    /// ETag to send next time.
+    Changed(Option<String>),
 }
 
 /// The error a non-2xx REST response stands for, with GitHub's `message`.

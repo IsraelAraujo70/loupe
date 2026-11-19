@@ -7,6 +7,7 @@ mod checks_feed;
 mod common;
 pub(crate) mod highlight;
 mod inbox;
+pub(crate) mod live;
 pub(crate) mod notification_filter;
 mod notifications;
 mod palette;

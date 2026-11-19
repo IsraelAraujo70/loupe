@@ -377,6 +377,13 @@ impl PageHeader {
         self.actions.push(action.into_any_element());
         self
     }
+
+    /// Like [`Self::action`], for an element that may be absent.
+    pub fn children_actions(mut self, action: Option<impl IntoElement>) -> Self {
+        self.actions
+            .extend(action.map(IntoElement::into_any_element));
+        self
+    }
 }
 
 impl RenderOnce for PageHeader {

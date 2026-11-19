@@ -14,7 +14,9 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ChecksState, Mergeable, PrState, PrSummary, ReviewDecision, ReviewRequest};
+use crate::{
+    ChecksState, Inbox, Mergeable, Page, PrState, PrSummary, ReviewDecision, ReviewRequest,
+};
 
 /// The file format version [`save`] writes.
 pub const VIEWS_VERSION: u32 = 1;
@@ -309,6 +311,22 @@ pub fn describe(clause: &Clause) -> String {
 /// filter the result like every other section, so editing them never
 /// starts another search.
 pub fn all_open_query(clauses: &[Clause]) -> Option<String> {
+    let scope = all_open_scope(clauses)?;
+    Some(format!(
+        "is:pr is:open archived:false {scope} sort:updated-desc"
+    ))
+}
+
+/// The search for every pull request "All open" may list for `clauses`,
+/// open or not: what to ask about when looking for changes since a time,
+/// since a pull request that closed leaves the list.
+pub fn all_open_changes_query(clauses: &[Clause]) -> Option<String> {
+    Some(format!("is:pr archived:false {}", all_open_scope(clauses)?))
+}
+
+/// The repositories (or else the organizations) the clauses keep, as
+/// search qualifiers.
+fn all_open_scope(clauses: &[Clause]) -> Option<String> {
     let scope = |field: Field, qualifier: &str| -> Option<String> {
         let values: Vec<String> = clauses
             .iter()
@@ -318,10 +336,64 @@ pub fn all_open_query(clauses: &[Clause]) -> Option<String> {
             .collect();
         (!values.is_empty()).then(|| values.join(" "))
     };
-    let scope = scope(Field::Repo, "repo").or_else(|| scope(Field::Org, "org"))?;
-    Some(format!(
-        "is:pr is:open archived:false {scope} sort:updated-desc"
-    ))
+    scope(Field::Repo, "repo").or_else(|| scope(Field::Org, "org"))
+}
+
+/// Which searches of a "what changed" question found a pull request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    /// `involves:@me` (you wrote it, are assigned, mentioned, or commented).
+    pub involves: bool,
+    /// `review-requested:@me`, your teams included.
+    pub requested: bool,
+    /// The view's "All open" scope ([`all_open_changes_query`]).
+    pub all_open: bool,
+}
+
+/// Puts each fresh row where the inbox's three searches and "All open"
+/// list it now, as `found` says, and takes it out of those that no longer
+/// do: what loading them all again would bring for these pull requests,
+/// for the price of reading only them. A row moves to the top of each list
+/// it is in, since every list is most recently updated first.
+pub fn patch_lists(
+    inbox: &mut Inbox,
+    mut all_open: Option<&mut Page<PrSummary>>,
+    fresh: Vec<(PrSummary, Found)>,
+) {
+    for (row, found) in fresh {
+        let open = row.state == PrState::Open;
+        let yours = row
+            .author
+            .as_ref()
+            .is_some_and(|author| author.login == inbox.viewer_login);
+        place(&mut inbox.review_requested, &row, open && found.requested);
+        place(&mut inbox.authored, &row, open && yours);
+        place(
+            &mut inbox.involved,
+            &row,
+            open && found.involves && !yours && !found.requested,
+        );
+        if let Some(page) = all_open.as_deref_mut() {
+            place(page, &row, open && found.all_open);
+        }
+    }
+}
+
+/// Puts `row` first in `page` when it `belongs` there, else takes it out,
+/// keeping the page's count of the search's results.
+fn place(page: &mut Page<PrSummary>, row: &PrSummary, belongs: bool) {
+    let had = page.items.iter().position(|item| item.id == row.id);
+    if let Some(at) = had {
+        page.items.remove(at);
+    }
+    if belongs {
+        page.items.insert(0, row.clone());
+    }
+    match (had.is_some(), belongs) {
+        (false, true) => page.total_count += 1,
+        (true, false) => page.total_count = page.total_count.saturating_sub(1),
+        _ => {}
+    }
 }
 
 /// One tab of the Reviews screen, in the order the tab row shows them.
@@ -833,14 +905,77 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        Clause, Field, Loaded, NeedsReview, NextStep, Op, ReviewGroup, ReviewTab, Sort, SortDir,
-        SortKey, ViewsFile, all_open_query, cycle_sort, describe, load, matches, needs_review,
-        next_step, options, save, set_op, sort_rows, toggle_value,
+        Clause, Field, Found, Loaded, NeedsReview, NextStep, Op, ReviewGroup, ReviewTab, Sort,
+        SortDir, SortKey, ViewsFile, all_open_query, cycle_sort, describe, load, matches,
+        needs_review, next_step, options, patch_lists, save, set_op, sort_rows, toggle_value,
     };
     use crate::{
-        Actor, ChecksState, Label, Mergeable, PrRef, PrState, PrSummary, RepoRef, ReviewDecision,
-        ReviewRequest,
+        Actor, ChecksState, Inbox, Label, Mergeable, Page, PrRef, PrState, PrSummary, RepoRef,
+        ReviewDecision, ReviewRequest,
     };
+
+    fn listed(page: &Page<PrSummary>) -> (Vec<u64>, u32) {
+        (
+            page.items.iter().map(|item| item.pr.number).collect(),
+            page.total_count,
+        )
+    }
+
+    fn page_of(items: Vec<PrSummary>) -> Page<PrSummary> {
+        Page {
+            total_count: items.len() as u32,
+            items,
+            next_cursor: None,
+        }
+    }
+
+    #[test]
+    fn a_patch_puts_each_pull_request_where_the_searches_list_it_now() {
+        let mine = PrSummary {
+            author: Some(actor("me")),
+            ..pr("o", "r", 1)
+        };
+        let mut inbox = Inbox {
+            review_requested: page_of(vec![pr("o", "r", 2), pr("o", "r", 3)]),
+            authored: page_of(vec![mine.clone()]),
+            involved: page_of(vec![pr("o", "r", 4)]),
+            viewer_login: "me".into(),
+        };
+        let mut all_open = page_of(vec![pr("o", "r", 4), pr("o", "r", 2)]);
+        let closed = PrSummary {
+            state: PrState::Merged,
+            ..mine
+        };
+        let requested = Found {
+            involves: false,
+            requested: true,
+            all_open: true,
+        };
+        let commented = Found {
+            involves: true,
+            requested: false,
+            all_open: true,
+        };
+        patch_lists(
+            &mut inbox,
+            Some(&mut all_open),
+            vec![
+                // Reviewed: no longer requested, involved now (you commented).
+                (pr("o", "r", 2), commented),
+                // New, asking for your review.
+                (pr("o", "r", 9), requested),
+                (closed, Found::default()),
+            ],
+        );
+        assert_eq!(listed(&inbox.review_requested), (vec![9, 3], 2));
+        assert_eq!(listed(&inbox.authored), (vec![], 0), "merged leaves");
+        assert_eq!(listed(&inbox.involved), (vec![2, 4], 2));
+        assert_eq!(
+            listed(&all_open),
+            (vec![9, 2, 4], 3),
+            "updated rows go first"
+        );
+    }
 
     fn actor(login: &str) -> Actor {
         Actor {

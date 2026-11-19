@@ -16,8 +16,9 @@ pub use self::group_sync::start as start_group_sync;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -32,17 +33,19 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::reviews::{
-    self, Clause, NeedsReview, NextStep, Op, ReviewGroup, ReviewTab, Sort, SortDir, SortKey,
+    self, Clause, Found, NeedsReview, NextStep, Op, ReviewGroup, ReviewTab, Sort, SortDir, SortKey,
     ViewsFile,
 };
 use loupe_github::{
-    Inbox, Notification as GitHubNotification, NotificationSubject, Page, PrRef, PrSummary, RepoRef,
+    Changes, ChangesQuery, ChecksState, Inbox, NodeId, Notification as GitHubNotification,
+    NotificationSubject, Page, PrRef, PrStamp, PrSummary, RepoRef,
 };
 
 use self::filter_menu::{FilterMenu, FilterOptions};
 use self::selection::{CONFIRM_ABOVE, Selection};
 use self::stacks::{OpenByBase, Stack, StackKey, Stacks};
 use super::common::{self, Loadable};
+use super::live::{self, Change, Marks, Pace, Step};
 use super::pr_row::{
     AgeFrom, Lanes, OnSelect, OnSort, ROW_GROUP, RowSelect, SelectGesture, StackPlace, StackRow,
     pr_row, select_box, stack_row,
@@ -59,6 +62,32 @@ use crate::ui::MenuTriggerExt as _;
 /// rows carried review requests would put every pull request in No reviewer
 /// until the refresh, so it is not read.
 pub(crate) const CACHE: &str = "reviews/2";
+
+/// What the cheap question asks about besides a view's repositories: every
+/// pull request that involves you or asks for your review, open or not, so
+/// one that closed counts as a change too.
+const CHANGED_SEARCHES: [&str; 2] = [
+    "is:pr archived:false involves:@me",
+    "is:pr archived:false review-requested:@me",
+];
+
+/// How far before the last reload the question looks: GitHub's search can
+/// take a moment to see an update.
+const SINCE_MARGIN: Duration = Duration::from_secs(120);
+
+/// The shortest time between two full reloads brought by questions with
+/// more answers than they read.
+const OVERFLOW_RELOAD_GAP: Duration = Duration::from_secs(5 * 60);
+
+/// Which searches of the question found pull request `id`, in the order
+/// [`InboxView::ask`] puts them: involves, requested, then "All open".
+fn found_by(changes: &Changes, id: &str) -> Found {
+    Found {
+        involves: changes.found(0, id),
+        requested: changes.found(1, id),
+        all_open: changes.found(2, id),
+    }
+}
 
 gpui_kit::actions!(
     github,
@@ -510,9 +539,24 @@ pub struct InboxView {
     /// Open pull requests per base branch, as GitHub last counted them for
     /// the branch chains ([`Stacks::build`]).
     open_by_base: OpenByBase,
+    /// When the page last asked GitHub and last reloaded ([`live`]).
+    pace: Pace,
+    /// When the last reload started; the question asks about changes since
+    /// a little before it.
+    reload_started: Option<DateTime<Utc>>,
+    /// Pull requests the questions found that no list shows (one that
+    /// closed, one past a page's end) and a reload already took in.
+    handled: Vec<PrStamp>,
+    /// The rows that came or changed in a refresh, until seen.
+    marks: Marks,
+    /// Where the question found each row it read since the last reload.
+    found: HashMap<NodeId, Found>,
     _bases: Option<Task<()>>,
     _load: Option<Task<()>>,
+    _ask: Option<Task<()>>,
     _checks: Subscription,
+    _ticker: Task<()>,
+    _activation: Subscription,
 }
 
 /// The unread notification threads about any pull request of `prs`.
@@ -559,6 +603,18 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
                 cx.notify();
             }
         });
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(live::TICK).await;
+                if this
+                    .update(cx, |view: &mut InboxView, cx| view.tick(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let activation = cx.observe_window_activation(window, |view, _, cx| view.tick(cx));
         let mut view = InboxView {
             inbox: Loadable::Loading,
             scroll: ScrollHandle::new(),
@@ -580,11 +636,19 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             mark_note: None,
             opened_on: None,
             open_by_base: OpenByBase::new(),
+            pace: Pace::new(Instant::now()),
+            reload_started: None,
+            handled: Vec::new(),
+            marks: Marks::default(),
+            found: HashMap::new(),
             _bases: None,
             _load: None,
+            _ask: None,
             _checks: checks,
+            _ticker: ticker,
+            _activation: activation,
         };
-        view.reload(cx);
+        view.refresh_now(cx);
         view
     })
 }
@@ -763,7 +827,10 @@ impl InboxView {
         )
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    /// Loads the page again now, keeping what it shows until the answer
+    /// lands. Refresh, a change the cheap question found, and the periodic
+    /// reload all come here.
+    pub(crate) fn refresh_now(&mut self, cx: &mut Context<Self>) {
         let key = crate::cache::github_key(cx, CACHE);
         if self.inbox.value().is_none()
             && let Some(value) = key.as_deref().and_then(crate::cache::get)
@@ -771,6 +838,13 @@ impl InboxView {
             self.inbox = Loadable::Loaded(value);
         }
         self.inbox.start_refresh();
+        let started = Utc::now();
+        self.pace.reloaded(Instant::now());
+        // The other views' "All open" copies are older than this reload;
+        // a view opened next loads its own again.
+        let current = self.page.all_open_query();
+        self.all_open
+            .retain(|query, _| current.as_ref() == Some(query));
         self._load = Some(common::run(
             cx,
             |gh| gh.inbox(),
@@ -778,15 +852,247 @@ impl InboxView {
                 if let (Some(key), Ok(value)) = (&key, &result) {
                     crate::cache::put(key, value);
                 }
-                if let Ok(inbox) = &result {
-                    group_sync::now(Some(inbox.clone()), cx);
-                }
-                view.inbox.finish(result);
-                view.count_bases(cx);
+                view.finish_inbox(result, started, cx);
             },
         ));
         self.load_all_open(true, cx);
         cx.notify();
+    }
+
+    /// Lands a load of the inbox that went out at `started`: the rows
+    /// change under the scroll, the selection, the folded groups, and the
+    /// cursor, which all stay. A failed load leaves the question looking
+    /// from the last load that worked, so no change goes unseen.
+    fn finish_inbox(
+        &mut self,
+        result: Result<Inbox, common::LoadError>,
+        started: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) {
+        match &result {
+            Ok(inbox) => {
+                group_sync::now(Some(inbox.clone()), cx);
+                self.pace.confirmed_at = Some(Local::now());
+                self.reload_started = Some(started);
+                self.handled
+                    .retain(|stamp| stamp.updated_at >= started - SINCE_MARGIN);
+                self.found.clear();
+            }
+            Err(_) => self.handled.clear(),
+        }
+        let had_copy = self.inbox.value().is_some();
+        self.take_in(had_copy, |view| view.inbox.finish(result));
+        self.count_bases(cx);
+        cx.notify();
+    }
+
+    /// Applies a load with `apply`, then points out the rows it brought or
+    /// changed, when the page showed a copy before it (a stored one counts:
+    /// it is what you last saw).
+    fn take_in(&mut self, had_copy: bool, apply: impl FnOnce(&mut Self)) {
+        let before: Vec<PrSummary> = match self.inbox.value() {
+            Some(inbox) if had_copy => self.loaded(inbox).cloned().collect(),
+            _ => Vec::new(),
+        };
+        apply(self);
+        if had_copy && let Some(inbox) = self.inbox.value() {
+            let changes = live::changed(&before, self.loaded(inbox));
+            self.marks.add(changes);
+        }
+    }
+
+    /// Every [`live::TICK`], and when the window gains or loses focus:
+    /// starts the clock of the marks on screen, and asks GitHub or reloads
+    /// when it is time ([`Pace::step`]).
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        let watched = crate::shell::is_on_screen(cx.entity_id(), cx);
+        let now = Instant::now();
+        if watched && self.marks.see(now) {
+            cx.notify();
+        }
+        let all_open_busy = self.all_open_state().is_some_and(Loadable::is_busy);
+        if self.inbox.is_busy() || all_open_busy || self._ask.is_some() {
+            return;
+        }
+        let rate = common::client(cx)
+            .map(|github| github.rate_limits())
+            .unwrap_or_default();
+        let step = self.pace.step(watched, now, rate, Utc::now());
+        let paused = match step {
+            Step::Paused(until) => Some(until),
+            Step::Wait | Step::Ask | Step::Reload => None,
+        };
+        if paused != self.pace.paused_until {
+            self.pace.paused_until = paused;
+            cx.notify();
+        }
+        match step {
+            // Without a load that worked there is nothing to ask about: a
+            // failed one is tried again.
+            Step::Ask if self.reload_started.is_some() && self.inbox.value().is_some() => {
+                self.ask(cx);
+            }
+            Step::Ask | Step::Reload => self.refresh_now(cx),
+            Step::Wait | Step::Paused(_) => {}
+        }
+    }
+
+    /// Asks GitHub (one rate-limit point) which pull requests changed since
+    /// a little before the last reload and what the pending checks say now,
+    /// then reads the rows of those the page does not show as they are (one
+    /// more point) and puts them where the lists have them now
+    /// ([`reviews::patch_lists`]). A question with more answers than it
+    /// reads brings a full reload instead.
+    fn ask(&mut self, cx: &mut Context<Self>) {
+        let (Some(started), Some(inbox)) = (self.reload_started, self.inbox.value()) else {
+            return;
+        };
+        let mut pending: Vec<NodeId> = self
+            .loaded(inbox)
+            .filter(|summary| summary.checks == Some(ChecksState::Pending))
+            .map(|summary| summary.id.clone())
+            .collect();
+        pending.sort();
+        pending.dedup();
+        let known: HashSet<PrStamp> = self
+            .loaded(inbox)
+            .map(|summary| PrStamp {
+                id: summary.id.clone(),
+                updated_at: summary.updated_at,
+            })
+            .chain(self.handled.iter().cloned())
+            .collect();
+        let recorded = self.found.clone();
+        let all_open = self
+            .page
+            .all_open_on()
+            .then(|| self.page.all_open_query())
+            .flatten();
+        let mut searches: Vec<String> = CHANGED_SEARCHES.map(str::to_owned).to_vec();
+        if all_open.is_some() {
+            searches.extend(reviews::all_open_changes_query(&self.page.draft));
+        }
+        let query = ChangesQuery {
+            since: started - SINCE_MARGIN,
+            searches,
+            pending,
+        };
+        self.pace.asked(Instant::now());
+        self._ask = Some(common::run(
+            cx,
+            move |gh| {
+                let changes = gh.changes_since(&query)?;
+                // A row read before goes again when search now finds it in
+                // other lists: the search index can trail the update.
+                let unknown: Vec<NodeId> = changes
+                    .updated()
+                    .into_iter()
+                    .filter(|stamp| {
+                        !known.contains(*stamp)
+                            || recorded
+                                .get(&stamp.id)
+                                .is_some_and(|found| *found != found_by(&changes, &stamp.id))
+                    })
+                    .map(|stamp| stamp.id.clone())
+                    .collect();
+                let rows = if changes.complete && !unknown.is_empty() {
+                    gh.pull_request_rows(&unknown)?
+                } else {
+                    Vec::new()
+                };
+                Ok((changes, rows))
+            },
+            move |view: &mut InboxView, result, cx| {
+                view._ask = None;
+                if let Ok((changes, rows)) = result {
+                    view.land_changes(changes, rows, all_open, cx);
+                }
+            },
+        ));
+    }
+
+    /// Lands an answer of [`Self::ask`]: the checks and the rows it read go
+    /// where the lists have them now, under the scroll, the selection, the
+    /// folded groups, and the cursor, which all stay.
+    fn land_changes(
+        &mut self,
+        changes: Changes,
+        rows: Vec<PrSummary>,
+        all_open: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.take_checks(&changes.checks);
+        let stamps = changes.updated().into_iter().cloned();
+        if !changes.complete {
+            // More changed than one question reads: a full reload, at most
+            // every OVERFLOW_RELOAD_GAP, so a busy organization cannot
+            // spend the rate limit on reloads.
+            if self.pace.since_reload(Instant::now()) >= OVERFLOW_RELOAD_GAP {
+                self.refresh_now(cx);
+                self.handled.extend(stamps);
+            }
+            return;
+        }
+        let fresh: Vec<(PrSummary, Found)> = rows
+            .into_iter()
+            .map(|row| {
+                let found = found_by(&changes, &row.id);
+                self.found.insert(row.id.clone(), found);
+                (row, found)
+            })
+            .collect();
+        if !fresh.is_empty() {
+            // The copies of the other views' "All open" miss these changes;
+            // a view opened next loads its own again. The view on screen
+            // keeps its copy, even when it changed while the question ran.
+            let current = self.page.all_open_query();
+            self.all_open.retain(|query, _| {
+                all_open.as_ref() == Some(query) || current.as_ref() == Some(query)
+            });
+            self.take_in(true, |view| {
+                let InboxView {
+                    inbox,
+                    all_open: pages,
+                    ..
+                } = view;
+                if let Some(inbox) = inbox.value_mut() {
+                    let page = all_open
+                        .as_ref()
+                        .and_then(|query| pages.get_mut(query))
+                        .and_then(Loadable::value_mut);
+                    reviews::patch_lists(inbox, page, fresh);
+                }
+            });
+        }
+        // Those that left every list are taken in too.
+        self.handled.extend(stamps);
+        self.pace.confirmed_at = Some(Local::now());
+        cx.notify();
+    }
+
+    /// Puts checks GitHub just reported on every row of their pull request
+    /// and points out the rows that changed.
+    fn take_checks(&mut self, checks: &[(NodeId, Option<ChecksState>)]) {
+        let mut changed: Vec<(PrRef, Change)> = Vec::new();
+        let mut pages: Vec<&mut Page<PrSummary>> = Vec::new();
+        if let Some(inbox) = self.inbox.value_mut() {
+            pages.extend([
+                &mut inbox.review_requested,
+                &mut inbox.authored,
+                &mut inbox.involved,
+            ]);
+        }
+        pages.extend(self.all_open.values_mut().filter_map(Loadable::value_mut));
+        for summary in pages.into_iter().flat_map(|page| page.items.iter_mut()) {
+            let Some((_, state)) = checks.iter().find(|(id, _)| *id == summary.id) else {
+                continue;
+            };
+            if summary.checks != *state {
+                summary.checks = *state;
+                changed.push((summary.pr.clone(), Change::Updated));
+            }
+        }
+        self.marks.add(changed);
     }
 
     /// Starts the search "All open" shows now, unless this run already has
@@ -814,7 +1120,13 @@ impl InboxView {
                 if let (Some(key), Ok(value)) = (&key, &result) {
                     crate::cache::put(key, value);
                 }
-                view.all_open.entry(query).or_default().finish(result);
+                let had_copy = view
+                    .all_open
+                    .get(&query)
+                    .is_some_and(|state| state.value().is_some());
+                view.take_in(had_copy, |view| {
+                    view.all_open.entry(query).or_default().finish(result);
+                });
                 view.count_bases(cx);
             },
         );
@@ -1661,8 +1973,17 @@ impl InboxView {
         } else {
             header
         };
+        let freshness = self.pace.label().map(|label| {
+            div()
+                .debug_selector(|| "inbox-freshness".into())
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .whitespace_nowrap()
+                .child(label)
+        });
         header
             .after_title(self.view_tabs(cx))
+            .children_actions(freshness)
             .action(
                 ui::icon_button("inbox-add-repo", IconName::Plus, "Add repository…")
                     .debug_selector(|| "inbox-add-repo".into())
@@ -1677,7 +1998,7 @@ impl InboxView {
                 .debug_selector(|| "inbox-refresh".into())
                 .loading(busy)
                 .disabled(busy)
-                .on_click(cx.listener(|view, _, _, cx| view.reload(cx))),
+                .on_click(cx.listener(|view, _, _, cx| view.refresh_now(cx))),
             )
     }
 
@@ -2236,6 +2557,7 @@ impl InboxView {
                     on_select: on_select.clone(),
                 }),
                 place,
+                self.marks.get(&summary.pr),
                 cx,
             )
             .into_any_element()
@@ -2368,7 +2690,7 @@ impl Render for InboxView {
             Loadable::Failed(error) => (
                 None,
                 None,
-                common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
+                common::load_error(error, cx.listener(|view, _, _, cx| view.refresh_now(cx)))
                     .px_0()
                     .into_any_element(),
             ),
@@ -2544,7 +2866,7 @@ mod tests {
         point, px, size,
     };
     use loupe_github::reviews::{Clause, Field, Op, Sort, SortDir, SortKey, ViewsFile};
-    use loupe_github::{Inbox, Page, PrRef, PrState, PrSummary, RepoRef};
+    use loupe_github::{Changes, Inbox, Page, PrRef, PrStamp, PrState, PrSummary, RepoRef};
 
     use loupe_github::reviews::{NeedsReview, NextStep, ReviewGroup, ReviewTab};
     use loupe_github::{ChecksState, ReviewDecision};
@@ -2980,6 +3302,122 @@ mod tests {
             cx.notify();
         });
         bounds(cx, "reviews-tab-All");
+    }
+
+    /// Three ready to merge from your review requests, and forty waiting
+    /// for a review in Involved, numbered from 10.
+    fn long_inbox() -> Inbox {
+        Inbox {
+            review_requested: page(
+                (1..=3).map(|number| ready(pr("a", number))).collect(),
+                3,
+                false,
+            ),
+            authored: page(Vec::new(), 0, false),
+            involved: page((10..50).map(|number| pr("b", number)).collect(), 40, false),
+            viewer_login: "me".into(),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_refresh_keeps_the_scroll_the_selection_the_folded_groups_and_the_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
+        let stale = long_inbox();
+        load(&view, stale.clone(), cx);
+        click(cx, "reviews-tab-All");
+        click(cx, "reviews-group-Ready to merge");
+        click(cx, "pr-select-PR_12");
+        click(cx, "pr-select-PR_13");
+        cx.simulate_keystrokes("j j");
+        let list = bounds(cx, "pr-row-PR_10").expect("the list");
+        wheel(cx, list, -400.);
+        let anchor = bounds(cx, "pr-row-PR_30").expect("row 30 on screen");
+        let state = |view: &Entity<InboxView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                (
+                    view.scroll.offset(),
+                    view.cursor.clone(),
+                    view.page.collapsed.clone(),
+                )
+            })
+        };
+        let before = state(&view, cx);
+        assert!(before.0.y < px(0.), "the list scrolled");
+        assert!(before.1.is_some(), "the cursor is on a row");
+
+        // While the refresh runs the rows stay; nothing shows as loading.
+        view.update(cx, |view, _| view.inbox.start_refresh());
+        assert_eq!(bounds(cx, "pr-row-PR_30"), Some(anchor), "no loading state");
+
+        // It lands with one new pull request and one whose checks passed.
+        let mut fresh = stale;
+        fresh.involved.items[25].checks = Some(ChecksState::Passing);
+        fresh.involved.items.push(pr("b", 50));
+        fresh.involved.total_count += 1;
+        view.update(cx, |view, cx| view.finish_inbox(Ok(fresh), Utc::now(), cx));
+
+        assert_eq!(state(&view, cx), before, "scroll, cursor and folds stay");
+        assert_eq!(picked(&view, cx), [12, 13], "the selection stays");
+        assert_eq!(
+            bounds(cx, "pr-row-PR_30"),
+            Some(anchor),
+            "row 30 did not move"
+        );
+        assert!(
+            bounds(cx, "pr-row-PR_1").is_none(),
+            "Ready to merge stays folded"
+        );
+        assert!(
+            bounds(cx, "pr-mark-PR_35").is_some(),
+            "the changed row is marked"
+        );
+        assert!(
+            bounds(cx, "pr-mark-PR_30").is_none(),
+            "an unchanged row is not"
+        );
+        let last = bounds(cx, "pr-row-PR_49").expect("row 49");
+        wheel(cx, last, -2000.);
+        assert!(
+            bounds(cx, "pr-mark-PR_50").is_some(),
+            "the new row is marked"
+        );
+
+        // The cheap question lands one more that involves you, read alone.
+        let after = state(&view, cx);
+        let anchor = bounds(cx, "pr-row-PR_49").expect("row 49");
+        let new = pr("b", 51);
+        let changes = Changes {
+            searches: vec![vec![PrStamp {
+                id: new.id.clone(),
+                updated_at: new.updated_at,
+            }]],
+            complete: true,
+            checks: Vec::new(),
+        };
+        view.update(cx, |view, cx| {
+            view.land_changes(changes, vec![new], None, cx);
+        });
+        assert_eq!(state(&view, cx), after, "scroll, cursor and folds stay");
+        assert_eq!(picked(&view, cx), [12, 13], "the selection stays");
+        assert!(
+            bounds(cx, "pr-row-PR_1").is_none(),
+            "Ready to merge stays folded"
+        );
+        let moved = bounds(cx, "pr-row-PR_49").expect("row 49");
+        assert_eq!(
+            moved.origin.y - anchor.origin.y,
+            anchor.size.height,
+            "the new row went first in its group, one row above"
+        );
+        wheel(cx, moved, 4000.);
+        assert!(
+            bounds(cx, "pr-mark-PR_51").is_some(),
+            "the new row is marked"
+        );
     }
 
     #[gpui_kit::test]

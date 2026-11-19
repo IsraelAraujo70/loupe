@@ -165,3 +165,19 @@ fn runs_of_a_branch_list_with_annotations_and_artifacts() {
     let annotations = github.run_annotations(suite).expect("annotations load");
     println!("annotations: {}", annotations.len());
 }
+
+#[test]
+#[ignore = "needs GITHUB_TOKEN and network"]
+fn a_pull_request_poll_answers_304_until_it_changes() {
+    // IsraelAraujo70/loupe#42 is merged, so its pull request object is fixed.
+    let pr = PrRef::new(RepoRef::new("IsraelAraujo70", "loupe"), 42);
+    let github = client();
+    let first = github.poll_pull_request(&pr, None).expect("first poll");
+    let loupe_github::PullRequestPoll::Changed(Some(etag)) = first else {
+        panic!("the first poll has nothing to compare with and returns an ETag: {first:?}");
+    };
+    let second = github
+        .poll_pull_request(&pr, Some(&etag))
+        .expect("second poll");
+    assert_eq!(second, loupe_github::PullRequestPoll::Unchanged);
+}

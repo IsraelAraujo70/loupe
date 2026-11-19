@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,35 @@ impl GitHub {
         }
     }
 
+    /// With `LOUPE_TRACE_GITHUB` set, prints one line per answered request
+    /// to stderr: what was asked, the status, how long it took, and the
+    /// rate-limit bucket it used. For measuring how much the app asks.
+    pub(crate) fn trace(
+        &self,
+        what: &str,
+        status: u16,
+        started: Instant,
+        headers: &ureq::http::HeaderMap,
+    ) {
+        if std::env::var_os("LOUPE_TRACE_GITHUB").is_none() {
+            return;
+        }
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-")
+                .to_owned()
+        };
+        eprintln!(
+            "github-call at={} what={what} status={status} ms={} bucket={} remaining={}",
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            started.elapsed().as_millis(),
+            header("x-ratelimit-resource"),
+            header("x-ratelimit-remaining"),
+        );
+    }
+
     pub fn viewer(&self) -> Result<Viewer> {
         #[derive(Deserialize)]
         struct Data {
@@ -72,6 +101,7 @@ impl GitHub {
         if std::env::var_os("LOUPE_OFFLINE").is_some() {
             return Err(Error::Transport("Offline mode".into()));
         }
+        let started = Instant::now();
         let mut response = self
             .agent
             .post(GRAPHQL_URL)
@@ -80,6 +110,12 @@ impl GitHub {
             .map_err(|error| Error::Transport(error.to_string()))?;
         self.record_rate(response.headers());
         let status = response.status().as_u16();
+        self.trace(
+            &format!("graphql:{}", operation_name(query)),
+            status,
+            started,
+            response.headers(),
+        );
         let text = response
             .body_mut()
             .read_to_string()
@@ -115,4 +151,34 @@ impl GitHub {
         serde_json::from_value(body["data"].clone())
             .map_err(|error| Error::Decode(error.to_string()))
     }
+}
+
+/// The name after `query` or `mutation` in a GraphQL document, or `-`.
+fn operation_name(document: &str) -> &str {
+    document
+        .split_whitespace()
+        .skip_while(|word| *word != "query" && *word != "mutation")
+        .nth(1)
+        .map(|name| name.split(['(', '{']).next().unwrap_or(name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or("-")
+}
+
+/// `path` without its query and with the owner, repository, numbers and
+/// commit hashes replaced by `*`, so a trace line names no repository.
+pub(crate) fn path_shape(path: &str) -> String {
+    let path = path.split('?').next().unwrap_or(path);
+    let mut after_repos = None;
+    path.split('/')
+        .enumerate()
+        .map(|(at, segment)| {
+            if segment == "repos" {
+                after_repos = Some(at);
+            }
+            let owner_or_name = after_repos.is_some_and(|repos| at == repos + 1 || at == repos + 2);
+            let id = !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_hexdigit());
+            if owner_or_name || id { "*" } else { segment }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }

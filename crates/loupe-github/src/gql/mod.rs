@@ -1,6 +1,7 @@
 //! GraphQL documents and the `GitHub` methods that send them. Each submodule
 //! lists the documents it sends in `DOCUMENTS` so the schema gate sees them.
 
+mod changes;
 mod mutations;
 mod pull_request;
 mod reads;
@@ -19,5 +20,11 @@ pub(crate) fn documents() -> Vec<(&'static str, &'static str)> {
         "open_pull_requests_by_base",
         Box::leak(reads::open_by_base_query(2).into_boxed_str()),
     ));
+    all.push((
+        "changes_since",
+        Box::leak(changes::changes_document(2).into_boxed_str()),
+    ));
     all
 }
+
+pub use changes::{Changes, ChangesQuery, PrStamp};

@@ -22,10 +22,11 @@ mod workflow_file;
 
 pub use client::{GitHub, Viewer};
 pub use error::{Error, Result};
+pub use gql::{Changes, ChangesQuery, PrStamp};
 pub use ids::{PrRef, RepoRef};
 pub use merge::MergeOutcome;
 pub use rate::{RateLimit, RateLimits};
-pub use rest::{ChecksEtag, ChecksPoll, NOTIFICATIONS_LIMIT};
+pub use rest::{ChecksEtag, ChecksPoll, NOTIFICATIONS_LIMIT, PullRequestPoll};
 pub use stack::{PrStack, StackEntry, StackMember, StackSummary};
 pub use types::*;
 pub use workflow::{

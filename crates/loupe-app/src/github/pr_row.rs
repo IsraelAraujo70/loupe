@@ -13,6 +13,7 @@ use gpui_kit::*;
 use loupe_github::reviews::{self, Sort, SortDir, SortKey};
 use loupe_github::{ChecksState, PrRef, PrSummary, ReviewDecision};
 
+use super::live::Change;
 use super::widgets;
 use crate::route::Route;
 use crate::shell::item_menu::{Item, with_item_menu};
@@ -293,13 +294,15 @@ fn review_chip(decision: ReviewDecision) -> Tag {
 /// `Route::PullRequest`. With `select`, a checkbox lane leads the row and a
 /// Shift+click picks instead of opening. With `place`, the row sits inside
 /// an open stack: indented past the stack's chevron, on the line linking the
-/// stack, with its place after the title.
+/// stack, with its place after the title. With `marked`, a dot in the
+/// leading edge says the pull request came or changed in the last refresh.
 pub fn pr_row(
     summary: &PrSummary,
     lanes: Lanes,
     selected: bool,
     select: Option<RowSelect>,
     place: Option<StackPlace>,
+    marked: Option<Change>,
     cx: &App,
 ) -> impl IntoElement + use<> {
     let Lanes {
@@ -326,7 +329,11 @@ pub fn pr_row(
     let id = summary.id.clone();
     // The accessible name: what the row shows, so assistive technology and UI
     // agents can find a pull request by number, title, or repository.
-    let name = format!("{reference} {}", summary.title);
+    let name = match marked {
+        Some(Change::Entered) => format!("{reference} {}, new", summary.title),
+        Some(Change::Updated) => format!("{reference} {}, updated", summary.title),
+        None => format!("{reference} {}", summary.title),
+    };
     let item = Item::pull_request(summary);
     let pr = summary.pr.clone();
     let row = h_flex()
@@ -357,6 +364,29 @@ pub fn pr_row(
                     .w(px(2.))
                     .rounded(px(1.))
                     .bg(tokens::accent()),
+            )
+        })
+        // Came or changed in the last refresh: the unread dot, in the edge
+        // the keyboard cursor's accent takes when it is on the row.
+        .when(marked.is_some() && !selected, |row| {
+            row.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("pr-mark-{id}")
+                            })
+                            .size_1p5()
+                            .rounded_full()
+                            .bg(tokens::accent()),
+                    ),
             )
         })
         // A hairline between rows, so a wide row reads across its columns.
@@ -830,6 +860,7 @@ mod tests {
                             picks.borrow_mut().push(gesture)
                         }),
                     }),
+                    None,
                     None,
                     cx,
                 ))

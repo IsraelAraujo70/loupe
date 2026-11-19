@@ -1,12 +1,15 @@
-//! When the pull request view asks GitHub again on its own: only while a
-//! check is queued or running, every 15 s while the pull request is on
-//! screen and every 60 s behind another page, and not while a rate limit
-//! runs low.
+//! When the pull request view asks GitHub again on its own: its checks
+//! only while one is queued or running, every 15 s while the pull request
+//! is on screen and every 60 s behind another page; the pull request itself
+//! as often as a Reviews list asks ([`live::WATCHED`], [`live::UNWATCHED`]);
+//! and nothing while a rate limit runs low.
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use loupe_github::{ActionsJob, CheckStatus, Checks, ChecksState, PullRequestDetail, RateLimits};
+
+use crate::github::live;
 
 /// How often the view looks at the clock to decide.
 pub(super) const TICK: Duration = Duration::from_secs(5);
@@ -60,13 +63,7 @@ pub(super) fn decide(
     if !may_change {
         return Poll::Idle;
     }
-    let paused_until = [rate.core, rate.graphql]
-        .into_iter()
-        .flatten()
-        .filter(|limit| limit.is_low() && limit.reset > now)
-        .map(|limit| limit.reset)
-        .max();
-    if let Some(until) = paused_until {
+    if let Some(until) = live::paused_until(rate, now) {
         return Poll::Paused(until);
     }
     let interval = if on_screen { ON_SCREEN } else { OFF_SCREEN };
@@ -75,6 +72,17 @@ pub(super) fn decide(
     } else {
         Poll::Wait
     }
+}
+
+/// Whether to ask if the pull request changed, given how long ago that was
+/// last asked (`None`: not since the last load, so at once).
+pub(super) fn pr_poll_due(since_polled: Option<Duration>, on_screen: bool) -> bool {
+    let every = if on_screen {
+        live::WATCHED
+    } else {
+        live::UNWATCHED
+    };
+    since_polled.is_none_or(|since| since >= every)
 }
 
 /// A pull request that comes back on screen after a while away loads
@@ -94,9 +102,10 @@ mod tests {
     };
 
     use super::{
-        AFTER_RERUN, OFF_SCREEN, ON_SCREEN, Poll, checks_may_change, decide, reload_on_return,
-        rerun_arrived,
+        AFTER_RERUN, OFF_SCREEN, ON_SCREEN, Poll, checks_may_change, decide, pr_poll_due,
+        reload_on_return, rerun_arrived,
     };
+    use crate::github::live;
 
     fn at(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).unwrap()
@@ -305,5 +314,17 @@ mod tests {
                 (CheckStatus::Queued, Some(replacement))
             ])
         ));
+    }
+
+    #[test]
+    fn the_pull_request_is_asked_right_after_a_load_then_as_often_as_a_list() {
+        assert!(pr_poll_due(None, false), "right after a load");
+        assert!(!pr_poll_due(Some(live::WATCHED / 2), true));
+        assert!(pr_poll_due(Some(live::WATCHED), true));
+        assert!(
+            !pr_poll_due(Some(live::WATCHED), false),
+            "behind: less often"
+        );
+        assert!(pr_poll_due(Some(live::UNWATCHED), false));
     }
 }

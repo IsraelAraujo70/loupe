@@ -8,8 +8,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::{
-    Actor, ChecksState, Error, GitHub, Inbox, Label, Mergeable, Page, PrListFilter, PrRef, PrState,
-    PrSummary, RepoRef, RepoSummary, Result, ReviewDecision, ReviewRequest, StackMember,
+    Actor, ChecksState, Error, GitHub, Inbox, Label, Mergeable, NodeId, Page, PrListFilter, PrRef,
+    PrState, PrSummary, RepoRef, RepoSummary, Result, ReviewDecision, ReviewRequest, StackMember,
     StackSummary,
 };
 
@@ -22,7 +22,7 @@ const INBOX_AUTHORED: &str = "is:open is:pr archived:false author:@me sort:updat
 const INBOX_INVOLVED: &str =
     "is:open is:pr archived:false involves:@me -author:@me -review-requested:@me sort:updated-desc";
 
-macro_rules! pr_fragments {
+macro_rules! pr_row_fragment {
     () => {
         "
 fragment PrRow on PullRequest {
@@ -54,12 +54,21 @@ fragment PrRow on PullRequest {
     entries(first: 50) { nodes { position pullRequest { number title state } } }
   }
 }
-fragment PrPage on SearchResultItemConnection {
+"
+    };
+}
+
+macro_rules! pr_fragments {
+    () => {
+        concat!(
+            pr_row_fragment!(),
+            "fragment PrPage on SearchResultItemConnection {
   issueCount
   pageInfo { hasNextPage endCursor }
   nodes { ... on PullRequest { ...PrRow } }
 }
 "
+        )
     };
 }
 
@@ -94,6 +103,13 @@ const SEARCH_PULL_REQUESTS_QUERY: &str = concat!(
     pr_fragments!()
 );
 
+const PULL_REQUEST_ROWS_QUERY: &str = concat!(
+    "query PullRequestRows($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on PullRequest { ...PrRow } }
+}",
+    pr_row_fragment!()
+);
+
 const VIEWER_REPOSITORIES_QUERY: &str = concat!(
     "query ViewerRepositories {
   viewer {
@@ -118,6 +134,9 @@ const SEARCH_REPOSITORIES_QUERY: &str = concat!(
 }",
     repo_fragment!()
 );
+
+const REVIEW_REQUESTED_COUNT_QUERY: &str = "query ReviewRequestedCount($query: String!) { \
+    search(type: ISSUE, query: $query) { issueCount } }";
 
 const REPOSITORY_LABELS_QUERY: &str = "query RepositoryLabels($owner: String!, $name: String!, \
     $cursor: String) { repository(owner: $owner, name: $name) { \
@@ -165,6 +184,8 @@ pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("viewer_repositories", VIEWER_REPOSITORIES_QUERY),
     ("search_repositories", SEARCH_REPOSITORIES_QUERY),
     ("repository_labels", REPOSITORY_LABELS_QUERY),
+    ("review_requested_count", REVIEW_REQUESTED_COUNT_QUERY),
+    ("pull_request_rows", PULL_REQUEST_ROWS_QUERY),
 ];
 
 impl GitHub {
@@ -181,6 +202,44 @@ impl GitHub {
             }),
         )?;
         data.into_inbox()
+    }
+
+    /// How many open pull requests wait on your review: the inbox's first
+    /// search, counted for one rate-limit point instead of 18.
+    pub fn review_requested_count(&self) -> Result<u32> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Count {
+            issue_count: u32,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            search: Count,
+        }
+        let data: Data = self.graphql(
+            REVIEW_REQUESTED_COUNT_QUERY,
+            json!({ "query": INBOX_REVIEW_REQUESTED }),
+        )?;
+        Ok(data.search.issue_count)
+    }
+
+    /// The list rows of the pull requests with node ids `ids`, as a search
+    /// would return them; ids GitHub no longer knows are left out.
+    pub fn pull_request_rows(&self, ids: &[NodeId]) -> Result<Vec<PrSummary>> {
+        #[derive(Deserialize)]
+        struct Data {
+            nodes: Vec<Value>,
+        }
+        let mut rows = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(MAX_PAGE_SIZE as usize) {
+            let data: Data = self.graphql(PULL_REQUEST_ROWS_QUERY, json!({ "ids": chunk }))?;
+            rows.extend(
+                decode_nodes::<WirePullRequest>(data.nodes)?
+                    .into_iter()
+                    .map(WirePullRequest::into_summary),
+            );
+        }
+        Ok(rows)
     }
 
     /// Runs a raw search query (GitHub search syntax). `is:pr` is added when
@@ -742,7 +801,7 @@ impl WirePullRequest {
     }
 }
 
-fn checks_state(rollup: &str) -> Option<ChecksState> {
+pub(super) fn checks_state(rollup: &str) -> Option<ChecksState> {
     match rollup {
         "SUCCESS" => Some(ChecksState::Passing),
         "FAILURE" | "ERROR" => Some(ChecksState::Failing),
@@ -1176,7 +1235,9 @@ mod tests {
                 "search_pull_requests",
                 "viewer_repositories",
                 "search_repositories",
-                "repository_labels"
+                "repository_labels",
+                "review_requested_count",
+                "pull_request_rows"
             ]
         );
     }
