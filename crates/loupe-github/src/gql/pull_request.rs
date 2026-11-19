@@ -12,7 +12,8 @@ use crate::{
     ActionsJob, Actor, BodyEdit, CheckRun, CheckStatus, Checks, ChecksState, Commit, Error, GitHub,
     IssueComment, Label, MergeMethod, MergeStateStatus, Mergeable, PendingReview, PrRef, PrState,
     PullRequestDetail, RepoRef, Result, Review, ReviewComment, ReviewDecision, ReviewState,
-    ReviewThread, Reviewer, ReviewerKind, ReviewerState, Side, TimelineItem, Timestamp,
+    ReviewThread, Reviewer, ReviewerKind, ReviewerState, Side, TimelineItem, Timestamp, Verdict,
+    ViewerReview,
 };
 
 /// Timeline and thread pages fetched per pull request, the first one included.
@@ -138,7 +139,7 @@ query PullRequestDetail($owner: String!, $name: String!, $number: Int!) {
         }
       }
       latestReviews(first: 50) {
-        nodes { author { login avatarUrl } state }
+        nodes { author { login avatarUrl } state commit { oid } }
       }
       labels(first: 50) { nodes { id name color } }
       assignees(first: 50) { nodes { login avatarUrl } }
@@ -621,6 +622,12 @@ struct WireRequestedReviewer {
 struct WireLatestReview {
     author: Option<WireActor>,
     state: WireReviewState,
+    commit: Option<WireOid>,
+}
+
+#[derive(Deserialize)]
+struct WireOid {
+    oid: String,
 }
 
 #[derive(Deserialize)]
@@ -837,9 +844,11 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
         });
 
     let author: Option<Actor> = wire.author.map(Actor::from);
+    let latest_reviews = wire.latest_reviews.into_nodes();
+    let viewer_review = viewer_review(&latest_reviews, &data.viewer.login);
     let reviewers = collect_reviewers(
         wire.review_requests.into_nodes(),
-        wire.latest_reviews.into_nodes(),
+        latest_reviews,
         author.as_ref().map(|author| author.login.as_str()),
     );
 
@@ -957,12 +966,33 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
         pending_review,
         viewer_login: data.viewer.login,
         viewer_can_update: wire.viewer_can_update,
+        viewer_review,
         stack: wire.stack.map(WireStack::into_stack),
     };
     Ok(FirstPage {
         detail,
         timeline_cursor,
         threads_cursor,
+    })
+}
+
+/// The viewer's latest review when it approves or asks for changes, with
+/// the head commit it was given on.
+fn viewer_review(latest: &[WireLatestReview], viewer: &str) -> Option<ViewerReview> {
+    let review = latest.iter().find(|review| {
+        review
+            .author
+            .as_ref()
+            .is_some_and(|author| author.login.eq_ignore_ascii_case(viewer))
+    })?;
+    let verdict = match review.state {
+        WireReviewState::Approved => Verdict::Approved,
+        WireReviewState::ChangesRequested => Verdict::ChangesRequested,
+        _ => return None,
+    };
+    Some(ViewerReview {
+        verdict,
+        commit_oid: review.commit.as_ref()?.oid.clone(),
     })
 }
 
@@ -1263,7 +1293,8 @@ mod tests {
                 { "author": actor("bob"), "state": "CHANGES_REQUESTED" },
                 { "author": actor("pr-author"), "state": "COMMENTED" },
                 { "author": actor("carol"), "state": "SOMETHING_NEW" },
-                { "author": null, "state": "APPROVED" }
+                { "author": null, "state": "APPROVED" },
+                { "author": actor("Me"), "state": "APPROVED", "commit": { "oid": "abc123" } }
             ] },
             "labels": { "nodes": [{ "id": "LA_bug", "name": "bug", "color": "d73a4a" }] },
             "assignees": { "nodes": [actor("dave")] },
@@ -1547,8 +1578,46 @@ mod tests {
                 ("team:core".to_owned(), ReviewerState::Requested),
                 ("bob".to_owned(), ReviewerState::ChangesRequested),
                 ("carol".to_owned(), ReviewerState::Commented),
+                ("Me".to_owned(), ReviewerState::Approved),
             ],
             "alice once as Requested, the author skipped, an unknown state is Commented, a null author skipped"
+        );
+    }
+
+    /// The mark a tab shows on a pull request you reviewed: your approval
+    /// or change request on the head commit, gone once a commit lands.
+    #[test]
+    fn your_verdict_stands_until_a_new_commit() {
+        let mut detail = parsed().detail;
+        assert_eq!(
+            detail.standing_verdict(),
+            Some(Verdict::Approved),
+            "your approval on the head commit, whatever the login's case"
+        );
+        detail.head_oid = "def456".into();
+        assert_eq!(detail.standing_verdict(), None, "a commit landed after it");
+
+        let mut json = pull_request_json();
+        json["latestReviews"]["nodes"] = json!([
+            { "author": actor("alice"), "state": "APPROVED", "commit": { "oid": "abc123" } },
+            { "author": actor("me"), "state": "CHANGES_REQUESTED", "commit": { "oid": "abc123" } }
+        ]);
+        let detail = parse_detail(&pr_ref(), data(json.clone())).unwrap().detail;
+        assert_eq!(detail.standing_verdict(), Some(Verdict::ChangesRequested));
+
+        for state in ["COMMENTED", "DISMISSED"] {
+            json["latestReviews"]["nodes"][1]["state"] = json!(state);
+            let detail = parse_detail(&pr_ref(), data(json.clone())).unwrap().detail;
+            assert_eq!(detail.standing_verdict(), None, "{state} decides nothing");
+        }
+        json["latestReviews"]["nodes"] = json!([
+            { "author": actor("alice"), "state": "APPROVED", "commit": { "oid": "abc123" } }
+        ]);
+        let detail = parse_detail(&pr_ref(), data(json)).unwrap().detail;
+        assert_eq!(
+            detail.standing_verdict(),
+            None,
+            "only someone else approved"
         );
     }
 

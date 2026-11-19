@@ -2053,11 +2053,8 @@ mod tests {
             [0, 3, 1, 2],
             "every tab of every pane, in order"
         );
-        assert_eq!(
-            ids("tab: web#"),
-            [3],
-            "the pull request's tab, by its title"
-        );
+        assert_eq!(ids("tab: #7"), [3], "the pull request's tab, by its number");
+        assert_eq!(ids("tab: web"), [3], "and by its repository");
         assert_eq!(ids("tab: SETT"), [1], "in any case");
         assert_eq!(
             ids("tab: inb"),

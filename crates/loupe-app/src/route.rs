@@ -143,7 +143,7 @@ impl Route {
             Route::Inbox => "Reviews".into(),
             Route::Notifications => "Inbox".into(),
             Route::Repo(repo) => repo.to_string(),
-            Route::PullRequest(pr) => format!("{}#{}", pr.repo.name, pr.number),
+            Route::PullRequest(pr) => format!("#{} {}", pr.number, pr.repo.name),
             Route::Actions { repo, .. } => format!("{} actions", repo.name),
             Route::WorkflowRun { title, .. } if !title.is_empty() => title.clone(),
             Route::WorkflowRun { repo, .. } => format!("{} run", repo.name),
@@ -285,7 +285,11 @@ mod tests {
     #[test]
     fn labels_name_the_page() {
         let pr = Route::PullRequest(PrRef::new(RepoRef::new("acme", "web"), 7));
-        assert_eq!(pr.label(), "web#7");
+        assert_eq!(
+            pr.label(),
+            "#7 web",
+            "the number first, the repository without its owner"
+        );
         assert_eq!(
             Route::LinearIssue {
                 identifier: "ENG-1".into()

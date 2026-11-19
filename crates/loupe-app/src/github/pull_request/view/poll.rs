@@ -152,6 +152,7 @@ mod tests {
             pending_review: None,
             viewer_login: String::new(),
             viewer_can_update: false,
+            viewer_review: None,
             stack: None,
         }
     }

@@ -16,7 +16,7 @@ mod repo;
 mod widgets;
 
 use gpui_kit::{AnyView, App, SharedString, Task, Window};
-use loupe_github::{PrRef, RepoRef};
+use loupe_github::{PrRef, RepoRef, Verdict};
 
 use crate::shell::PaletteItem;
 
@@ -65,6 +65,24 @@ pub fn workflow_run_view(
 
 pub fn pull_request_view(pr: PrRef, window: &mut Window, cx: &mut App) -> AnyView {
     pull_request::view(pr, window, cx)
+}
+
+/// What a pull request's tab shows of its loaded page: the title its tooltip
+/// names, and the viewer's approval or change request while no commit has
+/// landed since.
+pub struct PullRequestTab {
+    pub title: SharedString,
+    pub verdict: Option<Verdict>,
+}
+
+/// The pull request tab facts of page `view`, read from what the page already
+/// loaded. `None` when `view` is not a pull request page or has nothing yet.
+pub fn pull_request_tab(view: &AnyView, cx: &App) -> Option<PullRequestTab> {
+    let detail = pull_request::loaded_detail(view, cx)?;
+    Some(PullRequestTab {
+        title: detail.title.clone().into(),
+        verdict: detail.standing_verdict(),
+    })
 }
 
 /// Pull requests for a GitHub search query the command palette built.
