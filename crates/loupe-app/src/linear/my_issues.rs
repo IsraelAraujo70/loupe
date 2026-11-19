@@ -18,6 +18,7 @@ use crate::linear::widgets;
 use crate::route::Route;
 use crate::services::background;
 use crate::shell::OpenOnClick as _;
+use crate::shell::Refreshable as _;
 use crate::shell::item_menu::{Item, with_item_menu};
 use crate::shell::navigate;
 use crate::theme::scale;
@@ -73,7 +74,7 @@ fn replace_issue(groups: &mut Vec<Group>, issue: IssueSummary) -> bool {
     true
 }
 
-struct MyIssues {
+pub(super) struct MyIssues {
     client: Option<Arc<Linear>>,
     issues: Loadable<Vec<Group>>,
     teams: Loadable<Arc<Vec<TeamSummary>>>,
@@ -176,7 +177,7 @@ impl MyIssues {
         let teams = self.teams.clone();
         let actions = vec![
             ui::icon_button("my-issues-refresh", IconName::RefreshCw.into(), "Refresh")
-                .on_click(cx.listener(|view, _, _, cx| view.load_issues(cx)))
+                .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx)))
                 .into_any_element(),
             Button::new("my-issues-teams")
                 .ghost()
@@ -329,6 +330,12 @@ fn team_menu(menu: PopupMenu, teams: &Loadable<Arc<Vec<TeamSummary>>>) -> PopupM
                     .on_click(move |_, window, cx| navigate(route.clone(), window, cx)),
             )
         }),
+    }
+}
+
+impl crate::shell::Refreshable for MyIssues {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        self.load_issues(cx);
     }
 }
 

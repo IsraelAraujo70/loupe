@@ -51,8 +51,8 @@ use crate::shell::actions::{
     ActivateLastTab, ActivateTab1, ActivateTab2, ActivateTab3, ActivateTab4, ActivateTab5,
     ActivateTab6, ActivateTab7, ActivateTab8, CloseTab, ComposeIssue, CopyItemBranch, CopyItemId,
     CopyItemLink, GoBack, GoForward, NewTab, NextTab, OpenItemInNewTab, OpenItemSideBySide,
-    OpenPalette, PreviousTab, ScrollPageDown, ScrollPageUp, SearchTabs, SplitDown, SplitLeft,
-    SplitRight, SplitUp, SwitchWorkspace, ToggleSidebar,
+    OpenPalette, PreviousTab, RefreshAllTabs, RefreshPage, ScrollPageDown, ScrollPageUp,
+    SearchTabs, SplitDown, SplitLeft, SplitRight, SplitUp, SwitchWorkspace, ToggleSidebar,
 };
 use crate::shell::item_menu::Command;
 use crate::shell::panes::{Node, Pane, PaneId, Panes, Zone};
@@ -67,6 +67,23 @@ pub(crate) use crate::ui::HEADER_HEIGHT as TITLE_BAR_HEIGHT;
 /// The gap between the window edge and the content card, on its right and
 /// bottom; the top bar sits above it.
 pub(crate) const CARD_INSET: Pixels = px(6.);
+
+/// A page with a Refresh button. Cmd+R runs it on the open page and
+/// Cmd+Shift+R on every tab's, through [`router::refresh`].
+pub trait Refreshable: Render {
+    /// What the page's Refresh button does, and nothing while the button is
+    /// disabled.
+    fn refresh_page(&mut self, cx: &mut Context<Self>);
+}
+
+/// Refreshes page `view` when it is a `V`; false when it is another page.
+pub fn refresh_as<V: Refreshable>(view: &AnyView, cx: &mut App) -> bool {
+    let Ok(view) = view.clone().downcast::<V>() else {
+        return false;
+    };
+    view.update(cx, |view, cx| view.refresh_page(cx));
+    true
+}
 
 /// One command palette result.
 #[derive(Clone, Debug)]
@@ -618,6 +635,17 @@ impl Workspace {
         // After this update: opening a page updates the workspace again.
         window.defer(cx, move |window, cx| {
             item_menu::run(command, &item, window, cx)
+        });
+    }
+
+    /// Runs each page's Refresh. Deferred, so a page that touches the
+    /// workspace while it reloads does not update it from inside its own
+    /// update.
+    fn refresh_pages(&mut self, pages: Vec<AnyView>, cx: &mut Context<Self>) {
+        cx.defer(move |cx| {
+            for page in &pages {
+                router::refresh(page, cx);
+            }
         });
     }
 
@@ -1483,6 +1511,19 @@ impl Render for Workspace {
                     }))
                     .on_action(cx.listener(|this, _: &ScrollPageUp, window, cx| {
                         this.scroll_page(-1., window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &RefreshPage, _, cx| {
+                        let page = this.panes.active().active().current().view.clone();
+                        this.refresh_pages(vec![page], cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &RefreshAllTabs, _, cx| {
+                        let pages = this
+                            .panes
+                            .panes()
+                            .into_iter()
+                            .flat_map(|pane| pane.tabs.iter().map(|tab| tab.current().view.clone()))
+                            .collect();
+                        this.refresh_pages(pages, cx)
                     }))
                     .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                         let target = item_menu::target(this.active_page(), cx);
@@ -2978,6 +3019,79 @@ mod tests {
                 1
             ),
             "the pull request opens in a new pane on the right"
+        );
+    }
+
+    /// The page each tab shows, pane by pane in reading order, and the one
+    /// on screen in the active pane.
+    fn pages(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<gpui_kit::AnyView>, gpui_kit::AnyView) {
+        workspace.read_with(cx, |workspace, _| {
+            let all = workspace
+                .panes
+                .panes()
+                .into_iter()
+                .flat_map(|pane| pane.tabs.iter().map(|tab| tab.current().view.clone()))
+                .collect();
+            let active = workspace.panes.active().active().current().view.clone();
+            (all, active)
+        })
+    }
+
+    #[gpui_kit::test]
+    fn the_refresh_keys_reload_the_open_page_or_every_tab(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
+        // Reviews in a left pane, and two Reviews tabs in a right pane, the
+        // second one open.
+        cx.dispatch_action(NewTab);
+        cx.dispatch_action(SplitRight);
+        cx.dispatch_action(NewTab);
+        cx.run_until_parked();
+        let (all, active) = pages(&workspace, cx);
+        assert_eq!(all.len(), 3);
+        assert_eq!(saved_panes(cx).1, 1, "the right pane is the active one");
+
+        // Which pages started a reload after `pressed`.
+        let reloaded = |cx: &mut VisualTestContext, pressed: std::time::Instant| {
+            cx.update(|_, cx| {
+                all.iter()
+                    .map(|page| {
+                        let since =
+                            crate::github::reviews_since_reload(page, cx).expect("a Reviews page");
+                        since <= pressed.elapsed()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let (refresh, refresh_all) = if cfg!(target_os = "macos") {
+            ("cmd-r", "cmd-shift-r")
+        } else {
+            ("ctrl-r", "ctrl-shift-r")
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let pressed = std::time::Instant::now();
+        cx.simulate_keystrokes(refresh);
+        cx.run_until_parked();
+        assert_eq!(
+            reloaded(cx, pressed),
+            [false, false, true],
+            "only the open tab of the active pane reloads"
+        );
+        assert_eq!(all[2], active);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let pressed = std::time::Instant::now();
+        cx.simulate_keystrokes(refresh_all);
+        cx.run_until_parked();
+        assert_eq!(
+            reloaded(cx, pressed),
+            [true, true, true],
+            "every tab of every pane reloads"
         );
     }
 }

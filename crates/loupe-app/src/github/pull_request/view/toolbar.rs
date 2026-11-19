@@ -20,6 +20,7 @@ use super::model::{
 };
 use super::{PullRequestView, Write};
 use crate::github::widgets;
+use crate::shell::Refreshable as _;
 use crate::theme::{scale, tokens};
 use crate::ui;
 use crate::ui::{ControlSize as _, MenuTriggerExt as _};
@@ -222,7 +223,7 @@ impl PullRequestView {
                         PopupMenuItem::new("Refresh")
                             .icon(IconName::RefreshCw)
                             .on_click(move |_, _, cx| {
-                                this.update(cx, |this, cx| this.reload(cx)).ok();
+                                this.update(cx, |this, cx| this.refresh_page(cx)).ok();
                             }),
                     )
                 };

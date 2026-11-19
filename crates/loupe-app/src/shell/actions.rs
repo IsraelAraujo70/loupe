@@ -53,6 +53,12 @@ gpui_kit::actions!(
         /// O then W, as in Linear: open the Linear workspace switcher.
         /// Handled by `Workspace`.
         SwitchWorkspace,
+        /// Cmd+R (Ctrl+R off macOS): the active pane's open page does what
+        /// its Refresh button does. Handled by `Workspace`.
+        RefreshPage,
+        /// Cmd+Shift+R: every open tab, in every pane, refreshes its page.
+        /// Handled by `Workspace`.
+        RefreshAllTabs,
         /// Cmd+,: navigate to Settings. Handled by `Workspace`.
         OpenSettings,
         /// /: put the caret in the Settings search. Handled by the Settings

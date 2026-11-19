@@ -26,7 +26,16 @@ pub use self::issue::{ChangeAssignee, ChangeLabels, ChangePriority, ChangeState,
 pub use self::new_issue::{MoveToTeam, SetCycle, SetDueDate, SetEstimate, SetProject};
 pub use self::team::OpenFilter;
 use crate::links::PrLinkContext;
-use crate::shell::PaletteItem;
+use crate::shell::{PaletteItem, refresh_as};
+
+/// Runs page `view`'s Refresh when it is a Linear page with one; false
+/// otherwise.
+pub fn refresh(view: &AnyView, cx: &mut App) -> bool {
+    refresh_as::<my_issues::MyIssues>(view, cx)
+        || refresh_as::<team::TeamView>(view, cx)
+        || refresh_as::<project::ProjectView>(view, cx)
+        || refresh_as::<views_list::ViewsListView>(view, cx)
+}
 
 pub fn my_issues_view(window: &mut Window, cx: &mut App) -> AnyView {
     my_issues::view(window, cx)

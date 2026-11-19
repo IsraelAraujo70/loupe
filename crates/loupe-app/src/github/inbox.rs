@@ -51,6 +51,7 @@ use super::pr_row::{
     pr_row, select_box, stack_row,
 };
 use crate::route::Route;
+use crate::shell::Refreshable as _;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::shell::{self, GroupTarget, PaneGroup};
 use crate::store::ViewSync;
@@ -1998,7 +1999,7 @@ impl InboxView {
                 .debug_selector(|| "inbox-refresh".into())
                 .loading(busy)
                 .disabled(busy)
-                .on_click(cx.listener(|view, _, _, cx| view.refresh_now(cx))),
+                .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx))),
             )
     }
 
@@ -2666,6 +2667,22 @@ impl InboxView {
             .gap_2()
             .child(div().px_2().child(Skeleton::new().h_3().w_32()))
             .child(ui::skeleton_rows(8))
+    }
+}
+
+#[cfg(test)]
+impl InboxView {
+    /// How long since the page last started a reload.
+    pub(super) fn since_reload(&self) -> std::time::Duration {
+        self.pace.since_reload(Instant::now())
+    }
+}
+
+impl crate::shell::Refreshable for InboxView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        if !self.inbox.is_busy() {
+            self.refresh_now(cx);
+        }
     }
 }
 

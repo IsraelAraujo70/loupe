@@ -15,6 +15,7 @@ use loupe_github::{Page, PrListFilter, PrSummary, RepoRef, RepoSummary};
 use super::common::{self, LoadError, Loadable};
 use super::pr_row::{AgeFrom, Lanes, pr_row};
 use crate::route::Route;
+use crate::shell::Refreshable as _;
 use crate::shell::navigate;
 use crate::store::{Settings, update_settings};
 use crate::theme::scale;
@@ -196,7 +197,7 @@ impl RepoView {
                 ui::icon_button("refresh", IconName::RefreshCw, "Refresh")
                     .loading(busy)
                     .disabled(busy)
-                    .on_click(cx.listener(|view, _, _, cx| view.reload(cx))),
+                    .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx))),
             )
     }
 
@@ -234,6 +235,14 @@ impl RepoView {
                         .cleanable(true),
                 ),
             )
+    }
+}
+
+impl crate::shell::Refreshable for RepoView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        if !self.list.is_busy() {
+            self.reload(cx);
+        }
     }
 }
 
