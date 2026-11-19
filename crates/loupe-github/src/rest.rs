@@ -350,6 +350,20 @@ impl GitHub {
         Ok(ChecksPoll::of(sha, seen, runs, statuses))
     }
 
+    /// Whether pull request `pr` changed since `etag` was taken: its title,
+    /// state, head commit, mergeability, reviewers, or the time it was last
+    /// updated (a comment or a review moves it). A 304 costs no rate limit.
+    pub fn poll_pull_request(&self, pr: &PrRef, etag: Option<&str>) -> Result<PullRequestPoll> {
+        let path = format!(
+            "/repos/{}/{}/pulls/{}",
+            pr.repo.owner, pr.repo.name, pr.number
+        );
+        Ok(match self.conditional_get(&path, etag)? {
+            Conditional::NotModified => PullRequestPoll::Unchanged,
+            Conditional::Modified(etag) => PullRequestPoll::Changed(etag),
+        })
+    }
+
     pub(crate) fn authorize<B>(
         &self,
         request: RequestBuilder<B>,
@@ -412,6 +426,16 @@ impl ChecksPoll {
             }),
         }
     }
+}
+
+/// The answer of [`GitHub::poll_pull_request`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PullRequestPoll {
+    /// GitHub answered 304.
+    Unchanged,
+    /// The pull request changed, or there was no ETag to compare with; the
+    /// ETag to send next time.
+    Changed(Option<String>),
 }
 
 /// The error a non-2xx REST response stands for, with GitHub's `message`.

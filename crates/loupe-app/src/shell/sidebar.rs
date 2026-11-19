@@ -140,9 +140,7 @@ impl SidebarData {
                                 list.retain(|notification| notification.unread);
                                 Arc::new(list)
                             });
-                            let reviews = client
-                                .inbox()
-                                .map(|inbox| inbox.review_requested.total_count);
+                            let reviews = client.review_requested_count();
                             (unread, reviews)
                         })
                         .await;

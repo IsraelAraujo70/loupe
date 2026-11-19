@@ -21,7 +21,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{
     ActionsJob, ChecksEtag, ChecksPoll, GitHub, Label, MergeMethod, MergeOutcome, PrRef,
-    PullRequestDetail, ReviewEvent,
+    PullRequestDetail, PullRequestPoll, ReviewEvent,
 };
 
 use super::checks::{ChecksTab, Freshness};
@@ -170,6 +170,12 @@ pub struct PullRequestView {
     /// Whether the last tick found the pull request on screen.
     on_screen: bool,
     poll_task: Option<Task<()>>,
+    /// The ETag of the pull request as last loaded, which tells whether it
+    /// changed since; `None` until the poll after a load gets one.
+    pr_etag: Option<String>,
+    /// When that poll last went out; `None` right after a load.
+    pr_polled_at: Option<Instant>,
+    pr_poll_task: Option<Task<()>>,
     _ticker: Task<()>,
 }
 
@@ -242,6 +248,9 @@ impl PullRequestView {
             folded_check_groups: HashSet::new(),
             on_screen: true,
             poll_task: None,
+            pr_etag: None,
+            pr_polled_at: None,
+            pr_poll_task: None,
             _ticker: ticker,
         };
         let page = cx.entity_id();
@@ -270,6 +279,9 @@ impl PullRequestView {
         }
         self.detail.start_refresh();
         self.last_fetch = Instant::now();
+        // The poll after the load takes the ETag of what it brought.
+        self.pr_etag = None;
+        self.pr_polled_at = None;
         let pr = self.pr.clone();
         self.load_task = Some(common::run(
             cx,
@@ -455,7 +467,7 @@ impl PullRequestView {
     fn tick(&mut self, cx: &mut Context<Self>) {
         let on_screen = crate::shell::is_on_screen(cx.entity_id(), cx);
         let was_on_screen = std::mem::replace(&mut self.on_screen, on_screen);
-        if self.detail.is_busy() || self.poll_task.is_some() {
+        if self.detail.is_busy() || self.poll_task.is_some() || self.pr_poll_task.is_some() {
             return;
         }
         let Some(detail) = self.detail.value() else {
@@ -481,7 +493,36 @@ impl PullRequestView {
         }
         if decision == poll::Poll::Now {
             self.poll(cx);
+        } else if crate::github::live::paused_until(rate, Utc::now()).is_none()
+            && poll::pr_poll_due(self.pr_polled_at.map(|at| at.elapsed()), on_screen)
+        {
+            self.poll_pull_request(cx);
         }
+    }
+
+    /// Asks GitHub whether the pull request changed since it loaded (a 304
+    /// costs no rate limit) and loads it again when it did. The first poll
+    /// after a load only takes the ETag.
+    fn poll_pull_request(&mut self, cx: &mut Context<Self>) {
+        let pr = self.pr.clone();
+        let seen = self.pr_etag.clone();
+        self.pr_polled_at = Some(Instant::now());
+        self.pr_poll_task = Some(common::run(
+            cx,
+            move |github| github.poll_pull_request(&pr, seen.as_deref()),
+            |view, result, cx| {
+                view.pr_poll_task = None;
+                let Ok(PullRequestPoll::Changed(etag)) = result else {
+                    return;
+                };
+                let had_one = view.pr_etag.is_some();
+                if had_one {
+                    view.reload(cx);
+                }
+                view.pr_etag = etag;
+                view.pr_polled_at = Some(Instant::now());
+            },
+        ));
     }
 
     /// Asks GitHub whether the checks changed (a 304 costs no rate limit)

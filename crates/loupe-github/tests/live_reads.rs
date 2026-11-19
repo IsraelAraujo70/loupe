@@ -171,3 +171,36 @@ fn counts_open_pull_requests_by_base_branch() {
     assert!(counts[0].is_some());
     assert_eq!(counts[1], Some(0));
 }
+
+#[test]
+#[ignore = "needs GITHUB_TOKEN and network"]
+fn changes_since_finds_recent_updates_and_pending_checks() {
+    let github = client();
+    let since = chrono::Utc::now() - chrono::Duration::days(30);
+    let query = loupe_github::ChangesQuery {
+        since,
+        searches: vec!["is:pr archived:false repo:IsraelAraujo70/loupe".into()],
+        pending: Vec::new(),
+    };
+    let changes = github.changes_since(&query).expect("changes");
+    let updated = changes.updated();
+    println!(
+        "{} updated in 30 days, complete: {}",
+        updated.len(),
+        changes.complete
+    );
+    assert!(updated.iter().all(|stamp| stamp.updated_at >= since));
+    let ids: Vec<String> = updated
+        .iter()
+        .take(3)
+        .map(|stamp| stamp.id.clone())
+        .collect();
+    let rows = github.pull_request_rows(&ids).expect("rows");
+    assert_eq!(
+        rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+        ids,
+        "one row per id, in order"
+    );
+    let count = github.review_requested_count().expect("count");
+    println!("review requested: {count}");
+}
