@@ -2884,6 +2884,41 @@ mod tests {
         assert_eq!(listed, [ids[0]], "\"Mine\" finds the tab on that view");
     }
 
+    /// A pull request's tab copies the pull request's link from its menu,
+    /// the first item; another page's tab has no such item.
+    #[gpui_kit::test]
+    fn a_pull_request_tab_copies_its_link(cx: &mut TestAppContext) {
+        use loupe_github::{PrRef, RepoRef};
+
+        let (handle, _) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        let clipboard = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        };
+        let pr = Route::PullRequest(PrRef::new(RepoRef::new("octo", "app"), 7));
+        cx.update(|window, cx| super::navigate(pr, window, cx));
+        cx.run_until_parked();
+        click(cx, "tab-0", MouseButton::Right, Modifiers::none());
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(
+            clipboard(cx).as_deref(),
+            Some("https://github.com/octo/app/pull/7")
+        );
+
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("before".into()));
+        cx.update(|window, cx| super::navigate(Route::Inbox, window, cx));
+        cx.run_until_parked();
+        click(cx, "tab-0", MouseButton::Right, Modifiers::none());
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(
+            clipboard(cx).as_deref(),
+            Some("before"),
+            "Reviews' tab has no link to copy"
+        );
+    }
+
     /// With the pointer on no row, the item keys act on the page on screen:
     /// a pull request's link and branch are copied, an issue's ID is not
     /// one of its commands, and side by side opens it in a pane on the

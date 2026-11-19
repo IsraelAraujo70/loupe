@@ -170,6 +170,9 @@ pub struct PullRequestView {
     /// Whether the last tick found the pull request on screen.
     on_screen: bool,
     poll_task: Option<Task<()>>,
+    /// Runs while the header's Copy link button says "Copied", and puts its
+    /// label back when it ends.
+    link_copied: Option<Task<()>>,
     _ticker: Task<()>,
 }
 
@@ -242,6 +245,7 @@ impl PullRequestView {
             folded_check_groups: HashSet::new(),
             on_screen: true,
             poll_task: None,
+            link_copied: None,
             _ticker: ticker,
         };
         let page = cx.entity_id();

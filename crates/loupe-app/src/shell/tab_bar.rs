@@ -580,6 +580,11 @@ fn tabs(
                 .as_ref()
                 .map(|pr| (pr.full_name.clone(), pr.title.clone()));
             let icon = route_icon(route);
+            // A pull request's tab copies its link, as its row does.
+            let pr_link = match route {
+                Route::PullRequest(pr) => Some((pr.url(), pr.to_string())),
+                _ => None,
+            };
             let selected = index == active;
             let pinned = tab.pinned;
             let shown_label = if pinned {
@@ -867,6 +872,18 @@ fn tabs(
                                 })
                                 .ok();
                         })
+                    };
+                    let menu = match &pr_link {
+                        Some((url, reference)) => {
+                            let (url, reference) = (url.clone(), reference.clone());
+                            menu.item(PopupMenuItem::new("Copy link").on_click(
+                                move |_, window, cx| {
+                                    super::item_menu::copy_link(&url, &reference, window, cx)
+                                },
+                            ))
+                            .separator()
+                        }
+                        None => menu,
                     };
                     let menu = menu
                         .item(item("Split right", Zone::Right))
