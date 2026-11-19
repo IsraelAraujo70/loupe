@@ -11,9 +11,9 @@ use crate::shell::actions::{
     ActivateTab6, ActivateTab7, ActivateTab8, CloseTab, CloseWindow, ComposeIssue, CopyItemBranch,
     CopyItemId, CopyItemLink, FocusSettingsSearch, GoBack, GoForward, Minimize, NewTab, NextTab,
     OpenItemInNewTab, OpenItemSideBySide, OpenPalette, OpenSelected, OpenSettings,
-    PaletteOpenInNewTab, PreviousTab, Quit, ResetZoom, ScrollPageDown, ScrollPageUp, SearchTabs,
-    SelectNext, SelectPrevious, SplitDown, SplitLeft, SplitRight, SplitUp, SwitchWorkspace,
-    ToggleSidebar, ZoomIn, ZoomOut,
+    PaletteOpenInNewTab, PreviousTab, Quit, RefreshAllTabs, RefreshPage, ResetZoom, ScrollPageDown,
+    ScrollPageUp, SearchTabs, SelectNext, SelectPrevious, SplitDown, SplitLeft, SplitRight,
+    SplitUp, SwitchWorkspace, ToggleSidebar, ZoomIn, ZoomOut,
 };
 use crate::shell::navigate;
 use crate::store::{Settings, update_settings};
@@ -41,11 +41,20 @@ const ITEM_KEYS: &str = "Workspace && !Input";
 /// focus.
 const SETTINGS_KEYS: &str = "SettingsView && !Input";
 
+/// The browsers' refresh keys: Cmd+R and Cmd+Shift+R on macOS, Ctrl+R and
+/// Ctrl+Shift+R elsewhere. Bound without a key context, so they work from a
+/// text field too; no field binds them.
+#[cfg(target_os = "macos")]
+const REFRESH_KEYS: (&str, &str) = ("cmd-r", "cmd-shift-r");
+#[cfg(not(target_os = "macos"))]
+const REFRESH_KEYS: (&str, &str) = ("ctrl-r", "ctrl-shift-r");
+
 const ABOUT_DESCRIPTION: &str = "Review GitHub pull requests next to your Linear issues.";
 
 /// Binds every shortcut in `actions`, sets the menu bar (Loupe: About,
 /// Settings Cmd+,, Quit Cmd+Q; Edit: undo/redo/cut/copy/paste/select all as
-/// OS actions; View: Zoom In Cmd+=, Zoom Out Cmd+-, Actual Size Cmd+0;
+/// OS actions; View: Refresh Cmd+R, Refresh All Tabs Cmd+Shift+R, Zoom In
+/// Cmd+=, Zoom Out Cmd+-, Actual Size Cmd+0;
 /// Window: tabs, the four splits, Close Window Cmd+Shift+W, Minimize Cmd+M),
 /// handles `About`, `Quit`, `CloseWindow`, `Minimize` and the zoom actions,
 /// and quits when the last window closes.
@@ -69,6 +78,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-k", OpenPalette, None),
         KeyBinding::new("cmd-shift-a", SearchTabs, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new(REFRESH_KEYS.0, RefreshPage, None),
+        KeyBinding::new(REFRESH_KEYS.1, RefreshAllTabs, None),
         KeyBinding::new("pagedown", ScrollPageDown, Some("Workspace")),
         KeyBinding::new("pageup", ScrollPageUp, Some("Workspace")),
         KeyBinding::new("cmd-q", Quit, None),
@@ -182,6 +193,9 @@ fn set_menus(cx: &mut App) {
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Refresh", RefreshPage),
+            MenuItem::action("Refresh All Tabs", RefreshAllTabs),
+            MenuItem::separator(),
             MenuItem::action("Zoom In", ZoomIn),
             MenuItem::action("Zoom Out", ZoomOut),
             MenuItem::action("Actual Size", ResetZoom),

@@ -19,12 +19,30 @@ mod widgets;
 use gpui_kit::{AnyView, App, SharedString, Task, Window};
 use loupe_github::{PrRef, RepoRef, Verdict};
 
-use crate::shell::PaletteItem;
+use crate::shell::{PaletteItem, refresh_as};
 
 pub use self::inbox::{
     ClearReviewsSelection, CloseStack, OpenReviewsFilter, OpenStack, SelectTabRows, start_bells,
     start_group_sync,
 };
+
+/// Runs page `view`'s Refresh when it is a GitHub page with one; false
+/// otherwise.
+pub fn refresh(view: &AnyView, cx: &mut App) -> bool {
+    refresh_as::<inbox::InboxView>(view, cx)
+        || refresh_as::<notifications::NotificationsView>(view, cx)
+        || refresh_as::<repo::RepoView>(view, cx)
+        || actions::refresh(view, cx)
+        || pull_request::refresh(view, cx)
+}
+
+/// How long since the Reviews page `view` last started a reload; `None` for
+/// another page.
+#[cfg(test)]
+pub(crate) fn reviews_since_reload(view: &AnyView, cx: &App) -> Option<std::time::Duration> {
+    let inbox = view.clone().downcast::<inbox::InboxView>().ok()?;
+    Some(inbox.read(cx).since_reload())
+}
 
 pub fn inbox_view(window: &mut Window, cx: &mut App) -> AnyView {
     inbox::view(window, cx)

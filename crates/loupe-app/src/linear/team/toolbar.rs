@@ -26,6 +26,7 @@ use crate::linear::data::Loadable;
 use crate::linear::views_store::{self, Kind};
 use crate::linear::widgets;
 use crate::shell::OpenOnClick as _;
+use crate::shell::Refreshable as _;
 use crate::theme::scale::dp;
 use crate::ui;
 use crate::ui::MenuTriggerExt as _;
@@ -229,7 +230,7 @@ impl TeamView {
             .icon(IconName::RefreshCw)
             .tooltip("Refresh")
             .accessibility_label("Refresh")
-            .on_click(cx.listener(|this, _, _, cx| this.reload_all(cx)));
+            .on_click(cx.listener(|this, _, _, cx| this.refresh_page(cx)));
         let new_issue = Button::new("team-new-issue")
             .ghost()
             .small()

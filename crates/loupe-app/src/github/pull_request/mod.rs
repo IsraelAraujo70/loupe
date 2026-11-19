@@ -17,6 +17,10 @@ pub fn view(pr: PrRef, window: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|cx| PullRequestView::new(pr, window, cx)).into()
 }
 
+pub(in crate::github) fn refresh(view: &AnyView, cx: &mut App) -> bool {
+    crate::shell::refresh_as::<PullRequestView>(view, cx)
+}
+
 /// The pull request the page `view` shows, once loaded (from the cache or
 /// GitHub). `None` when `view` is not a pull request page or has nothing yet.
 pub fn loaded_detail<'a>(view: &AnyView, cx: &'a App) -> Option<&'a PullRequestDetail> {

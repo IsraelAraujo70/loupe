@@ -21,6 +21,11 @@ pub(super) use crate::github::pull_request::checks::{format_duration, status_sty
 /// How often a run or a list with a run in progress reloads.
 const POLL_EVERY: Duration = Duration::from_secs(5);
 
+pub(super) fn refresh(view: &AnyView, cx: &mut App) -> bool {
+    crate::shell::refresh_as::<runs::RunsView>(view, cx)
+        || crate::shell::refresh_as::<run::RunView>(view, cx)
+}
+
 pub fn runs_view(
     repo: RepoRef,
     branch: Option<String>,
