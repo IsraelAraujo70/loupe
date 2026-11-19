@@ -251,6 +251,10 @@ impl PullRequestView {
         view
     }
 
+    pub(in crate::github::pull_request) fn loaded_detail(&self) -> Option<&PullRequestDetail> {
+        self.detail.value().map(|detail| detail.as_ref())
+    }
+
     /// Loads the pull request again, keeping the stale one on screen. A failed
     /// refresh keeps the stale data and reports in the toolbar.
     fn reload(&mut self, cx: &mut Context<Self>) {

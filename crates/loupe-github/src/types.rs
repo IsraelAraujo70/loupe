@@ -416,10 +416,41 @@ pub struct PullRequestDetail {
     pub pending_review: Option<PendingReview>,
     pub viewer_login: String,
     pub viewer_can_update: bool,
+    /// The viewer's latest review when it approves or asks for changes.
+    /// Defaulted so details cached before this field still load.
+    #[serde(default)]
+    pub viewer_review: Option<ViewerReview>,
     /// The stack this pull request is part of; `None` outside a stack.
     /// Defaulted so details cached before this field still load.
     #[serde(default)]
     pub stack: Option<crate::PrStack>,
+}
+
+impl PullRequestDetail {
+    /// The viewer's approval or change request while it still covers the
+    /// pull request: `None` once a commit lands after it, since that code is
+    /// not reviewed yet.
+    pub fn standing_verdict(&self) -> Option<Verdict> {
+        self.viewer_review
+            .as_ref()
+            .filter(|review| review.commit_oid == self.head_oid)
+            .map(|review| review.verdict)
+    }
+}
+
+/// What a review decided about a pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Verdict {
+    Approved,
+    ChangesRequested,
+}
+
+/// A review that approved or asked for changes, and the head commit it was
+/// given on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewerReview {
+    pub verdict: Verdict,
+    pub commit_oid: String,
 }
 
 /// One edit of a pull request's description.

@@ -25,11 +25,16 @@
 //! Pinned tabs ("Pin tab" in a tab's right-click menu) come first, narrower,
 //! with their icon and a short name and no close button; the whole name is
 //! their tooltip. They are never in a group: adding one to a group unpins it.
+//!
+//! A pull request's tab reads `#592 repo`: a narrow tab cuts the repository,
+//! never the number, so a row of tabs from one repository stays readable.
+//! Its tooltip names `owner/repo#592` and the title, and a small mark shows
+//! your approval or change request until a commit lands after it.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -43,6 +48,7 @@ use crate::store::{ClosedTabGroup, TabGroupColor};
 use crate::theme::scale::dp;
 use crate::theme::tokens;
 use crate::ui::{self, WindowDragArea as _};
+use loupe_github::Verdict;
 
 /// Height of the top bar; the traffic lights are centered in it.
 pub(crate) const TOP_BAR_HEIGHT: Pixels = px(40.);
@@ -69,6 +75,62 @@ pub(super) fn page_label(page: &Page<AnyView>, cx: &App) -> SharedString {
     .unwrap_or_else(|| page.route.label().into())
 }
 
+/// What a pull request's tab shows beyond its route's label: the number and
+/// the repository apart, the tooltip, and your standing verdict. The title
+/// and the verdict come from what the page loaded, so they wait for it.
+struct PrTabTitle {
+    number: SharedString,
+    repo: SharedString,
+    full_name: SharedString,
+    title: Option<SharedString>,
+    verdict: Option<Verdict>,
+}
+
+fn pr_tab_title(page: &Page<AnyView>, cx: &App) -> Option<PrTabTitle> {
+    let Route::PullRequest(pr) = &page.route else {
+        return None;
+    };
+    let loaded = crate::github::pull_request_tab(&page.view, cx);
+    Some(PrTabTitle {
+        number: format!("#{}", pr.number).into(),
+        repo: pr.repo.name.clone().into(),
+        full_name: pr.to_string().into(),
+        title: loaded.as_ref().map(|loaded| loaded.title.clone()),
+        verdict: loaded.and_then(|loaded| loaded.verdict),
+    })
+}
+
+/// The icon, color, and words of the mark for your `verdict` on a pull
+/// request.
+fn verdict_mark(verdict: Verdict) -> (IconName, Hsla, &'static str) {
+    match verdict {
+        Verdict::Approved => (IconName::CircleCheck, tokens::open(), "you approved"),
+        Verdict::ChangesRequested => (IconName::CircleX, tokens::closed(), "you requested changes"),
+    }
+}
+
+/// A pull request tab's name: its number, which is never cut, then its
+/// repository, which is cut when the tab is narrow.
+fn pr_tab_name(id: u64, number: SharedString, repo: SharedString) -> Div {
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_1()
+        .child(
+            div()
+                .debug_selector(move || format!("tab-{id}-number"))
+                .flex_none()
+                .child(number),
+        )
+        .child(
+            div()
+                .debug_selector(move || format!("tab-{id}-repo"))
+                .min_w_0()
+                .truncate()
+                .child(repo),
+        )
+}
+
 /// The icon a tab showing `route` has.
 pub(super) fn route_icon(route: &Route) -> IconName {
     match route {
@@ -83,6 +145,16 @@ pub(super) fn route_icon(route: &Route) -> IconName {
         Route::LinearViews { .. } => IconName::Layers,
         Route::LinearIssue { .. } => IconName::CircleDot,
         Route::Settings => IconName::Settings,
+    }
+}
+
+/// What the palette's tab search calls a tab: its title, then a pull
+/// request's own title, so either finds it.
+pub(super) fn palette_label(page: &Page<AnyView>, cx: &App) -> String {
+    let label = page_label(page, cx);
+    match pr_tab_title(page, cx).and_then(|pr| pr.title) {
+        Some(title) => format!("{label} · {title}"),
+        None => label.into(),
     }
 }
 
@@ -499,6 +571,14 @@ fn tabs(
         let element = {
             let route = &tab.current().route;
             let label = page_label(tab.current(), cx);
+            let pr_title = pr_tab_title(tab.current(), cx);
+            let mark = pr_title
+                .as_ref()
+                .and_then(|pr| pr.verdict)
+                .map(verdict_mark);
+            let tooltip = pr_title
+                .as_ref()
+                .map(|pr| (pr.full_name.clone(), pr.title.clone()));
             let icon = route_icon(route);
             let selected = index == active;
             let pinned = tab.pinned;
@@ -556,19 +636,38 @@ fn tabs(
                 .debug_selector(|| format!("tab-{id}"))
                 .group(group.clone())
                 .role(Role::Tab)
-                .aria_label(if pinned {
-                    format!("{label}, pinned").into()
-                } else {
-                    label.clone()
+                .aria_label({
+                    let mut name = label.to_string();
+                    if let Some((_, _, words)) = mark {
+                        name.push_str(", ");
+                        name.push_str(words);
+                    }
+                    if pinned {
+                        name.push_str(", pinned");
+                    }
+                    SharedString::from(name)
                 })
                 .aria_selected(selected)
                 .relative()
                 .h(px(28.))
-                .when(pinned, |tab| {
+                .when(pinned && tooltip.is_none(), |tab| {
                     let label = label.clone();
-                    tab.flex_none()
-                        .max_w(dp(PINNED_TAB_MAX_WIDTH))
-                        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                    tab.tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                })
+                .when_some(tooltip, |tab, (full_name, title)| {
+                    tab.tooltip(move |window, cx| {
+                        let (full_name, title) = (full_name.clone(), title.clone());
+                        Tooltip::element(move |_, _| {
+                            v_flex()
+                                .max_w(px(360.))
+                                .child(full_name.clone())
+                                .children(title.clone())
+                        })
+                        .build(window, cx)
+                    })
+                })
+                .when(pinned, |tab| {
+                    tab.flex_none().max_w(dp(PINNED_TAB_MAX_WIDTH))
                 })
                 .when(!pinned, |tab| {
                     tab.min_w(dp(TAB_MIN_WIDTH))
@@ -622,13 +721,20 @@ fn tabs(
                 ))
                 .child({
                     let text = shown_label.clone();
-                    div()
-                        .debug_selector(move || format!("tab-{id}-label:{text}"))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(shown_label)
+                    match pr_title {
+                        Some(pr) => pr_tab_name(id, pr.number, pr.repo),
+                        None => div().flex_1().min_w_0().truncate().child(shown_label),
+                    }
+                    .debug_selector(move || format!("tab-{id}-label:{text}"))
                 })
+                .children(mark.map(|(icon, color, _)| {
+                    svg()
+                        .debug_selector(move || format!("tab-{id}-mark"))
+                        .path(icon.path())
+                        .flex_none()
+                        .size_3()
+                        .text_color(color)
+                }))
                 .when(!pinned, |tab| {
                     tab.child(
                         div()
@@ -1009,4 +1115,60 @@ pub(super) fn pane_strip(
         .border_color(tokens::border_subtle())
         .child(list)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{
+        App, AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _,
+        TestAppContext, VisualTestContext, Window, div, px,
+    };
+
+    use super::pr_tab_name;
+
+    /// The same pull request's name in a tab with room to spare (tab 1) and
+    /// in one far too narrow for it (tab 2).
+    struct Harness;
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let name = |id| pr_tab_name(id, "#592".into(), "a-very-long-repository-name".into());
+            div()
+                .child(div().flex().w(px(600.)).child(name(1)))
+                .child(div().flex().w(px(64.)).child(name(2)))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_narrow_tab_cuts_the_repository_never_the_number(cx: &mut TestAppContext) {
+        let (handle, _) = cx.update(|cx: &mut App| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            gpui_kit::open_window(Default::default(), cx, |_, cx| cx.new(|_| Harness))
+                .expect("open a window")
+        });
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let width = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.debug_bounds(selector).expect(selector).size.width
+        };
+        let number = width(cx, "tab-1-number");
+        let repo = width(cx, "tab-1-repo");
+        assert!(
+            number > px(0.) && repo > number,
+            "the whole name fits in the wide tab"
+        );
+        assert_eq!(
+            width(cx, "tab-2-number"),
+            number,
+            "the narrow tab keeps the whole number"
+        );
+        assert!(
+            width(cx, "tab-2-repo") < repo,
+            "the narrow tab cuts the repository"
+        );
+    }
 }

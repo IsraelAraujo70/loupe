@@ -530,7 +530,7 @@ impl Workspace {
     /// Every open tab, titled as its tab shows it, for the palette.
     fn open_tabs(&self, cx: &App) -> Vec<panes::OpenTab> {
         self.panes
-            .open_tabs(|page| tab_bar::page_label(page, cx).into())
+            .open_tabs(|page| tab_bar::palette_label(page, cx))
     }
 
     fn page(&self, route: Route, window: &mut Window, cx: &mut Context<Self>) -> Page<AnyView> {
