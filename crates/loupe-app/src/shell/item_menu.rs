@@ -458,12 +458,7 @@ pub fn run(command: Command, item: &Item, window: &mut Window, cx: &mut App) {
                 super::palette::open_picker((**issue).clone(), field, window, cx);
             }
         }
-        Command::CopyLink => copy(
-            item.link().to_owned(),
-            format!("Copied the link to {}", item.reference()),
-            window,
-            cx,
-        ),
+        Command::CopyLink => copy_link(item.link(), &item.reference(), window, cx),
         Command::CopyId => {
             if let Item::Issue(issue) = item {
                 copy(
@@ -488,6 +483,16 @@ pub fn run(command: Command, item: &Item, window: &mut Window, cx: &mut App) {
             }
         }
     }
+}
+
+/// Copies `link`, the address of what `reference` names, and says so.
+pub fn copy_link(link: &str, reference: &str, window: &mut Window, cx: &mut App) {
+    copy(
+        link.to_owned(),
+        format!("Copied the link to {reference}"),
+        window,
+        cx,
+    );
 }
 
 fn copy(text: String, note: String, window: &mut Window, cx: &mut App) {
