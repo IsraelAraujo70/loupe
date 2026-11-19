@@ -467,6 +467,7 @@ impl Workspace {
         });
         let sidebar = cx.new(sidebar::SidebarData::new);
         crate::github::start_group_sync(window, cx);
+        crate::github::start_bells(cx);
         let subscriptions = vec![
             // The focused element can leave the tree while its handle lives
             // on (a resolved thread's reply box, a sent composer, a closed

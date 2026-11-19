@@ -183,6 +183,8 @@ pub struct Settings {
     /// The Inbox's filter, one token per term (`org:x`, `repo:x`, or a
     /// word), as `github::notification_filter` reads it.
     pub notification_filter: Vec<String>,
+    /// Silences the system notifications of the Reviews views' bells.
+    pub mute_view_notifications: bool,
     /// The organization id of the Linear workspace the sidebar, the views,
     /// and My issues show; `None` picks the first connected one.
     pub linear_workspace: Option<String>,

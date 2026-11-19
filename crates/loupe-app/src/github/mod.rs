@@ -22,7 +22,7 @@ use loupe_github::{PrRef, RepoRef, Verdict};
 use crate::shell::{PaletteItem, refresh_as};
 
 pub use self::inbox::{
-    ClearReviewsSelection, CloseStack, OpenReviewsFilter, OpenStack, SelectTabRows,
+    ClearReviewsSelection, CloseStack, OpenReviewsFilter, OpenStack, SelectTabRows, start_bells,
     start_group_sync,
 };
 

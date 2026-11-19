@@ -738,6 +738,10 @@ pub struct SavedView {
     /// The groups folded in every tab.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed: Vec<ReviewGroup>,
+    /// The bell: whether a pull request that comes into the view raises a
+    /// system notification. Off until the user turns it on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notify: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -788,6 +792,7 @@ impl ViewsFile {
             sort: None,
             tab: None,
             collapsed: Vec::new(),
+            notify: false,
             created_at: now,
             updated_at: now,
         });
@@ -826,6 +831,11 @@ impl ViewsFile {
         now: DateTime<Utc>,
     ) -> bool {
         self.edit(id, now, |view| view.collapsed = collapsed)
+    }
+
+    /// Turns the view's bell on or off; whether the view exists.
+    pub fn set_notify(&mut self, id: &str, on: bool, now: DateTime<Utc>) -> bool {
+        self.edit(id, now, |view| view.notify = on)
     }
 
     pub fn delete(&mut self, id: &str) -> bool {
@@ -1388,6 +1398,19 @@ mod tests {
         let file: ViewsFile = serde_json::from_str(json).unwrap();
         assert_eq!(file.views[0].tab, None);
         assert!(file.views[0].collapsed.is_empty());
+        assert!(!file.views[0].notify, "the bell starts off");
+    }
+
+    #[test]
+    fn the_bell_is_saved_with_the_view() {
+        let now = Utc::now();
+        let mut file = ViewsFile::default();
+        let id = file.create("Loupe", Vec::new(), now);
+        assert!(!file.get(&id).unwrap().notify, "a new view's bell is off");
+        assert!(file.set_notify(&id, true, now));
+        let read: ViewsFile = serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert!(read.get(&id).unwrap().notify);
+        assert!(!file.set_notify("rv_gone", true, now));
     }
 
     #[test]

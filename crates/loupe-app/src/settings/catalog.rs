@@ -98,6 +98,7 @@ impl Section {
             Section::General => {
                 settings.sidebar_collapsed = defaults.sidebar_collapsed;
                 settings.notification_filter = defaults.notification_filter;
+                settings.mute_view_notifications = defaults.mute_view_notifications;
             }
             Section::Appearance => {
                 settings.zoom = defaults.zoom;
@@ -129,6 +130,7 @@ impl Section {
 pub enum Item {
     SidebarIcons,
     InboxFilter,
+    MuteNotifications,
     ColorScheme,
     Themes,
     Contrast,
@@ -211,6 +213,14 @@ pub fn entries() -> Vec<Entry> {
             "Inbox filter",
             "The org:, repo:, and words the Inbox shows. Type them in the Inbox.",
             "notifications org repo",
+        ),
+        entry(
+            MuteNotifications,
+            S::General,
+            "",
+            "Mute notifications",
+            "Silence the notifications of views with the bell on. Their tabs still count what is new.",
+            "bell alerts silence quiet views new pull requests",
         ),
         entry(
             ColorScheme,

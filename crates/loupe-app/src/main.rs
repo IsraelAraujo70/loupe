@@ -36,6 +36,8 @@ fn main() {
     });
     app.run(move |cx: &mut App| {
         gpui_kit::init(cx);
+        // Names the app in system notifications (the views' bells).
+        cx.set_app_identity(desktop::APP_ID, "Loupe");
         theme::init(cx);
         shell::http::install(cx);
         shell::menus::init(cx);
