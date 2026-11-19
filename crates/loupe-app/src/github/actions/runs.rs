@@ -9,6 +9,7 @@ use gpui_kit::*;
 use loupe_github::{RepoRef, WorkflowRun};
 
 use super::{POLL_EVERY, branch_chip, status_style, status_word};
+use crate::shell::Refreshable as _;
 use crate::github::common::{self, Loadable};
 use crate::route::Route;
 use crate::shell::{OpenOnClick as _, navigate};
@@ -96,7 +97,7 @@ impl RunsView {
             .action(
                 ui::icon_button("runs-refresh", IconName::RefreshCw, "Refresh")
                     .loading(busy)
-                    .on_click(cx.listener(|view, _, _, cx| view.reload(cx))),
+                    .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx))),
             )
     }
 
@@ -285,6 +286,14 @@ impl RunsView {
                     .text_color(theme.muted_foreground)
                     .child(ui::relative_time(run.created_at, now)),
             )
+    }
+}
+
+impl crate::shell::Refreshable for RunsView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        if !self.runs.is_busy() {
+            self.reload(cx);
+        }
     }
 }
 

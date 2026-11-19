@@ -853,6 +853,12 @@ impl PullRequestView {
     }
 }
 
+impl crate::shell::Refreshable for PullRequestView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        self.reload(cx);
+    }
+}
+
 impl Render for PullRequestView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The palette and the item keys act on the pull request on screen.

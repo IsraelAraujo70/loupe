@@ -23,6 +23,7 @@ use self::model::Field;
 use super::data::{self, Loadable};
 use super::team::{self, TeamView};
 use super::widgets;
+use crate::shell::Refreshable as _;
 use crate::route::Route;
 use crate::shell::svg_icon;
 use crate::theme::scale::{self, dp};
@@ -53,7 +54,7 @@ struct OpenPicker {
     cursor: usize,
 }
 
-struct ProjectView {
+pub(super) struct ProjectView {
     id: String,
     name: SharedString,
     /// The client the loads below belong to; a different client restarts them.
@@ -437,7 +438,7 @@ impl ProjectView {
             .icon(IconName::RefreshCw)
             .tooltip("Refresh")
             .accessibility_label("Refresh")
-            .on_click(cx.listener(|view, _, _, cx| view.refresh(cx)));
+            .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx)));
         let mut header = ui::page_header(self.name.clone())
             .prefix(crumb)
             .after_title(tabs);
@@ -468,6 +469,12 @@ impl ProjectView {
             header = header.action(refresh);
         }
         header.into_any_element()
+    }
+}
+
+impl crate::shell::Refreshable for ProjectView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
     }
 }
 

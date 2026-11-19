@@ -8,7 +8,7 @@ use crate::shell::actions::{
     ActivateLastTab, ActivateTab1, CloseTab, CloseWindow, ComposeIssue, CopyItemBranch, CopyItemId,
     CopyItemLink, FocusSettingsSearch, GoBack, GoForward, Minimize, NewTab, NextTab,
     OpenItemInNewTab, OpenItemSideBySide, OpenPalette, OpenSelected, OpenSettings,
-    PaletteOpenInNewTab, PreviousTab, Quit, ResetZoom, ScrollPageDown, ScrollPageUp, SearchTabs,
+    PaletteOpenInNewTab, PreviousTab, Quit, RefreshAllTabs, RefreshPage, ResetZoom, ScrollPageDown, ScrollPageUp, SearchTabs,
     SelectNext, SelectPrevious, SwitchWorkspace, ToggleSidebar, ZoomIn, ZoomOut,
 };
 
@@ -51,6 +51,8 @@ pub const SHORTCUTS: &[Shortcut] = &[
     }),
     shortcut("Tabs", "Last tab", || Box::new(ActivateLastTab)),
     shortcut("Tabs", "Search the open tabs", || Box::new(SearchTabs)),
+    shortcut("Tabs", "Refresh the open page", || Box::new(RefreshPage)),
+    shortcut("Tabs", "Refresh every open tab", || Box::new(RefreshAllTabs)),
     shortcut("Lists", "Next row", || Box::new(SelectNext)),
     shortcut("Lists", "Previous row", || Box::new(SelectPrevious)),
     shortcut("Lists", "Open the row", || Box::new(OpenSelected)),

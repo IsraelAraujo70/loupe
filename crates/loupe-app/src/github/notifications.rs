@@ -19,6 +19,7 @@ use loupe_github::{
 
 use super::common::{self, Loadable, Submit};
 use super::notification_filter::{self as filter, Term};
+use crate::shell::Refreshable as _;
 use crate::route::Route;
 use crate::shell::OpenOnClick as _;
 use crate::shell::item_menu::{Item, PrItem, with_item_menu};
@@ -561,7 +562,7 @@ impl NotificationsView {
                 ui::icon_button("refresh", IconName::RefreshCw, "Refresh")
                     .loading(busy)
                     .disabled(busy)
-                    .on_click(cx.listener(|view, _, _, cx| view.reload(cx))),
+                    .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx))),
             )
     }
 
@@ -1089,6 +1090,14 @@ impl NotificationsView {
         match item {
             Some(item) => with_item_menu(row, item).into_any_element(),
             None => row.into_any_element(),
+        }
+    }
+}
+
+impl crate::shell::Refreshable for NotificationsView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        if !self.list.is_busy() {
+            self.reload(cx);
         }
     }
 }

@@ -3,6 +3,14 @@ use gpui_kit::{AnyView, App, Window};
 use crate::route::Route;
 use crate::{github, linear, settings};
 
+/// Runs page `view`'s Refresh, as its button does. Nothing on a page
+/// without one (Settings, an issue).
+pub fn refresh(view: &AnyView, cx: &mut App) {
+    if !github::refresh(view, cx) {
+        linear::refresh(view, cx);
+    }
+}
+
 /// Builds the view a route shows. Each arm calls the front that owns it.
 pub fn build(route: &Route, window: &mut Window, cx: &mut App) -> AnyView {
     match route.clone() {

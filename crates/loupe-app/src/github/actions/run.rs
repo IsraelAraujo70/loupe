@@ -27,6 +27,7 @@ use super::log::JobPane;
 use super::{
     POLL_EVERY, branch_chip, format_duration, job_duration_label, status_style, status_word,
 };
+use crate::shell::Refreshable as _;
 use crate::github::common::{self, Loadable, Submit};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
@@ -465,7 +466,7 @@ impl RunView {
             .action(
                 ui::icon_button("run-refresh", IconName::RefreshCw, "Refresh")
                     .loading(busy)
-                    .on_click(cx.listener(|view, _, _, cx| view.reload(cx))),
+                    .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx))),
             )
             .into_any_element()
     }
@@ -873,6 +874,14 @@ impl RunView {
                     .children(self.annotations(cx))
                     .child(self.artifacts(cx)),
             )
+    }
+}
+
+impl crate::shell::Refreshable for RunView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        if !self.run.is_busy() {
+            self.reload(cx);
+        }
     }
 }
 

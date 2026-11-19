@@ -22,6 +22,7 @@ use loupe_linear::{IssueSummary, Team};
 
 use super::filter::{self, DATE_PRESETS, FieldOption};
 use super::{TeamView, dialogs};
+use crate::shell::Refreshable as _;
 use crate::linear::data::Loadable;
 use crate::linear::views_store::{self, Kind};
 use crate::linear::widgets;
@@ -229,7 +230,7 @@ impl TeamView {
             .icon(IconName::RefreshCw)
             .tooltip("Refresh")
             .accessibility_label("Refresh")
-            .on_click(cx.listener(|this, _, _, cx| this.reload_all(cx)));
+            .on_click(cx.listener(|this, _, _, cx| this.refresh_page(cx)));
         let new_issue = Button::new("team-new-issue")
             .ghost()
             .small()

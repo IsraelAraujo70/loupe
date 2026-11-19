@@ -19,6 +19,7 @@ use super::model::{
     stack_entry_problems, stack_merge, stack_merge_confirm_text,
 };
 use super::{PullRequestView, Write};
+use crate::shell::Refreshable as _;
 use crate::github::widgets;
 use crate::theme::{scale, tokens};
 use crate::ui;
@@ -222,7 +223,7 @@ impl PullRequestView {
                         PopupMenuItem::new("Refresh")
                             .icon(IconName::RefreshCw)
                             .on_click(move |_, _, cx| {
-                                this.update(cx, |this, cx| this.reload(cx)).ok();
+                                this.update(cx, |this, cx| this.refresh_page(cx)).ok();
                             }),
                     )
                 };

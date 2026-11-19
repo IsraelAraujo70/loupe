@@ -16,6 +16,7 @@ use gpui_kit::*;
 use loupe_linear::TeamSummary;
 use loupe_linear::views::View;
 
+use crate::shell::Refreshable as _;
 use crate::linear::data::{self, Loadable};
 use crate::linear::views_store::{self, Kind};
 use crate::linear::{remote_views, widgets};
@@ -48,7 +49,7 @@ pub fn view(team_id: Option<String>, _window: &mut Window, cx: &mut App) -> AnyV
     .into()
 }
 
-struct ViewsListView {
+pub(super) struct ViewsListView {
     /// `None`: every team's views.
     team_id: Option<String>,
     client: Option<Arc<loupe_linear::Linear>>,
@@ -375,6 +376,14 @@ fn confirm_delete(
     });
 }
 
+impl crate::shell::Refreshable for ViewsListView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        if !cx.global::<remote_views::RemoteViews>().loading {
+            remote_views::retry(cx);
+        }
+    }
+}
+
 impl Render for ViewsListView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !data::same_client(&self.client, &data::client(cx)) {
@@ -404,7 +413,7 @@ impl Render for ViewsListView {
                     "Refresh Linear views",
                 )
                 .disabled(loading)
-                .on_click(|_, _, cx| remote_views::retry(cx)),
+                .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx))),
             );
 
         let mut rows: Vec<AnyElement> = Vec::new();

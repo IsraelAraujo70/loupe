@@ -1090,6 +1090,12 @@ impl TeamView {
     }
 }
 
+impl crate::shell::Refreshable for TeamView {
+    fn refresh_page(&mut self, cx: &mut Context<Self>) {
+        self.reload_all(cx);
+    }
+}
+
 impl Render for TeamView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if crate::shell::page_may_take_focus(window, cx) {
