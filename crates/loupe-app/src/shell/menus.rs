@@ -11,9 +11,9 @@ use crate::shell::actions::{
     ActivateTab6, ActivateTab7, ActivateTab8, CloseTab, CloseWindow, ComposeIssue, CopyItemBranch,
     CopyItemId, CopyItemLink, FocusSettingsSearch, GoBack, GoForward, Minimize, NewTab, NextTab,
     OpenItemInNewTab, OpenItemSideBySide, OpenPalette, OpenSelected, OpenSettings,
-    PaletteOpenInNewTab, PreviousTab, Quit, RefreshAllTabs, RefreshPage, ResetZoom, ScrollPageDown, ScrollPageUp, SearchTabs,
-    SelectNext, SelectPrevious, SplitDown, SplitLeft, SplitRight, SplitUp, SwitchWorkspace,
-    ToggleSidebar, ZoomIn, ZoomOut,
+    PaletteOpenInNewTab, PreviousTab, Quit, RefreshAllTabs, RefreshPage, ResetZoom, ScrollPageDown,
+    ScrollPageUp, SearchTabs, SelectNext, SelectPrevious, SplitDown, SplitLeft, SplitRight,
+    SplitUp, SwitchWorkspace, ToggleSidebar, ZoomIn, ZoomOut,
 };
 use crate::shell::navigate;
 use crate::store::{Settings, update_settings};

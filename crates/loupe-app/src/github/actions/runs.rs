@@ -9,9 +9,9 @@ use gpui_kit::*;
 use loupe_github::{RepoRef, WorkflowRun};
 
 use super::{POLL_EVERY, branch_chip, status_style, status_word};
-use crate::shell::Refreshable as _;
 use crate::github::common::{self, Loadable};
 use crate::route::Route;
+use crate::shell::Refreshable as _;
 use crate::shell::{OpenOnClick as _, navigate};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};

@@ -3060,8 +3060,8 @@ mod tests {
             cx.update(|_, cx| {
                 all.iter()
                     .map(|page| {
-                        let since = crate::github::reviews_since_reload(page, cx)
-                            .expect("a Reviews page");
+                        let since =
+                            crate::github::reviews_since_reload(page, cx).expect("a Reviews page");
                         since <= pressed.elapsed()
                     })
                     .collect::<Vec<_>>()

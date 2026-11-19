@@ -19,9 +19,9 @@ use loupe_github::{
 
 use super::common::{self, Loadable, Submit};
 use super::notification_filter::{self as filter, Term};
-use crate::shell::Refreshable as _;
 use crate::route::Route;
 use crate::shell::OpenOnClick as _;
+use crate::shell::Refreshable as _;
 use crate::shell::item_menu::{Item, PrItem, with_item_menu};
 use crate::store::{Settings, update_settings};
 use crate::theme::scale::dp;

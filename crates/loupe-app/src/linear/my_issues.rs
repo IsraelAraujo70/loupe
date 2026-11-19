@@ -13,12 +13,12 @@ use gpui_kit::*;
 use loupe_linear::views::ViewConfig;
 use loupe_linear::{IssueSummary, Linear, StateType, TeamSummary};
 
-use crate::shell::Refreshable as _;
 use crate::linear::data::{self, Loadable};
 use crate::linear::widgets;
 use crate::route::Route;
 use crate::services::background;
 use crate::shell::OpenOnClick as _;
+use crate::shell::Refreshable as _;
 use crate::shell::item_menu::{Item, with_item_menu};
 use crate::shell::navigate;
 use crate::theme::scale;

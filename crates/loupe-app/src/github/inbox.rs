@@ -50,8 +50,8 @@ use super::pr_row::{
     AgeFrom, Lanes, OnSelect, OnSort, ROW_GROUP, RowSelect, SelectGesture, StackPlace, StackRow,
     pr_row, select_box, stack_row,
 };
-use crate::shell::Refreshable as _;
 use crate::route::Route;
+use crate::shell::Refreshable as _;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::shell::{self, GroupTarget, PaneGroup};
 use crate::store::ViewSync;

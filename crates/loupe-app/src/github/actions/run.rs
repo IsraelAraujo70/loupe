@@ -27,8 +27,8 @@ use super::log::JobPane;
 use super::{
     POLL_EVERY, branch_chip, format_duration, job_duration_label, status_style, status_word,
 };
-use crate::shell::Refreshable as _;
 use crate::github::common::{self, Loadable, Submit};
+use crate::shell::Refreshable as _;
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui::{self, ControlSize as _, MenuTriggerExt as _};

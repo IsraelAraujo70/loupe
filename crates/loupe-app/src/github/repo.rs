@@ -14,8 +14,8 @@ use loupe_github::{Page, PrListFilter, PrSummary, RepoRef, RepoSummary};
 
 use super::common::{self, LoadError, Loadable};
 use super::pr_row::{AgeFrom, Lanes, pr_row};
-use crate::shell::Refreshable as _;
 use crate::route::Route;
+use crate::shell::Refreshable as _;
 use crate::shell::navigate;
 use crate::store::{Settings, update_settings};
 use crate::theme::scale;

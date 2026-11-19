@@ -22,11 +22,11 @@ use loupe_linear::{IssueSummary, Team};
 
 use super::filter::{self, DATE_PRESETS, FieldOption};
 use super::{TeamView, dialogs};
-use crate::shell::Refreshable as _;
 use crate::linear::data::Loadable;
 use crate::linear::views_store::{self, Kind};
 use crate::linear::widgets;
 use crate::shell::OpenOnClick as _;
+use crate::shell::Refreshable as _;
 use crate::theme::scale::dp;
 use crate::ui;
 use crate::ui::MenuTriggerExt as _;

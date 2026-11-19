@@ -16,12 +16,12 @@ use gpui_kit::*;
 use loupe_linear::TeamSummary;
 use loupe_linear::views::View;
 
-use crate::shell::Refreshable as _;
 use crate::linear::data::{self, Loadable};
 use crate::linear::views_store::{self, Kind};
 use crate::linear::{remote_views, widgets};
 use crate::route::Route;
 use crate::shell::OpenOnClick as _;
+use crate::shell::Refreshable as _;
 use crate::store::{self, Favorite, Settings};
 use crate::theme::scale::{self, dp};
 use crate::theme::tokens;
