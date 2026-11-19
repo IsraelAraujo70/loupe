@@ -5,6 +5,7 @@
 //! tab, pull requests group by their next step. Filter clauses (the Linear board's "Add Filter…"
 //! pattern) narrow every tab and can be saved as views.
 
+mod bells;
 mod dialogs;
 mod filter_menu;
 mod group_sync;
@@ -12,6 +13,7 @@ mod selection;
 mod stacks;
 mod views_store;
 
+pub use self::bells::start as start_bells;
 pub use self::group_sync::start as start_group_sync;
 
 use std::collections::{HashMap, HashSet};
@@ -33,8 +35,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::reviews::{
-    self, Clause, Found, NeedsReview, NextStep, Op, ReviewGroup, ReviewTab, Sort, SortDir, SortKey,
-    ViewsFile,
+    self, Clause, Found, NeedsReview, NextStep, Op, ReviewGroup, ReviewTab, SavedView, Sort,
+    SortDir, SortKey, ViewsFile,
 };
 use loupe_github::{
     Changes, ChangesQuery, ChecksState, Inbox, NodeId, Notification as GitHubNotification,
@@ -54,7 +56,7 @@ use crate::route::Route;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::shell::{self, GroupTarget, PaneGroup};
 use crate::store::ViewSync;
-use crate::theme::scale;
+use crate::theme::{scale, tokens};
 use crate::ui;
 use crate::ui::MenuTriggerExt as _;
 
@@ -105,6 +107,25 @@ gpui_kit::actions!(
         CloseStack
     ]
 );
+
+/// How many pull requests a view's bell announced that were not seen yet:
+/// the unread accent, with the count.
+fn unseen_badge(count: usize, cx: &App) -> Div {
+    let theme = cx.theme();
+    h_flex()
+        .flex_none()
+        .ml_1p5()
+        .h(rems(1.125))
+        .min_w(rems(1.125))
+        .px_1p5()
+        .justify_center()
+        .rounded(px(9.))
+        .bg(theme.primary)
+        .text_size(scale::meta())
+        .line_height(rems(1.))
+        .text_color(theme.primary_foreground)
+        .child(count.to_string())
+}
 
 /// The line an empty tab shows when no filter is set.
 fn tab_empty(tab: ReviewTab) -> (IconName, &'static str) {
@@ -910,6 +931,9 @@ impl InboxView {
         if watched && self.marks.see(now) {
             cx.notify();
         }
+        if watched && let Some(id) = self.page.view_id.clone() {
+            bells::see(&id, cx);
+        }
         let all_open_busy = self.all_open_state().is_some_and(Loadable::is_busy);
         if self.inbox.is_busy() || all_open_busy || self._ask.is_some() {
             return;
@@ -1466,6 +1490,9 @@ impl InboxView {
         let same = self.page.view_id.as_deref() == id;
         let display = (self.page.tab, self.page.collapsed.clone());
         self.page.switch(&views, id);
+        if let Some(id) = id {
+            bells::see(id, cx);
+        }
         if same {
             (self.page.tab, self.page.collapsed) = display;
         } else {
@@ -2025,10 +2052,26 @@ impl InboxView {
             .map(|(ix, saved)| {
                 let id = saved.id.clone();
                 let selected = active.as_deref() == Some(saved.id.as_str());
-                ui::view_tab(("reviews-view-tab", ix), saved.name.clone(), selected, cx)
+                let unseen = bells::unseen(&saved.id, cx);
+                let label = match unseen {
+                    0 => format!("View {}", saved.name),
+                    n => format!("View {}, {n} new", saved.name),
+                };
+                let tab = ui::view_tab(("reviews-view-tab", ix), saved.name.clone(), selected, cx)
                     .debug_selector(move || format!("reviews-view-tab-{ix}"))
-                    .accessibility_label(format!("View {}", saved.name))
-                    .on_click(cx.listener(move |this, _, _, cx| this.switch_view(Some(&id), cx)))
+                    .accessibility_label(label)
+                    .when(unseen > 0, |tab| {
+                        tab.child(
+                            unseen_badge(unseen, cx)
+                                .debug_selector(move || format!("reviews-view-unseen-{ix}")),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.switch_view(Some(&id), cx)));
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .child(tab)
+                    .child(self.bell_button(ix, saved, cx))
                     .into_any_element()
             })
             .collect();
@@ -2044,6 +2087,10 @@ impl InboxView {
             .map(|saved| (saved.id.clone(), saved.name.clone()));
         let all_open_on = self.page.all_open_on();
         let has_scope = reviews::all_open_query(&self.page.draft).is_some();
+        let notify_on = active
+            .as_deref()
+            .and_then(|id| views.get(id))
+            .is_some_and(|saved| saved.notify);
         let view_menu = active_view.map(|(id, name)| {
             let view = view.clone();
             ui::icon_button("reviews-view-menu", IconName::Ellipsis, "View actions")
@@ -2065,6 +2112,15 @@ impl InboxView {
                             view.update(cx, |this, cx| this.set_all_open(!all_open_on, cx))
                                 .ok();
                         })
+                    };
+                    let bell = {
+                        let (view, id) = (view.clone(), id.clone());
+                        PopupMenuItem::new("Notify about new pull requests")
+                            .checked(notify_on)
+                            .on_click(move |_, _, cx| {
+                                let error = bells::set(&id, !notify_on, cx).err();
+                                view.update(cx, |this, cx| this.report(error, cx)).ok();
+                            })
                     };
                     let rename = {
                         let (view, id, name) = (view.clone(), id.clone(), name.clone());
@@ -2088,6 +2144,7 @@ impl InboxView {
                     };
                     menu.min_w(px(200.))
                         .item(all_open)
+                        .item(bell)
                         .item(PopupMenuItem::separator())
                         .item(rename)
                         .item(PopupMenuItem::separator())
@@ -2162,6 +2219,31 @@ impl InboxView {
                         })
                     }),
             )
+    }
+
+    /// The bell beside a saved view's tab: on, a pull request that comes
+    /// into the view raises a system notification.
+    fn bell_button(&self, ix: usize, saved: &SavedView, cx: &mut Context<Self>) -> Button {
+        let (on, id) = (saved.notify, saved.id.clone());
+        let (icon, name) = if on {
+            (
+                IconName::BellRing,
+                format!("Stop notifications for {}", saved.name),
+            )
+        } else {
+            (
+                IconName::Bell,
+                format!("Notify about new pull requests in {}", saved.name),
+            )
+        };
+        ui::icon_button(("reviews-view-bell", ix), icon, name)
+            .debug_selector(move || format!("reviews-view-bell-{ix}"))
+            .selected(on)
+            .when(!on, |bell| bell.text_color(tokens::text_faint()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let error = bells::set(&id, !on, cx).err();
+                this.report(error, cx);
+            }))
     }
 
     /// Chips for every clause and Clear, shown only while a filter is set.
@@ -2906,7 +2988,7 @@ mod tests {
         }
     }
 
-    fn page(items: Vec<PrSummary>, total: u32, more: bool) -> Page<PrSummary> {
+    pub(super) fn page(items: Vec<PrSummary>, total: u32, more: bool) -> Page<PrSummary> {
         Page {
             items,
             total_count: total,
@@ -3021,7 +3103,10 @@ mod tests {
     }
 
     /// Where the element with `selector` was last painted.
-    fn bounds(cx: &mut VisualTestContext, selector: &'static str) -> Option<Bounds<Pixels>> {
+    pub(super) fn bounds(
+        cx: &mut VisualTestContext,
+        selector: &'static str,
+    ) -> Option<Bounds<Pixels>> {
         cx.update(|window, cx| {
             window.refresh();
             window.draw(cx).clear(cx);
@@ -3030,7 +3115,7 @@ mod tests {
     }
 
     /// The Reviews screen in a 1280 × 820 window, with no account.
-    fn open(cx: &mut TestAppContext) -> (VisualTestContext, Entity<InboxView>) {
+    pub(super) fn open(cx: &mut TestAppContext) -> (VisualTestContext, Entity<InboxView>) {
         let (handle, view) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::init(cx);
@@ -3054,7 +3139,7 @@ mod tests {
     }
 
     /// Clicks the element with `selector` where it was last painted.
-    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+    pub(super) fn click(cx: &mut VisualTestContext, selector: &'static str) {
         let at = bounds(cx, selector).unwrap_or_else(|| panic!("{selector} is on screen"));
         cx.simulate_click(at.center(), Modifiers::none());
     }

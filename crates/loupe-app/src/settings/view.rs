@@ -301,6 +301,16 @@ impl SettingsView {
                     store::update_settings(cx, |settings| settings.sidebar_collapsed = checked);
                 })
                 .into_any_element()),
+            Item::MuteNotifications => row(Switch::new("mute-notifications")
+                .checked(settings.mute_view_notifications)
+                .accessibility_label(entry.title)
+                .on_click(|checked, _, cx| {
+                    let checked = *checked;
+                    store::update_settings(cx, |settings| {
+                        settings.mute_view_notifications = checked
+                    });
+                })
+                .into_any_element()),
             Item::InboxFilter => {
                 let filter = settings.notification_filter.join(" ");
                 let empty = filter.is_empty();
