@@ -1043,9 +1043,12 @@ impl InboxView {
             .collect();
         if !fresh.is_empty() {
             // The copies of the other views' "All open" miss these changes;
-            // a view opened next loads its own again.
-            self.all_open
-                .retain(|query, _| all_open.as_ref() == Some(query));
+            // a view opened next loads its own again. The view on screen
+            // keeps its copy, even when it changed while the question ran.
+            let current = self.page.all_open_query();
+            self.all_open.retain(|query, _| {
+                all_open.as_ref() == Some(query) || current.as_ref() == Some(query)
+            });
             self.take_in(true, |view| {
                 let InboxView {
                     inbox,
