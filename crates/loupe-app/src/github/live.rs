@@ -94,6 +94,11 @@ impl Pace {
         }
     }
 
+    /// How long since the last reload started.
+    pub fn since_reload(&self, now: Instant) -> Duration {
+        now.duration_since(self.reloaded_at)
+    }
+
     pub fn asked(&mut self, now: Instant) {
         self.asked_at = now;
     }

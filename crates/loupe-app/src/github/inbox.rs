@@ -75,6 +75,20 @@ const CHANGED_SEARCHES: [&str; 2] = [
 /// take a moment to see an update.
 const SINCE_MARGIN: Duration = Duration::from_secs(120);
 
+/// The shortest time between two full reloads brought by questions with
+/// more answers than they read.
+const OVERFLOW_RELOAD_GAP: Duration = Duration::from_secs(5 * 60);
+
+/// Which searches of the question found pull request `id`, in the order
+/// [`InboxView::ask`] puts them: involves, requested, then "All open".
+fn found_by(changes: &Changes, id: &str) -> Found {
+    Found {
+        involves: changes.found(0, id),
+        requested: changes.found(1, id),
+        all_open: changes.found(2, id),
+    }
+}
+
 gpui_kit::actions!(
     github,
     [
@@ -535,6 +549,8 @@ pub struct InboxView {
     handled: Vec<PrStamp>,
     /// The rows that came or changed in a refresh, until seen.
     marks: Marks,
+    /// Where the question found each row it read since the last reload.
+    found: HashMap<NodeId, Found>,
     _bases: Option<Task<()>>,
     _load: Option<Task<()>>,
     _ask: Option<Task<()>>,
@@ -624,6 +640,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             reload_started: None,
             handled: Vec::new(),
             marks: Marks::default(),
+            found: HashMap::new(),
             _bases: None,
             _load: None,
             _ask: None,
@@ -823,9 +840,6 @@ impl InboxView {
         self.inbox.start_refresh();
         let started = Utc::now();
         self.pace.reloaded(Instant::now());
-        self.reload_started = Some(started);
-        self.handled
-            .retain(|stamp| stamp.updated_at >= started - SINCE_MARGIN);
         // The other views' "All open" copies are older than this reload;
         // a view opened next loads its own again.
         let current = self.page.all_open_query();
@@ -838,20 +852,31 @@ impl InboxView {
                 if let (Some(key), Ok(value)) = (&key, &result) {
                     crate::cache::put(key, value);
                 }
-                view.finish_inbox(result, cx);
+                view.finish_inbox(result, started, cx);
             },
         ));
         self.load_all_open(true, cx);
         cx.notify();
     }
 
-    /// Lands a load of the inbox: the rows change under the scroll, the
-    /// selection, the folded groups, and the cursor, which all stay.
-    fn finish_inbox(&mut self, result: Result<Inbox, common::LoadError>, cx: &mut Context<Self>) {
+    /// Lands a load of the inbox that went out at `started`: the rows
+    /// change under the scroll, the selection, the folded groups, and the
+    /// cursor, which all stay. A failed load leaves the question looking
+    /// from the last load that worked, so no change goes unseen.
+    fn finish_inbox(
+        &mut self,
+        result: Result<Inbox, common::LoadError>,
+        started: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) {
         match &result {
             Ok(inbox) => {
                 group_sync::now(Some(inbox.clone()), cx);
                 self.pace.confirmed_at = Some(Local::now());
+                self.reload_started = Some(started);
+                self.handled
+                    .retain(|stamp| stamp.updated_at >= started - SINCE_MARGIN);
+                self.found.clear();
             }
             Err(_) => self.handled.clear(),
         }
@@ -885,7 +910,8 @@ impl InboxView {
         if watched && self.marks.see(now) {
             cx.notify();
         }
-        if self.inbox.value().is_none() || self.inbox.is_busy() || self._ask.is_some() {
+        let all_open_busy = self.all_open_state().is_some_and(Loadable::is_busy);
+        if self.inbox.is_busy() || all_open_busy || self._ask.is_some() {
             return;
         }
         let rate = common::client(cx)
@@ -901,8 +927,12 @@ impl InboxView {
             cx.notify();
         }
         match step {
-            Step::Ask => self.ask(cx),
-            Step::Reload => self.refresh_now(cx),
+            // Without a load that worked there is nothing to ask about: a
+            // failed one is tried again.
+            Step::Ask if self.reload_started.is_some() && self.inbox.value().is_some() => {
+                self.ask(cx);
+            }
+            Step::Ask | Step::Reload => self.refresh_now(cx),
             Step::Wait | Step::Paused(_) => {}
         }
     }
@@ -932,6 +962,7 @@ impl InboxView {
             })
             .chain(self.handled.iter().cloned())
             .collect();
+        let recorded = self.found.clone();
         let all_open = self
             .page
             .all_open_on()
@@ -951,10 +982,17 @@ impl InboxView {
             cx,
             move |gh| {
                 let changes = gh.changes_since(&query)?;
+                // A row read before goes again when search now finds it in
+                // other lists: the search index can trail the update.
                 let unknown: Vec<NodeId> = changes
                     .updated()
                     .into_iter()
-                    .filter(|stamp| !known.contains(*stamp))
+                    .filter(|stamp| {
+                        !known.contains(*stamp)
+                            || recorded
+                                .get(&stamp.id)
+                                .is_some_and(|found| *found != found_by(&changes, &stamp.id))
+                    })
                     .map(|stamp| stamp.id.clone())
                     .collect();
                 let rows = if changes.complete && !unknown.is_empty() {
@@ -986,22 +1024,28 @@ impl InboxView {
         self.take_checks(&changes.checks);
         let stamps = changes.updated().into_iter().cloned();
         if !changes.complete {
-            self.refresh_now(cx);
-            self.handled.extend(stamps);
+            // More changed than one question reads: a full reload, at most
+            // every OVERFLOW_RELOAD_GAP, so a busy organization cannot
+            // spend the rate limit on reloads.
+            if self.pace.since_reload(Instant::now()) >= OVERFLOW_RELOAD_GAP {
+                self.refresh_now(cx);
+                self.handled.extend(stamps);
+            }
             return;
         }
         let fresh: Vec<(PrSummary, Found)> = rows
             .into_iter()
             .map(|row| {
-                let found = Found {
-                    involves: changes.found(0, &row.id),
-                    requested: changes.found(1, &row.id),
-                    all_open: changes.found(2, &row.id),
-                };
+                let found = found_by(&changes, &row.id);
+                self.found.insert(row.id.clone(), found);
                 (row, found)
             })
             .collect();
         if !fresh.is_empty() {
+            // The copies of the other views' "All open" miss these changes;
+            // a view opened next loads its own again.
+            self.all_open
+                .retain(|query, _| all_open.as_ref() == Some(query));
             self.take_in(true, |view| {
                 let InboxView {
                     inbox,
@@ -3311,7 +3355,7 @@ mod tests {
         fresh.involved.items[25].checks = Some(ChecksState::Passing);
         fresh.involved.items.push(pr("b", 50));
         fresh.involved.total_count += 1;
-        view.update(cx, |view, cx| view.finish_inbox(Ok(fresh), cx));
+        view.update(cx, |view, cx| view.finish_inbox(Ok(fresh), Utc::now(), cx));
 
         assert_eq!(state(&view, cx), before, "scroll, cursor and folds stay");
         assert_eq!(picked(&view, cx), [12, 13], "the selection stays");

@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 use super::reads::checks_state;
 use crate::{ChecksState, GitHub, NodeId, Result, Timestamp};
 
-/// Pull requests read per search; more than that changed is "everything".
-const STAMPS_PER_SEARCH: u32 = 50;
+/// Pull requests read per search (GitHub's page maximum, still one point);
+/// more than that changed is "everything".
+const STAMPS_PER_SEARCH: u32 = 100;
 /// GitHub's limit on `nodes(ids:)`.
 const MAX_PENDING: usize = 100;
 

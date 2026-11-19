@@ -50,6 +50,17 @@ struct Loaded {
     t3: AnyView,
 }
 
+/// What the pull request poll compares GitHub's answer with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PrSeen {
+    /// A load just landed: the next poll only takes its ETag.
+    Unknown,
+    /// The ETag of the pull request on screen.
+    Etag(String),
+    /// The last load failed: the next poll loads again whatever it says.
+    Stale,
+}
+
 /// A write against the pull request.
 #[derive(Clone, Debug)]
 enum Write {
@@ -170,9 +181,8 @@ pub struct PullRequestView {
     /// Whether the last tick found the pull request on screen.
     on_screen: bool,
     poll_task: Option<Task<()>>,
-    /// The ETag of the pull request as last loaded, which tells whether it
-    /// changed since; `None` until the poll after a load gets one.
-    pr_etag: Option<String>,
+    /// What the pull request poll compares with.
+    pr_seen: PrSeen,
     /// When that poll last went out; `None` right after a load.
     pr_polled_at: Option<Instant>,
     pr_poll_task: Option<Task<()>>,
@@ -251,7 +261,7 @@ impl PullRequestView {
             folded_check_groups: HashSet::new(),
             on_screen: true,
             poll_task: None,
-            pr_etag: None,
+            pr_seen: PrSeen::Unknown,
             pr_polled_at: None,
             pr_poll_task: None,
             link_copied: None,
@@ -284,7 +294,7 @@ impl PullRequestView {
         self.detail.start_refresh();
         self.last_fetch = Instant::now();
         // The poll after the load takes the ETag of what it brought.
-        self.pr_etag = None;
+        self.pr_seen = PrSeen::Unknown;
         self.pr_polled_at = None;
         let pr = self.pr.clone();
         self.load_task = Some(common::run(
@@ -332,6 +342,7 @@ impl PullRequestView {
     }
 
     fn finish_failed_load(&mut self, error: LoadError) {
+        self.pr_seen = PrSeen::Stale;
         self.incoming_etag = None;
         match self.detail.value().cloned() {
             Some(stale) => {
@@ -509,7 +520,10 @@ impl PullRequestView {
     /// after a load only takes the ETag.
     fn poll_pull_request(&mut self, cx: &mut Context<Self>) {
         let pr = self.pr.clone();
-        let seen = self.pr_etag.clone();
+        let seen = match &self.pr_seen {
+            PrSeen::Etag(etag) => Some(etag.clone()),
+            PrSeen::Unknown | PrSeen::Stale => None,
+        };
         self.pr_polled_at = Some(Instant::now());
         self.pr_poll_task = Some(common::run(
             cx,
@@ -519,11 +533,10 @@ impl PullRequestView {
                 let Ok(PullRequestPoll::Changed(etag)) = result else {
                     return;
                 };
-                let had_one = view.pr_etag.is_some();
-                if had_one {
+                if !matches!(view.pr_seen, PrSeen::Unknown) {
                     view.reload(cx);
                 }
-                view.pr_etag = etag;
+                view.pr_seen = etag.map_or(PrSeen::Unknown, PrSeen::Etag);
                 view.pr_polled_at = Some(Instant::now());
             },
         ));

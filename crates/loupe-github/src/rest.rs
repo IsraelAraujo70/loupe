@@ -351,11 +351,13 @@ impl GitHub {
     }
 
     /// Whether pull request `pr` changed since `etag` was taken: its title,
-    /// state, head commit, mergeability, reviewers, or the time it was last
-    /// updated (a comment or a review moves it). A 304 costs no rate limit.
+    /// state, labels, assignees, comments, or the time it was last updated
+    /// (a push, a review, or a comment moves it). It asks for the pull
+    /// request's issue: `pulls/{n}` carries the repositories, whose
+    /// counters move with any activity there. A 304 costs no rate limit.
     pub fn poll_pull_request(&self, pr: &PrRef, etag: Option<&str>) -> Result<PullRequestPoll> {
         let path = format!(
-            "/repos/{}/{}/pulls/{}",
+            "/repos/{}/{}/issues/{}",
             pr.repo.owner, pr.repo.name, pr.number
         );
         Ok(match self.conditional_get(&path, etag)? {
