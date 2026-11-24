@@ -3,7 +3,6 @@
 //! review and merge actions). Owned by the GitHub front.
 
 mod actions;
-mod checks_feed;
 mod common;
 pub(crate) mod highlight;
 mod inbox;
@@ -11,6 +10,7 @@ pub(crate) mod live;
 pub(crate) mod notification_filter;
 mod notifications;
 mod palette;
+mod pr_feed;
 mod pr_row;
 mod pull_request;
 mod repo;

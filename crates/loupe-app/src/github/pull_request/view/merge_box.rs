@@ -4,17 +4,19 @@
 //! under the checks' bar the list of checks it opens.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{CheckRun, PullRequestDetail};
 
-use super::PullRequestView;
 use super::model::{
-    MergeAction, MergeTone, Panel, Progress, approvals, available_actions, check_groups,
-    check_outcome, check_tally, checks_open_at_first, merge_status, resolved_threads,
+    DraftAction, MergeAction, MergeTone, Panel, Progress, approvals, available_actions,
+    check_groups, check_outcome, check_tally, checks_open_at_first, merge_status, resolved_threads,
 };
+use super::{PullRequestView, Write};
+use crate::github::common::Submit;
 use crate::github::pull_request::checks::{check_route, status_style};
 use crate::route::Route;
 use crate::shell::OpenOnClick as _;
@@ -154,12 +156,38 @@ impl PullRequestView {
         let status = merge_status(detail);
         let (icon, color) = tone_look(status.tone, cx);
         let busy = self.write.is_busy();
-        let merge = match available_actions(detail).merge {
+        let actions = available_actions(detail);
+        let merge = match actions.merge {
             MergeAction::Available { methods, .. } => {
                 Some(self.render_merge_controls(&methods, busy, cx))
             }
             MergeAction::Hidden | MergeAction::Unavailable(_) => None,
         };
+        // A draft the viewer may change: the block's action takes it out of
+        // draft, and says here when GitHub refuses.
+        let marks_ready = actions.draft == Some(DraftAction::MarkReady);
+        let ready = marks_ready.then(|| {
+            div()
+                .flex_none()
+                .debug_selector(|| "pr-ready-for-review".to_owned())
+                .child(
+                    Button::new("pr-ready-for-review")
+                        .outline()
+                        .icon(IconName::GitPullRequest)
+                        .label("Ready for review")
+                        .tooltip("Take this pull request out of draft")
+                        .loading(self.ready.is_busy())
+                        .disabled(busy)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.start_write(Write::MarkReady, cx)),
+                        ),
+                )
+        });
+        let ready_error = self
+            .ready
+            .error()
+            .filter(|_| marks_ready)
+            .map(str::to_owned);
         let confirm =
             matches!(self.panel, Panel::ConfirmMerge(_)).then(|| self.render_panel(detail, cx));
 
@@ -228,8 +256,27 @@ impl PullRequestView {
                                     .child(status.detail),
                             ),
                     )
-                    .children(merge),
+                    .children(merge)
+                    .children(ready),
             )
+            .children(ready_error.map(|message| {
+                h_flex()
+                    .debug_selector(|| "pr-ready-error".to_owned())
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(Alert::error("pr-ready-error", message).flex_1())
+                    .child(
+                        ui::icon_button("pr-ready-error-dismiss", IconName::Close, "Dismiss")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ready = Submit::Idle;
+                                cx.notify();
+                            })),
+                    )
+            }))
             .children(confirm.map(|confirm| {
                 div()
                     .px_4()
@@ -465,5 +512,115 @@ impl PullRequestView {
                     .on_click(move |_, _, cx| cx.open_url(&url))
                 }),
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui_kit::{
+        AppContext as _, Bounds, TestAppContext, VisualTestContext, WindowBounds, WindowOptions,
+        px, size,
+    };
+    use loupe_github::{PrState, PullRequestDetail};
+
+    use super::super::{PullRequestView, model};
+    use crate::github::common::{Loadable, Submit};
+    use crate::services::{Accounts, Services};
+    use crate::store::Settings;
+
+    /// The page of `detail` on its Conversation tab, with `ready` as the
+    /// state of Ready for review; GitHub is not connected.
+    fn open(
+        detail: PullRequestDetail,
+        ready: Submit,
+        cx: &mut TestAppContext,
+    ) -> VisualTestContext {
+        let detail = Arc::new(detail);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(Settings::default());
+            cx.set_global(Services::default());
+            cx.set_global(Accounts::default());
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1280.), px(820.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| PullRequestView::new(detail.pr.clone(), window, cx)),
+            )
+            .expect("open a window")
+        });
+        let mut cx = VisualTestContext::from_window(handle, cx);
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| {
+            view.incoming = Some(detail.clone());
+            view.detail = Loadable::Loaded(detail);
+            view.ready = ready;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx
+    }
+
+    fn draft() -> PullRequestDetail {
+        PullRequestDetail {
+            is_draft: true,
+            ..model::tests::detail()
+        }
+    }
+
+    fn has_ready_button(detail: PullRequestDetail, cx: &mut TestAppContext) -> bool {
+        open(detail, Submit::Idle, cx)
+            .debug_bounds("pr-ready-for-review")
+            .is_some()
+    }
+
+    #[gpui_kit::test]
+    fn a_draft_you_can_change_offers_ready_for_review(cx: &mut TestAppContext) {
+        assert!(has_ready_button(draft(), cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_draft_you_cannot_change_has_no_ready_for_review(cx: &mut TestAppContext) {
+        let detail = PullRequestDetail {
+            viewer_can_update: false,
+            ..draft()
+        };
+        assert!(!has_ready_button(detail, cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_pull_request_out_of_draft_has_no_ready_for_review(cx: &mut TestAppContext) {
+        assert!(!has_ready_button(model::tests::detail(), cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_closed_draft_has_no_ready_for_review(cx: &mut TestAppContext) {
+        let detail = PullRequestDetail {
+            state: PrState::Closed,
+            ..draft()
+        };
+        assert!(!has_ready_button(detail, cx));
+    }
+
+    #[gpui_kit::test]
+    fn githubs_refusal_shows_in_the_draft_block(cx: &mut TestAppContext) {
+        let refused = Submit::Failed("Resource not accessible by integration".into());
+        let mut cx = open(draft(), refused, cx);
+        assert!(cx.debug_bounds("pr-ready-error").is_some());
+        assert!(
+            cx.debug_bounds("pr-ready-for-review").is_some(),
+            "the button stays to try again"
+        );
     }
 }
