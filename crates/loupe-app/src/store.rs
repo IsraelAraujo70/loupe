@@ -76,6 +76,8 @@ pub struct GuideSettings {
     pub executable: Option<String>,
     /// Maximum automatic guides generated per rolling hour across saved views.
     pub auto_max_per_hour: u32,
+    /// Language guide prose is written in.
+    pub language: loupe_guide::LanguagePreference,
 }
 
 impl Default for GuideSettings {
@@ -85,6 +87,7 @@ impl Default for GuideSettings {
             effort: loupe_guide::GuideEffort::Medium,
             executable: None,
             auto_max_per_hour: 6,
+            language: loupe_guide::LanguagePreference::SameAsPullRequest,
         }
     }
 }

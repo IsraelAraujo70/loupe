@@ -182,7 +182,7 @@ pub fn enqueue_stale_if_watched(detail: Arc<PullRequestDetail>, cx: &mut App) {
     if views.is_empty() {
         return;
     }
-    if !guide_service::has_stale_guide(cx, &detail.pr, &detail.head_oid) {
+    if !guide_service::has_stale_guide(cx, &detail) {
         return;
     }
     let matches_any = views.iter().any(|view| {
@@ -298,9 +298,13 @@ impl Watcher {
                 .find(|(tab, _)| *tab == ReviewTab::NeedsReview)
                 .map(|(_, shown)| shown.items)
                 .unwrap_or_default();
+            let language = Settings::get(cx).guide.language.clone();
             for row in needs_review {
                 // Skip if a guide already exists and the PR hasn't been updated since.
-                let needs_guide = match guide_service::latest_generated_at(cx, &row.pr) {
+                // The list has no description, so the title alone picks the language here;
+                // `has_fresh_guide` settles it once the pull request is loaded.
+                let language = language.resolve(&row.title, "");
+                let needs_guide = match guide_service::latest_generated_at(cx, &row.pr, &language) {
                     None => true,
                     Some(generated_at) => row.updated_at > generated_at,
                 };
@@ -335,7 +339,7 @@ impl Watcher {
                     watcher.pump(cx);
                     return;
                 };
-                if guide_service::has_fresh_guide(cx, &detail.pr, &detail.head_oid) {
+                if guide_service::has_fresh_guide(cx, &detail) {
                     // Already cached for this exact commit: keep budget intact and move on.
                     watcher.pump(cx);
                     return;

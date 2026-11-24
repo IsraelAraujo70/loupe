@@ -3,8 +3,9 @@
 //! pull request actions).
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
 use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use loupe_github::PullRequestDetail;
@@ -169,7 +170,7 @@ impl PullRequestView {
     /// Claude Code (or shows the cached guide when already up to date).
     fn render_summarize_button(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> Div {
         let busy = crate::github::guide_service::is_generating(cx, &detail.pr);
-        let fresh = crate::github::guide_service::has_fresh_guide(cx, &detail.pr, &detail.head_oid);
+        let fresh = crate::github::guide_service::has_fresh_guide(cx, detail);
         let tooltip = if busy {
             "Generating guided review with Claude Code"
         } else if fresh {
@@ -177,18 +178,54 @@ impl PullRequestView {
         } else {
             "Generate a guided review using local Claude Code"
         };
+        let current = crate::github::guide_service::wanted_language(cx, detail);
+        let choices = crate::github::guide_service::language_choices(cx, detail);
+        let view = cx.entity().downgrade();
         div()
             .flex_none()
             .debug_selector(|| "pr-summarize".into())
             .child(
-                Button::new("pr-summarize")
+                DropdownButton::new("pr-summarize")
                     .outline()
-                    .control()
-                    .icon(IconName::Sparkles)
-                    .label(if busy { "Summarizing…" } else { "Summarize" })
-                    .tooltip(tooltip)
-                    .loading(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.summarize_pull_request(cx))),
+                    .button(
+                        Button::new("pr-summarize-action")
+                            .outline()
+                            .control()
+                            .icon(IconName::Sparkles)
+                            .label(if busy { "Summarizing…" } else { "Summarize" })
+                            .tooltip(tooltip)
+                            .loading(busy)
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.summarize_pull_request(cx)),
+                            ),
+                    )
+                    .menu_accessibility_label("Summarize in another language")
+                    .dropdown_menu(move |menu, _, _| {
+                        let menu = menu.min_w(scale::menu_min_width()).label("Summarize in");
+                        choices
+                            .iter()
+                            .enumerate()
+                            .fold(menu, |menu, (ix, language)| {
+                                let label = if ix == 0 {
+                                    format!("{} (Settings)", language.name())
+                                } else {
+                                    language.name().to_owned()
+                                };
+                                let language = language.clone();
+                                let view = view.clone();
+                                menu.item(
+                                    PopupMenuItem::new(label)
+                                        .checked(language == current)
+                                        .on_click(move |_, _, cx| {
+                                            let language = language.clone();
+                                            view.update(cx, |this, cx| {
+                                                this.summarize_in(language, cx)
+                                            })
+                                            .ok();
+                                        }),
+                                )
+                            })
+                    }),
             )
     }
 

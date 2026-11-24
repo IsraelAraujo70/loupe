@@ -10,9 +10,9 @@ use futures::StreamExt as _;
 use gpui_kit::{App, Global, Task};
 use loupe_github::{ChangedFile, FileStatus, PrRef, PullRequestDetail, TimelineItem};
 use loupe_guide::{
-    CancelToken, ClaudeAvailability, GuidePromptInput, GuideRunError, ProgressEvent, PromptComment,
-    PromptCommit, PromptFile, SCHEMA_VERSION, StepChange, StoredGuide, changed_steps_since,
-    check_availability, generate_for_pr, validate,
+    CancelToken, ClaudeAvailability, GuideLanguage, GuidePromptInput, GuideRunError, ProgressEvent,
+    PromptComment, PromptCommit, PromptFile, SCHEMA_VERSION, StepChange, StoredGuide,
+    changed_steps_since, check_availability, generate_for_pr, validate,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,9 @@ struct GuideService {
     _probe_task: Option<Task<()>>,
     runs: HashMap<PrRef, ActiveRun>,
     errors: HashMap<PrRef, String>,
+    /// Languages picked from Summarize's menu for one pull request in this
+    /// session, instead of the one Settings resolves to.
+    language_override: HashMap<PrRef, GuideLanguage>,
     /// Monotonic counter bumped whenever availability, runs, errors, or stored
     /// guides change so views only recompute `view_state` when needed.
     revision: u64,
@@ -125,25 +128,92 @@ pub fn any_generating(cx: &App) -> bool {
     service(cx).is_some_and(|s| !s.runs.is_empty())
 }
 
-/// Returns whether a valid cached guide already exists for `(pr, head_oid)`.
-pub fn has_fresh_guide(cx: &App, pr: &PrRef, head_oid: &str) -> bool {
-    matches!(load_cached_commit(cx, pr, head_oid), Some(Ok(_)))
+/// The language the Guide tab shows and generates for `detail`: the one picked
+/// from Summarize's menu for this pull request in this session, else the one
+/// Settings resolves to for its title and description.
+pub fn wanted_language(cx: &App, detail: &PullRequestDetail) -> GuideLanguage {
+    if let Some(language) = service(cx).and_then(|s| s.language_override.get(&detail.pr)) {
+        return language.clone();
+    }
+    configured_language(cx, detail)
 }
 
-/// Returns whether `pr` has a cached guide for an older commit than `head_oid`.
-pub fn has_stale_guide(cx: &App, pr: &PrRef, head_oid: &str) -> bool {
-    load_latest_guide(cx, pr).is_some_and(|stored| stored.is_stale(head_oid))
+fn configured_language(cx: &App, detail: &PullRequestDetail) -> GuideLanguage {
+    Settings::get(cx)
+        .guide
+        .language
+        .resolve(&detail.title, &detail.body)
 }
 
-/// When the most recent cached guide for `pr` was generated, if any.
-pub fn latest_generated_at(cx: &App, pr: &PrRef) -> Option<DateTime<Utc>> {
-    load_latest_guide(cx, pr).map(|stored| stored.generated_at)
+/// Languages Summarize's menu offers for `detail`: the one Settings resolves
+/// to first, then English, Brazilian Portuguese, and the pull request's own.
+pub fn language_choices(cx: &App, detail: &PullRequestDetail) -> Vec<GuideLanguage> {
+    let mut choices = vec![configured_language(cx, detail)];
+    for language in [
+        GuideLanguage::english(),
+        GuideLanguage::portuguese_brazil(),
+        loupe_guide::detect_language(&detail.title, &detail.body),
+    ] {
+        if !choices.contains(&language) {
+            choices.push(language);
+        }
+    }
+    choices
 }
 
-/// Returns the cached guide for `pr` at `head_oid`, validated at the boundary.
-fn load_cached_commit(cx: &App, pr: &PrRef, head_oid: &str) -> Option<Result<StoredGuide, String>> {
-    let key = commit_cache_key(cx, pr, head_oid);
+/// Shows and generates `detail`'s guide in `language` for the rest of this
+/// session, without changing Settings.
+pub fn set_language_for(detail: &PullRequestDetail, language: GuideLanguage, cx: &mut App) {
+    let configured = configured_language(cx, detail);
+    let svc = service_mut(cx);
+    if language == configured {
+        svc.language_override.remove(&detail.pr);
+    } else {
+        svc.language_override.insert(detail.pr.clone(), language);
+    }
+    svc.bump_revision();
+}
+
+/// Returns whether a valid cached guide in the wanted language exists for
+/// `detail`'s head commit.
+pub fn has_fresh_guide(cx: &App, detail: &PullRequestDetail) -> bool {
+    let language = wanted_language(cx, detail);
+    matches!(
+        load_cached_commit(cx, &detail.pr, &detail.head_oid, &language),
+        Some(Ok(_))
+    )
+}
+
+/// Returns whether `detail` has a cached guide in the wanted language for an
+/// older commit than its head.
+pub fn has_stale_guide(cx: &App, detail: &PullRequestDetail) -> bool {
+    let language = wanted_language(cx, detail);
+    load_latest_guide(cx, &detail.pr, &language)
+        .is_some_and(|stored| stored.is_stale(&detail.head_oid))
+}
+
+/// When the most recent cached guide for `pr` in `language` was generated, if any.
+pub fn latest_generated_at(
+    cx: &App,
+    pr: &PrRef,
+    language: &GuideLanguage,
+) -> Option<DateTime<Utc>> {
+    load_latest_guide(cx, pr, language).map(|stored| stored.generated_at)
+}
+
+/// Returns the cached guide for `pr` at `head_oid` in `language`, validated at
+/// the boundary.
+fn load_cached_commit(
+    cx: &App,
+    pr: &PrRef,
+    head_oid: &str,
+    language: &GuideLanguage,
+) -> Option<Result<StoredGuide, String>> {
+    let key = commit_cache_key(cx, pr, head_oid, language);
     let stored = crate::cache::get::<StoredGuide>(&key)?;
+    if stored.language != *language {
+        return None;
+    }
     if stored.schema_version != SCHEMA_VERSION {
         return Some(Err(format!(
             "Unsupported cached guide schema version {} (expected {SCHEMA_VERSION}).",
@@ -159,10 +229,10 @@ fn load_cached_commit(cx: &App, pr: &PrRef, head_oid: &str) -> Option<Result<Sto
 /// Persists a validated guide for `(pr, stored.head_oid)` and updates the PR's
 /// latest/previous commit pointers for stale detection and step diffing.
 pub fn store_guide(cx: &mut App, pr: &PrRef, stored: &StoredGuide) {
-    let commit_key = commit_cache_key(cx, pr, &stored.head_oid);
+    let commit_key = commit_cache_key(cx, pr, &stored.head_oid, &stored.language);
     crate::cache::put(&commit_key, stored);
 
-    let index_key = index_cache_key(cx, pr);
+    let index_key = index_cache_key(cx, pr, &stored.language);
     let mut index = crate::cache::get::<PrGuideIndex>(&index_key).unwrap_or_default();
     if index.latest_head.as_deref() != Some(stored.head_oid.as_str()) {
         index.previous_head = index.latest_head.take();
@@ -172,8 +242,20 @@ pub fn store_guide(cx: &mut App, pr: &PrRef, stored: &StoredGuide) {
     service_mut(cx).bump_revision();
 }
 
-/// Computes the current [`GuideViewState`] for `(pr, current_head_oid)`.
-pub fn view_state(cx: &App, pr: &PrRef, current_head_oid: &str) -> GuideViewState {
+/// Computes the current [`GuideViewState`] for `detail` in the wanted language.
+pub fn view_state(cx: &App, detail: &PullRequestDetail) -> GuideViewState {
+    let language = wanted_language(cx, detail);
+    view_state_in(cx, &detail.pr, &detail.head_oid, &language)
+}
+
+/// [`GuideViewState`] for `(pr, current_head_oid)` in `language`. A guide in
+/// another language never shows: the tab offers Summarize instead.
+fn view_state_in(
+    cx: &App,
+    pr: &PrRef,
+    current_head_oid: &str,
+    language: &GuideLanguage,
+) -> GuideViewState {
     if let Some(run) = service(cx).and_then(|s| s.runs.get(pr)) {
         return GuideViewState::Generating {
             status: run.status.clone(),
@@ -187,7 +269,7 @@ pub fn view_state(cx: &App, pr: &PrRef, current_head_oid: &str) -> GuideViewStat
         };
     }
 
-    if let Some(result) = load_cached_commit(cx, pr, current_head_oid) {
+    if let Some(result) = load_cached_commit(cx, pr, current_head_oid, language) {
         return match result {
             Ok(stored) => {
                 let changed_steps = diff_against_previous(cx, pr, &stored);
@@ -202,7 +284,7 @@ pub fn view_state(cx: &App, pr: &PrRef, current_head_oid: &str) -> GuideViewStat
 
     // No guide for `current_head_oid` yet: check if we have a guide for an earlier commit
     // so the Guide tab can display it with a stale warning banner.
-    if let Some(latest) = load_latest_guide(cx, pr) {
+    if let Some(latest) = load_latest_guide(cx, pr, language) {
         return GuideViewState::Ready {
             stored: Box::new(latest),
             changed_steps: HashMap::new(),
@@ -228,10 +310,10 @@ pub fn view_state(cx: &App, pr: &PrRef, current_head_oid: &str) -> GuideViewStat
     GuideViewState::Empty
 }
 
-fn load_latest_guide(cx: &App, pr: &PrRef) -> Option<StoredGuide> {
-    let index = crate::cache::get::<PrGuideIndex>(&index_cache_key(cx, pr))?;
+fn load_latest_guide(cx: &App, pr: &PrRef, language: &GuideLanguage) -> Option<StoredGuide> {
+    let index = crate::cache::get::<PrGuideIndex>(&index_cache_key(cx, pr, language))?;
     let head = index.latest_head?;
-    load_cached_commit(cx, pr, &head)?.ok()
+    load_cached_commit(cx, pr, &head, language)?.ok()
 }
 
 fn diff_against_previous(
@@ -239,7 +321,9 @@ fn diff_against_previous(
     pr: &PrRef,
     current: &StoredGuide,
 ) -> HashMap<String, StepChange> {
-    let Some(index) = crate::cache::get::<PrGuideIndex>(&index_cache_key(cx, pr)) else {
+    let Some(index) =
+        crate::cache::get::<PrGuideIndex>(&index_cache_key(cx, pr, &current.language))
+    else {
         return HashMap::new();
     };
     let Some(prev_head) = index.previous_head.as_deref() else {
@@ -248,7 +332,7 @@ fn diff_against_previous(
     if prev_head == current.head_oid {
         return HashMap::new();
     }
-    match load_cached_commit(cx, pr, prev_head) {
+    match load_cached_commit(cx, pr, prev_head, &current.language) {
         Some(Ok(prev)) => changed_steps_since(&prev.guide, &current.guide),
         _ => HashMap::new(),
     }
@@ -263,9 +347,10 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
     }
 
     let config = Settings::get(cx).guide.claude_config();
+    let language = wanted_language(cx, &detail);
     let github_client = Services::get(cx).github.clone();
     let github_token = service(cx).and_then(|s| s.github_token.clone());
-    let previous_step_ids = load_latest_guide(cx, &pr)
+    let previous_step_ids = load_latest_guide(cx, &pr, &language)
         .map(|prev| prev.guide.steps.into_iter().map(|s| s.id).collect())
         .unwrap_or_default();
     let cached_files_key = crate::cache::github_key(
@@ -291,6 +376,7 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
     let repo = pr.repo.to_string();
     let pr_number = pr.number;
     let effort_label = config.effort.as_cli_arg().to_owned();
+    let worker_language = language.clone();
 
     let worker_pr = pr.clone();
     let worker_detail = detail.clone();
@@ -303,7 +389,7 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
             },
         };
         let changed_files: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
-        let input = build_prompt_input(&worker_detail, &files, previous_step_ids);
+        let input = build_prompt_input(&worker_detail, &files, previous_step_ids, worker_language);
         let outcome = generate_for_pr(
             &input,
             github_token.as_deref(),
@@ -353,6 +439,7 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
                         effort: effort_label,
                         generated_at: Utc::now(),
                         changed_files,
+                        language,
                         guide: generated.guide,
                     };
                     store_guide(cx, &pr_for_task, &stored);
@@ -415,6 +502,7 @@ pub fn build_prompt_input(
     detail: &PullRequestDetail,
     files: &[ChangedFile],
     previous_step_ids: Vec<String>,
+    language: GuideLanguage,
 ) -> GuidePromptInput {
     let author = detail
         .author
@@ -500,6 +588,7 @@ pub fn build_prompt_input(
         comments,
         files,
         previous_step_ids,
+        language,
     }
 }
 
@@ -514,14 +603,28 @@ fn file_status_label(status: FileStatus) -> &'static str {
     }
 }
 
-fn commit_cache_key(cx: &App, pr: &PrRef, head_oid: &str) -> String {
-    let resource = format!("guide-v1/{}/{head_oid}", pr.url());
+fn commit_cache_key(cx: &App, pr: &PrRef, head_oid: &str, language: &GuideLanguage) -> String {
+    let resource = format!(
+        "guide-v1/{}/{head_oid}{}",
+        pr.url(),
+        language_segment(language)
+    );
     crate::cache::github_key(cx, &resource).unwrap_or_else(|| format!("local/{resource}"))
 }
 
-fn index_cache_key(cx: &App, pr: &PrRef) -> String {
-    let resource = format!("guide-index-v1/{}", pr.url());
+fn index_cache_key(cx: &App, pr: &PrRef, language: &GuideLanguage) -> String {
+    let resource = format!("guide-index-v1/{}{}", pr.url(), language_segment(language));
     crate::cache::github_key(cx, &resource).unwrap_or_else(|| format!("local/{resource}"))
+}
+
+/// The cache keys' language part. English has none: guides saved before
+/// Loupe asked for a language were English and keep loading from their keys.
+fn language_segment(language: &GuideLanguage) -> String {
+    if language.is_english() {
+        String::new()
+    } else {
+        format!("/lang/{}", language.name().to_lowercase())
+    }
 }
 
 #[cfg(test)]
@@ -530,10 +633,11 @@ mod tests {
     use gpui_kit::TestAppContext;
     use loupe_github::{PrRef, RepoRef};
     use loupe_guide::{
-        GuideStep, GuideSummary, ReviewGuide, SCHEMA_VERSION, StepChange, StepKind, StoredGuide,
+        GuideLanguage, GuideStep, GuideSummary, ReviewGuide, SCHEMA_VERSION, StepChange, StepKind,
+        StoredGuide,
     };
 
-    use super::{has_fresh_guide, store_guide, view_state};
+    use super::{load_cached_commit, store_guide, view_state_in};
     use crate::github::pull_request::guide::GuideViewState;
     use crate::services::Accounts;
 
@@ -548,6 +652,7 @@ mod tests {
             effort: "medium".into(),
             generated_at: Utc::now(),
             changed_files: Vec::new(),
+            language: GuideLanguage::english(),
             guide: ReviewGuide {
                 schema_version: SCHEMA_VERSION,
                 summary: GuideSummary {
@@ -575,6 +680,13 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let pr = PrRef::new(RepoRef::new("acme", "cache-test"), 700);
+        let english = GuideLanguage::english();
+        let has_fresh_guide = |cx: &gpui_kit::App, pr: &PrRef, head: &str| {
+            matches!(load_cached_commit(cx, pr, head, &english), Some(Ok(_)))
+        };
+        let view_state = |cx: &gpui_kit::App, pr: &PrRef, head: &str| {
+            view_state_in(cx, pr, head, &GuideLanguage::english())
+        };
         cx.update(|cx| {
             cx.set_global(Accounts::default());
             let first = sample_stored(&pr, "commit_aaa1111", "Original explanation");
@@ -613,6 +725,47 @@ mod tests {
                     assert_eq!(changed_steps.get("new-step"), Some(&StepChange::New));
                 }
                 other => panic!("expected Ready fresh guide, got {other:?}"),
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn guides_are_cached_per_language_and_never_shown_in_another_one(cx: &mut TestAppContext) {
+        let pr = PrRef::new(RepoRef::new("acme", "language-test"), 701);
+        let portuguese = GuideLanguage::portuguese_brazil();
+        let english = GuideLanguage::english();
+        cx.update(|cx| {
+            cx.set_global(Accounts::default());
+            store_guide(cx, &pr, &sample_stored(&pr, "commit_ccc3333", "In English"));
+
+            // Asking for Portuguese never serves the English guide, fresh or stale.
+            assert!(load_cached_commit(cx, &pr, "commit_ccc3333", &portuguese).is_none());
+            assert_eq!(
+                view_state_in(cx, &pr, "commit_ccc3333", &portuguese),
+                GuideViewState::Empty
+            );
+            assert_eq!(
+                view_state_in(cx, &pr, "commit_ddd4444", &portuguese),
+                GuideViewState::Empty
+            );
+
+            let mut localized = sample_stored(&pr, "commit_ccc3333", "Em português");
+            localized.language = portuguese.clone();
+            store_guide(cx, &pr, &localized);
+
+            for (language, explanation) in [(&portuguese, "Em português"), (&english, "In English")]
+            {
+                match view_state_in(cx, &pr, "commit_ccc3333", language) {
+                    GuideViewState::Ready {
+                        stored,
+                        changed_steps,
+                    } => {
+                        assert_eq!(stored.language, *language);
+                        assert_eq!(stored.guide.steps[0].explanation, explanation);
+                        assert!(changed_steps.is_empty());
+                    }
+                    other => panic!("expected the {} guide, got {other:?}", language.name()),
+                }
             }
         });
     }
