@@ -761,7 +761,7 @@ impl NotificationsView {
                     .child(match unread {
                         0 => format!("{total}"),
                         unread if unread == total => format!("{unread} unread"),
-                        _ => format!("{unread} unread · {total}"),
+                        _ => format!("{unread} unread of {total}"),
                     }),
             )
             .into_any_element()
@@ -987,7 +987,7 @@ impl NotificationsView {
         let trailing_meta: SharedString = match (open, nested, &run) {
             (Some(_), _, _) => format!("Latest {exact}").into(),
             (None, true, _) => exact.clone().into(),
-            (None, false, Some(_)) => if failed { "Check failed" } else { "Workflow" }.into(),
+            (None, false, Some(_)) => "Workflow".into(),
             (None, false, None) => reason_label(&notification.reason).into(),
         };
 

@@ -27,7 +27,7 @@ const ZOOM_STEP: f32 = 1.25;
 /// Room around the graph when it is fitted to the view.
 const FIT_MARGIN: f32 = 24.;
 /// Minimum inline canvas height so short graphs stay compact and balanced.
-const MIN_INLINE_HEIGHT: f32 = 112.;
+const MIN_INLINE_HEIGHT: f32 = 104.;
 /// Inline, a wide graph shrinks to fit the width down to this zoom, which
 /// keeps its names readable; past it the graph is dragged sideways.
 const INLINE_MIN_ZOOM: f32 = 0.72;
@@ -350,7 +350,7 @@ impl GraphView {
             .child(
                 ui::icon_button(
                     "graph-fit",
-                    IconName::Scan,
+                    IconName::Focus,
                     "Fit to view (drag to pan, Cmd/Ctrl + scroll to zoom)",
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -362,9 +362,9 @@ impl GraphView {
                 ui::icon_button(
                     "graph-fullscreen",
                     if self.fullscreen {
-                        IconName::Minimize
+                        IconName::Minimize2
                     } else {
-                        IconName::Maximize
+                        IconName::Maximize2
                     },
                     if self.fullscreen {
                         "Exit full screen"
@@ -452,6 +452,7 @@ impl Render for GraphView {
             })
             .collect();
         let edge_color = cx.theme().muted_foreground.opacity(0.55);
+        let dot_color = tokens::border_subtle();
         let viewport = self.viewport.clone();
         let needs_fit = !self.fitted;
         let edges = canvas(
@@ -460,6 +461,28 @@ impl Render for GraphView {
                 bounds
             },
             move |_, bounds, window, _| {
+                // Subtle dot grid signals an interactive pan/zoom canvas.
+                let step = (20. * zoom).clamp(12., 36.);
+                let width = f32::from(bounds.size.width);
+                let height = f32::from(bounds.size.height);
+                let ox = f32::from(pan.x).rem_euclid(step);
+                let oy = f32::from(pan.y).rem_euclid(step);
+                let dot = size(px(1.5), px(1.5));
+                let mut y = oy;
+                while y < height {
+                    let mut x = ox;
+                    while x < width {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(bounds.origin.x + px(x), bounds.origin.y + px(y)),
+                                dot,
+                            ),
+                            dot_color,
+                        ));
+                        x += step;
+                    }
+                    y += step;
+                }
                 let at = |(x, y): (f32, f32)| {
                     point(
                         bounds.origin.x + pan.x + dp(x * zoom),

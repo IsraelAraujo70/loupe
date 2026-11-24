@@ -565,6 +565,7 @@ impl SettingsView {
         let pick = id.clone();
         v_flex()
             .id(("theme-card", index))
+            .group("theme-card")
             .debug_selector({
                 let id = id.clone();
                 move || format!("theme-card-{id}")
@@ -623,6 +624,8 @@ impl SettingsView {
                                 let id = id.clone();
                                 move || format!("theme-actions-{id}")
                             })
+                            .opacity(0.45)
+                            .group_hover("theme-card", |style| style.opacity(1.))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(actions),
                     ),
@@ -1126,20 +1129,20 @@ fn slider_control(
         .gap_3()
         .items_center()
         .child(
-            div()
-                .w(dp(40.))
-                .text_right()
-                .text_size(scale::meta())
-                .text_color(colors.muted)
-                .child(format!("{value}%")),
-        )
-        .child(
             div().w(dp(160.)).child(
                 Slider::new(state)
                     .horizontal()
                     .disabled(disabled)
                     .accessibility_label(name),
             ),
+        )
+        .child(
+            div()
+                .w(dp(40.))
+                .text_right()
+                .text_size(scale::meta())
+                .text_color(colors.muted)
+                .child(format!("{value}%")),
         )
         .into_any_element()
 }

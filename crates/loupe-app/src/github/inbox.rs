@@ -2171,7 +2171,14 @@ impl InboxView {
                     .items_center()
                     .child(save_as)
                     .children(view_menu)
-                    .child(div().w_2())
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(1.))
+                            .h_4()
+                            .mx_1()
+                            .bg(cx.theme().border),
+                    )
                     .child(self.filter_button(cx))
                     .child(self.sort_button(cx))
                     .when(dirty, |row| {

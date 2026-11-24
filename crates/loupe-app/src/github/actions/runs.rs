@@ -18,8 +18,8 @@ use crate::theme::scale::dp;
 use crate::ui;
 
 /// The lanes after the title, in px: workflow, branch, actor, duration, age.
-const WORKFLOW_LANE: f32 = 180.;
-const BRANCH_LANE: f32 = 160.;
+const WORKFLOW_LANE: f32 = 220.;
+const BRANCH_LANE: f32 = 196.;
 const ACTOR_LANE: f32 = 48.;
 const DURATION_LANE: f32 = 64.;
 const AGE_LANE: f32 = 40.;

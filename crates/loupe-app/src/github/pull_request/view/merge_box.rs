@@ -122,7 +122,7 @@ fn bar_cell(
                         .rounded_full()
                         .overflow_hidden()
                         .bg(if settled {
-                            tokens::border_subtle().opacity(0.5)
+                            tokens::border_subtle()
                         } else {
                             tokens::border()
                         })

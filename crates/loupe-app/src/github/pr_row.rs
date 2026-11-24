@@ -263,7 +263,7 @@ pub struct StackPlace {
 fn none(cx: &App) -> Div {
     div()
         .text_size(scale::meta())
-        .text_color(cx.theme().muted_foreground.opacity(0.4))
+        .text_color(cx.theme().muted_foreground.opacity(0.55))
         .child("–")
 }
 
