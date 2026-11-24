@@ -204,3 +204,12 @@ fn changes_since_finds_recent_updates_and_pending_checks() {
     let count = github.review_requested_count().expect("count");
     println!("review requested: {count}");
 }
+
+#[test]
+#[ignore = "needs GITHUB_TOKEN and network"]
+fn lists_the_repositories_of_your_pull_requests() {
+    let repos = client().pull_request_repositories().expect("repositories");
+    let unique: std::collections::HashSet<_> = repos.iter().collect();
+    assert_eq!(unique.len(), repos.len(), "each repository once");
+    println!("repositories of your pull requests: {}", repos.len());
+}

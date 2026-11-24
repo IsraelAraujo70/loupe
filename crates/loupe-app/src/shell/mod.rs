@@ -212,7 +212,9 @@ pub fn navigate(route: Route, window: &mut Window, cx: &mut App) {
 /// of the route (the branch of a repository's runs, a team's saved view).
 fn same_page(from: &Route, to: &Route) -> bool {
     match (from, to) {
-        (Route::Actions { repo: a, .. }, Route::Actions { repo: b, .. }) => a == b,
+        (Route::Actions { repo: a, .. }, Route::Actions { repo: b, .. })
+        | (Route::Repo(a), Route::Actions { repo: b, .. })
+        | (Route::Actions { repo: a, .. }, Route::Repo(b)) => a == b,
         (Route::LinearTeam { team_id: a, .. }, Route::LinearTeam { team_id: b, .. }) => a == b,
         _ => false,
     }
@@ -465,6 +467,7 @@ impl Workspace {
         let panes = Panes::restore(&saved.pane_layout(), saved.active_pane, initial, |route| {
             router::build(route, window, cx)
         });
+        crate::github::repos::start_pull_request_repos(cx);
         let sidebar = cx.new(sidebar::SidebarData::new);
         crate::github::start_group_sync(window, cx);
         crate::github::start_bells(cx);
@@ -2541,7 +2544,8 @@ mod tests {
     }
 
     /// A pinned tab that changes its own filter through its route (the
-    /// branch of a repository's runs) stays on its page; another
+    /// branch of a repository's runs, the repository page's tabs) stays on
+    /// its page; another
     /// repository's runs open in a new tab.
     #[gpui_kit::test]
     fn a_pinned_tab_changes_its_own_filter_in_place(cx: &mut TestAppContext) {
@@ -2570,6 +2574,18 @@ mod tests {
             one(vec![runs("app", None)], 0),
             "clearing the branch stays in the pinned tab"
         );
+
+        // The repository page's tabs, Pull requests and Actions, are one page.
+        let pulls = Route::Repo(RepoRef::new("octo", "app"));
+        cx.update(|window, cx| super::navigate(pulls.clone(), window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            saved_panes(cx).0,
+            one(vec![pulls], 0),
+            "the repository's Pull requests tab stays in the pinned tab"
+        );
+        cx.update(|window, cx| super::navigate(runs("app", None), window, cx));
+        cx.run_until_parked();
 
         cx.update(|window, cx| super::navigate(runs("web", None), window, cx));
         cx.run_until_parked();
