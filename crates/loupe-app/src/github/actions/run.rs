@@ -224,13 +224,25 @@ impl RunView {
             .unwrap_or(&run.workflow)
             .to_owned();
         let trigger = run.event.clone();
-        self.jobs = jobs;
-        self.run.finish(Ok(run));
         let nodes = graph_nodes(
             self.spec.as_ref().and_then(Option::as_ref),
-            &self.jobs,
+            &jobs,
             Utc::now(),
         );
+        // Keep the sidebar job list in the same topological order as the graph
+        // so both views walk jobs identically.
+        let mut order = std::collections::HashMap::new();
+        for (ix, id) in nodes
+            .iter()
+            .flat_map(|node| node.jobs.iter().map(|job| job.id))
+            .enumerate()
+        {
+            order.entry(id).or_insert(ix);
+        }
+        let mut jobs = jobs;
+        jobs.sort_by_key(|job| order.get(&job.id).copied().unwrap_or(usize::MAX));
+        self.jobs = jobs;
+        self.run.finish(Ok(run));
         let selected = self.selected;
         self.graph.update(cx, |graph, cx| {
             graph.set_meta(file_name, trigger, cx);
@@ -695,7 +707,6 @@ impl RunView {
                 .gap_1()
                 .child(
                     h_flex()
-                        .px_2()
                         .gap_2()
                         .items_center()
                         .child(ui::group_title("Annotations"))
@@ -768,7 +779,6 @@ impl RunView {
             .gap_1()
             .child(
                 h_flex()
-                    .px_2()
                     .gap_2()
                     .items_center()
                     .child(ui::group_title("Artifacts"))
@@ -777,11 +787,11 @@ impl RunView {
                     }),
             )
             .when(rows.is_empty(), |column| {
-                column.child(div().px_2().child(ui::empty_line(
+                column.child(ui::empty_line(
                     IconName::Package,
                     "This run uploaded no artifacts.",
                     cx,
-                )))
+                ))
             })
             .children(rows)
     }

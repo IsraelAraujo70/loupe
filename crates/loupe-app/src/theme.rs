@@ -499,9 +499,9 @@ pub mod scale {
     pub fn side_wide_width() -> Rems {
         rems(360. / BASE)
     }
-    /// Secondary leading side column (Settings nav, Actions Run jobs), 240 px.
+    /// Secondary leading side column (Settings nav, Actions Run jobs), 220 px.
     pub fn nav_width() -> Rems {
-        rems(240. / BASE)
+        rems(220. / BASE)
     }
     /// Standard toolbar search field width, 240 px.
     pub fn search_width() -> Pixels {

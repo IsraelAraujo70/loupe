@@ -101,7 +101,7 @@ impl PullRequestView {
             .child(self.render_copy_link(detail, cx))
             .child(
                 Button::new("pr-open-in-browser")
-                    .outline()
+                    .ghost()
                     .control()
                     .icon(IconName::ExternalLink)
                     .label("Open on GitHub")
@@ -178,7 +178,7 @@ impl PullRequestView {
             .debug_selector(move || format!("pr-copy-link:{label}"))
             .child(
                 Button::new("pr-copy-link")
-                    .outline()
+                    .ghost()
                     .control()
                     .icon(icon)
                     .label(label)
@@ -253,14 +253,23 @@ impl PullRequestView {
         );
         let branch = |text: String| ui::branch_chip(text, cx).max_w(dp(360.));
         let checks = match detail.checks.state {
-            Some(state) => h_flex()
-                .gap_1()
-                .items_center()
-                .text_size(scale::meta())
-                .text_color(foreground)
-                .child(widgets::checks_icon(state))
-                .child(summary.label())
-                .into_any_element(),
+            Some(state) => {
+                let tone = widgets::checks_color(state);
+                h_flex()
+                    .h(scale::chip_height())
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .rounded(theme.radius)
+                    .bg(tone.opacity(0.10))
+                    .border_1()
+                    .border_color(tone.opacity(0.24))
+                    .text_size(scale::meta())
+                    .text_color(foreground)
+                    .child(widgets::checks_icon(state))
+                    .child(summary.label())
+                    .into_any_element()
+            }
             None => div()
                 .text_size(scale::meta())
                 .text_color(muted)

@@ -243,25 +243,33 @@ impl SettingsView {
             .map(|(index, scheme)| {
                 let selected = appearance.color_scheme == scheme;
                 let thumbnail = match scheme {
-                    ColorScheme::System => h_flex()
+                    ColorScheme::System => div()
+                        .relative()
                         .size_full()
+                        .child(scheme_thumbnail(&file.light))
                         .child(
+                            // Clip a full-width dark miniature to the trailing
+                            // half so both halves keep identical geometry.
                             div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
                                 .w(relative(0.5))
-                                .h_full()
                                 .overflow_hidden()
-                                .child(scheme_thumbnail(&file.light, false)),
-                        )
-                        .child(
-                            div()
-                                .w(relative(0.5))
-                                .h_full()
-                                .overflow_hidden()
-                                .child(scheme_thumbnail(&file.dark, true)),
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .right_0()
+                                        .w(relative(2.))
+                                        .child(scheme_thumbnail(&file.dark)),
+                                ),
                         )
                         .into_any_element(),
-                    ColorScheme::Light => scheme_thumbnail(&file.light, false).into_any_element(),
-                    ColorScheme::Dark => scheme_thumbnail(&file.dark, false).into_any_element(),
+                    ColorScheme::Light => scheme_thumbnail(&file.light).into_any_element(),
+                    ColorScheme::Dark => scheme_thumbnail(&file.dark).into_any_element(),
                 };
                 v_flex()
                     .id(("color-scheme", index))
@@ -1138,7 +1146,7 @@ fn slider_control(
 
 /// A miniature of the app in `palette`: the sidebar, the panel with a title
 /// and lines, a card with state dots, and the composer with the accent.
-fn scheme_thumbnail(palette: &Palette, flush_right: bool) -> Div {
+fn scheme_thumbnail(palette: &Palette) -> Div {
     let bar = |width: f32, height: f32, color: Hsla| {
         div().w(dp(width)).h(dp(height)).rounded_full().bg(color)
     };
@@ -1146,7 +1154,6 @@ fn scheme_thumbnail(palette: &Palette, flush_right: bool) -> Div {
     h_flex()
         .size_full()
         .bg(palette.window.0)
-        .when(flush_right, |row| row.justify_end())
         .child(
             v_flex()
                 .flex_none()

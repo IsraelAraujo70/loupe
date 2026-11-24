@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
@@ -272,8 +272,8 @@ impl LinkedThreads {
 
     fn settings_button(label: &'static str) -> Button {
         Button::new("t3-settings")
-            .outline()
-            .small()
+            .ghost()
+            .xsmall()
             .icon(IconName::Settings)
             .label(label)
             .on_click(|_, window, cx| shell::navigate(Route::Settings, window, cx))

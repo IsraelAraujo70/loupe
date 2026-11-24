@@ -28,7 +28,7 @@ pub fn settings_view(window: &mut Window, cx: &mut App) -> AnyView {
 }
 
 /// The width of the page's column of cards.
-const PAGE_WIDTH: f32 = 680.;
+const PAGE_WIDTH: f32 = 760.;
 
 /// The Linear key form's progress. The connected state lives in `Accounts`.
 pub(super) enum LinearForm {

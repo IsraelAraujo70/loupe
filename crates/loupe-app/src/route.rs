@@ -144,7 +144,7 @@ impl Route {
             Route::Notifications => "Inbox".into(),
             Route::Repo(repo) => repo.to_string(),
             Route::PullRequest(pr) => format!("#{} {}", pr.number, pr.repo.name),
-            Route::Actions { repo, .. } => format!("{} actions", repo.name),
+            Route::Actions { repo, .. } => format!("{} · Actions", repo.name),
             Route::WorkflowRun { title, .. } if !title.is_empty() => title.clone(),
             Route::WorkflowRun { repo, .. } => format!("{} run", repo.name),
             Route::LinearMyIssues => "My issues".into(),

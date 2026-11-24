@@ -372,15 +372,7 @@ pub fn pr_row(
         // A hairline between rows, so a wide row reads across its columns.
         // It starts and ends on the content's edge, under the icons, while
         // the hover fill reaches 8 px past it.
-        .child(
-            div()
-                .absolute()
-                .left_2()
-                .right_2()
-                .bottom_0()
-                .h(px(1.))
-                .bg(tokens::border_subtle()),
-        )
+        .child(ui::list_row_divider(cx))
         .map(|row| match &select {
             Some(select) => {
                 let (on_select, pr) = (select.on_select.clone(), pr.clone());

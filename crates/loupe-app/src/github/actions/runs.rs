@@ -13,8 +13,8 @@ use crate::github::common::{self, Loadable};
 use crate::route::Route;
 use crate::shell::Refreshable as _;
 use crate::shell::{OpenOnClick as _, navigate};
+use crate::theme::scale;
 use crate::theme::scale::dp;
-use crate::theme::{scale, tokens};
 use crate::ui;
 
 /// The lanes after the title, in px: workflow, branch, actor, duration, age.
@@ -84,7 +84,7 @@ impl RunsView {
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.runs.is_busy();
         let url = format!("{}/actions", self.repo.url());
-        let header = ui::page_header(format!("{} actions", self.repo)).icon(IconName::Workflow);
+        let header = ui::page_header(format!("{} · Actions", self.repo)).icon(IconName::Workflow);
         let header = match self.runs.value() {
             Some(runs) => header.count(runs.len()),
             None => header,
@@ -202,15 +202,7 @@ impl RunsView {
             .role(Role::Link)
             .aria_label(name)
             .relative()
-            .child(
-                div()
-                    .absolute()
-                    .left_2()
-                    .right_2()
-                    .bottom_0()
-                    .h(px(1.))
-                    .bg(tokens::border_subtle()),
-            )
+            .child(ui::list_row_divider(cx))
             .opens(route)
             .child(Icon::new(icon).small().flex_none().text_color(color))
             .child(

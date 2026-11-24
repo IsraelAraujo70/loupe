@@ -33,6 +33,19 @@ pub fn list_row(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .hover(move |row| row.bg(hover))
 }
 
+/// Hairline along the bottom of a `relative()` [`list_row`], inset to the row's
+/// content edge so the hover fill extends past it while wide tables stay easy
+/// to scan across columns.
+pub fn list_row_divider(cx: &App) -> Div {
+    div()
+        .absolute()
+        .left_2()
+        .right_2()
+        .bottom_0()
+        .h(px(1.))
+        .bg(cx.theme().border.opacity(0.45))
+}
+
 /// The 24 px column heading over a multi-lane list, sitting inside
 /// [`list_container`] on the exact leading edge of its [`list_row`]s.
 pub fn list_column_header(cx: &App) -> Div {

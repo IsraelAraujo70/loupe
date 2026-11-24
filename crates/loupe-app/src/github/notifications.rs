@@ -885,15 +885,7 @@ impl NotificationsView {
         .group("notification")
         .when(nested, |row| row.pl_6())
         .gap_2()
-        .child(
-            div()
-                .absolute()
-                .left_2()
-                .right_2()
-                .bottom_0()
-                .h(px(1.))
-                .bg(tokens::border_subtle()),
-        );
+        .child(ui::list_row_divider(cx));
         let row =
             match fold {
                 Some((key, _)) => row.on_click(cx.listener(move |view, _, _, cx| {
@@ -993,10 +985,10 @@ impl NotificationsView {
         if open.is_some() {
             line = line.child(ui::count_badge(count, cx));
         }
-        let trailing_meta: SharedString = match (open, nested, &run) {
-            (Some(_), _, _) => format!("Latest {exact}").into(),
-            (None, true, _) | (None, false, Some(_)) => exact.clone().into(),
-            (None, false, None) => reason_label(&notification.reason).into(),
+        let trailing_meta: SharedString = match (open, nested) {
+            (Some(_), _) => format!("Latest {exact}").into(),
+            (None, true) => exact.clone().into(),
+            (None, false) => reason_label(&notification.reason).into(),
         };
 
         // The pull request of a failed run, one click away from the row
