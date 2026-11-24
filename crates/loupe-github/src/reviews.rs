@@ -742,6 +742,11 @@ pub struct SavedView {
     /// system notification. Off until the user turns it on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notify: bool,
+    /// Whether Loupe automatically generates guided reviews for pull requests
+    /// entering this view's Needs review tab (one at a time, subject to the
+    /// hourly limit in Settings).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_guide: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -793,6 +798,7 @@ impl ViewsFile {
             tab: None,
             collapsed: Vec::new(),
             notify: false,
+            auto_guide: false,
             created_at: now,
             updated_at: now,
         });
@@ -836,6 +842,12 @@ impl ViewsFile {
     /// Turns the view's bell on or off; whether the view exists.
     pub fn set_notify(&mut self, id: &str, on: bool, now: DateTime<Utc>) -> bool {
         self.edit(id, now, |view| view.notify = on)
+    }
+
+    /// Turns automatic guided reviews for Needs review pull requests in this
+    /// view on or off; whether the view exists.
+    pub fn set_auto_guide(&mut self, id: &str, on: bool, now: DateTime<Utc>) -> bool {
+        self.edit(id, now, |view| view.auto_guide = on)
     }
 
     pub fn delete(&mut self, id: &str) -> bool {

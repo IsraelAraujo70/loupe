@@ -378,6 +378,7 @@ impl PullRequestView {
                         view.stack_task = None;
                     }
                     let detail = Arc::new(detail);
+                    crate::github::enqueue_auto_guide_if_watched(detail.clone(), _cx);
                     view.incoming = Some(detail.clone());
                     view.detail.finish(Ok(detail));
                 }

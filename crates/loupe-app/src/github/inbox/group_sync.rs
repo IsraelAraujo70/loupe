@@ -177,6 +177,7 @@ mod tests {
             tab: None,
             collapsed: Vec::new(),
             notify: false,
+            auto_guide: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

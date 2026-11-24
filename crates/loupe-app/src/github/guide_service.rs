@@ -30,7 +30,6 @@ struct PrGuideIndex {
 }
 
 struct ActiveRun {
-    head_oid: String,
     status: String,
     started_at: DateTime<Utc>,
     cancel: CancelToken,
@@ -107,7 +106,6 @@ pub fn is_generating(cx: &App, pr: &PrRef) -> bool {
 
 /// Whether ANY guide generation is currently running (used by the sequential
 /// saved-view auto-summarizer so only one PR generates at a time).
-#[allow(dead_code)]
 pub fn any_generating(cx: &App) -> bool {
     service(cx).is_some_and(|s| !s.runs.is_empty())
 }
@@ -115,6 +113,16 @@ pub fn any_generating(cx: &App) -> bool {
 /// Returns whether a valid cached guide already exists for `(pr, head_oid)`.
 pub fn has_fresh_guide(cx: &App, pr: &PrRef, head_oid: &str) -> bool {
     matches!(load_cached_commit(cx, pr, head_oid), Some(Ok(_)))
+}
+
+/// Returns whether `pr` has a cached guide for an older commit than `head_oid`.
+pub fn has_stale_guide(cx: &App, pr: &PrRef, head_oid: &str) -> bool {
+    load_latest_guide(cx, pr).is_some_and(|stored| stored.is_stale(head_oid))
+}
+
+/// When the most recent cached guide for `pr` was generated, if any.
+pub fn latest_generated_at(cx: &App, pr: &PrRef) -> Option<DateTime<Utc>> {
+    load_latest_guide(cx, pr).map(|stored| stored.generated_at)
 }
 
 /// Returns the cached guide for `pr` at `head_oid`, validated at the boundary.
@@ -356,7 +364,6 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
     svc.runs.insert(
         pr,
         ActiveRun {
-            head_oid: detail.head_oid.clone(),
             status: ProgressEvent::PreparingCheckout.message(),
             started_at: Utc::now(),
             cancel,
@@ -489,14 +496,6 @@ fn commit_cache_key(cx: &App, pr: &PrRef, head_oid: &str) -> String {
 fn index_cache_key(cx: &App, pr: &PrRef) -> String {
     let resource = format!("guide-index-v1/{}", pr.url());
     crate::cache::github_key(cx, &resource).unwrap_or_else(|| format!("local/{resource}"))
-}
-
-/// Active run's target commit SHA, if any.
-#[allow(dead_code)]
-pub fn active_run_head(cx: &App, pr: &PrRef) -> Option<String> {
-    service(cx)
-        .and_then(|s| s.runs.get(pr))
-        .map(|run| run.head_oid.clone())
 }
 
 #[cfg(test)]
