@@ -14,9 +14,9 @@ use gpui_kit::*;
 use loupe_github::{MergeMethod, PullRequestDetail, ReviewEvent, StackEntry};
 
 use super::model::{
-    DraftAction, Panel, PrActions, StackMerge, StateAction, can_approve, discard_confirm_text,
-    merge_button_label, merge_confirm_text, pending_comments_label, resolve_method,
-    stack_entry_problems, stack_merge, stack_merge_confirm_text,
+    DraftAction, Panel, PrActions, PrTab, StackMerge, StateAction, can_approve,
+    discard_confirm_text, merge_button_label, merge_confirm_text, pending_comments_label,
+    resolve_method, stack_entry_problems, stack_merge, stack_merge_confirm_text,
 };
 use super::{PullRequestView, Write};
 use crate::github::widgets;
@@ -43,7 +43,16 @@ impl PullRequestView {
     ) -> impl IntoElement {
         let border = cx.theme().border;
         let surface = cx.theme().group_box;
-        let error = self.write.error().map(str::to_owned);
+        // Ready for review reports in the merge box, which only the
+        // Conversation tab shows; elsewhere its error comes here.
+        let error = self
+            .write
+            .error()
+            .or(self
+                .ready
+                .error()
+                .filter(|_| self.tab != PrTab::Conversation))
+            .map(str::to_owned);
         v_flex()
             .flex_none()
             .when(
@@ -74,6 +83,7 @@ impl PullRequestView {
                             ui::icon_button("pr-write-error-dismiss", IconName::Close, "Dismiss")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.write = crate::github::common::Submit::Idle;
+                                    this.ready = crate::github::common::Submit::Idle;
                                     cx.notify();
                                 })),
                         ),
