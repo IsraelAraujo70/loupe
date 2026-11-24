@@ -469,9 +469,93 @@ pub mod scale {
     pub fn toolbar_height() -> Rems {
         rems(40. / BASE)
     }
+    /// A compact metadata band under a detail header, 36 px.
+    pub fn band_height() -> Rems {
+        rems(36. / BASE)
+    }
+    /// List column heading row, 24 px.
+    pub fn column_header_height() -> Rems {
+        rems(24. / BASE)
+    }
+    /// A labeled control button in a header or form, 28 px.
+    pub fn control_height() -> Rems {
+        rems(28. / BASE)
+    }
+    /// A count badge beside a title, tab, or row, 18 px.
+    pub fn badge_height() -> Rems {
+        rems(18. / BASE)
+    }
+    /// A chip or branch pill, 20 px.
+    pub fn chip_height() -> Rems {
+        rems(20. / BASE)
+    }
     /// Side columns (the pull request's reviewers, labels, links), 296 px.
     pub fn side_width() -> Rems {
         rems(296. / BASE)
+    }
+    /// Wide side columns (Linear issue and project properties), 360 px.
+    pub fn side_wide_width() -> Rems {
+        rems(360. / BASE)
+    }
+    /// Secondary navigation side column (Settings), 220 px.
+    pub fn nav_width() -> Rems {
+        rems(220. / BASE)
+    }
+    /// Jobs side column in Actions runs, 240 px.
+    pub fn jobs_width() -> Rems {
+        rems(240. / BASE)
+    }
+    /// Standard toolbar search field width, 240 px.
+    pub fn search_width() -> Pixels {
+        dp(240.)
+    }
+    /// Compact dialog width (confirmations, quick prompts), 400 px.
+    pub fn dialog_sm() -> Pixels {
+        dp(400.)
+    }
+    /// Medium dialog width (forms with multiple fields), 440 px.
+    pub fn dialog_md() -> Pixels {
+        dp(440.)
+    }
+    /// Standard dropdown/popover menu width, 280 px.
+    pub fn popover_width() -> Pixels {
+        dp(280.)
+    }
+    /// Compact dropdown menu minimum width, 200 px.
+    pub fn menu_min_width() -> Pixels {
+        dp(200.)
+    }
+    /// Tiny icon (sort arrows, chip close buttons), 12 px.
+    pub fn icon_xs() -> Pixels {
+        dp(12.)
+    }
+    /// Small inline icon (status dots, check icons), 14 px.
+    pub fn icon_sm() -> Pixels {
+        dp(14.)
+    }
+    /// Standard icon (row glyphs, header icons), 16 px.
+    pub fn icon_md() -> Pixels {
+        dp(16.)
+    }
+    /// Compact inline avatar (metadata lines, issue rows), 16 px.
+    pub fn avatar_xs() -> Pixels {
+        dp(16.)
+    }
+    /// List row avatar, 18 px.
+    pub fn avatar_sm() -> Pixels {
+        dp(18.)
+    }
+    /// Side panel person avatar, 20 px.
+    pub fn avatar_md() -> Pixels {
+        dp(20.)
+    }
+    /// Header / comment author avatar, 24 px.
+    pub fn avatar_lg() -> Pixels {
+        dp(24.)
+    }
+    /// Full pill corner radius for badges and chips.
+    pub fn pill_radius() -> Pixels {
+        px(9999.)
     }
     /// Sidebar and menu rows, 28 px at the default density.
     pub fn nav_row_height() -> Rems {
