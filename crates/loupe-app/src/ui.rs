@@ -185,9 +185,9 @@ pub fn accent_badge(count: impl std::fmt::Display, _cx: &App) -> Div {
         .child(count.to_string())
 }
 
-/// A Git branch pill: 20 px tall, monospace, accent wash with link text,
-/// truncated cleanly when narrow. Shared by pull request headers, Actions
-/// runs, and workflow run pages.
+/// A Git branch pill: 20 px tall, monospace, quiet surface with subtle border
+/// and link text, sized to its label and truncated cleanly when narrow. Shared
+/// by pull request headers, Actions runs, and workflow run pages.
 pub fn branch_chip(branch: impl Into<SharedString>, cx: &App) -> Div {
     let theme = cx.theme();
     div()
@@ -197,10 +197,12 @@ pub fn branch_chip(branch: impl Into<SharedString>, cx: &App) -> Div {
         .truncate()
         .px_1p5()
         .rounded(theme.radius)
-        .bg(tokens::accent().opacity(0.16))
+        .border_1()
+        .border_color(tokens::border_subtle())
+        .bg(theme.secondary)
         .font_family(theme.mono_font_family.clone())
         .text_size(scale::code())
-        .line_height(rems(1.25))
+        .line_height(rems(1.125))
         .text_color(tokens::link())
         .child(branch.into())
 }

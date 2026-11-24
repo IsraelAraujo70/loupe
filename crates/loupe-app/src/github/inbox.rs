@@ -1994,7 +1994,7 @@ impl InboxView {
             .after_title(self.view_tabs(cx))
             .children_actions(freshness)
             .action(
-                ui::icon_button("inbox-add-repo", IconName::Plus, "Add repository…")
+                ui::icon_button("inbox-add-repo", IconName::FolderGit2, "Add repository…")
                     .debug_selector(|| "inbox-add-repo".into())
                     .on_click(|_, window, cx| super::repo::open_add_repository(window, cx)),
             )
@@ -2794,7 +2794,6 @@ impl Render for InboxView {
                         .w_full()
                         .px_2()
                         .child(super::pr_row::column_header(
-                            true,
                             true,
                             shows_author(active),
                             self.page.sort,

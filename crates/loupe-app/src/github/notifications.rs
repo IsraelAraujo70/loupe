@@ -56,6 +56,8 @@ fn group(notifications: &[Notification]) -> Vec<(RepoRef, Vec<&Notification>)> {
     groups
 }
 
+/// Width of the trailing reason lane ("Review requested").
+const REASON_LANE: f32 = 120.;
 /// Width of the lane for a row's age ("3mo").
 const AGE_LANE: f32 = 40.;
 
@@ -752,14 +754,15 @@ impl NotificationsView {
                     }))
                     .child(ui::group_title(repo.to_string()).truncate()),
             )
+            .when(unread > 0, |row| row.child(ui::count_badge(unread, cx)))
             .child(
                 div()
                     .text_size(scale::meta())
                     .text_color(muted)
                     .child(match unread {
-                        0 => total.to_string(),
-                        unread if unread == total => format!("{unread} unread"),
-                        unread => format!("{unread} unread of {total}"),
+                        0 => format!("{total}"),
+                        unread if unread == total => "unread".to_owned(),
+                        _ => format!("unread of {total}"),
                     }),
             )
             .into_any_element()
@@ -878,9 +881,19 @@ impl NotificationsView {
             Role::Link
         })
         .aria_label(name)
+        .relative()
         .group("notification")
         .when(nested, |row| row.pl_6())
-        .gap_2();
+        .gap_2()
+        .child(
+            div()
+                .absolute()
+                .left_2()
+                .right_2()
+                .bottom_0()
+                .h(px(1.))
+                .bg(tokens::border_subtle()),
+        );
         let row =
             match fold {
                 Some((key, _)) => row.on_click(cx.listener(move |view, _, _, cx| {
@@ -980,11 +993,11 @@ impl NotificationsView {
         if open.is_some() {
             line = line.child(ui::count_badge(count, cx));
         }
-        line = line.child(faint(match (open, nested, &run) {
+        let trailing_meta: SharedString = match (open, nested, &run) {
             (Some(_), _, _) => format!("Latest {exact}").into(),
             (None, true, _) | (None, false, Some(_)) => exact.clone().into(),
             (None, false, None) => reason_label(&notification.reason).into(),
-        }));
+        };
 
         // The pull request of a failed run, one click away from the row
         // that reports it. Opening it marks what the row stands for as read.
@@ -1039,6 +1052,16 @@ impl NotificationsView {
             )
             .child(line)
             .children(open_pr)
+            .child(
+                div()
+                    .flex_none()
+                    .w(dp(REASON_LANE))
+                    .truncate()
+                    .text_right()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(trailing_meta),
+            )
             .child(
                 // A shortcut: opening a notification also marks it read.
                 slot().w_6().invisible().when(unread, |lane| {

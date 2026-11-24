@@ -18,9 +18,9 @@ use crate::theme::{scale, tokens};
 use crate::ui;
 
 /// The lanes after the title, in px: workflow, branch, actor, duration, age.
-const WORKFLOW_LANE: f32 = 150.;
-const BRANCH_LANE: f32 = 150.;
-const ACTOR_LANE: f32 = 24.;
+const WORKFLOW_LANE: f32 = 180.;
+const BRANCH_LANE: f32 = 160.;
+const ACTOR_LANE: f32 = 48.;
 const DURATION_LANE: f32 = 64.;
 const AGE_LANE: f32 = 40.;
 
@@ -154,11 +154,16 @@ impl RunsView {
                 .child(text)
         };
         ui::list_column_header(cx)
-            .child(div().flex_none().w_4())
-            .child(div().flex_1().child("Run"))
+            .child(div().flex_1().min_w_0().child("Run"))
             .child(label("Workflow", WORKFLOW_LANE, false))
             .child(label("Branch", BRANCH_LANE, false))
-            .child(div().flex_none().w(dp(ACTOR_LANE)))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w(dp(ACTOR_LANE))
+                    .justify_center()
+                    .child("Actor"),
+            )
             .child(label("Duration", DURATION_LANE, true))
             .child(label("Age", AGE_LANE, true))
     }
@@ -239,16 +244,18 @@ impl RunsView {
                     .child(run.workflow.clone()),
             )
             .child(
-                div()
+                h_flex()
                     .flex_none()
                     .w(dp(BRANCH_LANE))
                     .min_w_0()
+                    .items_center()
                     .children(run.branch.clone().map(|branch| ui::branch_chip(branch, cx))),
             )
             .child(
-                div()
+                h_flex()
                     .flex_none()
                     .w(dp(ACTOR_LANE))
+                    .justify_center()
                     .when(!login.is_empty(), |cell| {
                         cell.child(ui::avatar_named(avatar_url, login, scale::avatar_md()))
                     }),

@@ -120,7 +120,11 @@ fn bar_cell(
                         .h(dp(4.))
                         .rounded_full()
                         .overflow_hidden()
-                        .bg(tokens::border())
+                        .bg(if settled {
+                            tokens::border_subtle()
+                        } else {
+                            tokens::border()
+                        })
                         .children(
                             runs.into_iter()
                                 .filter(|(part, _)| *part > 0.)

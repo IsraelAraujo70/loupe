@@ -87,9 +87,10 @@ impl PullRequestView {
         let muted = cx.theme().muted_foreground;
         let reference = format!("{} #{}", detail.pr.repo, detail.pr.number);
         let pr_actions = available_actions(detail);
-        // Review is the page's filled action until the pull request can be
-        // merged; then the merge button is, and Review steps back.
-        let review_is_primary = !matches!(pr_actions.merge, MergeAction::Available { .. });
+        // Review is the page's filled action on an open pull request until it
+        // can be merged; once merged or closed it steps back to outlined.
+        let review_is_primary = detail.state == loupe_github::PrState::Open
+            && !matches!(pr_actions.merge, MergeAction::Available { .. });
         // The actions with a label are in sight; the ones that were icons
         // alone (edit the title, the repository's list, refresh) are items
         // of the "More actions" menu, with the state changes.
@@ -252,14 +253,13 @@ impl PullRequestView {
         );
         let branch = |text: String| ui::branch_chip(text, cx).max_w(dp(360.));
         let checks = match detail.checks.state {
-            Some(state) => widgets::tinted_tag(widgets::checks_color(state))
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(widgets::checks_icon(state))
-                        .child(summary.label()),
-                )
+            Some(state) => h_flex()
+                .gap_1()
+                .items_center()
+                .text_size(scale::meta())
+                .text_color(foreground)
+                .child(widgets::checks_icon(state))
+                .child(summary.label())
                 .into_any_element(),
             None => div()
                 .text_size(scale::meta())

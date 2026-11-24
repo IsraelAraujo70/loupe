@@ -273,7 +273,7 @@ impl LinkedThreads {
     fn settings_button(label: &'static str) -> Button {
         Button::new("t3-settings")
             .outline()
-            .xsmall()
+            .small()
             .icon(IconName::Settings)
             .label(label)
             .on_click(|_, window, cx| shell::navigate(Route::Settings, window, cx))

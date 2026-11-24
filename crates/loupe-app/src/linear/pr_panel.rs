@@ -289,7 +289,7 @@ impl PrPanel {
             .child(
                 Button::new("pr-panel-open-settings")
                     .outline()
-                    .xsmall()
+                    .small()
                     .icon(IconName::Settings)
                     .label("Connect in Settings…")
                     .on_click(|_, window, cx| navigate(Route::Settings, window, cx)),

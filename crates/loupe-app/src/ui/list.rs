@@ -7,7 +7,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::theme::scale;
+use crate::theme::{scale, tokens};
 
 /// Outer padding for a vertical list of [`list_row`]s: 8 px on every side so
 /// rows with `px_2()` land their content on the 16 px `content_inset` while
@@ -40,8 +40,11 @@ pub fn list_column_header(cx: &App) -> Div {
         .w_full()
         .h(scale::column_header_height())
         .px_2()
+        .mb_1()
         .gap_3()
         .items_center()
+        .border_b_1()
+        .border_color(tokens::border_subtle())
         .text_size(scale::meta())
         .text_color(cx.theme().muted_foreground)
 }

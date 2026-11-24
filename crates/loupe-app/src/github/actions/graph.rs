@@ -26,15 +26,15 @@ const MAX_ZOOM: f32 = 2.;
 const ZOOM_STEP: f32 = 1.25;
 /// Room around the graph when it is fitted to the view.
 const FIT_MARGIN: f32 = 24.;
-/// Top clearance for the floating zoom controls so they never sit over a job box.
-const TOP_RESERVE: f32 = 52.;
 /// Bottom clearance for the drag/zoom hint.
 const BOTTOM_RESERVE: f32 = 34.;
+/// Minimum inline canvas height so short graphs feel grounded instead of cramped.
+const MIN_INLINE_HEIGHT: f32 = 176.;
 /// Inline, a wide graph shrinks to fit the width down to this zoom, which
 /// keeps its names readable; past it the graph is dragged sideways.
-const INLINE_MIN_ZOOM: f32 = 0.6;
+const INLINE_MIN_ZOOM: f32 = 0.72;
 /// The inline height before the view knows its width.
-const INLINE_HEIGHT: f32 = 480.;
+const INLINE_HEIGHT: f32 = 240.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphEvent {
@@ -45,6 +45,8 @@ pub enum GraphEvent {
 pub struct GraphView {
     nodes: Vec<GraphNode>,
     layout: Layout,
+    file_name: Option<String>,
+    trigger: Option<String>,
     selected: Option<u64>,
     fullscreen: bool,
     zoom: f32,
@@ -68,6 +70,8 @@ impl GraphView {
         Self {
             nodes: Vec::new(),
             layout: Layout::default(),
+            file_name: None,
+            trigger: None,
             selected: None,
             fullscreen: false,
             zoom: 1.,
@@ -101,6 +105,16 @@ impl GraphView {
         }
         self.nodes = nodes;
         cx.notify();
+    }
+
+    pub fn set_meta(&mut self, file_name: String, trigger: String, cx: &mut Context<Self>) {
+        if self.file_name.as_deref() != Some(&file_name)
+            || self.trigger.as_deref() != Some(&trigger)
+        {
+            self.file_name = Some(file_name);
+            self.trigger = Some(trigger);
+            cx.notify();
+        }
     }
 
     pub fn set_selected(&mut self, job: Option<u64>, cx: &mut Context<Self>) {
@@ -139,13 +153,26 @@ impl GraphView {
         };
         let shown_width = dp(self.layout.width).as_f32() * self.zoom;
         let shown_height = dp(self.layout.height).as_f32() * self.zoom;
-        let top = if self.fullscreen {
-            ((height - shown_height) / 2.).max(TOP_RESERVE)
+        let (left, top) = if self.fullscreen {
+            (
+                ((width - shown_width) / 2.).max(FIT_MARGIN),
+                ((height - shown_height) / 2.).max(FIT_MARGIN),
+            )
         } else {
-            self.inline_height = Some(px(shown_height + TOP_RESERVE + BOTTOM_RESERVE));
-            TOP_RESERVE
+            let canvas_height = (shown_height + FIT_MARGIN + BOTTOM_RESERVE).max(MIN_INLINE_HEIGHT);
+            self.inline_height = Some(px(canvas_height));
+            // Align near the leading edge on wide viewports so a small graph
+            // does not float in the middle of an empty expanse; center when
+            // tight so narrow viewports keep balanced margins without clipping.
+            let left = if width >= shown_width + 2. * FIT_MARGIN {
+                FIT_MARGIN
+            } else {
+                ((width - shown_width) / 2.).max(12.)
+            };
+            let top = ((canvas_height - BOTTOM_RESERVE - shown_height) / 2.).max(FIT_MARGIN);
+            (left, top)
         };
-        self.pan = point(px((width - shown_width) / 2.), px(top));
+        self.pan = point(px(left), px(top));
         self.fitted = true;
     }
 
@@ -289,18 +316,11 @@ impl GraphView {
     }
 
     fn controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let percent = (self.zoom * 100.).round() as u32;
         h_flex()
-            .absolute()
-            .top_2()
-            .right_2()
-            .p_0p5()
+            .flex_none()
             .gap_0p5()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
+            .items_center()
             .child(
                 ui::icon_button("graph-zoom-out", IconName::ZoomOut, "Zoom out")
                     .on_click(cx.listener(|this, _, _, cx| this.zoom_center(1. / ZOOM_STEP, cx))),
@@ -345,6 +365,50 @@ impl GraphView {
                 )
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(GraphEvent::ToggleFullscreen))),
             )
+    }
+
+    fn header_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let file = self
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "Workflow".to_owned());
+        h_flex()
+            .flex_none()
+            .w_full()
+            .h(scale::band_height())
+            .px_3()
+            .gap_2()
+            .items_center()
+            .bg(theme.group_box)
+            .border_b_1()
+            .border_color(tokens::border_subtle())
+            .child(
+                Icon::new(IconName::FileCode)
+                    .small()
+                    .flex_none()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(scale::code())
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(file),
+            )
+            .when_some(self.trigger.clone(), |bar, trigger| {
+                bar.child(
+                    div()
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(theme.muted_foreground)
+                        .child(format!("· on: {trigger}")),
+                )
+            })
+            .child(div().flex_1())
+            .child(self.controls(cx))
     }
 }
 
@@ -418,12 +482,13 @@ impl Render for GraphView {
             .enumerate()
             .map(|(ix, (node, placed))| self.node(ix, node, placed, cx))
             .collect();
-        div()
+        let canvas_area = div()
             .id("run-graph")
             .role(Role::Group)
             .aria_label("Run graph")
             .relative()
-            .when(self.fullscreen, |view| view.size_full())
+            .bg(tokens::background().opacity(0.45))
+            .when(self.fullscreen, |view| view.flex_1().w_full().min_h_0())
             .when(!self.fullscreen, |view| {
                 view.w_full()
                     .h(self.inline_height.unwrap_or(dp(INLINE_HEIGHT)))
@@ -452,12 +517,11 @@ impl Render for GraphView {
             .on_scroll(cx.listener(Self::on_scroll))
             .child(edges)
             .children(nodes)
-            .child(self.controls(cx))
             .child(
                 div()
                     .absolute()
                     .bottom_2()
-                    .left(scale::content_inset())
+                    .left_3()
                     .text_size(scale::meta())
                     .text_color(tokens::text_faint())
                     .child(if self.fullscreen {
@@ -465,7 +529,12 @@ impl Render for GraphView {
                     } else {
                         "Drag to move · Cmd or Ctrl and scroll to zoom"
                     }),
-            )
+            );
+        v_flex()
+            .when(self.fullscreen, |view| view.size_full())
+            .when(!self.fullscreen, |view| view.w_full())
+            .child(self.header_bar(cx))
+            .child(canvas_area)
             .into_any_element()
     }
 }

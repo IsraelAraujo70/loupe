@@ -186,6 +186,14 @@ impl RepoView {
                     .on_click(cx.listener(|view, _, _, cx| view.toggle_watch(cx))),
             )
             .action(
+                div()
+                    .flex_none()
+                    .w(px(1.))
+                    .h_4()
+                    .mx_0p5()
+                    .bg(crate::theme::tokens::border_subtle()),
+            )
+            .action(
                 ui::icon_button("add-repo", IconName::Plus, "Add repository…")
                     .on_click(|_, window, cx| open_add_repository(window, cx)),
             )
@@ -271,7 +279,7 @@ impl Render for RepoView {
                     age_from: AgeFrom::Updated,
                 };
                 ui::list_container()
-                    .child(column_header(false, false, true, None, None, cx))
+                    .child(column_header(false, true, None, None, cx))
                     .children(
                         page.items
                             .iter()

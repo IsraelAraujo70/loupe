@@ -216,6 +216,14 @@ impl RunView {
         if run.is_finished() {
             self.cancelling = false;
         }
+        let file_name = run
+            .path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&run.workflow)
+            .to_owned();
+        let trigger = run.event.clone();
         self.jobs = jobs;
         self.run.finish(Ok(run));
         let nodes = graph_nodes(
@@ -225,6 +233,7 @@ impl RunView {
         );
         let selected = self.selected;
         self.graph.update(cx, |graph, cx| {
+            graph.set_meta(file_name, trigger, cx);
             graph.set_nodes(nodes, cx);
             graph.set_selected(selected, cx);
         });
@@ -495,7 +504,7 @@ impl RunView {
                     .child(format!("Triggered by {}", run.event)),
             )
             .when(!login.is_empty(), |band| {
-                band.child(
+                band.child(separator()).child(
                     h_flex()
                         .flex_none()
                         .gap_1p5()
@@ -508,22 +517,26 @@ impl RunView {
                         .child(div().text_color(cx.theme().foreground).child(login)),
                 )
             })
-            .children(
-                run.branch
-                    .clone()
-                    .map(|branch| div().min_w_0().child(ui::branch_chip(branch, cx))),
-            )
+            .children(run.branch.clone().map(|branch| {
+                h_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .items_center()
+                    .child(separator())
+                    .child(ui::branch_chip(branch, cx))
+            }))
             .child(separator())
             .child(div().flex_none().child(format!(
                 "Total {}",
                 format_duration(run.duration_seconds(now))
             )))
-            .child(separator())
-            .child(div().flex_none().child(match artifacts {
-                0 => "No artifacts".to_owned(),
-                1 => "1 artifact".to_owned(),
-                count => format!("{count} artifacts"),
-            }))
+            .when(artifacts > 0, |band| {
+                band.child(separator())
+                    .child(div().flex_none().child(match artifacts {
+                        1 => "1 artifact".to_owned(),
+                        count => format!("{count} artifacts"),
+                    }))
+            })
             .when(run.attempt > 1, |band| {
                 band.child(separator())
                     .child(div().flex_none().child(format!("Attempt {}", run.attempt)))
@@ -572,14 +585,17 @@ impl RunView {
                 .into_any_element()
             })
             .collect();
-        ui::side_panel("run-jobs", ui::SideEdge::Leading, scale::jobs_width())
+        ui::side_panel("run-jobs", ui::SideEdge::Leading, scale::nav_width())
             .p_2()
-            .gap_3()
+            .gap_2()
             .child(summary)
             .child(
                 v_flex()
                     .w_full()
+                    .pt_2()
                     .gap_1()
+                    .border_t_1()
+                    .border_color(tokens::border_subtle())
                     .child(
                         div()
                             .px_2()

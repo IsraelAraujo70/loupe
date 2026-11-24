@@ -28,7 +28,7 @@ pub fn settings_view(window: &mut Window, cx: &mut App) -> AnyView {
 }
 
 /// The width of the page's column of cards.
-const PAGE_WIDTH: f32 = 640.;
+const PAGE_WIDTH: f32 = 680.;
 
 /// The Linear key form's progress. The connected state lives in `Accounts`.
 pub(super) enum LinearForm {
@@ -310,19 +310,29 @@ impl SettingsView {
                 })
                 .into_any_element()),
             Item::InboxFilter => {
-                let filter = settings.notification_filter.join(" ");
-                let empty = filter.is_empty();
+                let tokens = &settings.notification_filter;
+                let empty = tokens.is_empty();
+                let summary: AnyElement = if empty {
+                    div()
+                        .text_size(scale::meta())
+                        .text_color(colors.muted)
+                        .child("None")
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .justify_end()
+                        .max_w(dp(240.))
+                        .children(tokens.iter().map(|token| {
+                            ui::chip().child(div().max_w(dp(200.)).truncate().child(token.clone()))
+                        }))
+                        .into_any_element()
+                };
                 row(h_flex()
-                    .gap_3()
+                    .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .max_w(dp(200.))
-                            .truncate()
-                            .text_size(scale::meta())
-                            .text_color(colors.muted)
-                            .child(if empty { "None".to_owned() } else { filter }),
-                    )
+                    .child(summary)
                     .child(
                         Button::new("inbox-filter-clear")
                             .outline()
@@ -816,6 +826,7 @@ impl Render for SettingsView {
             .flex_1()
             .min_w_0()
             .h_full()
+            .items_center()
             .overflow_y_scroll()
             .px(scale::content_inset())
             .py(scale::section_gap())

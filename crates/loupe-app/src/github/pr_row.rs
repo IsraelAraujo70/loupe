@@ -117,12 +117,12 @@ pub const ROW_GROUP: &str = "pr-row";
 pub type OnSort = Rc<dyn Fn(SortKey, &mut Window, &mut App)>;
 
 /// The 24 px heading over a list of [`pr_row`]s: a 12 px label over each
-/// lane, starting on the rows' own leading edge. With `on_sort`, every lane
-/// but the title's sorts the list when clicked, and the column `sort` names
-/// shows its direction with an arrow. The age lane sorts by the date its
-/// rows show: created when `sort` is by creation, else updated.
+/// lane, flush on the 16 px `content_inset` so every list shares one leading
+/// edge even when rows reveal a hover checkbox lane. With `on_sort`, every
+/// lane but the title's sorts the list when clicked, and the column `sort`
+/// names shows its direction with an arrow. The age lane sorts by the date
+/// its rows show: created when `sort` is by creation, else updated.
 pub fn column_header(
-    checkbox_lane: bool,
     show_repo: bool,
     show_author: bool,
     sort: Option<Sort>,
@@ -149,9 +149,6 @@ pub fn column_header(
             })
     };
     ui::list_column_header(cx)
-        .when(checkbox_lane, |row| {
-            row.child(div().flex_none().w(dp(CHECKBOX_LANE)))
-        })
         .child(div().flex_1().min_w_0().child("Pull request"))
         .when(show_author, |row| {
             row.child(heading(SortKey::Author, "Author", AUTHOR_LANE, true))
