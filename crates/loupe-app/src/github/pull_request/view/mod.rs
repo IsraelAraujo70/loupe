@@ -31,6 +31,7 @@ use super::checks::{ChecksTab, Freshness};
 use super::commits;
 use super::conversation::ConversationTab;
 use super::files::FilesTab;
+use super::guide::GuideTab;
 use super::tab::{PrTabContext, PrTabEvent};
 use crate::github::common::{self, LoadError, Loadable, Submit};
 use crate::github::pr_feed::{self, PrLoaded};
@@ -44,6 +45,7 @@ use model::{Panel, PrTab, review_blocker};
 #[derive(Clone)]
 struct Loaded {
     conversation: Entity<ConversationTab>,
+    guide: Entity<GuideTab>,
     files: Entity<FilesTab>,
     checks: Entity<ChecksTab>,
     /// What the Linear and T3 panels were built from; they are rebuilt when
@@ -178,6 +180,7 @@ pub struct PullRequestView {
     /// panel just opened, and what the user types next belongs there.
     focus_review_body: bool,
     conversation_scroll: ScrollHandle,
+    guide_scroll: ScrollHandle,
     commits_scroll: ScrollHandle,
     checks_scroll: ScrollHandle,
     side_scroll: ScrollHandle,
@@ -279,6 +282,7 @@ impl PullRequestView {
             clear_review_body: false,
             focus_review_body: false,
             conversation_scroll: ScrollHandle::new(),
+            guide_scroll: ScrollHandle::new(),
             commits_scroll: ScrollHandle::new(),
             checks_scroll: ScrollHandle::new(),
             side_scroll: ScrollHandle::new(),
@@ -419,6 +423,9 @@ impl PullRequestView {
                 .conversation
                 .update(cx, |tab, cx| tab.set_detail(detail.clone(), window, cx));
             loaded
+                .guide
+                .update(cx, |tab, cx| tab.set_detail(detail.clone(), window, cx));
+            loaded
                 .files
                 .update(cx, |tab, cx| tab.set_detail(detail.clone(), window, cx));
             loaded
@@ -436,12 +443,18 @@ impl PullRequestView {
             detail: detail.clone(),
         };
         let conversation = cx.new(|cx| ConversationTab::new(context.clone(), window, cx));
+        let guide = cx.new(|cx| GuideTab::new(context.clone(), window, cx));
         let files = cx.new(|cx| FilesTab::new(context.clone(), window, cx));
         let checks = cx.new(|_| ChecksTab::new(context));
         self.subscriptions.push(cx.subscribe_in(
             &conversation,
             window,
             Self::reload_on_tab_event::<ConversationTab>,
+        ));
+        self.subscriptions.push(cx.subscribe_in(
+            &guide,
+            window,
+            Self::reload_on_tab_event::<GuideTab>,
         ));
         self.subscriptions.push(cx.subscribe_in(
             &files,
@@ -457,6 +470,7 @@ impl PullRequestView {
         let t3 = crate::t3::pr_linked_threads(link_context.clone(), window, cx);
         self.loaded = Some(Loaded {
             conversation,
+            guide,
             files,
             checks,
             link_context,
@@ -469,7 +483,7 @@ impl PullRequestView {
         &mut self,
         _tab: &Entity<T>,
         event: &PrTabEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
@@ -477,6 +491,15 @@ impl PullRequestView {
             PrTabEvent::ChecksRequested(jobs) => {
                 self.rerun = Some((Instant::now(), jobs.clone()));
                 self.reload(cx);
+            }
+            PrTabEvent::OpenFile { path, line, side } => {
+                self.tab = PrTab::Files;
+                if let Some(loaded) = &self.loaded {
+                    loaded.files.update(cx, |files, cx| {
+                        files.reveal_line(path, *line, *side, window, cx)
+                    });
+                }
+                cx.notify();
             }
         }
     }
@@ -1063,10 +1086,18 @@ impl PullRequestView {
     }
 
     fn render_tabs(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> impl IntoElement {
+        let guide_count = self
+            .loaded
+            .as_ref()
+            .and_then(|loaded| loaded.guide.read(cx).step_count());
         let tabs = PrTab::ALL.into_iter().map(|tab| {
+            let count = match tab {
+                PrTab::Guide => guide_count,
+                _ => tab.count(detail),
+            };
             ui::section_tab(("pr-tab", tab.index()), tab.title())
                 .icon(tab.icon())
-                .maybe_count(tab.count(detail))
+                .maybe_count(count)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.tab = tab;
                     cx.notify();
@@ -1105,6 +1136,11 @@ impl PullRequestView {
                     )
                     .child(loaded.conversation.clone())
                     .into_any_element(),
+            ),
+            PrTab::Guide => scrolling(
+                "pr-guide",
+                &self.guide_scroll,
+                loaded.guide.clone().into_any_element(),
             ),
             PrTab::Files => div()
                 .flex_1()

@@ -12,14 +12,16 @@ use crate::github::pull_request::checks::format_duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PrTab {
     Conversation,
+    Guide,
     Files,
     Commits,
     Checks,
 }
 
 impl PrTab {
-    pub(super) const ALL: [PrTab; 4] = [
+    pub(super) const ALL: [PrTab; 5] = [
         PrTab::Conversation,
+        PrTab::Guide,
         PrTab::Files,
         PrTab::Commits,
         PrTab::Checks,
@@ -28,6 +30,7 @@ impl PrTab {
     pub(super) fn title(self) -> &'static str {
         match self {
             PrTab::Conversation => "Conversation",
+            PrTab::Guide => "Guide",
             PrTab::Files => "Files",
             PrTab::Commits => "Commits",
             PrTab::Checks => "Checks",
@@ -38,6 +41,7 @@ impl PrTab {
         use gpui_kit::assets::IconName;
         match self {
             PrTab::Conversation => IconName::MessageSquare,
+            PrTab::Guide => IconName::BookOpen,
             PrTab::Files => IconName::FileDiff,
             PrTab::Commits => IconName::GitCommitHorizontal,
             PrTab::Checks => IconName::ListChecks,
@@ -64,7 +68,7 @@ impl PrTab {
     /// The count shown next to the tab title.
     pub(super) fn count(self, detail: &PullRequestDetail) -> Option<usize> {
         match self {
-            PrTab::Conversation => None,
+            PrTab::Conversation | PrTab::Guide => None,
             PrTab::Files => Some(detail.changed_files as usize),
             PrTab::Commits => Some(detail.commits.len()),
             PrTab::Checks => Some(detail.checks.runs.len()),
@@ -1189,9 +1193,10 @@ pub(super) mod tests {
         for tab in PrTab::ALL {
             assert_eq!(PrTab::from_index(tab.index()), Some(tab));
         }
-        assert_eq!(PrTab::from_index(4), None);
+        assert_eq!(PrTab::from_index(5), None);
         assert!(!PrTab::Files.has_side_column());
         assert!(PrTab::Conversation.has_side_column());
+        assert!(PrTab::Guide.has_side_column());
         assert!(PrTab::Commits.has_side_column());
         assert!(PrTab::Checks.has_side_column());
     }
