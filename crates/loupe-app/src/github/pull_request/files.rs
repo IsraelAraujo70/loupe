@@ -96,6 +96,7 @@ pub struct FilesTab {
     threads: HashMap<NodeId, ThreadSlot>,
     threads_dirty: bool,
     composer: Option<ComposerSlot>,
+    pending_reveal: Option<(String, Option<u32>, loupe_github::Side)>,
 }
 
 impl FilesTab {
@@ -127,6 +128,7 @@ impl FilesTab {
             threads: HashMap::new(),
             threads_dirty: false,
             composer: None,
+            pending_reveal: None,
         };
         tab.load_files(cx);
         tab
@@ -277,6 +279,9 @@ impl FilesTab {
             self.composer = None;
         }
         self.threads_dirty = true;
+        if let Some((path, line, side)) = self.pending_reveal.take() {
+            self.apply_reveal(&path, line, side, cx);
+        }
     }
 
     fn collapse_viewed(&self, cx: &mut Context<Self>) {
@@ -365,6 +370,69 @@ impl FilesTab {
         if let Some(state) = &self.diff {
             state.update(cx, |state, cx| state.scroll_to_file(path, cx));
         }
+    }
+
+    /// Selects `path` in the file tree and scrolls the diff to `line` on `side`
+    /// (falling back to the file header when `line` is not in a diff hunk). If
+    /// the diff is still loading, queues the reveal until files land.
+    pub fn reveal_line(
+        &mut self,
+        path: &str,
+        line: Option<u32>,
+        side: loupe_github::Side,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.filter.read(cx).value().is_empty() {
+            self.filter
+                .update(cx, |filter, cx| filter.set_value("", window, cx));
+        }
+        if self.diff.is_none() {
+            self.pending_reveal = Some((path.to_owned(), line, side));
+            cx.notify();
+            return;
+        }
+        self.apply_reveal(path, line, side, cx);
+        cx.notify();
+    }
+
+    fn apply_reveal(
+        &mut self,
+        path: &str,
+        line: Option<u32>,
+        side: loupe_github::Side,
+        cx: &mut Context<Self>,
+    ) {
+        // Expand every parent folder so the file is visible in the tree.
+        let mut cursor = path;
+        while let Some((dir, _)) = cursor.rsplit_once('/') {
+            self.collapsed.remove(dir);
+            cursor = dir;
+        }
+        self.selected = Some(path.to_owned());
+        let rows = self.current_rows(cx);
+        if let Some(ix) = rows.iter().position(|row| row.path == path) {
+            self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
+        let Some(state) = &self.diff else {
+            return;
+        };
+        let has_exact_line = line.is_some_and(|line_no| {
+            self.hunks
+                .get(path)
+                .is_some_and(|hunks| find_line(hunks, line_no, side).is_some())
+        });
+        state.update(cx, |state, cx| {
+            state.set_file_collapsed(path, false, cx);
+            if let Some(line_no) = line.filter(|_| has_exact_line) {
+                state.scroll_to_line(
+                    DiffLinePosition::new(path.to_owned(), to_diff_side(side), line_no as usize),
+                    cx,
+                );
+            } else {
+                state.scroll_to_file(path, cx);
+            }
+        });
     }
 
     /// Marks a file viewed or unviewed at once, collapses or expands it, and

@@ -38,9 +38,9 @@ jobs:
       - name: Website
         run: python3 site/build.py
       - name: Clippy
-        run: cargo clippy -p loupe-github -p loupe-linear -p loupe-t3 -p loupe-update --all-targets -- -D warnings
+        run: cargo clippy -p loupe-github -p loupe-guide -p loupe-linear -p loupe-t3 -p loupe-update --all-targets -- -D warnings
       - name: Test
-        run: cargo test -p loupe-github -p loupe-linear -p loupe-t3 -p loupe-update
+        run: cargo test -p loupe-github -p loupe-guide -p loupe-linear -p loupe-t3 -p loupe-update
 
   app-tests:
     # The `loupe-app` tests, headless: GPUI's test platform needs its system

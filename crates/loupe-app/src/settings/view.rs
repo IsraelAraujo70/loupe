@@ -59,6 +59,7 @@ pub struct SettingsView {
     pub(super) t3_url: Entity<InputState>,
     pub(super) t3_token: Entity<InputState>,
     pub(super) t3_notice: Notice,
+    pub(super) guide_executable: Entity<InputState>,
     pub(super) github_error: Option<SharedString>,
     pub(super) appearance: AppearanceState,
     pub(super) review: ReviewFields,
@@ -87,11 +88,29 @@ impl SettingsView {
                 .masked(true)
                 .placeholder(super::accounts::token_placeholder())
         });
+        let saved_guide_exe = Settings::get(cx)
+            .guide
+            .executable
+            .clone()
+            .unwrap_or_default();
+        let guide_executable = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("claude (auto-detected)")
+                .default_value(saved_guide_exe)
+        });
         let (review, review_subscriptions) = ReviewFields::new(window, cx);
         let mut subscriptions = vec![
             cx.observe_global::<crate::services::Accounts>(|_, cx| cx.notify()),
             cx.observe_global::<crate::services::Services>(|_, cx| cx.notify()),
             cx.observe_global::<Settings>(|_, cx| cx.notify()),
+            cx.subscribe(&guide_executable, |_, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let raw = input.read(cx).value().trim().to_owned();
+                    let next = (!raw.is_empty()).then_some(raw);
+                    store::update_settings(cx, |settings| settings.guide.executable = next);
+                    crate::github::guide_service::recheck_availability(cx);
+                }
+            }),
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     // The page now holds other sections: start it at the top.
@@ -132,6 +151,7 @@ impl SettingsView {
             t3_url,
             t3_token,
             t3_notice: Notice::None,
+            guide_executable,
             github_error: None,
             appearance,
             review,
@@ -181,6 +201,16 @@ impl SettingsView {
             theme::apply_zoom(Settings::get(cx).zoom, cx);
             theme::apply(cx);
             self.appearance.sync(window, cx);
+        }
+        if section == Section::GitHub {
+            let exe = Settings::get(cx)
+                .guide
+                .executable
+                .clone()
+                .unwrap_or_default();
+            self.guide_executable
+                .update(cx, |input, cx| input.set_value(exe, window, cx));
+            crate::github::guide_service::recheck_availability(cx);
         }
         if section == Section::T3 {
             self.review.sync(window, cx);
@@ -459,6 +489,104 @@ impl SettingsView {
                 |settings, place| settings.comment_box = Some(place),
             )
             .into_any_element()),
+            Item::GuideModel => {
+                let current = settings.guide.model.clone();
+                let current_label = current.label();
+                row(Button::new("guide-model")
+                    .outline()
+                    .control()
+                    .label(current_label.clone())
+                    .dropdown_caret(true)
+                    .accessibility_label(format!("Guide model: {current_label}"))
+                    .menu_trigger()
+                    .dropdown_menu(move |menu, _, _| {
+                        let choices = [
+                            (
+                                loupe_guide::GuideModel::Sonnet,
+                                "Claude Sonnet (recommended)",
+                            ),
+                            (loupe_guide::GuideModel::Opus, "Claude Opus"),
+                            (loupe_guide::GuideModel::Haiku, "Claude Haiku (fast)"),
+                        ];
+                        choices.into_iter().fold(
+                            menu.min_w(scale::menu_min_width()),
+                            |menu, (model, label)| {
+                                let selected = model == current;
+                                menu.item(PopupMenuItem::new(label).checked(selected).on_click(
+                                    move |_, _, cx| {
+                                        let model = model.clone();
+                                        store::update_settings(cx, move |settings| {
+                                            settings.guide.model = model;
+                                        });
+                                    },
+                                ))
+                            },
+                        )
+                    })
+                    .into_any_element())
+            }
+            Item::GuideEffort => {
+                let current = settings.guide.effort;
+                row(Button::new("guide-effort")
+                    .outline()
+                    .control()
+                    .label(current.label())
+                    .dropdown_caret(true)
+                    .accessibility_label(format!("Guide effort: {}", current.label()))
+                    .menu_trigger()
+                    .dropdown_menu(move |menu, _, _| {
+                        loupe_guide::GuideEffort::ALL.into_iter().fold(
+                            menu.min_w(dp(160.)),
+                            |menu, effort| {
+                                menu.item(
+                                    PopupMenuItem::new(effort.label())
+                                        .checked(effort == current)
+                                        .on_click(move |_, _, cx| {
+                                            store::update_settings(cx, move |settings| {
+                                                settings.guide.effort = effort;
+                                            });
+                                        }),
+                                )
+                            },
+                        )
+                    })
+                    .into_any_element())
+            }
+            Item::GuideExecutable => row(div()
+                .w(dp(260.))
+                .child(
+                    Input::new(&self.guide_executable)
+                        .small()
+                        .cleanable(true)
+                        .aria_label(entry.title),
+                )
+                .into_any_element()),
+            Item::GuideAutoLimit => {
+                let current = settings.guide.auto_max_per_hour;
+                row(Button::new("guide-auto-limit")
+                    .outline()
+                    .control()
+                    .label(format!("{current} / hour"))
+                    .dropdown_caret(true)
+                    .accessibility_label(format!("Auto-summarize limit: {current} per hour"))
+                    .menu_trigger()
+                    .dropdown_menu(move |menu, _, _| {
+                        crate::store::GuideSettings::AUTO_LIMIT_OPTIONS
+                            .into_iter()
+                            .fold(menu.min_w(dp(140.)), |menu, limit| {
+                                menu.item(
+                                    PopupMenuItem::new(format!("{limit} / hour"))
+                                        .checked(limit == current)
+                                        .on_click(move |_, _, cx| {
+                                            store::update_settings(cx, move |settings| {
+                                                settings.guide.auto_max_per_hour = limit;
+                                            });
+                                        }),
+                                )
+                            })
+                    })
+                    .into_any_element())
+            }
             Item::Repositories => self
                 .repositories(entry, &settings, colors)
                 .into_any_element(),

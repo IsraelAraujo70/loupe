@@ -5,6 +5,7 @@
 //! tab, pull requests group by their next step. Filter clauses (the Linear board's "Add Filter…"
 //! pattern) narrow every tab and can be saved as views.
 
+mod auto_guide;
 mod bells;
 mod dialogs;
 mod filter_menu;
@@ -13,6 +14,9 @@ mod selection;
 mod stacks;
 mod views_store;
 
+pub use self::auto_guide::{
+    enqueue_stale_if_watched as enqueue_auto_guide_if_watched, start as start_auto_guide,
+};
 pub use self::bells::start as start_bells;
 pub use self::group_sync::start as start_group_sync;
 
@@ -2074,6 +2078,10 @@ impl InboxView {
             .as_deref()
             .and_then(|id| views.get(id))
             .is_some_and(|saved| saved.notify);
+        let auto_guide_on = active
+            .as_deref()
+            .and_then(|id| views.get(id))
+            .is_some_and(|saved| saved.auto_guide);
         let view_menu = active_view.map(|(id, name)| {
             let view = view.clone();
             ui::icon_button("reviews-view-menu", IconName::Ellipsis, "View actions")
@@ -2105,6 +2113,15 @@ impl InboxView {
                                 view.update(cx, |this, cx| this.report(error, cx)).ok();
                             })
                     };
+                    let auto_guide = {
+                        let (view, id) = (view.clone(), id.clone());
+                        PopupMenuItem::new("Auto-summarize Needs review")
+                            .checked(auto_guide_on)
+                            .on_click(move |_, _, cx| {
+                                let error = auto_guide::set(&id, !auto_guide_on, cx).err();
+                                view.update(cx, |this, cx| this.report(error, cx)).ok();
+                            })
+                    };
                     let rename = {
                         let (view, id, name) = (view.clone(), id.clone(), name.clone());
                         PopupMenuItem::new("Rename view…").on_click(move |_, window, cx| {
@@ -2128,6 +2145,7 @@ impl InboxView {
                     menu.min_w(scale::menu_min_width())
                         .item(all_open)
                         .item(bell)
+                        .item(auto_guide)
                         .item(PopupMenuItem::separator())
                         .item(rename)
                         .item(PopupMenuItem::separator())

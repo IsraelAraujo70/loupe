@@ -4,6 +4,7 @@ pub(crate) mod checks;
 mod commits;
 mod conversation;
 mod files;
+pub(crate) mod guide;
 mod tab;
 mod thread;
 mod view;

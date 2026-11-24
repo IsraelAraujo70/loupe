@@ -479,6 +479,7 @@ impl Watcher {
         let Some(data) = &self.data else {
             return;
         };
+        super::auto_guide::observe_inbox(&data.inbox, &data.all_open, cx);
         let views = watched(cx);
         let mut notifications: Vec<SystemNotification> = Vec::new();
         for view in &views {

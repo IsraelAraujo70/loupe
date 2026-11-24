@@ -7,6 +7,7 @@ Loupe is a native macOS client for reviewing GitHub pull requests next to the Li
 | Crate | Owns | Depends on GPUI |
 |---|---|---|
 | `loupe-github` | GitHub GraphQL/REST client, domain types, diff parsing | no |
+| `loupe-guide` | Guided PR review schema, validation, safe local Claude Code runner | no |
 | `loupe-linear` | Linear GraphQL client and domain types | no |
 | `loupe-t3` | T3 Code server client | no |
 | `loupe-app` | The GPUI app (binary `loupe`) | yes |

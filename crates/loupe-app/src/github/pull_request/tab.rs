@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use loupe_github::{ActionsJob, PrRef, PullRequestDetail};
+use loupe_github::{ActionsJob, PrRef, PullRequestDetail, Side};
 
 /// What a tab is built from.
 #[derive(Clone)]
@@ -20,4 +20,10 @@ pub enum PrTabEvent {
     /// These failed jobs were re-run: reload, and keep asking GitHub until
     /// their replacements show up, even before any shows as pending.
     ChecksRequested(Vec<ActionsJob>),
+    /// Switch to the Files tab and reveal `path` (and `line` on `side` when given).
+    OpenFile {
+        path: String,
+        line: Option<u32>,
+        side: Side,
+    },
 }

@@ -3846,6 +3846,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "loupe-github",
+ "loupe-guide",
  "loupe-linear",
  "loupe-t3",
  "loupe-update",
@@ -3866,6 +3867,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "ureq",
+]
+
+[[package]]
+name = "loupe-guide"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

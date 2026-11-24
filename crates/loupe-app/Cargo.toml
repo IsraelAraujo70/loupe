@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 loupe-update = { path = "../loupe-update" }
 loupe-github.workspace = true
+loupe-guide.workspace = true
 loupe-linear.workspace = true
 loupe-t3.workspace = true
 gpui-kit.workspace = true

@@ -4,6 +4,7 @@
 
 mod actions;
 mod common;
+pub(crate) mod guide_service;
 pub(crate) mod highlight;
 mod inbox;
 pub(crate) mod live;
@@ -23,8 +24,8 @@ use loupe_github::{PrRef, RepoRef, Verdict};
 use crate::shell::{PaletteItem, refresh_as};
 
 pub use self::inbox::{
-    ClearReviewsSelection, CloseStack, OpenReviewsFilter, OpenStack, SelectTabRows, start_bells,
-    start_group_sync,
+    ClearReviewsSelection, CloseStack, OpenReviewsFilter, OpenStack, SelectTabRows,
+    enqueue_auto_guide_if_watched, start_auto_guide, start_bells, start_group_sync,
 };
 
 /// Runs page `view`'s Refresh when it is a GitHub page with one; false

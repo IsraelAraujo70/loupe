@@ -111,6 +111,7 @@ impl Section {
                 settings.file_tree_position = defaults.file_tree_position;
                 settings.comment_order = defaults.comment_order;
                 settings.comment_box = defaults.comment_box;
+                settings.guide = defaults.guide;
             }
             Section::T3 => settings.t3_review = defaults.t3_review,
             Section::Linear | Section::Shortcuts | Section::About => {}
@@ -146,6 +147,10 @@ pub enum Item {
     LongLines,
     CommentOrder,
     CommentBox,
+    GuideModel,
+    GuideEffort,
+    GuideExecutable,
+    GuideAutoLimit,
     Repositories,
     LinearAccount,
     WorkspaceMappings,
@@ -341,6 +346,38 @@ pub fn entries() -> Vec<Entry> {
             "Comment box",
             "Where the new-comment box sits in a conversation.",
             "top bottom end compose",
+        ),
+        entry(
+            GuideModel,
+            S::GitHub,
+            "Review guide",
+            "Guide model",
+            "The Claude model used by local Claude Code to build guided PR reviews.",
+            "guide summarize claude sonnet opus haiku ai",
+        ),
+        entry(
+            GuideEffort,
+            S::GitHub,
+            "Review guide",
+            "Guide effort",
+            "How deeply Claude Code reasons when building a guided PR review.",
+            "guide summarize reasoning effort low medium high",
+        ),
+        entry(
+            GuideExecutable,
+            S::GitHub,
+            "Review guide",
+            "Claude Code executable",
+            "Optional path to the claude binary. Leave empty to detect automatically.",
+            "guide claude cli binary path executable",
+        ),
+        entry(
+            GuideAutoLimit,
+            S::GitHub,
+            "Review guide",
+            "Auto-summarize limit",
+            "Maximum guides generated automatically per hour across saved views.",
+            "guide auto summarize hourly limit rate cap views",
         ),
         entry(
             Repositories,
