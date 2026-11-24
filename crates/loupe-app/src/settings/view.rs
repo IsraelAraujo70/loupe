@@ -28,7 +28,7 @@ pub fn settings_view(window: &mut Window, cx: &mut App) -> AnyView {
 }
 
 /// The width of the page's column of cards.
-const PAGE_WIDTH: f32 = 760.;
+const PAGE_WIDTH: f32 = 820.;
 
 /// The Linear key form's progress. The connected state lives in `Accounts`.
 pub(super) enum LinearForm {
@@ -652,21 +652,23 @@ impl SettingsView {
         ui::side_panel("settings-nav", ui::SideEdge::Leading, scale::nav_width())
             .px_2()
             .py_3()
-            .gap_1()
+            .gap_2()
             .child(
-                Input::new(&self.search)
-                    .small()
-                    .prefix(
-                        svg()
-                            .path(IconName::Search.path())
-                            .size_3p5()
-                            .text_color(colors.faint),
-                    )
-                    .when_some(
-                        Keystroke::parse("/").ok().filter(|_| search_empty),
-                        |input, key| input.suffix(Kbd::new(key).outline()),
-                    )
-                    .cleanable(true),
+                div().px_1().child(
+                    Input::new(&self.search)
+                        .small()
+                        .prefix(
+                            svg()
+                                .path(IconName::Search.path())
+                                .size_3p5()
+                                .text_color(colors.faint),
+                        )
+                        .when_some(
+                            Keystroke::parse("/").ok().filter(|_| search_empty),
+                            |input, key| input.suffix(Kbd::new(key).outline()),
+                        )
+                        .cleanable(true),
+                ),
             )
             .child(list)
     }

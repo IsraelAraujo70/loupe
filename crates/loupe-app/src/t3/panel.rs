@@ -276,6 +276,7 @@ impl LinkedThreads {
             .xsmall()
             .icon(IconName::Settings)
             .label(label)
+            .text_color(crate::theme::tokens::link())
             .on_click(|_, window, cx| shell::navigate(Route::Settings, window, cx))
     }
 

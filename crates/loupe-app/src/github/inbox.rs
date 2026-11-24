@@ -2795,6 +2795,7 @@ impl Render for InboxView {
                         .px_2()
                         .child(super::pr_row::column_header(
                             true,
+                            true,
                             shows_author(active),
                             self.page.sort,
                             Some(self.on_sort(cx)),

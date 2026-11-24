@@ -191,7 +191,7 @@ impl RepoView {
                     .w(px(1.))
                     .h_4()
                     .mx_0p5()
-                    .bg(crate::theme::tokens::border_subtle()),
+                    .bg(cx.theme().border),
             )
             .action(
                 ui::icon_button("add-repo", IconName::Plus, "Add repository…")
@@ -279,7 +279,7 @@ impl Render for RepoView {
                     age_from: AgeFrom::Updated,
                 };
                 ui::list_container()
-                    .child(column_header(false, true, None, None, cx))
+                    .child(column_header(false, false, true, None, None, cx))
                     .children(
                         page.items
                             .iter()

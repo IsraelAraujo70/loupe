@@ -754,15 +754,14 @@ impl NotificationsView {
                     }))
                     .child(ui::group_title(repo.to_string()).truncate()),
             )
-            .when(unread > 0, |row| row.child(ui::count_badge(unread, cx)))
             .child(
                 div()
                     .text_size(scale::meta())
                     .text_color(muted)
                     .child(match unread {
                         0 => format!("{total}"),
-                        unread if unread == total => "unread".to_owned(),
-                        _ => format!("unread of {total}"),
+                        unread if unread == total => format!("{unread} unread"),
+                        _ => format!("{unread} unread · {total}"),
                     }),
             )
             .into_any_element()
@@ -985,10 +984,11 @@ impl NotificationsView {
         if open.is_some() {
             line = line.child(ui::count_badge(count, cx));
         }
-        let trailing_meta: SharedString = match (open, nested) {
-            (Some(_), _) => format!("Latest {exact}").into(),
-            (None, true) => exact.clone().into(),
-            (None, false) => reason_label(&notification.reason).into(),
+        let trailing_meta: SharedString = match (open, nested, &run) {
+            (Some(_), _, _) => format!("Latest {exact}").into(),
+            (None, true, _) => exact.clone().into(),
+            (None, false, Some(_)) => if failed { "Check failed" } else { "Workflow" }.into(),
+            (None, false, None) => reason_label(&notification.reason).into(),
         };
 
         // The pull request of a failed run, one click away from the row

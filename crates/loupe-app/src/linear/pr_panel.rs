@@ -292,6 +292,7 @@ impl PrPanel {
                     .xsmall()
                     .icon(IconName::Settings)
                     .label("Connect in Settings…")
+                    .text_color(crate::theme::tokens::link())
                     .on_click(|_, window, cx| navigate(Route::Settings, window, cx)),
             )
     }

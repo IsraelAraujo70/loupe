@@ -776,6 +776,9 @@ impl RunView {
         });
         let rows: Vec<_> = rows.collect();
         v_flex()
+            .pt_4()
+            .border_t_1()
+            .border_color(tokens::border_subtle())
             .gap_1()
             .child(
                 h_flex()

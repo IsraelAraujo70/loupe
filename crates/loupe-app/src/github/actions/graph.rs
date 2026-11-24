@@ -26,15 +26,13 @@ const MAX_ZOOM: f32 = 2.;
 const ZOOM_STEP: f32 = 1.25;
 /// Room around the graph when it is fitted to the view.
 const FIT_MARGIN: f32 = 24.;
-/// Bottom clearance for the drag/zoom hint.
-const BOTTOM_RESERVE: f32 = 34.;
-/// Minimum inline canvas height so short graphs feel grounded instead of cramped.
-const MIN_INLINE_HEIGHT: f32 = 176.;
+/// Minimum inline canvas height so short graphs stay compact and balanced.
+const MIN_INLINE_HEIGHT: f32 = 112.;
 /// Inline, a wide graph shrinks to fit the width down to this zoom, which
 /// keeps its names readable; past it the graph is dragged sideways.
 const INLINE_MIN_ZOOM: f32 = 0.72;
 /// The inline height before the view knows its width.
-const INLINE_HEIGHT: f32 = 240.;
+const INLINE_HEIGHT: f32 = 140.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphEvent {
@@ -159,7 +157,7 @@ impl GraphView {
                 ((height - shown_height) / 2.).max(FIT_MARGIN),
             )
         } else {
-            let canvas_height = (shown_height + FIT_MARGIN + BOTTOM_RESERVE).max(MIN_INLINE_HEIGHT);
+            let canvas_height = (shown_height + 2. * FIT_MARGIN).max(MIN_INLINE_HEIGHT);
             self.inline_height = Some(px(canvas_height));
             // Align near the leading edge on wide viewports so a small graph
             // does not float in the middle of an empty expanse; center when
@@ -169,7 +167,7 @@ impl GraphView {
             } else {
                 ((width - shown_width) / 2.).max(12.)
             };
-            let top = ((canvas_height - BOTTOM_RESERVE - shown_height) / 2.).max(FIT_MARGIN);
+            let top = ((canvas_height - shown_height) / 2.).max(FIT_MARGIN);
             (left, top)
         };
         self.pan = point(px(left), px(top));
@@ -342,12 +340,23 @@ impl GraphView {
                     .on_click(cx.listener(|this, _, _, cx| this.zoom_center(ZOOM_STEP, cx))),
             )
             .child(
-                ui::icon_button("graph-fit", IconName::Scan, "Fit to view").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.fitted = false;
-                        cx.notify();
-                    },
-                )),
+                div()
+                    .flex_none()
+                    .w(px(1.))
+                    .h_3p5()
+                    .mx_1()
+                    .bg(cx.theme().border),
+            )
+            .child(
+                ui::icon_button(
+                    "graph-fit",
+                    IconName::Scan,
+                    "Fit to view (drag to pan, Cmd/Ctrl + scroll to zoom)",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.fitted = false;
+                    cx.notify();
+                })),
             )
             .child(
                 ui::icon_button(
@@ -517,19 +526,17 @@ impl Render for GraphView {
             .on_scroll(cx.listener(Self::on_scroll))
             .child(edges)
             .children(nodes)
-            .child(
-                div()
-                    .absolute()
-                    .bottom_2()
-                    .left_3()
-                    .text_size(scale::meta())
-                    .text_color(tokens::text_faint())
-                    .child(if self.fullscreen {
-                        "Drag or scroll to move · Cmd or Ctrl and scroll to zoom"
-                    } else {
-                        "Drag to move · Cmd or Ctrl and scroll to zoom"
-                    }),
-            );
+            .when(self.fullscreen, |canvas| {
+                canvas.child(
+                    div()
+                        .absolute()
+                        .bottom_2()
+                        .left_3()
+                        .text_size(scale::meta())
+                        .text_color(tokens::text_faint())
+                        .child("Drag or scroll to move · Cmd or Ctrl and scroll to zoom"),
+                )
+            });
         v_flex()
             .when(self.fullscreen, |view| view.size_full())
             .when(!self.fullscreen, |view| view.w_full())
