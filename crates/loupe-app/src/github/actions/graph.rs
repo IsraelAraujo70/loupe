@@ -41,6 +41,43 @@ const INLINE_MIN_ZOOM: f32 = 0.72;
 /// The inline height before the view knows its width.
 const INLINE_HEIGHT: f32 = 140.;
 
+/// How the view's zoom and position follow the graph.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fit {
+    /// The graph's shape or the mode changed, or "Fit to view" was pressed:
+    /// the first frame that knows the view's size fits the graph.
+    Pending,
+    /// Fitted to a view of this [`fit_key`]; a view of another one (the
+    /// window was resized) fits again.
+    To(Size<Pixels>),
+    /// The user zoomed or moved the graph, which stays put until its shape
+    /// changes or "Fit to view" is pressed.
+    Manual,
+}
+
+impl Fit {
+    fn wants(self, key: Size<Pixels>) -> bool {
+        match self {
+            Fit::Pending => true,
+            Fit::To(fitted) => fitted != key,
+            Fit::Manual => false,
+        }
+    }
+}
+
+/// The part of the view's size a fit depends on: inline the view takes the
+/// graph's height, so only its width counts.
+fn fit_key(fullscreen: bool, size: Size<Pixels>) -> Size<Pixels> {
+    if fullscreen {
+        size
+    } else {
+        Size {
+            width: size.width,
+            height: px(0.),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphEvent {
     OpenJob(u64),
@@ -64,9 +101,7 @@ pub struct GraphView {
     zoom: f32,
     /// Where the graph's top-left corner is, from the view's.
     pan: Point<Pixels>,
-    /// Whether the view has been fitted to the graph since its shape last
-    /// changed; until it is, the next frame fits it.
-    fitted: bool,
+    fit: Fit,
     /// The view's bounds as last painted, in the current mode.
     viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Inline, the view is as tall as the graph at its fitted zoom.
@@ -91,7 +126,7 @@ impl GraphView {
             fullscreen: false,
             zoom: 1.,
             pan: point(px(0.), px(0.)),
-            fitted: false,
+            fit: Fit::Pending,
             viewport: Rc::new(Cell::new(None)),
             inline_height: None,
             drag: None,
@@ -145,7 +180,7 @@ impl GraphView {
         if open != self.open {
             self.layout = layout(&self.nodes, &open);
             self.open = open;
-            self.fitted = false;
+            self.fit = Fit::Pending;
         }
     }
 
@@ -185,7 +220,7 @@ impl GraphView {
     pub fn set_fullscreen(&mut self, fullscreen: bool, cx: &mut Context<Self>) {
         if self.fullscreen != fullscreen {
             self.fullscreen = fullscreen;
-            self.fitted = false;
+            self.fit = Fit::Pending;
             // The bounds of the other mode would fit the wrong size.
             self.viewport.set(None);
             cx.notify();
@@ -196,6 +231,7 @@ impl GraphView {
     /// the whole graph fits; inline it fits the width (down to
     /// [`INLINE_MIN_ZOOM`]) and the view takes the graph's height.
     fn fit(&mut self, size: Size<Pixels>) {
+        self.fit = Fit::To(fit_key(self.fullscreen, size));
         let (width, height) = (f32::from(size.width), f32::from(size.height));
         let graph_width = dp(self.layout.width).as_f32() + 2. * FIT_MARGIN;
         let graph_height = dp(self.layout.height).as_f32() + 2. * FIT_MARGIN;
@@ -231,7 +267,11 @@ impl GraphView {
             (left, top)
         };
         self.pan = point(px(left), px(top));
-        self.fitted = true;
+    }
+
+    fn fit_to_view(&mut self, cx: &mut Context<Self>) {
+        self.fit = Fit::Pending;
+        cx.notify();
     }
 
     /// Zooms by `factor` keeping the point `anchor` (from the view's corner)
@@ -244,6 +284,7 @@ impl GraphView {
             anchor.y - (anchor.y - self.pan.y) * applied,
         );
         self.zoom = zoom;
+        self.fit = Fit::Manual;
     }
 
     fn zoom_center(&mut self, factor: f32, cx: &mut Context<Self>) {
@@ -265,6 +306,7 @@ impl GraphView {
             self.zoom_at(factor, event.position - origin);
         } else if self.fullscreen {
             self.pan += delta;
+            self.fit = Fit::Manual;
         } else {
             // Inline, the wheel scrolls the page around the graph.
             return;
@@ -493,12 +535,8 @@ impl GraphView {
             )
             .child(ui::vertical_divider(cx))
             .child(
-                ui::icon_button("graph-fit", IconName::Focus, "Fit to view").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.fitted = false;
-                        cx.notify();
-                    },
-                )),
+                ui::icon_button("graph-fit", IconName::Focus, "Fit to view")
+                    .on_click(cx.listener(|this, _, _, cx| this.fit_to_view(cx))),
             )
             .child(
                 ui::icon_button(
@@ -575,8 +613,8 @@ impl Render for GraphView {
                 ))
                 .into_any_element();
         }
-        if !self.fitted
-            && let Some(bounds) = self.viewport.get()
+        if let Some(bounds) = self.viewport.get()
+            && self.fit.wants(fit_key(self.fullscreen, bounds.size))
         {
             self.fit(bounds.size);
         }
@@ -596,10 +634,19 @@ impl Render for GraphView {
         let edge_color = cx.theme().muted_foreground.opacity(0.55);
         let dot_color = tokens::border_subtle();
         let viewport = self.viewport.clone();
-        let needs_fit = !self.fitted;
+        let (fit, fullscreen) = (self.fit, self.fullscreen);
+        let view = cx.entity().downgrade();
         let edges = canvas(
-            move |bounds, _, _| {
+            move |bounds, window, _| {
                 viewport.set(Some(bounds));
+                // The view's size is known only now, too late for this frame;
+                // GPUI ignores `refresh` while drawing, so render again on the
+                // next one, which fits the graph to this size.
+                if fit.wants(fit_key(fullscreen, bounds.size)) {
+                    window.on_next_frame(move |_, cx| {
+                        view.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
                 bounds
             },
             move |_, bounds, window, _| {
@@ -641,10 +688,6 @@ impl Render for GraphView {
                         window.paint_path(path, edge_color);
                     }
                 }
-                // The first frame learns the view's size; fit on the next.
-                if needs_fit {
-                    window.refresh();
-                }
             },
         )
         .absolute()
@@ -660,6 +703,7 @@ impl Render for GraphView {
             .collect();
         let canvas_area = div()
             .id("run-graph")
+            .debug_selector(|| "run-graph".into())
             .role(Role::Group)
             .aria_label("Run graph")
             .relative()
@@ -679,6 +723,7 @@ impl Render for GraphView {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if let (Some((start, pan)), true) = (this.drag, event.dragging()) {
                     this.pan = pan + (event.position - start);
+                    this.fit = Fit::Manual;
                     cx.notify();
                 }
             }))
@@ -710,5 +755,161 @@ impl Render for GraphView {
             .child(self.header_bar(cx))
             .child(canvas_area)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{
+        AppContext as _, Bounds, Entity, Pixels, Point, Size, TestAppContext, VisualTestContext,
+        WindowBounds, WindowOptions, px, size,
+    };
+    use loupe_github::CheckStatus;
+
+    use super::super::layout::{GraphJob, GraphNode, GroupKind};
+    use super::GraphView;
+    use crate::services::Services;
+    use crate::store::Settings;
+
+    fn job(id: u64, name: &str) -> GraphJob {
+        GraphJob {
+            id,
+            label: name.into(),
+            name: name.into(),
+            status: CheckStatus::Passed,
+            seconds: Some(60),
+        }
+    }
+
+    fn single(id: u64, name: &str, needs: Vec<usize>) -> GraphNode {
+        GraphNode {
+            group: None,
+            jobs: vec![job(id, name)],
+            needs,
+        }
+    }
+
+    /// A CI run in the shape of a busy one: three roots, a matrix of eight
+    /// open by default (it holds the selected job), six jobs after them, and
+    /// one check at the end; four columns, taller than the default view.
+    fn nodes() -> Vec<GraphNode> {
+        let mut nodes = vec![
+            single(1, "Changes", vec![]),
+            single(2, "Lint", vec![]),
+            GraphNode {
+                group: Some((GroupKind::Matrix, "test_server".into())),
+                jobs: (0..8)
+                    .map(|n| job(10 + n, &format!("Test Server {}", n + 1)))
+                    .collect(),
+                needs: vec![0],
+            },
+        ];
+        for (ix, name) in ["Build", "Test", "Rust", "Mobile", "Smoke", "Web"]
+            .iter()
+            .enumerate()
+        {
+            nodes.push(single(30 + ix as u64, name, vec![0]));
+        }
+        nodes.push(single(50, "Check", (0..9).collect()));
+        nodes
+    }
+
+    fn open(width: f32, cx: &mut TestAppContext) -> (Entity<GraphView>, VisualTestContext) {
+        let (handle, graph) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(Settings::default());
+            cx.set_global(Services::default());
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(width), px(900.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| cx.new(|_| GraphView::new()),
+            )
+            .expect("open the window")
+        });
+        let mut cx = VisualTestContext::from_window(handle, cx);
+        graph.update(&mut cx, |graph, cx| {
+            graph.set_selected(Some(10), cx);
+            graph.set_nodes(nodes(), cx);
+        });
+        (graph, cx)
+    }
+
+    /// Delivers frames as the platform would until none is asked for.
+    fn settle(cx: &mut VisualTestContext) {
+        for _ in 0..10 {
+            cx.run_until_parked();
+            if cx.update(|window, cx| window.simulate_next_frame(cx)) == 0 {
+                return;
+            }
+        }
+        panic!("the graph keeps asking for frames");
+    }
+
+    /// What the user sees of the graph: the canvas's size, the zoom, and
+    /// where the graph sits in it.
+    fn shown(
+        graph: &Entity<GraphView>,
+        cx: &mut VisualTestContext,
+    ) -> (Size<Pixels>, f32, Point<Pixels>) {
+        let canvas = cx.debug_bounds("run-graph").expect("the graph's canvas");
+        let graph = graph.read_with(cx, |graph, _| (graph.zoom, graph.pan));
+        (canvas.size, graph.0, graph.1)
+    }
+
+    fn fit_to_view(graph: &Entity<GraphView>, cx: &mut VisualTestContext) {
+        graph.update(cx, |graph, cx| graph.fit_to_view(cx));
+        settle(cx);
+    }
+
+    /// The whole graph is inside the canvas at the zoom it shows.
+    fn whole(graph: &Entity<GraphView>, cx: &mut VisualTestContext) -> bool {
+        let (canvas, zoom, pan) = shown(graph, cx);
+        let height = graph.read_with(cx, |graph, _| graph.layout.height);
+        f32::from(pan.y) >= 0.
+            && f32::from(pan.y) + crate::theme::scale::dp(height * zoom).as_f32()
+                <= f32::from(canvas.height)
+    }
+
+    #[gpui_kit::test]
+    fn the_first_frames_fit_the_graph_as_fit_to_view_does(cx: &mut TestAppContext) {
+        let (graph, mut cx) = open(1200., cx);
+        settle(&mut cx);
+        let first = shown(&graph, &mut cx);
+        assert!(whole(&graph, &mut cx), "the graph is cut: {first:?}");
+        fit_to_view(&graph, &mut cx);
+        assert_eq!(first, shown(&graph, &mut cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_resized_window_fits_the_graph_again(cx: &mut TestAppContext) {
+        let (graph, mut cx) = open(1200., cx);
+        settle(&mut cx);
+        let wide = shown(&graph, &mut cx);
+        cx.simulate_resize(size(px(800.), px(900.)));
+        settle(&mut cx);
+        let narrow = shown(&graph, &mut cx);
+        assert!(narrow.1 < wide.1, "a narrower view shrinks the graph");
+        assert!(whole(&graph, &mut cx), "the graph is cut: {narrow:?}");
+        fit_to_view(&graph, &mut cx);
+        assert_eq!(narrow, shown(&graph, &mut cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_resize_keeps_the_users_zoom(cx: &mut TestAppContext) {
+        let (graph, mut cx) = open(1200., cx);
+        settle(&mut cx);
+        graph.update(&mut cx, |graph, cx| graph.zoom_center(1.25, cx));
+        settle(&mut cx);
+        let zoomed = shown(&graph, &mut cx).1;
+        cx.simulate_resize(size(px(800.), px(900.)));
+        settle(&mut cx);
+        assert_eq!(zoomed, shown(&graph, &mut cx).1);
     }
 }
