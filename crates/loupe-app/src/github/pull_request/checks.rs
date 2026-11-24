@@ -11,12 +11,13 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{ActionsJob, CheckRun, CheckStatus, PullRequestDetail, StepLog};
+use loupe_github::{ActionsJob, CheckRun, CheckStatus, PullRequestDetail, RepoRef, StepLog};
 
 use super::tab::{PrTabContext, PrTabEvent};
 use crate::github::common::{self, Submit};
 use crate::github::widgets;
 use crate::route::Route;
+use crate::shell::OpenOnClick as _;
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
@@ -97,6 +98,55 @@ pub(crate) fn status_style(status: CheckStatus) -> (IconName, Hsla) {
         CheckStatus::Cancelled => (IconName::Ban, tokens::text_muted()),
         CheckStatus::ActionRequired => (IconName::CircleAlert, tokens::pending()),
     }
+}
+
+/// Where a check opens in Loupe: its Actions run, on its own job, whether it
+/// is queued, running, or done. The job comes from the check itself, or else
+/// from its Actions link (`…/actions/runs/<run>/job/<job>`); an Actions check
+/// GitHub names no run for opens the pull request's workflow runs. A commit
+/// status or another app's check has no page in Loupe.
+pub(crate) fn check_route(repo: &RepoRef, head_ref: &str, run: &CheckRun) -> Option<Route> {
+    let title = run.workflow.clone().unwrap_or_else(|| run.name.clone());
+    if let Some(job) = run.actions {
+        return Some(Route::WorkflowRun {
+            repo: repo.clone(),
+            run_id: job.run_id,
+            job_id: Some(job.job_id),
+            title,
+        });
+    }
+    if let Some((run_id, job_id)) = run
+        .details_url
+        .as_deref()
+        .and_then(|url| actions_link(repo, url))
+    {
+        return Some(Route::WorkflowRun {
+            repo: repo.clone(),
+            run_id,
+            job_id,
+            title,
+        });
+    }
+    run.workflow.is_some().then(|| Route::Actions {
+        repo: repo.clone(),
+        branch: Some(head_ref.to_owned()),
+    })
+}
+
+/// The run and job of an Actions link of `repo`.
+fn actions_link(repo: &RepoRef, url: &str) -> Option<(u64, Option<u64>)> {
+    let prefix = format!("{}/actions/runs/", repo.url());
+    if !url.get(..prefix.len())?.eq_ignore_ascii_case(&prefix) {
+        return None;
+    }
+    let rest = url[prefix.len()..].split(['?', '#']).next()?;
+    let mut parts = rest.split('/');
+    let run_id = parts.next()?.parse().ok()?;
+    let job_id = match (parts.next(), parts.next()) {
+        (Some("job"), Some(job)) => Some(job.parse().ok()?),
+        _ => None,
+    };
+    Some((run_id, job_id))
 }
 
 /// How current the checks on screen are: the quiet line in the summary
@@ -355,8 +405,8 @@ impl ChecksTab {
                                 .outline()
                                 .small()
                                 .icon(IconName::Workflow)
-                                .label("Open in Actions")
-                                .tooltip("This branch's workflow runs")
+                                .label("View workflow runs")
+                                .tooltip("The workflow runs of this pull request's branch")
                                 .on_click(move |event, window, cx| {
                                     crate::shell::open(actions.clone(), event, window, cx)
                                 }),
@@ -448,7 +498,13 @@ impl ChecksTab {
         let url = run.details_url.clone();
         let job = failed_job(run);
         let log_open = job.is_some_and(|job| self.logs.contains_key(&job.job_id));
+        let route = check_route(&self.context.pr.repo, &self.context.detail.head_ref, run);
         ui::list_row(("check", ix), cx)
+            .when_some(route.clone(), |row, route| {
+                row.role(Role::Button)
+                    .aria_label(format!("{}, open its run", run.name))
+                    .opens(route)
+            })
             .child(Icon::new(icon).small().text_color(color))
             .child(
                 h_flex()
@@ -499,13 +555,7 @@ impl ChecksTab {
                     .flex_none()
                     .w_6()
                     .justify_center()
-                    .children(run.actions.map(|job| {
-                        let route = Route::WorkflowRun {
-                            repo: self.context.pr.repo.clone(),
-                            run_id: job.run_id,
-                            job_id: Some(job.job_id),
-                            title: run.workflow.clone().unwrap_or_else(|| run.name.clone()),
-                        };
+                    .children(route.map(|route| {
                         ui::icon_button(("check-run", ix), IconName::Workflow, "Open in Actions")
                             .xsmall()
                             .accessibility_label(format!("Open {} in Actions", run.name))
@@ -571,7 +621,10 @@ mod tests {
 
     use chrono::{Local, TimeZone};
 
-    use super::{ChecksSummary, Freshness, format_duration, run_duration};
+    use loupe_github::{ActionsJob, RepoRef};
+
+    use super::{ChecksSummary, Freshness, check_route, format_duration, run_duration};
+    use crate::route::Route;
 
     fn run(status: CheckStatus) -> CheckRun {
         CheckRun {
@@ -679,5 +732,71 @@ mod tests {
         let busy = Freshness { busy: true, ..live };
         assert_eq!(busy.label().as_deref(), Some("Updating…"));
         assert_eq!(Freshness::default().label(), None);
+    }
+
+    #[test]
+    fn a_check_opens_its_own_job_whether_it_is_pending_running_or_done() {
+        let repo = RepoRef::new("IsraelAraujo70", "loupe");
+        let job = |run: u64, job: u64| Route::WorkflowRun {
+            repo: repo.clone(),
+            run_id: run,
+            job_id: Some(job),
+            title: "CI".into(),
+        };
+        for status in [
+            CheckStatus::Queued,
+            CheckStatus::Running,
+            CheckStatus::Failed,
+            CheckStatus::Passed,
+        ] {
+            let check = CheckRun {
+                workflow: Some("CI".into()),
+                actions: Some(ActionsJob {
+                    job_id: 138,
+                    run_id: 45,
+                }),
+                ..run(status)
+            };
+            assert_eq!(
+                check_route(&repo, "issue/121", &check),
+                Some(job(45, 138)),
+                "{status:?}"
+            );
+        }
+        // No ids on the check: its Actions link names the run and the job.
+        let linked = CheckRun {
+            workflow: Some("CI".into()),
+            details_url: Some(
+                "https://github.com/israelaraujo70/loupe/actions/runs/46/job/139?pr=124".into(),
+            ),
+            ..run(CheckStatus::Queued)
+        };
+        assert_eq!(check_route(&repo, "issue/121", &linked), Some(job(46, 139)));
+    }
+
+    #[test]
+    fn an_actions_check_without_a_run_opens_the_branch_runs_and_a_status_opens_nothing() {
+        let repo = RepoRef::new("IsraelAraujo70", "loupe");
+        let waiting = CheckRun {
+            workflow: Some("Release".into()),
+            ..run(CheckStatus::Queued)
+        };
+        assert_eq!(
+            check_route(&repo, "issue/121", &waiting),
+            Some(Route::Actions {
+                repo: repo.clone(),
+                branch: Some("issue/121".into()),
+            })
+        );
+        let status = CheckRun {
+            details_url: Some("https://ci.example/build/7".into()),
+            ..run(CheckStatus::Running)
+        };
+        assert_eq!(check_route(&repo, "issue/121", &status), None);
+        let other_repo = CheckRun {
+            details_url: Some("https://github.com/acme/web/actions/runs/1/job/2".into()),
+            ..run(CheckStatus::Running)
+        };
+        assert_eq!(check_route(&repo, "issue/121", &other_repo), None);
     }
 }

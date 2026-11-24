@@ -4,6 +4,7 @@
 //! steps and logs, annotations and artifacts, and its actions.
 
 mod graph;
+mod jobs;
 mod layout;
 mod log;
 mod run;
