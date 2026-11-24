@@ -1128,6 +1128,7 @@ fn slider_control(
     h_flex()
         .gap_3()
         .items_center()
+        .when(disabled, |row| row.opacity(0.4))
         .child(
             div().w(dp(160.)).child(
                 Slider::new(state)

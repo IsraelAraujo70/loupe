@@ -654,21 +654,19 @@ impl SettingsView {
             .py_3()
             .gap_2()
             .child(
-                div().px_1().child(
-                    Input::new(&self.search)
-                        .small()
-                        .prefix(
-                            svg()
-                                .path(IconName::Search.path())
-                                .size_3p5()
-                                .text_color(colors.faint),
-                        )
-                        .when_some(
-                            Keystroke::parse("/").ok().filter(|_| search_empty),
-                            |input, key| input.suffix(Kbd::new(key).outline()),
-                        )
-                        .cleanable(true),
-                ),
+                Input::new(&self.search)
+                    .small()
+                    .prefix(
+                        svg()
+                            .path(IconName::Search.path())
+                            .size_3p5()
+                            .text_color(colors.faint),
+                    )
+                    .when_some(
+                        Keystroke::parse("/").ok().filter(|_| search_empty),
+                        |input, key| input.suffix(Kbd::new(key).outline()),
+                    )
+                    .cleanable(true),
             )
             .child(list)
     }

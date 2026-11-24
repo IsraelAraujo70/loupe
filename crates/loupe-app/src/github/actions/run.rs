@@ -497,17 +497,23 @@ impl RunView {
         );
         let artifacts = self.extras.artifacts.len();
         let separator = || div().text_color(tokens::text_faint()).child("·");
-        let status_pill = ui::tinted_chip(color).child(
-            h_flex()
-                .gap_1()
-                .items_center()
-                .child(
-                    Icon::new(icon)
-                        .with_size(scale::icon_sm())
-                        .text_color(color),
-                )
-                .child(capitalized(status_word(run.status))),
-        );
+        let status_pill = h_flex()
+            .h(scale::chip_height())
+            .px_2()
+            .gap_1()
+            .items_center()
+            .rounded(cx.theme().radius)
+            .bg(color.opacity(0.12))
+            .border_1()
+            .border_color(color.opacity(0.28))
+            .text_size(scale::meta())
+            .text_color(color)
+            .child(
+                Icon::new(icon)
+                    .with_size(scale::icon_sm())
+                    .text_color(color),
+            )
+            .child(capitalized(status_word(run.status)));
         ui::meta_band(cx)
             .child(div().flex_none().child(status_pill))
             .child(

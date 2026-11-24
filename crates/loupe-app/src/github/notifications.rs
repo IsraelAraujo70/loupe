@@ -1017,6 +1017,14 @@ impl NotificationsView {
         // the line above. At the trailing edge, fixed columns: Open PR,
         // mark as read (on hover), and the age.
         let row = row
+            .child(
+                slot().w_2().child(
+                    div()
+                        .size_1p5()
+                        .rounded_full()
+                        .when(unread, |dot| dot.bg(tokens::accent())),
+                ),
+            )
             .child(slot().w_4().map(|slot| {
                 match open {
                     Some(open) => slot.child(
@@ -1034,14 +1042,6 @@ impl NotificationsView {
                     ),
                 }
             }))
-            .child(
-                slot().w_2().child(
-                    div()
-                        .size_1p5()
-                        .rounded_full()
-                        .when(unread, |dot| dot.bg(tokens::accent())),
-                ),
-            )
             .child(line)
             .children(open_pr)
             .child(

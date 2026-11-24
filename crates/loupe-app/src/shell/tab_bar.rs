@@ -691,11 +691,16 @@ fn tabs(
                 .rounded(radius)
                 .text_size(rems(13. / 16.))
                 .when(selected, |tab| {
-                    tab.bg(tokens::glass_selected()).text_color(if emphasized {
-                        foreground
+                    let dark = crate::theme::is_dark();
+                    tab.bg(if dark {
+                        tokens::glass_selected()
                     } else {
-                        muted
+                        tokens::surface()
                     })
+                    .when(!dark, |tab| {
+                        tab.border_1().border_color(tokens::border_subtle())
+                    })
+                    .text_color(if emphasized { foreground } else { muted })
                 })
                 .when(!selected, |tab| {
                     tab.text_color(muted)
