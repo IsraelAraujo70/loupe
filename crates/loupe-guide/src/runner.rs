@@ -177,6 +177,13 @@ pub fn run_in_checkout_with_timeout(
     let user_prompt = build_user_prompt(input);
 
     let mut cmd = build_command(exe, checkout_dir, config, &schema_json, SYSTEM_PROMPT);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Put the agent in its own process group so cancel/timeout terminates
+        // any grandchild processes that may still hold stdout/stderr pipes.
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|err| GuideRunError::Spawn(err.to_string()))?;
@@ -323,8 +330,9 @@ pub fn run_in_checkout_with_timeout(
 
 #[cfg(unix)]
 fn terminate_pid(pid: u32) {
+    let pgid = format!("-{pid}");
     let _ = std::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
+        .args(["-TERM", "--", &pgid])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -332,8 +340,9 @@ fn terminate_pid(pid: u32) {
 
 #[cfg(unix)]
 fn force_kill_pid(pid: u32) {
+    let pgid = format!("-{pid}");
     let _ = std::process::Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
+        .args(["-KILL", "--", &pgid])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -490,7 +499,7 @@ mod tests {
 
         let (src, sha) = create_malicious_test_repo();
         let stub = std::env::temp_dir().join(format!("loupe-stall-stub-{}.sh", std::process::id()));
-        fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::write(&stub, "#!/bin/sh\nsleep 30 &\nwait\n").unwrap();
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
 
         let checkout_path;
