@@ -24,16 +24,11 @@ use loupe_github::{
 use super::graph::{GraphEvent, GraphView};
 use super::layout::graph_nodes;
 use super::log::JobPane;
-use super::{
-    POLL_EVERY, branch_chip, format_duration, job_duration_label, status_style, status_word,
-};
+use super::{POLL_EVERY, format_duration, job_duration_label, status_style, status_word};
 use crate::github::common::{self, Loadable, Submit};
 use crate::shell::Refreshable as _;
-use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui::{self, ControlSize as _, MenuTriggerExt as _};
-
-const JOBS_COLUMN: f32 = 260.;
 
 /// What one load reads.
 struct Snapshot {
@@ -221,15 +216,36 @@ impl RunView {
         if run.is_finished() {
             self.cancelling = false;
         }
-        self.jobs = jobs;
-        self.run.finish(Ok(run));
+        let file_name = run
+            .path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&run.workflow)
+            .to_owned();
+        let trigger = run.event.clone();
         let nodes = graph_nodes(
             self.spec.as_ref().and_then(Option::as_ref),
-            &self.jobs,
+            &jobs,
             Utc::now(),
         );
+        // Keep the sidebar job list in the same topological order as the graph
+        // so both views walk jobs identically.
+        let mut order = std::collections::HashMap::new();
+        for (ix, id) in nodes
+            .iter()
+            .flat_map(|node| node.jobs.iter().map(|job| job.id))
+            .enumerate()
+        {
+            order.entry(id).or_insert(ix);
+        }
+        let mut jobs = jobs;
+        jobs.sort_by_key(|job| order.get(&job.id).copied().unwrap_or(usize::MAX));
+        self.jobs = jobs;
+        self.run.finish(Ok(run));
         let selected = self.selected;
         self.graph.update(cx, |graph, cx| {
+            graph.set_meta(file_name, trigger, cx);
             graph.set_nodes(nodes, cx);
             graph.set_selected(selected, cx);
         });
@@ -452,7 +468,7 @@ impl RunView {
             )
             .action(h_flex().gap_2().children(rerun).children(cancel))
             .action(
-                ui::outline_icon_button(
+                ui::icon_button(
                     "run-workflow-file",
                     IconName::FileCode,
                     "Open workflow file",
@@ -460,7 +476,7 @@ impl RunView {
                 .on_click(move |_, _, cx| cx.open_url(&workflow_url)),
             )
             .action(
-                ui::outline_icon_button("run-browser", IconName::ExternalLink, "Open in browser")
+                ui::icon_button("run-browser", IconName::ExternalLink, "Open in browser")
                     .on_click(move |_, _, cx| cx.open_url(&run_url)),
             )
             .action(
@@ -473,63 +489,63 @@ impl RunView {
 
     /// What started the run, where, by whom, how long, and what it made.
     fn band(&self, run: &WorkflowRun, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let now = Utc::now();
+        let (icon, color) = status_style(run.status);
         let (login, avatar_url) = run.actor.as_ref().map_or_else(
             || (String::new(), String::new()),
             |actor| (actor.login.clone(), actor.avatar_url.clone()),
         );
         let artifacts = self.extras.artifacts.len();
         let separator = || div().text_color(tokens::text_faint()).child("·");
-        h_flex()
-            .flex_none()
-            .h_8()
-            .px(scale::content_inset())
-            .gap_2()
-            .items_center()
-            .overflow_hidden()
-            .border_b_1()
-            .border_color(tokens::border_subtle())
-            .text_size(scale::meta())
-            .text_color(theme.muted_foreground)
+        let status_pill = ui::status_chip(color, cx)
+            .text_color(color)
             .child(
-                div()
-                    .flex_none()
-                    .text_color(theme.foreground)
-                    .child(capitalized(status_word(run.status))),
+                Icon::new(icon)
+                    .with_size(scale::icon_sm())
+                    .text_color(color),
             )
-            .child(separator())
+            .child(capitalized(status_word(run.status)));
+        ui::meta_band(cx)
+            .child(div().flex_none().child(status_pill))
             .child(
                 div()
                     .flex_none()
                     .child(format!("Triggered by {}", run.event)),
             )
             .when(!login.is_empty(), |band| {
-                band.child(
+                band.child(separator()).child(
                     h_flex()
                         .flex_none()
-                        .gap_1()
+                        .gap_1p5()
                         .items_center()
-                        .child(ui::avatar_named(avatar_url, login.clone(), dp(16.)))
-                        .child(login),
+                        .child(ui::avatar_named(
+                            avatar_url,
+                            login.clone(),
+                            scale::avatar_xs(),
+                        ))
+                        .child(div().text_color(cx.theme().foreground).child(login)),
                 )
             })
-            .children(
-                run.branch
-                    .clone()
-                    .map(|branch| div().min_w_0().child(branch_chip(branch, cx))),
-            )
+            .children(run.branch.clone().map(|branch| {
+                h_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .items_center()
+                    .child(separator())
+                    .child(ui::branch_chip(branch, cx))
+            }))
             .child(separator())
             .child(div().flex_none().child(format!(
                 "Total {}",
                 format_duration(run.duration_seconds(now))
             )))
-            .child(separator())
-            .child(div().flex_none().child(match artifacts {
-                0 => "No artifacts".to_owned(),
-                1 => "1 artifact".to_owned(),
-                count => format!("{count} artifacts"),
-            }))
+            .when(artifacts > 0, |band| {
+                band.child(separator())
+                    .child(div().flex_none().child(match artifacts {
+                        1 => "1 artifact".to_owned(),
+                        count => format!("{count} artifacts"),
+                    }))
+            })
             .when(run.attempt > 1, |band| {
                 band.child(separator())
                     .child(div().flex_none().child(format!("Attempt {}", run.attempt)))
@@ -544,20 +560,7 @@ impl RunView {
     fn jobs_column(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let now = Utc::now();
-        let row = |id: ElementId, selected: bool| {
-            h_flex()
-                .id(id)
-                .role(Role::Button)
-                .h(scale::nav_row_height())
-                .px_2()
-                .gap_2()
-                .items_center()
-                .rounded(theme.radius)
-                .when(selected, |row| row.bg(theme.list_active))
-                .hover(|row| row.bg(theme.list_hover))
-                .text_size(scale::body())
-        };
-        let summary = row("run-summary".into(), self.selected.is_none())
+        let summary = ui::nav_row("run-summary", self.selected.is_none(), cx)
             .aria_label("Summary")
             .child(
                 Icon::new(IconName::Workflow)
@@ -572,9 +575,10 @@ impl RunView {
             .map(|job| {
                 let (icon, color) = status_style(job.status);
                 let id = job.id;
-                row(
-                    SharedString::from(format!("run-job-{id}")).into(),
+                ui::nav_row(
+                    SharedString::from(format!("run-job-{id}")),
                     self.selected == Some(id),
+                    cx,
                 )
                 .aria_label(format!("{}, {}", job.name, status_word(job.status)))
                 .child(Icon::new(icon).small().flex_none().text_color(color))
@@ -590,28 +594,24 @@ impl RunView {
                 .into_any_element()
             })
             .collect();
-        v_flex()
-            .id("run-jobs")
-            .flex_none()
-            .w(dp(JOBS_COLUMN))
-            .h_full()
+        ui::side_panel("run-jobs", ui::SideEdge::Leading, scale::nav_width())
             .p_2()
-            .gap_0p5()
-            .overflow_y_scroll()
-            .border_r_1()
-            .border_color(tokens::border_subtle())
+            .gap_2()
             .child(summary)
             .child(
-                h_flex()
-                    .h_8()
-                    .px_2()
-                    .mt_2()
-                    .gap_2()
-                    .items_center()
-                    .child(ui::section_label("Jobs", cx))
-                    .child(ui::count_badge(self.jobs.len(), cx)),
+                v_flex()
+                    .w_full()
+                    .pt_2()
+                    .gap_1()
+                    .border_t_1()
+                    .border_color(tokens::border_subtle())
+                    .child(
+                        div()
+                            .px_2()
+                            .child(ui::side_section("Jobs").count(self.jobs.len())),
+                    )
+                    .child(v_flex().w_full().gap_0p5().children(jobs)),
             )
-            .children(jobs)
     }
 
     fn annotations(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -704,7 +704,6 @@ impl RunView {
                 .gap_1()
                 .child(
                     h_flex()
-                        .px_2()
                         .gap_2()
                         .items_center()
                         .child(ui::group_title("Annotations"))
@@ -774,10 +773,12 @@ impl RunView {
         });
         let rows: Vec<_> = rows.collect();
         v_flex()
+            .pt_4()
+            .border_t_1()
+            .border_color(tokens::border_subtle())
             .gap_1()
             .child(
                 h_flex()
-                    .px_2()
                     .gap_2()
                     .items_center()
                     .child(ui::group_title("Artifacts"))
@@ -786,11 +787,11 @@ impl RunView {
                     }),
             )
             .when(rows.is_empty(), |column| {
-                column.child(div().px_2().child(ui::empty_line(
+                column.child(ui::empty_line(
                     IconName::Package,
                     "This run uploaded no artifacts.",
                     cx,
-                )))
+                ))
             })
             .children(rows)
     }
@@ -911,7 +912,7 @@ impl Render for RunView {
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
                     .into_any_element()
             }
-            (_, None) => div().p_2().child(ui::skeleton_rows(8)).into_any_element(),
+            (_, None) => ui::loading_rows(8).into_any_element(),
             (_, Some(_)) if self.fullscreen => div()
                 .flex_1()
                 .min_h_0()
@@ -961,7 +962,10 @@ fn keeps_polling(run: Option<&WorkflowRun>, awaited: Option<u32>) -> bool {
 fn confirm_cancel(view: WeakEntity<RunView>, window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, move |dialog, _, cx| {
         let view = view.clone();
-        dialog.title("Cancel this run?").w(px(400.)).child(
+        dialog
+            .title("Cancel this run?")
+            .w(scale::dialog_sm())
+            .child(
             v_flex()
                 .gap_3()
                 .child(

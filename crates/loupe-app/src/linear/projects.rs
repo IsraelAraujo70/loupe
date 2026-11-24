@@ -15,7 +15,6 @@ use crate::route::Route;
 use crate::services::background;
 use crate::shell::OpenOnClick as _;
 use crate::theme::scale;
-use crate::theme::scale::dp;
 use crate::ui;
 
 pub fn view(team_id: Option<String>, _window: &mut Window, cx: &mut App) -> AnyView {
@@ -72,9 +71,19 @@ impl ProjectsView {
         cx.notify();
     }
 
+    fn heading(&self, cx: &App) -> impl IntoElement {
+        ui::list_column_header(cx)
+            .child(div().flex_none().size_2p5())
+            .child(div().flex_1().min_w_0().child("Project"))
+            .child(div().flex_none().w_32().child("Status"))
+            .child(div().flex_none().w_40().child("Lead"))
+            .child(div().flex_none().w_24().child("Progress"))
+            .child(div().flex_none().w_20().text_right().child("Target"))
+    }
+
     fn row(&self, project: &ProjectSummary, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+        let muted = theme.muted_foreground;
         let color = widgets::hex_color(&project.color).unwrap_or(muted);
         let status_color = widgets::hex_color(&project.status.color).unwrap_or(muted);
         let route = Route::LinearProject {
@@ -82,18 +91,12 @@ impl ProjectsView {
             name: project.name.clone(),
         };
         let percent = (project.progress * 100.).round() as u32;
-        h_flex()
-            .id(SharedString::from(format!("project-{}", project.id)))
+        ui::list_row(SharedString::from(format!("project-{}", project.id)), cx)
             .role(Role::Link)
             .aria_label(format!(
                 "{}, {}, {percent}%",
                 project.name, project.status.name
             ))
-            .h(scale::row_height())
-            .px(scale::content_inset())
-            .gap_3()
-            .items_center()
-            .hover(move |row| row.bg(hover))
             .opens(route)
             .child(div().flex_none().size_2p5().rounded_sm().bg(color))
             .child(
@@ -101,8 +104,6 @@ impl ProjectsView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(scale::body())
-                    .font_weight(FontWeight::MEDIUM)
                     .child(project.name.clone()),
             )
             .child(
@@ -123,7 +124,7 @@ impl ProjectsView {
                     .items_center()
                     .text_size(scale::meta())
                     .text_color(muted)
-                    .child(widgets::avatar(project.lead.as_ref(), dp(18.)))
+                    .child(widgets::avatar(project.lead.as_ref(), scale::avatar_sm()))
                     .child(
                         div().truncate().child(
                             project
@@ -184,7 +185,7 @@ impl Render for ProjectsView {
             _ => ui::page_header("Projects").icon(IconName::Box),
         };
         let body = match &self.projects {
-            Loadable::Loading => ui::skeleton_rows(8).into_any_element(),
+            Loadable::Loading => ui::loading_rows(8).into_any_element(),
             Loadable::Failed(message) => {
                 widgets::load_error(message.clone(), cx.listener(|this, _, _, cx| this.load(cx)))
             }
@@ -194,8 +195,8 @@ impl Render for ProjectsView {
                 "Projects you can see in Linear show up here.",
             )
             .into_any_element(),
-            Loadable::Ready(projects) => v_flex()
-                .py_2()
+            Loadable::Ready(projects) => ui::list_container()
+                .child(self.heading(cx))
                 .children(projects.iter().map(|project| self.row(project, cx)))
                 .into_any_element(),
         };

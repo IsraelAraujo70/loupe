@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
@@ -288,10 +288,11 @@ impl PrPanel {
             ))
             .child(
                 Button::new("pr-panel-open-settings")
-                    .outline()
+                    .ghost()
                     .xsmall()
                     .icon(IconName::Settings)
                     .label("Connect in Settings…")
+                    .text_color(crate::theme::tokens::link())
                     .on_click(|_, window, cx| navigate(Route::Settings, window, cx)),
             )
     }

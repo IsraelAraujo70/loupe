@@ -17,9 +17,13 @@ use crate::theme::{scale, tokens};
 use crate::ui;
 
 /// Bodies taller than this show cut, with "Show more".
-const MAX_BODY_HEIGHT: Pixels = px(600.);
+fn max_body_height() -> Pixels {
+    scale::dp(600.)
+}
 /// The fade over the bottom of a cut body.
-const FADE_HEIGHT: Pixels = px(72.);
+fn fade_height() -> Pixels {
+    scale::dp(72.)
+}
 
 /// What the reader folded or unfolded in this conversation. Anything not
 /// here follows its default.
@@ -106,11 +110,12 @@ impl ConversationTab {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let uncapped = self.folds.uncapped.contains(id);
+        let cap = max_body_height();
         let tall = self
             .folds
             .heights
             .get(id)
-            .is_some_and(|height| *height > MAX_BODY_HEIGHT);
+            .is_some_and(|height| *height > cap);
         let content = self.markdown(id, &segments::split(body), "", cx);
         let view = cx.entity().downgrade();
         let measured = id.clone();
@@ -135,7 +140,7 @@ impl ConversationTab {
             })
             .child(div().flex_none().w_full().child(content));
         if !uncapped {
-            frame = frame.max_h(MAX_BODY_HEIGHT).overflow_hidden();
+            frame = frame.max_h(cap).overflow_hidden();
         }
         if tall && !uncapped {
             frame = frame.child(
@@ -144,7 +149,7 @@ impl ConversationTab {
                     .left_0()
                     .right_0()
                     .bottom_0()
-                    .h(FADE_HEIGHT)
+                    .h(fade_height())
                     .bg(linear_gradient(
                         180.,
                         linear_color_stop(fade_to.opacity(0.), 0.),

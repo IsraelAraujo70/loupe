@@ -56,6 +56,8 @@ fn group(notifications: &[Notification]) -> Vec<(RepoRef, Vec<&Notification>)> {
     groups
 }
 
+/// Width of the trailing reason lane ("Review requested").
+const REASON_LANE: f32 = 120.;
 /// Width of the lane for a row's age ("3mo").
 const AGE_LANE: f32 = 40.;
 
@@ -599,7 +601,7 @@ impl NotificationsView {
                 .child(div().max_w(dp(220.)).truncate().child(value))
                 .child(
                     Icon::new(IconName::Close)
-                        .with_size(dp(12.))
+                        .with_size(scale::icon_xs())
                         .text_color(muted),
                 ),
         )
@@ -706,7 +708,7 @@ impl NotificationsView {
                 Input::new(&self.query)
                     .small()
                     .flex_none()
-                    .w(dp(240.))
+                    .w(scale::search_width())
                     .cleanable(true)
                     .prefix(IconName::Search)
                     .aria_label("Filter notifications"),
@@ -725,38 +727,18 @@ impl NotificationsView {
         let only = repo.clone();
         let hint = SharedString::from(format!("Show only repo:{repo}"));
         let muted = cx.theme().muted_foreground;
-        let hover = cx.theme().list_hover;
-        h_flex()
-            .id(SharedString::from(format!("group-{repo}")))
-            .role(Role::Button)
+        ui::list_group_header(SharedString::from(format!("group-{repo}")), collapsed, cx)
             .aria_label(if collapsed {
                 format!("Expand {repo}")
             } else {
                 format!("Collapse {repo}")
             })
-            .h(scale::row_height())
-            .px_2()
-            .gap_3()
-            .items_center()
-            .rounded(cx.theme().radius)
-            .hover(move |row| row.bg(hover))
             .on_click(cx.listener(move |view, _, _, cx| {
                 if !view.collapsed.remove(&toggle) {
                     view.collapsed.insert(toggle.clone());
                 }
                 cx.notify();
             }))
-            .child(
-                h_flex().flex_none().w_4().justify_center().child(
-                    Icon::new(if collapsed {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .small()
-                    .text_color(muted),
-                ),
-            )
             .child(
                 // The title narrows the Inbox to its repository.
                 div()
@@ -777,9 +759,9 @@ impl NotificationsView {
                     .text_size(scale::meta())
                     .text_color(muted)
                     .child(match unread {
-                        0 => total.to_string(),
+                        0 => format!("{total}"),
                         unread if unread == total => format!("{unread} unread"),
-                        unread => format!("{unread} unread of {total}"),
+                        _ => format!("{unread} unread of {total}"),
                     }),
             )
             .into_any_element()
@@ -865,8 +847,7 @@ impl NotificationsView {
         let unread = !unread_ids.is_empty();
         let count = stack.len();
         let theme = cx.theme();
-        let (muted, foreground, hover) =
-            (theme.muted_foreground, theme.foreground, theme.list_hover);
+        let (muted, foreground) = (theme.muted_foreground, theme.foreground);
         let icon_color = match (failed && nested, unread) {
             (true, _) => tokens::closed(),
             (false, true) => foreground,
@@ -886,26 +867,24 @@ impl NotificationsView {
             ),
             None => format!("{}{pull_name}", notification.title),
         };
-        let row = h_flex()
-            .id(SharedString::from(match &fold {
+        let row = ui::list_row(
+            SharedString::from(match &fold {
                 Some(_) => format!("notification-stack-{id}"),
                 None => format!("notification-{id}"),
-            }))
-            .role(if fold.is_some() {
-                Role::Button
-            } else {
-                Role::Link
-            })
-            .aria_label(name)
-            .group("notification")
-            .w_full()
-            .h(scale::row_height())
-            .px_2()
-            .when(nested, |row| row.pl_6())
-            .gap_2()
-            .items_center()
-            .rounded(theme.radius)
-            .hover(move |row| row.bg(hover));
+            }),
+            cx,
+        )
+        .role(if fold.is_some() {
+            Role::Button
+        } else {
+            Role::Link
+        })
+        .aria_label(name)
+        .relative()
+        .group("notification")
+        .when(nested, |row| row.pl_6())
+        .gap_2()
+        .child(ui::list_row_divider(cx));
         let row =
             match fold {
                 Some((key, _)) => row.on_click(cx.listener(move |view, _, _, cx| {
@@ -965,7 +944,7 @@ impl NotificationsView {
                         .when(failed, |status| {
                             status.child(
                                 Icon::new(IconName::CircleX)
-                                    .with_size(dp(14.))
+                                    .with_size(scale::icon_sm())
                                     .text_color(tokens::closed()),
                             )
                         })
@@ -1005,11 +984,12 @@ impl NotificationsView {
         if open.is_some() {
             line = line.child(ui::count_badge(count, cx));
         }
-        line = line.child(faint(match (open, nested, &run) {
+        let trailing_meta: SharedString = match (open, nested, &run) {
             (Some(_), _, _) => format!("Latest {exact}").into(),
-            (None, true, _) | (None, false, Some(_)) => exact.clone().into(),
+            (None, true, _) => exact.clone().into(),
+            (None, false, Some(_)) => "Workflow".into(),
             (None, false, None) => reason_label(&notification.reason).into(),
-        }));
+        };
 
         // The pull request of a failed run, one click away from the row
         // that reports it. Opening it marks what the row stands for as read.
@@ -1037,6 +1017,14 @@ impl NotificationsView {
         // the line above. At the trailing edge, fixed columns: Open PR,
         // mark as read (on hover), and the age.
         let row = row
+            .child(
+                slot().w_2().child(
+                    div()
+                        .size_1p5()
+                        .rounded_full()
+                        .when(unread, |dot| dot.bg(tokens::accent())),
+                ),
+            )
             .child(slot().w_4().map(|slot| {
                 match open {
                     Some(open) => slot.child(
@@ -1047,19 +1035,25 @@ impl NotificationsView {
                         })
                         .text_color(muted),
                     ),
-                    None => slot.child(Icon::new(icon).with_size(dp(14.)).text_color(icon_color)),
+                    None => slot.child(
+                        Icon::new(icon)
+                            .with_size(scale::icon_sm())
+                            .text_color(icon_color),
+                    ),
                 }
             }))
-            .child(
-                slot().w_2().child(
-                    div()
-                        .size_1p5()
-                        .rounded_full()
-                        .when(unread, |dot| dot.bg(tokens::accent())),
-                ),
-            )
             .child(line)
             .children(open_pr)
+            .child(
+                div()
+                    .flex_none()
+                    .w(dp(REASON_LANE))
+                    .truncate()
+                    .text_right()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(trailing_meta),
+            )
             .child(
                 // A shortcut: opening a notification also marks it read.
                 slot().w_6().invisible().when(unread, |lane| {
@@ -1080,11 +1074,13 @@ impl NotificationsView {
             )
             .child(
                 div()
+                    .id(SharedString::from(format!("notification-age-{id}")))
                     .flex_none()
                     .w(dp(AGE_LANE))
                     .text_right()
                     .text_size(scale::meta())
                     .text_color(muted)
+                    .tooltip(move |window, cx| Tooltip::new(exact.clone()).build(window, cx))
                     .child(ui::relative_time(notification.updated_at, Utc::now())),
             );
         match item {
@@ -1110,7 +1106,7 @@ impl Render for NotificationsView {
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
                     .into_any_element()
             }
-            Loadable::Loading => div().py_2().child(ui::skeleton_rows(10)).into_any_element(),
+            Loadable::Loading => ui::loading_rows(10).into_any_element(),
             Loadable::Loaded(list) | Loadable::Refreshing(list) if list.is_empty() => {
                 let state = ui::empty_state(
                     IconName::BellCheck,
@@ -1169,10 +1165,7 @@ impl Render for NotificationsView {
                     filter::apply(&terms, list).into_iter().cloned().collect();
                 let groups = group(&list);
                 let runs = match_runs(&list, &self.ci);
-                v_flex()
-                    .w_full()
-                    .px_2()
-                    .py_2()
+                ui::list_container()
                     .gap_2()
                     .children(groups.into_iter().map(|(repo, items)| {
                         let unread = items.iter().filter(|item| item.unread).count();

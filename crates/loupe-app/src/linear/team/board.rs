@@ -228,7 +228,7 @@ impl TeamView {
             self.board_scroll.offset().x,
             self.board_scroll.max_offset().x,
         );
-        let (more_before, more_after) = (offset < px(-1.), max + offset > px(1.));
+        let (more_before, more_after) = (offset < -px(1.), max + offset > px(1.));
         let shade = crate::theme::tokens::panel();
         let fade = |toward_start: bool| {
             let (from, to) = if toward_start {
@@ -425,7 +425,7 @@ impl Render for DraggedColumn {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         h_flex()
-            .w(px(widgets::COLUMN_WIDTH))
+            .w(dp(widgets::COLUMN_WIDTH))
             .h(dp(widgets::TOOLBAR_HEIGHT))
             .px_3()
             .gap_2()
@@ -456,7 +456,7 @@ impl Render for DraggedIssue {
         // The drag layer is drawn outside the window's tree, so it inherits
         // no text color.
         div()
-            .w(px(widgets::COLUMN_WIDTH))
+            .w(dp(widgets::COLUMN_WIDTH))
             .text_color(cx.theme().foreground)
             .child(
                 widgets::issue_card(&self.issue, Utc::now(), &self.props, cx)
@@ -498,9 +498,9 @@ fn render_column(
             // a hitbox of its own, which a drag-over style of its own gives.
             .drag_over::<DraggedColumn>(move |style, _, _, _| style.bg(ring));
         if on_right {
-            line.right(px(-7.))
+            line.right(dp(-7.))
         } else {
-            line.left(px(-7.))
+            line.left(dp(-7.))
         }
     });
     let column_drop = {
@@ -521,8 +521,8 @@ fn render_column(
     // A drop target whose top border lights up as the line where the card
     // lands. The border is always there, so lighting it moves nothing.
     let drop_zone = |zone: Div| {
-        zone.mt(px(3.))
-            .pt(px(3.))
+        zone.mt(dp(3.))
+            .pt(dp(3.))
             .border_t_2()
             .border_color(transparent_black())
             .when(positional, |zone| {
@@ -609,7 +609,7 @@ fn render_column(
                         // below the cards lands at the end and says so.
                         drop_zone(div())
                             .flex_1()
-                            .min_h(px(48.))
+                            .min_h(dp(48.))
                             .on_drop(on_drop(None)),
                     ),
                 ),

@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
@@ -263,12 +263,7 @@ impl LinkedThreads {
             .gap_2()
             .items_center()
             .child(ui::section_label("T3 threads", cx))
-            .children(count.map(|count| {
-                div()
-                    .text_size(scale::label())
-                    .text_color(cx.theme().muted_foreground)
-                    .child(count.to_string())
-            }))
+            .children(count.map(|count| ui::count_badge(count, cx)))
             .child(div().flex_1())
             .children(self.review_button(cx))
             .children(refresh)
@@ -277,10 +272,11 @@ impl LinkedThreads {
 
     fn settings_button(label: &'static str) -> Button {
         Button::new("t3-settings")
-            .outline()
+            .ghost()
             .xsmall()
             .icon(IconName::Settings)
             .label(label)
+            .text_color(crate::theme::tokens::link())
             .on_click(|_, window, cx| shell::navigate(Route::Settings, window, cx))
     }
 

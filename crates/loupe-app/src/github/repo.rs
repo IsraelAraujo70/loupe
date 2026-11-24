@@ -13,7 +13,7 @@ use gpui_kit::*;
 use loupe_github::{Page, PrListFilter, PrSummary, RepoRef, RepoSummary};
 
 use super::common::{self, LoadError, Loadable};
-use super::pr_row::{AgeFrom, Lanes, pr_row};
+use super::pr_row::{AgeFrom, Lanes, column_header, pr_row};
 use crate::route::Route;
 use crate::shell::Refreshable as _;
 use crate::shell::navigate;
@@ -185,6 +185,7 @@ impl RepoView {
                     })
                     .on_click(cx.listener(|view, _, _, cx| view.toggle_watch(cx))),
             )
+            .action(ui::vertical_divider(cx))
             .action(
                 ui::icon_button("add-repo", IconName::Plus, "Add repository…")
                     .on_click(|_, window, cx| open_add_repository(window, cx)),
@@ -228,7 +229,7 @@ impl RepoView {
             ))
             .child(div().flex_1())
             .child(
-                div().w_64().child(
+                div().w(scale::search_width()).child(
                     Input::new(&self.search)
                         .small()
                         .prefix(Icon::new(IconName::Search).xsmall())
@@ -253,7 +254,7 @@ impl Render for RepoView {
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
                     .into_any_element()
             }
-            Loadable::Loading => div().p_2().child(ui::skeleton_rows(10)).into_any_element(),
+            Loadable::Loading => ui::loading_rows(10).into_any_element(),
             Loadable::Loaded(page) | Loadable::Refreshing(page) if page.items.is_empty() => {
                 ui::empty_state(
                     IconName::GitPullRequest,
@@ -270,9 +271,8 @@ impl Render for RepoView {
                     author: true,
                     age_from: AgeFrom::Updated,
                 };
-                v_flex()
-                    .w_full()
-                    .p_2()
+                ui::list_container()
+                    .child(column_header(false, false, true, None, None, cx))
                     .children(
                         page.items
                             .iter()

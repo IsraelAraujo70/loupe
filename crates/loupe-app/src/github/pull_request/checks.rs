@@ -387,7 +387,7 @@ impl ChecksTab {
         let theme = cx.theme();
         let (muted, danger) = (theme.muted_foreground, theme.danger);
         let panel = v_flex()
-            .mx(scale::content_inset())
+            .mx_2()
             .mb_2()
             .p(scale::card_padding())
             .gap_1()
@@ -443,19 +443,12 @@ impl ChecksTab {
     }
 
     fn check_row(&self, ix: usize, run: &CheckRun, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+        let muted = cx.theme().muted_foreground;
         let (icon, color) = status_style(run.status);
         let url = run.details_url.clone();
         let job = failed_job(run);
         let log_open = job.is_some_and(|job| self.logs.contains_key(&job.job_id));
-        h_flex()
-            .id(("check", ix))
-            .h(scale::row_height())
-            .px(scale::content_inset())
-            .gap_3()
-            .items_center()
-            .hover(move |row| row.bg(hover))
+        ui::list_row(("check", ix), cx)
             .child(Icon::new(icon).small().text_color(color))
             .child(
                 h_flex()
@@ -463,14 +456,7 @@ impl ChecksTab {
                     .min_w_0()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(scale::body())
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(run.name.clone()),
-                    )
+                    .child(div().min_w_0().truncate().child(run.name.clone()))
                     .when_some(run.workflow.clone(), |row, workflow| {
                         row.child(
                             div()
@@ -571,9 +557,9 @@ impl Render for ChecksTab {
         v_flex()
             .w_full()
             .py_4()
-            .gap_3()
+            .gap_2()
             .child(div().px(scale::content_inset()).child(card))
-            .child(v_flex().children(rows))
+            .child(ui::list_container().children(rows))
             .into_any_element()
     }
 }

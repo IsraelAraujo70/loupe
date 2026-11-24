@@ -117,10 +117,11 @@ pub const ROW_GROUP: &str = "pr-row";
 pub type OnSort = Rc<dyn Fn(SortKey, &mut Window, &mut App)>;
 
 /// The 24 px heading over a list of [`pr_row`]s: a 12 px label over each
-/// lane, starting on the rows' own leading edge. With `on_sort`, every lane
-/// but the title's sorts the list when clicked, and the column `sort` names
-/// shows its direction with an arrow. The age lane sorts by the date its
-/// rows show: created when `sort` is by creation, else updated.
+/// lane, aligned to the rows' own leading edge (after the 16 px checkbox lane
+/// when `checkbox_lane` is true). With `on_sort`, every lane but the title's
+/// sorts the list when clicked, and the column `sort` names shows its
+/// direction with an arrow. The age lane sorts by the date its rows show:
+/// created when `sort` is by creation, else updated.
 pub fn column_header(
     checkbox_lane: bool,
     show_repo: bool,
@@ -129,7 +130,6 @@ pub fn column_header(
     on_sort: Option<OnSort>,
     cx: &App,
 ) -> Div {
-    let muted = cx.theme().muted_foreground;
     let age_key = match sort {
         Some(Sort {
             key: SortKey::Created,
@@ -149,14 +149,7 @@ pub fn column_header(
                 }
             })
     };
-    h_flex()
-        .w_full()
-        .h_6()
-        .px_2()
-        .gap_3()
-        .items_center()
-        .text_size(scale::meta())
-        .text_color(muted)
+    ui::list_column_header(cx)
         .when(checkbox_lane, |row| {
             row.child(div().flex_none().w(dp(CHECKBOX_LANE)))
         })
@@ -199,7 +192,7 @@ fn sort_heading(
         .gap_0p5()
         .items_center()
         .when(active.is_some(), |cell| cell.text_color(theme.foreground))
-        .children(arrow.map(|arrow| Icon::new(arrow).with_size(dp(12.))))
+        .children(arrow.map(|arrow| Icon::new(arrow).with_size(scale::icon_xs())))
         .child(label);
     let Some(on_sort) = on_sort else {
         return cell;
@@ -270,7 +263,7 @@ pub struct StackPlace {
 fn none(cx: &App) -> Div {
     div()
         .text_size(scale::meta())
-        .text_color(cx.theme().muted_foreground.opacity(0.4))
+        .text_color(cx.theme().muted_foreground.opacity(0.55))
         .child("–")
 }
 
@@ -312,7 +305,6 @@ pub fn pr_row(
     } = lanes;
     let theme = cx.theme();
     let muted = theme.muted_foreground;
-    let hover = theme.list_hover;
     let number = format!("#{}", summary.pr.number);
     let reference: SharedString = summary.pr.to_string().into();
     let repo = summary.pr.repo.name.clone();
@@ -336,23 +328,15 @@ pub fn pr_row(
     };
     let item = Item::pull_request(summary);
     let pr = summary.pr.clone();
-    let row = h_flex()
-        .id(SharedString::from(format!("pr-row-{id}")))
+    let row = ui::list_row(SharedString::from(format!("pr-row-{id}")), cx)
         .debug_selector({
             let id = id.clone();
             move || format!("pr-row-{id}")
         })
         .role(Role::Link)
         .aria_label(name)
-        .w_full()
-        .h(scale::row_height())
-        .px_2()
-        .gap_3()
-        .items_center()
         .relative()
         .group(ROW_GROUP)
-        .rounded(theme.radius)
-        .hover(move |row| row.bg(hover))
         // The keyboard cursor: a fill and the accent on the leading edge.
         .when(selected, |row| {
             row.bg(theme.list_active).child(
@@ -392,15 +376,7 @@ pub fn pr_row(
         // A hairline between rows, so a wide row reads across its columns.
         // It starts and ends on the content's edge, under the icons, while
         // the hover fill reaches 8 px past it.
-        .child(
-            div()
-                .absolute()
-                .left_2()
-                .right_2()
-                .bottom_0()
-                .h(px(1.))
-                .bg(tokens::border_subtle()),
-        )
+        .child(ui::list_row_divider(cx))
         .map(|row| match &select {
             Some(select) => {
                 let (on_select, pr) = (select.on_select.clone(), pr.clone());
@@ -486,7 +462,7 @@ pub fn pr_row(
             row.child(lane(AUTHOR_LANE).justify_center().child(ui::avatar_named(
                 avatar_url,
                 login,
-                dp(20.),
+                scale::avatar_md(),
             )))
         })
         // The lane shows the repository's name; the tooltip keeps the full
@@ -526,7 +502,7 @@ pub fn pr_row(
                         SharedString::from(format!("pr-checks-{id}")),
                         widgets::checks_label(checks),
                         Icon::new(widgets::checks_icon_name(checks))
-                            .with_size(dp(16.))
+                            .with_size(scale::icon_md())
                             .text_color(widgets::checks_color(checks)),
                     ))
                 }),
@@ -630,7 +606,7 @@ pub fn stack_row(
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
-    let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+    let muted = theme.muted_foreground;
     let rows = stack.rows;
     let summary = stack_summary(rows, stack.total);
     let name = format!("Stack {}, {summary}", stack.name);
@@ -658,21 +634,13 @@ pub fn stack_row(
     let repo = rows.first().map(|row| row.pr.repo.clone());
     let checks = worst_checks(rows);
     let id = stack.id.clone();
-    h_flex()
-        .id(stack.id.clone())
+    ui::list_row(stack.id.clone(), cx)
         .debug_selector(move || id.to_string())
         .role(Role::Button)
         .aria_label(name)
         .aria_expanded(stack.expanded)
-        .w_full()
-        .h(scale::row_height())
-        .px_2()
-        .gap_3()
-        .items_center()
         .relative()
         .group(ROW_GROUP)
-        .rounded(theme.radius)
-        .hover(move |row| row.bg(hover))
         .when(selected, |row| {
             row.bg(theme.list_active).child(
                 div()
@@ -773,7 +741,7 @@ pub fn stack_row(
                 .when_some(checks, |lane, checks| {
                     lane.child(
                         Icon::new(widgets::checks_icon_name(checks))
-                            .with_size(dp(16.))
+                            .with_size(scale::icon_md())
                             .text_color(widgets::checks_color(checks)),
                     )
                 }),

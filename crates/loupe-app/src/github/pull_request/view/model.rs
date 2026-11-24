@@ -50,6 +50,7 @@ impl PrTab {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub(super) fn from_index(index: usize) -> Option<PrTab> {
         Self::ALL.get(index).copied()
     }

@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{Commit, PullRequestDetail};
@@ -10,7 +10,6 @@ use loupe_github::{Commit, PullRequestDetail};
 use crate::github::pr_row::hint;
 use crate::github::widgets;
 use crate::theme::scale;
-use crate::theme::scale::dp;
 use crate::ui;
 
 const SHA_LENGTH: usize = 7;
@@ -37,13 +36,11 @@ pub fn render(detail: &PullRequestDetail, cx: &App) -> AnyElement {
         .into_any_element();
     }
     let theme = cx.theme();
-    let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+    let muted = theme.muted_foreground;
     let mono = theme.mono_font_family.clone();
     let now = Utc::now();
     let repo_url = detail.pr.repo.url();
-    v_flex()
-        .w_full()
-        .py_2()
+    ui::list_container()
         .children(detail.commits.iter().enumerate().map(|(ix, commit)| {
             let url = format!("{repo_url}/commit/{}", commit.oid);
             let author = author_name(commit).to_owned();
@@ -51,19 +48,13 @@ pub fn render(detail: &PullRequestDetail, cx: &App) -> AnyElement {
                 .author
                 .as_ref()
                 .map_or_else(String::new, |actor| actor.avatar_url.clone());
-            h_flex()
-                .id(("commit", ix))
+            ui::list_row(("commit", ix), cx)
                 .role(Role::Link)
                 .aria_label(format!(
                     "Commit {}: {}",
                     short_sha(&commit.oid),
                     commit.headline
                 ))
-                .h(scale::row_height())
-                .px(scale::content_inset())
-                .gap_3()
-                .items_center()
-                .hover(move |row| row.bg(hover))
                 .tooltip(|window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new("Open commit in browser")
                         .build(window, cx)
@@ -79,8 +70,6 @@ pub fn render(detail: &PullRequestDetail, cx: &App) -> AnyElement {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(scale::body())
-                        .font_weight(FontWeight::MEDIUM)
                         .child(commit.headline.clone()),
                 )
                 .child(
@@ -90,7 +79,7 @@ pub fn render(detail: &PullRequestDetail, cx: &App) -> AnyElement {
                         .items_center()
                         .text_size(scale::meta())
                         .text_color(muted)
-                        .child(ui::avatar_named(avatar, author.clone(), dp(20.)))
+                        .child(ui::avatar_named(avatar, author.clone(), scale::avatar_md()))
                         .child(author),
                 )
                 .child(h_flex().flex_none().w_4().justify_center().when_some(

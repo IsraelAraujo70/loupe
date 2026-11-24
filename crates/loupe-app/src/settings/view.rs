@@ -27,10 +27,8 @@ pub fn settings_view(window: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|cx| SettingsView::new(window, cx)).into()
 }
 
-/// The width of the nav beside the page.
-const NAV_WIDTH: f32 = 220.;
 /// The width of the page's column of cards.
-const PAGE_WIDTH: f32 = 640.;
+const PAGE_WIDTH: f32 = 820.;
 
 /// The Linear key form's progress. The connected state lives in `Accounts`.
 pub(super) enum LinearForm {
@@ -312,19 +310,29 @@ impl SettingsView {
                 })
                 .into_any_element()),
             Item::InboxFilter => {
-                let filter = settings.notification_filter.join(" ");
-                let empty = filter.is_empty();
+                let tokens = &settings.notification_filter;
+                let empty = tokens.is_empty();
+                let summary: AnyElement = if empty {
+                    div()
+                        .text_size(scale::meta())
+                        .text_color(colors.muted)
+                        .child("None")
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .justify_end()
+                        .max_w(dp(240.))
+                        .children(tokens.iter().map(|token| {
+                            ui::chip().child(div().max_w(dp(200.)).truncate().child(token.clone()))
+                        }))
+                        .into_any_element()
+                };
                 row(h_flex()
-                    .gap_3()
+                    .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .max_w(dp(200.))
-                            .truncate()
-                            .text_size(scale::meta())
-                            .text_color(colors.muted)
-                            .child(if empty { "None".to_owned() } else { filter }),
-                    )
+                    .child(summary)
                     .child(
                         Button::new("inbox-filter-clear")
                             .outline()
@@ -621,28 +629,10 @@ impl SettingsView {
             }
             let selected = reading == Some(section);
             list = list.child(
-                h_flex()
-                    .id(("settings-nav", index))
+                ui::nav_row(("settings-nav", index), selected, cx)
                     .debug_selector(move || format!("settings-nav-{}", section.id()))
                     .role(Role::Link)
                     .aria_label(section.title())
-                    .h(scale::nav_row_height())
-                    .px_2()
-                    .gap_2()
-                    .items_center()
-                    .rounded(dp(6.))
-                    .text_size(scale::body())
-                    .when(selected, |row| {
-                        row.bg(tokens::glass_selected())
-                            .text_color(colors.foreground)
-                    })
-                    .when(!selected, |row| {
-                        row.text_color(colors.muted).hover(|style| {
-                            style
-                                .bg(tokens::glass_hover())
-                                .text_color(colors.foreground)
-                        })
-                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.go_to(index, cx)))
                     .child(
                         svg()
@@ -659,17 +649,10 @@ impl SettingsView {
             );
         }
         let search_empty = self.search.read(cx).value().is_empty();
-        v_flex()
-            .id("settings-nav")
-            .flex_none()
-            .w(dp(NAV_WIDTH))
-            .h_full()
+        ui::side_panel("settings-nav", ui::SideEdge::Leading, scale::nav_width())
             .px_2()
             .py_3()
-            .gap_1()
-            .border_r_1()
-            .border_color(tokens::border_subtle())
-            .overflow_y_scroll()
+            .gap_2()
             .child(
                 Input::new(&self.search)
                     .small()
@@ -843,6 +826,7 @@ impl Render for SettingsView {
             .flex_1()
             .min_w_0()
             .h_full()
+            .items_center()
             .overflow_y_scroll()
             .px(scale::content_inset())
             .py(scale::section_gap())

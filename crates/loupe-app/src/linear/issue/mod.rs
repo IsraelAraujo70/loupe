@@ -466,18 +466,12 @@ impl IssueView {
                 .child(self.render_composer(focused, cx)),
         );
 
-        let side = v_flex()
-            .id("issue-side")
-            // Wider than a pull request's side column: a value sits beside
-            // its label, and three labels or a full name fit on one line
-            // with the picker's caret after them.
-            .w(dp(360.))
-            .flex_none()
-            .h_full()
-            .overflow_y_scroll()
-            .border_l_1()
-            .border_color(crate::theme::tokens::border_subtle())
-            .child(self.render_properties(loaded, &shown, cx));
+        let side = ui::side_panel(
+            "issue-side",
+            ui::SideEdge::Trailing,
+            crate::theme::scale::side_wide_width(),
+        )
+        .child(self.render_properties(loaded, &shown, cx));
 
         h_flex()
             .flex_1()

@@ -771,7 +771,7 @@ pub fn skeleton_board(cx: &App) -> AnyElement {
         .size_full()
         .items_start()
         .gap_3()
-        .px_5()
+        .px(scale::content_inset())
         .py_3()
         .children((0..4).map(|column| {
             v_flex()
@@ -799,12 +799,7 @@ pub fn load_error(
     message: SharedString,
     on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    div()
-        .w_full()
-        .px(scale::content_inset())
-        .py_4()
-        .child(ui::error_banner(message, on_retry))
-        .into_any_element()
+    ui::load_error(message, on_retry).into_any_element()
 }
 
 /// A Linear screen without a key: its page header and "Connect Linear" with

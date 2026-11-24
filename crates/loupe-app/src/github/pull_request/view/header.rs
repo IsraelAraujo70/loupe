@@ -13,8 +13,7 @@ use super::PullRequestView;
 use super::model::{MergeAction, available_actions, head_label};
 use crate::github::pull_request::checks::ChecksSummary;
 use crate::github::widgets;
-use crate::theme::scale::dp;
-use crate::theme::{scale, tokens};
+use crate::theme::scale::{self, dp};
 use crate::ui::{self, ControlSize as _, WindowDragArea as _};
 
 /// How long Copy link says "Copied" after a click.
@@ -88,9 +87,10 @@ impl PullRequestView {
         let muted = cx.theme().muted_foreground;
         let reference = format!("{} #{}", detail.pr.repo, detail.pr.number);
         let pr_actions = available_actions(detail);
-        // Review is the page's filled action until the pull request can be
-        // merged; then the merge button is, and Review steps back.
-        let review_is_primary = !matches!(pr_actions.merge, MergeAction::Available { .. });
+        // Review is the page's filled action on an open pull request until it
+        // can be merged; once merged or closed it steps back to outlined.
+        let review_is_primary = detail.state == loupe_github::PrState::Open
+            && !matches!(pr_actions.merge, MergeAction::Available { .. });
         // The actions with a label are in sight; the ones that were icons
         // alone (edit the title, the repository's list, refresh) are items
         // of the "More actions" menu, with the state changes.
@@ -101,7 +101,7 @@ impl PullRequestView {
             .child(self.render_copy_link(detail, cx))
             .child(
                 Button::new("pr-open-in-browser")
-                    .outline()
+                    .ghost()
                     .control()
                     .icon(IconName::ExternalLink)
                     .label("Open on GitHub")
@@ -178,7 +178,7 @@ impl PullRequestView {
             .debug_selector(move || format!("pr-copy-link:{label}"))
             .child(
                 Button::new("pr-copy-link")
-                    .outline()
+                    .ghost()
                     .control()
                     .icon(icon)
                     .label(label)
@@ -241,45 +241,22 @@ impl PullRequestView {
     fn render_meta(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> Div {
         let head = head_label(detail);
         let theme = cx.theme();
-        // A branch is a 20 px chip in the accent's wash with the link color
-        // on it: it reads as a reference, apart from the plain text around.
-        let (muted, foreground, mono, chip_bg, chip_text, radius) = (
+        let (muted, foreground, mono) = (
             theme.muted_foreground,
             theme.foreground,
             theme.mono_font_family.clone(),
-            tokens::accent().opacity(0.16),
-            tokens::link(),
-            theme.radius,
         );
         let summary = ChecksSummary::of(&detail.checks.runs);
         let (login, avatar_url) = detail.author.as_ref().map_or_else(
             || ("ghost".to_owned(), String::new()),
             |author| (author.login.clone(), author.avatar_url.clone()),
         );
-        let branch = |text: String| {
-            div()
-                .min_w_0()
-                .max_w(dp(360.))
-                .h_5()
-                .truncate()
-                .px_1p5()
-                .rounded(radius)
-                .bg(chip_bg)
-                .font_family(mono.clone())
-                .text_size(scale::meta())
-                .line_height(rems(1.25))
-                .text_color(chip_text)
-                .child(text)
-        };
+        let branch = |text: String| ui::branch_chip(text, cx).max_w(dp(360.));
         let checks = match detail.checks.state {
-            Some(state) => widgets::tinted_tag(widgets::checks_color(state))
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(widgets::checks_icon(state))
-                        .child(summary.label()),
-                )
+            Some(state) => ui::status_chip(widgets::checks_color(state), cx)
+                .text_color(foreground)
+                .child(widgets::checks_icon(state))
+                .child(summary.label())
                 .into_any_element(),
             None => div()
                 .text_size(scale::meta())
@@ -330,7 +307,7 @@ impl PullRequestView {
                     .child(div().flex_none().child(ui::avatar_named(
                         avatar_url,
                         login.clone(),
-                        dp(16.),
+                        scale::avatar_xs(),
                     )))
                     .child(
                         div()

@@ -33,7 +33,7 @@ fn state_icon_name(state: PrState, is_draft: bool) -> IconName {
 /// differs per state, so the state never rests on color alone.
 pub fn state_icon(state: PrState, is_draft: bool) -> Icon {
     Icon::new(state_icon_name(state, is_draft))
-        .with_size(scale::dp(16.))
+        .with_size(scale::icon_md())
         .text_color(state_color(state, is_draft))
 }
 
@@ -73,7 +73,7 @@ pub fn state_tag(state: PrState, is_draft: bool) -> Tag {
             .items_center()
             .child(
                 Icon::new(state_icon_name(state, is_draft))
-                    .with_size(scale::dp(14.))
+                    .with_size(scale::icon_sm())
                     .text_color(color),
             )
             .child(state_label(state, is_draft)),
@@ -98,7 +98,7 @@ pub fn checks_icon_name(state: ChecksState) -> IconName {
 
 pub fn checks_icon(state: ChecksState) -> Icon {
     Icon::new(checks_icon_name(state))
-        .with_size(scale::dp(14.))
+        .with_size(scale::icon_sm())
         .text_color(checks_color(state))
 }
 

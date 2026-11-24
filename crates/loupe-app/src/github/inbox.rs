@@ -109,25 +109,6 @@ gpui_kit::actions!(
     ]
 );
 
-/// How many pull requests a view's bell announced that were not seen yet:
-/// the unread accent, with the count.
-fn unseen_badge(count: usize, cx: &App) -> Div {
-    let theme = cx.theme();
-    h_flex()
-        .flex_none()
-        .ml_1p5()
-        .h(rems(1.125))
-        .min_w(rems(1.125))
-        .px_1p5()
-        .justify_center()
-        .rounded(px(9.))
-        .bg(theme.primary)
-        .text_size(scale::meta())
-        .line_height(rems(1.))
-        .text_color(theme.primary_foreground)
-        .child(count.to_string())
-}
-
 /// The line an empty tab shows when no filter is set.
 fn tab_empty(tab: ReviewTab) -> (IconName, &'static str) {
     match tab {
@@ -812,8 +793,8 @@ fn chip(
             };
             let field = clause.field;
             let menu = menu
-                .min_w(px(220.))
-                .max_h(px(360.))
+                .min_w(scale::dp(220.))
+                .max_h(scale::dp(360.))
                 .scrollable(true)
                 .item(op("is", Op::In))
                 .item(op("is not", Op::NotIn))
@@ -1818,7 +1799,7 @@ impl InboxView {
                     })
                 };
                 let menu = menu
-                    .min_w(px(220.))
+                    .min_w(scale::dp(220.))
                     .item(item("New group…".into(), GroupPick::New));
                 let menu = match &view_name {
                     Some(name) => {
@@ -2013,7 +1994,7 @@ impl InboxView {
             .after_title(self.view_tabs(cx))
             .children_actions(freshness)
             .action(
-                ui::icon_button("inbox-add-repo", IconName::Plus, "Add repository…")
+                ui::icon_button("inbox-add-repo", IconName::FolderGit2, "Add repository…")
                     .debug_selector(|| "inbox-add-repo".into())
                     .on_click(|_, window, cx| super::repo::open_add_repository(window, cx)),
             )
@@ -2063,7 +2044,8 @@ impl InboxView {
                     .accessibility_label(label)
                     .when(unseen > 0, |tab| {
                         tab.child(
-                            unseen_badge(unseen, cx)
+                            ui::accent_badge(unseen)
+                                .ml_1p5()
                                 .debug_selector(move || format!("reviews-view-unseen-{ix}")),
                         )
                     })
@@ -2143,7 +2125,7 @@ impl InboxView {
                                 )
                             })
                     };
-                    menu.min_w(px(200.))
+                    menu.min_w(scale::menu_min_width())
                         .item(all_open)
                         .item(bell)
                         .item(PopupMenuItem::separator())
@@ -2189,7 +2171,7 @@ impl InboxView {
                     .items_center()
                     .child(save_as)
                     .children(view_menu)
-                    .child(div().w_2())
+                    .child(ui::vertical_divider(cx))
                     .child(self.filter_button(cx))
                     .child(self.sort_button(cx))
                     .when(dirty, |row| {
@@ -2292,7 +2274,7 @@ impl InboxView {
             // opens under it, toward the content, not over the sidebar.
             .anchor(Anchor::TopLeft)
             .p_1()
-            .w(px(280.))
+            .w(scale::popover_width())
             .open(self.filter_open)
             .on_open_change(move |open, window, cx| {
                 on_change
@@ -2348,17 +2330,18 @@ impl InboxView {
                             view.update(cx, |this, cx| this.set_sort(next, cx)).ok();
                         })
                 };
-                let menu = SortKey::ALL
-                    .iter()
-                    .fold(menu.min_w(px(200.)), |menu, &key| {
-                        // A new field keeps the direction already picked.
-                        let dir = sort.map_or(SortDir::Ascending, |sort| sort.dir);
-                        menu.item(set(
-                            key.label(),
-                            sort.is_some_and(|sort| sort.key == key),
-                            Some(Sort { key, dir }),
-                        ))
-                    });
+                let menu =
+                    SortKey::ALL
+                        .iter()
+                        .fold(menu.min_w(scale::menu_min_width()), |menu, &key| {
+                            // A new field keeps the direction already picked.
+                            let dir = sort.map_or(SortDir::Ascending, |sort| sort.dir);
+                            menu.item(set(
+                                key.label(),
+                                sort.is_some_and(|sort| sort.key == key),
+                                Some(Sort { key, dir }),
+                            ))
+                        });
                 let menu = match sort {
                     Some(sort) => {
                         let (ascending, descending) = sort.key.directions();
@@ -2523,24 +2506,16 @@ impl InboxView {
     fn notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let text = self.notice.clone()?;
         Some(
-            ui::toolbar()
-                .text_sm()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(cx.theme().danger)
-                        .child(text),
-                )
-                .child(
-                    ui::icon_button("reviews-notice-dismiss", IconName::Close, "Dismiss").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.notice = None;
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .into_any_element(),
+            ui::notice_bar(
+                "reviews-notice-dismiss",
+                text,
+                Some(Box::new(cx.listener(|this, _, _, cx| {
+                    this.notice = None;
+                    cx.notify();
+                }))),
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
@@ -2553,24 +2528,19 @@ impl InboxView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
-        let buttons: Vec<AnyElement> = tabs
+        let active_ix = tabs
             .iter()
-            .map(|(tab, shown)| {
-                let (tab, count) = (*tab, shown.count);
-                let id = format!("reviews-tab-{}", tab.label());
-                ui::view_tab(
-                    SharedString::from(id.clone()),
-                    tab.label(),
-                    tab == active,
-                    cx,
-                )
+            .position(|(tab, _)| *tab == active)
+            .unwrap_or_default();
+        let items = tabs.iter().map(|(tab, shown)| {
+            let (tab, count) = (*tab, shown.count);
+            let id = format!("reviews-tab-{}", tab.label());
+            ui::section_tab(SharedString::from(id.clone()), tab.label())
+                .count(count)
+                .aria_label(format!("{}, {count}", tab.label()))
                 .debug_selector(move || id.clone())
-                .accessibility_label(format!("{}, {count}", tab.label()))
-                .child(ui::count_badge(count, cx))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
-                .into_any_element()
-            })
-            .collect();
+        });
         let note = tabs
             .iter()
             .find(|(tab, _)| *tab == active)
@@ -2582,11 +2552,9 @@ impl InboxView {
                     .text_color(muted)
                     .child(text)
             });
-        ui::toolbar()
-            .gap_1()
-            .children(buttons)
-            .child(div().flex_1())
-            .children(note)
+        ui::section_tabs("reviews-tabs", active_ix)
+            .tabs(items)
+            .maybe_trailing(note)
             .into_any_element()
     }
 

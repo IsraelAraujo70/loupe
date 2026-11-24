@@ -21,7 +21,6 @@ use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
 
-const STEP_HEIGHT: f32 = 32.;
 const LINE_HEIGHT: f32 = 20.;
 
 enum LogState {
@@ -270,7 +269,7 @@ impl JobPane {
                     .child(text)
             }))
             .child(
-                div().w(dp(240.)).flex_none().child(
+                div().w(scale::search_width()).flex_none().child(
                     Input::new(&self.search)
                         .small()
                         .prefix(Icon::new(IconName::Search).xsmall())
@@ -425,17 +424,10 @@ fn step_row(
             ""
         }
     );
-    h_flex()
-        .id(("job-step", ix))
+    ui::list_row(("job-step", ix), cx)
         .role(Role::Button)
         .aria_label(name)
-        .h(dp(STEP_HEIGHT))
-        .w_full()
-        .px_2()
         .gap_2()
-        .items_center()
-        .rounded(theme.radius)
-        .hover(|row| row.bg(theme.list_hover))
         .child(div().flex_none().size_4().children(can_open.then(|| {
             Icon::new(if is_open {
                 IconName::ChevronDown

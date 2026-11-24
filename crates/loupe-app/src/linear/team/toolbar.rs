@@ -460,9 +460,9 @@ impl TeamView {
                 .accessibility_label(format!("More views, {}", overflow.len()))
                 .menu_trigger()
                 .dropdown_menu(move |menu, _, _| {
-                    overflow
-                        .iter()
-                        .fold(menu.min_w(dp(200.)), |menu, (id, name)| {
+                    overflow.iter().fold(
+                        menu.min_w(crate::theme::scale::menu_min_width()),
+                        |menu, (id, name)| {
                             let (id, view) = (id.clone(), view.clone());
                             menu.item(PopupMenuItem::new(name.clone()).on_click(
                                 move |_, window, cx| {
@@ -470,7 +470,8 @@ impl TeamView {
                                         .ok();
                                 },
                             ))
-                        })
+                        },
+                    )
                 })
         });
 
@@ -564,13 +565,8 @@ impl TeamView {
         let has_chips = !chips.is_empty();
         let muted = cx.theme().muted_foreground;
         Some(
-            h_flex()
-                .h(dp(widgets::TOOLBAR_HEIGHT))
-                .flex_none()
-                .px(crate::theme::scale::content_inset())
+            ui::toolbar()
                 .gap_1p5()
-                .border_b_1()
-                .border_color(crate::theme::tokens::border_subtle())
                 .overflow_hidden()
                 .children(chips)
                 .when(has_chips, |row| {
@@ -643,7 +639,7 @@ impl TeamView {
             // edge sits under it.
             .anchor(Anchor::TopRight)
             .p_1()
-            .w(dp(280.))
+            .w(crate::theme::scale::popover_width())
             .open(self.filter_open)
             .on_open_change(move |open, window, cx| {
                 on_change
@@ -677,12 +673,7 @@ impl TeamView {
         let theme = cx.theme();
         let created = self.created.as_ref().map(|issue| {
             let identifier = issue.identifier.clone();
-            h_flex()
-                .h(dp(widgets::TOOLBAR_HEIGHT))
-                .px_5()
-                .gap_2()
-                .border_b_1()
-                .border_color(theme.border)
+            ui::toolbar()
                 .text_sm()
                 .child(
                     div()

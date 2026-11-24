@@ -195,7 +195,7 @@ impl FloatingMenu {
         deferred(
             anchored()
                 .position(self.position)
-                .snap_to_window_with_margin(px(8.))
+                .snap_to_window_with_margin(crate::theme::scale::dp(8.))
                 .child(self.menu.clone()),
         )
         .with_priority(gpui_kit::base::POPUP_PRIORITY)
