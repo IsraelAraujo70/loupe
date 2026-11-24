@@ -3869,6 +3869,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "loupe-guide"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "loupe-linear"
 version = "0.1.0"
 dependencies = [

@@ -10,6 +10,7 @@ license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 loupe-github = { path = "crates/loupe-github" }
+loupe-guide = { path = "crates/loupe-guide" }
 loupe-linear = { path = "crates/loupe-linear" }
 loupe-t3 = { path = "crates/loupe-t3" }
 # Tree-sitter grammars for the languages Loupe's diffs, review threads and
