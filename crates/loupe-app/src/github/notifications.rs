@@ -599,7 +599,7 @@ impl NotificationsView {
                 .child(div().max_w(dp(220.)).truncate().child(value))
                 .child(
                     Icon::new(IconName::Close)
-                        .with_size(dp(12.))
+                        .with_size(scale::icon_xs())
                         .text_color(muted),
                 ),
         )
@@ -706,7 +706,7 @@ impl NotificationsView {
                 Input::new(&self.query)
                     .small()
                     .flex_none()
-                    .w(dp(240.))
+                    .w(scale::search_width())
                     .cleanable(true)
                     .prefix(IconName::Search)
                     .aria_label("Filter notifications"),
@@ -725,38 +725,18 @@ impl NotificationsView {
         let only = repo.clone();
         let hint = SharedString::from(format!("Show only repo:{repo}"));
         let muted = cx.theme().muted_foreground;
-        let hover = cx.theme().list_hover;
-        h_flex()
-            .id(SharedString::from(format!("group-{repo}")))
-            .role(Role::Button)
+        ui::list_group_header(SharedString::from(format!("group-{repo}")), collapsed, cx)
             .aria_label(if collapsed {
                 format!("Expand {repo}")
             } else {
                 format!("Collapse {repo}")
             })
-            .h(scale::row_height())
-            .px_2()
-            .gap_3()
-            .items_center()
-            .rounded(cx.theme().radius)
-            .hover(move |row| row.bg(hover))
             .on_click(cx.listener(move |view, _, _, cx| {
                 if !view.collapsed.remove(&toggle) {
                     view.collapsed.insert(toggle.clone());
                 }
                 cx.notify();
             }))
-            .child(
-                h_flex().flex_none().w_4().justify_center().child(
-                    Icon::new(if collapsed {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .small()
-                    .text_color(muted),
-                ),
-            )
             .child(
                 // The title narrows the Inbox to its repository.
                 div()
@@ -865,8 +845,7 @@ impl NotificationsView {
         let unread = !unread_ids.is_empty();
         let count = stack.len();
         let theme = cx.theme();
-        let (muted, foreground, hover) =
-            (theme.muted_foreground, theme.foreground, theme.list_hover);
+        let (muted, foreground) = (theme.muted_foreground, theme.foreground);
         let icon_color = match (failed && nested, unread) {
             (true, _) => tokens::closed(),
             (false, true) => foreground,
@@ -886,26 +865,22 @@ impl NotificationsView {
             ),
             None => format!("{}{pull_name}", notification.title),
         };
-        let row = h_flex()
-            .id(SharedString::from(match &fold {
+        let row = ui::list_row(
+            SharedString::from(match &fold {
                 Some(_) => format!("notification-stack-{id}"),
                 None => format!("notification-{id}"),
-            }))
-            .role(if fold.is_some() {
-                Role::Button
-            } else {
-                Role::Link
-            })
-            .aria_label(name)
-            .group("notification")
-            .w_full()
-            .h(scale::row_height())
-            .px_2()
-            .when(nested, |row| row.pl_6())
-            .gap_2()
-            .items_center()
-            .rounded(theme.radius)
-            .hover(move |row| row.bg(hover));
+            }),
+            cx,
+        )
+        .role(if fold.is_some() {
+            Role::Button
+        } else {
+            Role::Link
+        })
+        .aria_label(name)
+        .group("notification")
+        .when(nested, |row| row.pl_6())
+        .gap_2();
         let row =
             match fold {
                 Some((key, _)) => row.on_click(cx.listener(move |view, _, _, cx| {
@@ -965,7 +940,7 @@ impl NotificationsView {
                         .when(failed, |status| {
                             status.child(
                                 Icon::new(IconName::CircleX)
-                                    .with_size(dp(14.))
+                                    .with_size(scale::icon_sm())
                                     .text_color(tokens::closed()),
                             )
                         })
@@ -1047,7 +1022,7 @@ impl NotificationsView {
                         })
                         .text_color(muted),
                     ),
-                    None => slot.child(Icon::new(icon).with_size(dp(14.)).text_color(icon_color)),
+                    None => slot.child(Icon::new(icon).with_size(scale::icon_sm()).text_color(icon_color)),
                 }
             }))
             .child(
@@ -1110,7 +1085,7 @@ impl Render for NotificationsView {
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
                     .into_any_element()
             }
-            Loadable::Loading => div().py_2().child(ui::skeleton_rows(10)).into_any_element(),
+            Loadable::Loading => ui::loading_rows(10).into_any_element(),
             Loadable::Loaded(list) | Loadable::Refreshing(list) if list.is_empty() => {
                 let state = ui::empty_state(
                     IconName::BellCheck,
@@ -1169,10 +1144,7 @@ impl Render for NotificationsView {
                     filter::apply(&terms, list).into_iter().cloned().collect();
                 let groups = group(&list);
                 let runs = match_runs(&list, &self.ci);
-                v_flex()
-                    .w_full()
-                    .px_2()
-                    .py_2()
+                ui::list_container()
                     .gap_2()
                     .children(groups.into_iter().map(|(repo, items)| {
                         let unread = items.iter().filter(|item| item.unread).count();

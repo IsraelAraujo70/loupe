@@ -358,7 +358,7 @@ impl Render for FilterMenu {
                     .border_b_1()
                     .border_color(border)
                     .when(back.is_none(), |row| {
-                        row.child(svg_icon(IconName::Search, px(16.), muted))
+                        row.child(svg_icon(IconName::Search, crate::theme::scale::icon_md(), muted))
                     })
                     .when_some(back, |row, field| {
                         row.child(
@@ -376,7 +376,11 @@ impl Render for FilterMenu {
                                 .on_click(cx.listener(|menu, _, window, cx| {
                                     menu.go_to(Page::Fields, window, cx)
                                 }))
-                                .child(svg_icon(IconName::ChevronLeft, px(16.), muted)),
+                                .child(svg_icon(
+                                    IconName::ChevronLeft,
+                                    crate::theme::scale::icon_md(),
+                                    muted,
+                                )),
                         )
                     })
                     .child(
@@ -403,7 +407,7 @@ impl Render for FilterMenu {
             .child(
                 div()
                     .id("reviews-filter-rows")
-                    .max_h(px(420.))
+                    .max_h(crate::theme::scale::dp(420.))
                     .overflow_y_scroll()
                     .pt_1()
                     .when(empty, |list| {

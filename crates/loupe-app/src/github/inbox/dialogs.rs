@@ -12,6 +12,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 
 use super::InboxView;
+use crate::theme::scale;
 
 type OnName = Rc<dyn Fn(&mut InboxView, &str, &mut Context<InboxView>)>;
 
@@ -102,7 +103,7 @@ fn open_name_dialog(
         if focus_once.replace(false) {
             input.focus_handle(cx).focus(window, cx);
         }
-        dialog.title(title).w(px(400.)).child(form.clone())
+        dialog.title(title).w(scale::dialog_sm()).child(form.clone())
     });
 }
 
@@ -149,7 +150,7 @@ pub(super) fn confirm_delete(
     let title: SharedString = format!("Delete “{name}”?").into();
     window.open_dialog(cx, move |dialog, _, cx| {
         let (parent, id) = (parent.clone(), id.clone());
-        dialog.title(title.clone()).w(px(400.)).child(
+        dialog.title(title.clone()).w(scale::dialog_sm()).child(
             v_flex()
                 .gap_3()
                 .child(
