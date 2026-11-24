@@ -698,7 +698,7 @@ fn tabs(
                         tokens::surface()
                     })
                     .when(!dark, |tab| {
-                        tab.border_1().border_color(tokens::border_subtle())
+                        tab.border_1().border_color(tokens::border()).shadow_xs()
                     })
                     .text_color(if emphasized { foreground } else { muted })
                 })

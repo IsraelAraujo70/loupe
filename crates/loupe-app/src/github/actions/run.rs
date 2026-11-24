@@ -468,7 +468,7 @@ impl RunView {
             )
             .action(h_flex().gap_2().children(rerun).children(cancel))
             .action(
-                ui::outline_icon_button(
+                ui::icon_button(
                     "run-workflow-file",
                     IconName::FileCode,
                     "Open workflow file",
@@ -476,11 +476,11 @@ impl RunView {
                 .on_click(move |_, _, cx| cx.open_url(&workflow_url)),
             )
             .action(
-                ui::outline_icon_button("run-browser", IconName::ExternalLink, "Open in browser")
+                ui::icon_button("run-browser", IconName::ExternalLink, "Open in browser")
                     .on_click(move |_, _, cx| cx.open_url(&run_url)),
             )
             .action(
-                ui::outline_icon_button("run-refresh", IconName::RefreshCw, "Refresh")
+                ui::icon_button("run-refresh", IconName::RefreshCw, "Refresh")
                     .loading(busy)
                     .on_click(cx.listener(|view, _, _, cx| view.refresh_page(cx))),
             )

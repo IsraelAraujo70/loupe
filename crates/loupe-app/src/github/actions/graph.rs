@@ -320,7 +320,7 @@ impl GraphView {
             .gap_0p5()
             .items_center()
             .child(
-                ui::icon_button("graph-zoom-out", IconName::ZoomOut, "Zoom out")
+                ui::icon_button("graph-zoom-out", IconName::Minus, "Zoom out")
                     .on_click(cx.listener(|this, _, _, cx| this.zoom_center(1. / ZOOM_STEP, cx))),
             )
             .child(
@@ -336,7 +336,7 @@ impl GraphView {
                     })),
             )
             .child(
-                ui::icon_button("graph-zoom-in", IconName::ZoomIn, "Zoom in")
+                ui::icon_button("graph-zoom-in", IconName::Plus, "Zoom in")
                     .on_click(cx.listener(|this, _, _, cx| this.zoom_center(ZOOM_STEP, cx))),
             )
             .child(
