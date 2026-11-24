@@ -221,6 +221,8 @@ pub struct PullRequestView {
     /// Runs while the header's Copy link button says "Copied", and puts its
     /// label back when it ends.
     link_copied: Option<Task<()>>,
+    /// Last `(head_oid, guide_service::revision)` synchronized into `GuideTab`.
+    guide_sync: Option<(String, u64)>,
     _ticker: Task<()>,
 }
 
@@ -304,6 +306,7 @@ impl PullRequestView {
             pr_polled_at: None,
             pr_poll_task: None,
             link_copied: None,
+            guide_sync: None,
             _ticker: ticker,
         };
         let page = cx.entity_id();
@@ -1242,11 +1245,18 @@ impl Render for PullRequestView {
                 .checks
                 .update(cx, |tab, cx| tab.set_freshness(freshness, cx));
             if let Some(detail) = self.detail.value() {
-                let guide_state =
-                    crate::github::guide_service::view_state(cx, &detail.pr, &detail.head_oid);
-                loaded
-                    .guide
-                    .update(cx, |tab, cx| tab.set_state(guide_state, cx));
+                let sync_key = (
+                    detail.head_oid.clone(),
+                    crate::github::guide_service::revision(cx),
+                );
+                if self.guide_sync.as_ref() != Some(&sync_key) {
+                    let guide_state =
+                        crate::github::guide_service::view_state(cx, &detail.pr, &detail.head_oid);
+                    loaded
+                        .guide
+                        .update(cx, |tab, cx| tab.set_state(guide_state, cx));
+                    self.guide_sync = Some(sync_key);
+                }
             }
         }
         if std::mem::take(&mut self.focus_review_body) {

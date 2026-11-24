@@ -285,6 +285,14 @@ fn apply_safe_env(cmd: &mut Command) {
     cmd.env("CLAUDE_CODE_RESTRICTED", "1");
     cmd.env("CLAUDE_CODE_SAFE_MODE", "1");
     cmd.env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1");
+    // Defense-in-depth in case a future CLI release invokes git inside the checkout.
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_CONFIG_COUNT", "2");
+    cmd.env("GIT_CONFIG_KEY_0", "core.fsmonitor");
+    cmd.env("GIT_CONFIG_VALUE_0", "false");
+    cmd.env("GIT_CONFIG_KEY_1", "core.hooksPath");
+    cmd.env("GIT_CONFIG_VALUE_1", "/dev/null");
 }
 
 /// Builds the hardened headless Claude Code command for a temporary checkout.
@@ -621,5 +629,52 @@ mod tests {
             unexpected_init_tools(&["Read".into(), "Bash".into(), "Write".into()]),
             vec!["Bash".to_owned(), "Write".to_owned()]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_child_does_not_inherit_non_allowlisted_env_vars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `CARGO_MANIFEST_DIR` is guaranteed to exist in the parent `cargo test`
+        // environment and is NOT in `SAFE_ENV_ALLOWLIST`.
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "parent test process must have CARGO_MANIFEST_DIR set"
+        );
+
+        let stub = std::env::temp_dir().join(format!(
+            "loupe-env-probe-{}-{}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::write(&stub, "#!/bin/sh\nenv\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cmd = build_command(
+            &stub,
+            &std::env::temp_dir(),
+            &ClaudeConfig::default(),
+            r#"{"type":"object"}"#,
+            "system",
+        );
+        let output = cmd.output().expect("spawn env probe");
+        let _ = std::fs::remove_file(&stub);
+
+        assert!(output.status.success());
+        let env_dump = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !env_dump
+                .lines()
+                .any(|l| l.starts_with("CARGO_MANIFEST_DIR=")),
+            "env_clear() must prevent parent env vars from leaking into Claude Code"
+        );
+        assert!(env_dump.lines().any(|l| l == "CLAUDE_CODE_RESTRICTED=1"));
+        assert!(env_dump.lines().any(|l| l == "CLAUDE_CODE_SAFE_MODE=1"));
+        assert!(env_dump.lines().any(|l| l == "GIT_CONFIG_GLOBAL=/dev/null"));
+        assert!(env_dump.lines().any(|l| l == "GIT_CONFIG_NOSYSTEM=1"));
     }
 }

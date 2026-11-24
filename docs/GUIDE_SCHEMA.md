@@ -28,7 +28,7 @@ All objects reject unknown fields (`additionalProperties: false`).
 
 | Field | Type | Notes |
 |---|---|---|
-| `id` | non-empty unique string | Stable identifier within the guide. |
+| `id` | unique kebab-case slug | Lowercase ASCII slug (`^[a-z0-9]+(-[a-z0-9]+)*$`, max 64 chars). |
 | `title` | non-empty string | Short decision headline. |
 | `category` | enum | `behavior`, `data`, `money`, `event_format`, `security`, `api`, `other`. |
 | `impact` | non-empty string | What changes and what the reviewer is accepting. |
@@ -39,7 +39,7 @@ All objects reject unknown fields (`additionalProperties: false`).
 
 | Field | Type | Notes |
 |---|---|---|
-| `id` | non-empty unique string | Stable slug (e.g. `boundary-parser`). Preserved across commits when the same step persists so viewed marks and changed-step badges stay accurate. |
+| `id` | unique kebab-case slug | Stable lowercase ASCII slug (`^[a-z0-9]+(-[a-z0-9]+)*$`, max 64 chars, e.g. `boundary-parser`). Preserved across commits when the same step persists so viewed marks and changed-step badges stay accurate. |
 | `kind` | enum | `overview`, `flow`, `callers`, `contract`, `subsystem`, `tests`. |
 | `title` | non-empty string | Short heading for the step. |
 | `explanation` | non-empty string (Markdown) | Narrative explanation of this part of the change. |
@@ -75,6 +75,7 @@ Loupe caches validated guides locally per GitHub account, repository, pull reque
 - `head_oid` and `base_oid`
 - `model` and `effort`
 - `generated_at` (UTC RFC 3339 timestamp)
+- `changed_files` (authoritative list of PR-changed file paths from GitHub, used outside the model to surface any file omitted from the walkthrough)
 - `guide` (`ReviewGuide`)
 
 When a pull request advances to a new `head_oid`, the cached guide for the previous commit is marked stale and Loupe highlights which steps are `New` or `Updated` once a guide is generated for the new commit. Per-step viewed marks are stored separately per `(repo, pr_number, head_oid)`.

@@ -46,9 +46,23 @@ struct GuideService {
     _probe_task: Option<Task<()>>,
     runs: HashMap<PrRef, ActiveRun>,
     errors: HashMap<PrRef, String>,
+    /// Monotonic counter bumped whenever availability, runs, errors, or stored
+    /// guides change so views only recompute `view_state` when needed.
+    revision: u64,
 }
 
 impl Global for GuideService {}
+
+impl GuideService {
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+/// Monotonic revision of guide service state for cheap render-time change detection.
+pub fn revision(cx: &App) -> u64 {
+    service(cx).map_or(0, |s| s.revision)
+}
 
 fn service_mut(cx: &mut App) -> &mut GuideService {
     if !cx.has_global::<GuideService>() {
@@ -93,6 +107,7 @@ pub fn recheck_availability(cx: &mut App) {
             let svc = service_mut(cx);
             svc.probing = false;
             svc.availability = Some(availability);
+            svc.bump_revision();
             cx.refresh_windows();
         });
     });
@@ -143,7 +158,7 @@ fn load_cached_commit(cx: &App, pr: &PrRef, head_oid: &str) -> Option<Result<Sto
 
 /// Persists a validated guide for `(pr, stored.head_oid)` and updates the PR's
 /// latest/previous commit pointers for stale detection and step diffing.
-pub fn store_guide(cx: &App, pr: &PrRef, stored: &StoredGuide) {
+pub fn store_guide(cx: &mut App, pr: &PrRef, stored: &StoredGuide) {
     let commit_key = commit_cache_key(cx, pr, &stored.head_oid);
     crate::cache::put(&commit_key, stored);
 
@@ -154,6 +169,7 @@ pub fn store_guide(cx: &App, pr: &PrRef, stored: &StoredGuide) {
         index.latest_head = Some(stored.head_oid.clone());
     }
     crate::cache::put(&index_key, &index);
+    service_mut(cx).bump_revision();
 }
 
 /// Computes the current [`GuideViewState`] for `(pr, current_head_oid)`.
@@ -286,6 +302,7 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
                 None => Vec::new(),
             },
         };
+        let changed_files: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         let input = build_prompt_input(&worker_detail, &files, previous_step_ids);
         let outcome = generate_for_pr(
             &input,
@@ -297,7 +314,7 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
             },
         );
         drop(tx);
-        outcome
+        (changed_files, outcome)
     });
 
     let pr_for_task = pr.clone();
@@ -306,13 +323,15 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
             let message = event.message();
             let pr_key = pr_for_task.clone();
             cx.update(|cx| {
-                if let Some(run) = service_mut(cx).runs.get_mut(&pr_key) {
+                let svc = service_mut(cx);
+                if let Some(run) = svc.runs.get_mut(&pr_key) {
                     run.status = message;
+                    svc.bump_revision();
                     cx.refresh_windows();
                 }
             });
         }
-        let outcome = worker.await;
+        let (changed_files, outcome) = worker.await;
         cx.update(|cx| {
             let svc = service_mut(cx);
             let removed = svc.runs.remove(&pr_for_task);
@@ -333,16 +352,19 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
                         model: generated.model,
                         effort: effort_label,
                         generated_at: Utc::now(),
+                        changed_files,
                         guide: generated.guide,
                     };
                     store_guide(cx, &pr_for_task, &stored);
                 }
                 Err(GuideRunError::Cancelled) => {
                     svc.errors.remove(&pr_for_task);
+                    svc.bump_revision();
                 }
                 Err(GuideRunError::NotInstalled { tried }) => {
                     svc.errors.remove(&pr_for_task);
                     svc.availability = Some(ClaudeAvailability::NotInstalled { tried });
+                    svc.bump_revision();
                 }
                 Err(GuideRunError::NotLoggedIn(detail)) => {
                     svc.errors.remove(&pr_for_task);
@@ -350,9 +372,11 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
                         path: std::path::PathBuf::from("claude"),
                         detail,
                     });
+                    svc.bump_revision();
                 }
                 Err(err) => {
                     svc.errors.insert(pr_for_task.clone(), err.to_string());
+                    svc.bump_revision();
                 }
             }
             cx.refresh_windows();
@@ -370,6 +394,7 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
             _task: task,
         },
     );
+    svc.bump_revision();
     cx.refresh_windows();
 }
 
@@ -381,6 +406,7 @@ pub fn cancel_generation(pr: &PrRef, cx: &mut App) {
         run.cancel.cancel();
     }
     svc.errors.remove(pr);
+    svc.bump_revision();
     cx.refresh_windows();
 }
 
@@ -521,6 +547,7 @@ mod tests {
             model: "claude-sonnet-5-5".into(),
             effort: "medium".into(),
             generated_at: Utc::now(),
+            changed_files: Vec::new(),
             guide: ReviewGuide {
                 schema_version: SCHEMA_VERSION,
                 summary: GuideSummary {

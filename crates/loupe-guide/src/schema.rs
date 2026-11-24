@@ -179,7 +179,52 @@ pub struct StoredGuide {
     pub model: String,
     pub effort: String,
     pub generated_at: DateTime<Utc>,
+    /// Authoritative list of files changed in the pull request (from GitHub, not the model),
+    /// used to show files the guide did not cover with any snippet.
+    #[serde(default)]
+    pub changed_files: Vec<String>,
     pub guide: ReviewGuide,
+}
+
+/// Returns repository-relative paths in `changed_files` that are not referenced
+/// by any diff snippet or removed-test entry in `guide`.
+pub fn uncovered_files(changed_files: &[String], guide: &ReviewGuide) -> Vec<String> {
+    let mut covered: HashSet<&str> = HashSet::new();
+    for step in &guide.steps {
+        for snippet in &step.snippets {
+            covered.insert(snippet.path.as_str());
+        }
+    }
+    for removed in &guide.removed_tests {
+        covered.insert(removed.path.as_str());
+    }
+    changed_files
+        .iter()
+        .filter(|path| !covered.contains(path.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Validates that an identifier is a short lowercase kebab-case slug
+/// (`^[a-z0-9]+(-[a-z0-9]+)*$`, 1..=64 ASCII characters) so cached IDs can
+/// never smuggle newlines or prompt-injection text.
+pub fn is_valid_slug(id: &str) -> bool {
+    if id.is_empty() || id.len() > 64 {
+        return false;
+    }
+    let bytes = id.as_bytes();
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    let mut prev_dash = false;
+    for &b in bytes {
+        let ok = b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+        if !ok || (b == b'-' && prev_dash) {
+            return false;
+        }
+        prev_dash = b == b'-';
+    }
+    true
 }
 
 impl StoredGuide {
@@ -248,6 +293,8 @@ pub enum GuideValidationError {
     UnsupportedVersion { found: u32, supported: u32 },
     #[error("Missing required text in `{field}`")]
     EmptyField { field: String },
+    #[error("Invalid identifier `{id}` in `{field}`: must be lowercase kebab-case (1-64 chars)")]
+    InvalidSlug { field: String, id: String },
     #[error("Guide must contain at least one walkthrough step")]
     NoSteps,
     #[error("Duplicate step id `{id}`")]
@@ -317,7 +364,7 @@ pub fn validate(guide: &ReviewGuide) -> Result<(), GuideValidationError> {
 
     let mut step_snippets: HashMap<&str, usize> = HashMap::with_capacity(guide.steps.len());
     for (ix, step) in guide.steps.iter().enumerate() {
-        require_non_empty(&step.id, &format!("steps[{ix}].id"))?;
+        require_slug(&step.id, &format!("steps[{ix}].id"))?;
         require_non_empty(&step.title, &format!("steps[{ix}].title"))?;
         require_non_empty(&step.explanation, &format!("steps[{ix}].explanation"))?;
         if step_snippets
@@ -354,7 +401,7 @@ pub fn validate(guide: &ReviewGuide) -> Result<(), GuideValidationError> {
 
     let mut decision_ids: HashSet<&str> = HashSet::with_capacity(guide.decisions.len());
     for (ix, decision) in guide.decisions.iter().enumerate() {
-        require_non_empty(&decision.id, &format!("decisions[{ix}].id"))?;
+        require_slug(&decision.id, &format!("decisions[{ix}].id"))?;
         require_non_empty(&decision.title, &format!("decisions[{ix}].title"))?;
         require_non_empty(&decision.impact, &format!("decisions[{ix}].impact"))?;
         if !decision_ids.insert(decision.id.as_str()) {
@@ -402,6 +449,17 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), GuideValidationErro
         })
     } else {
         Ok(())
+    }
+}
+
+fn require_slug(value: &str, field: &str) -> Result<(), GuideValidationError> {
+    if is_valid_slug(value) {
+        Ok(())
+    } else {
+        Err(GuideValidationError::InvalidSlug {
+            field: field.to_owned(),
+            id: value.to_owned(),
+        })
     }
 }
 
@@ -544,7 +602,7 @@ pub fn guide_json_schema() -> serde_json::Value {
                     "additionalProperties": false,
                     "required": ["id", "title", "category", "impact", "step_id", "snippet_index"],
                     "properties": {
-                        "id": { "type": "string" },
+                        "id": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64 },
                         "title": { "type": "string" },
                         "category": {
                             "type": "string",
@@ -569,7 +627,7 @@ pub fn guide_json_schema() -> serde_json::Value {
                     "additionalProperties": false,
                     "required": ["id", "kind", "title", "explanation", "snippets"],
                     "properties": {
-                        "id": { "type": "string" },
+                        "id": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64 },
                         "kind": {
                             "type": "string",
                             "enum": ["overview", "flow", "callers", "contract", "subsystem", "tests"]
@@ -731,6 +789,28 @@ mod tests {
         no_steps.steps.clear();
         no_steps.decisions.clear();
         assert_eq!(validate(&no_steps), Err(GuideValidationError::NoSteps));
+
+        // Slugs with newlines, spaces, or uppercase are rejected to block prompt injection.
+        for bad_slug in [
+            "",
+            "a\nSYSTEM OVERRIDE",
+            "UpperCase",
+            "-leading",
+            "trailing-",
+            "double--dash",
+            "has space",
+        ] {
+            let mut bad = sample_guide();
+            bad.steps[0].id = bad_slug.into();
+            bad.decisions[0].step_id = bad_slug.into();
+            assert!(
+                matches!(
+                    validate(&bad),
+                    Err(GuideValidationError::InvalidSlug { .. })
+                ),
+                "slug `{bad_slug}` must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -835,8 +915,16 @@ mod tests {
             model: "claude-sonnet-5-5".into(),
             effort: "medium".into(),
             generated_at: Utc::now(),
+            changed_files: vec![
+                "crates/api/src/auth.rs".into(),
+                "crates/api/src/telemetry.rs".into(),
+            ],
             guide: guide_v1.clone(),
         };
+        assert_eq!(
+            super::uncovered_files(&stored.changed_files, &stored.guide),
+            vec!["crates/api/src/telemetry.rs".to_owned()]
+        );
         assert!(!stored.is_stale("aaaa1111bbbb2222"));
         assert!(stored.is_stale("cccc3333dddd4444"));
         assert_eq!(stored.short_sha(), "aaaa111");

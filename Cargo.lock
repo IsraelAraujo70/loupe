@@ -3846,6 +3846,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "loupe-github",
+ "loupe-guide",
  "loupe-linear",
  "loupe-t3",
  "loupe-update",

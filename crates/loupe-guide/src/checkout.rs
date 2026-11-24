@@ -10,8 +10,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+/// Maximum wall-clock time permitted for a single `git` invocation.
+const GIT_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Error)]
 pub enum CheckoutError {
@@ -21,6 +25,8 @@ pub enum CheckoutError {
     InvalidCommit(String),
     #[error("Cancelled while preparing repository checkout")]
     Cancelled,
+    #[error("Git operation timed out")]
+    TimedOut,
     #[error("Failed to create temporary checkout directory: {0}")]
     Io(#[from] std::io::Error),
     #[error("Git checkout failed: {0}")]
@@ -134,22 +140,34 @@ impl TempCheckout {
 
     fn create_empty() -> Result<Self, CheckoutError> {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let dir = std::env::temp_dir().join(format!("loupe-guide-{pid}-{nanos}-{seq}"));
-        fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        for _ in 0..32 {
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            let dir = std::env::temp_dir().join(format!("loupe-guide-{pid}-{nanos}-{seq}"));
+            // Atomic `create_dir` refuses pre-existing directories (prevents /tmp pre-creation).
+            match fs::create_dir(&dir) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+                    }
+                    return Ok(Self {
+                        dir,
+                        read_only_applied: false,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(CheckoutError::Io(err)),
+            }
         }
-        Ok(Self {
-            dir,
-            read_only_applied: false,
-        })
+        Err(CheckoutError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create unique temporary directory",
+        )))
     }
 
     fn verify_head(&self, expected: &str) -> Result<(), CheckoutError> {
@@ -169,7 +187,7 @@ impl TempCheckout {
         Ok(())
     }
 
-    /// Strips `.git/` and any symlinks, then locks permissions to read-only on Unix.
+    /// Strips `.git/` and any symlinks, then locks permissions to owner-only read-only on Unix.
     fn harden(&mut self) -> Result<(), CheckoutError> {
         let git_dir = self.dir.join(".git");
         if git_dir.exists() {
@@ -178,8 +196,9 @@ impl TempCheckout {
         remove_all_symlinks(&self.dir)?;
         #[cfg(unix)]
         {
-            set_tree_writable(&self.dir, false)?;
+            // Mark before mutating permissions so Drop still unlocks a partially locked tree.
             self.read_only_applied = true;
+            set_tree_writable(&self.dir, false)?;
         }
         Ok(())
     }
@@ -265,6 +284,8 @@ fn hardened_git(dir: &Path, allow_file_protocol: bool) -> Command {
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -302,11 +323,17 @@ fn run_git(
         cmd.env(k, v);
     }
     let mut child = cmd.spawn()?;
+    let deadline = Instant::now() + GIT_TIMEOUT;
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(CheckoutError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CheckoutError::TimedOut);
         }
         if let Some(status) = child.try_wait()? {
             if status.success() {
@@ -322,7 +349,7 @@ fn run_git(
                 safe
             }));
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -403,12 +430,13 @@ fn set_tree_writable(dir: &Path, writable: bool) -> std::io::Result<()> {
         if meta.is_dir() {
             set_tree_writable(&path, writable)?;
         } else if meta.is_file() {
-            let mode = if writable { 0o600 } else { 0o444 };
+            // Owner-only permissions prevent other local users on shared Linux hosts from reading private repos.
+            let mode = if writable { 0o600 } else { 0o400 };
             fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
         }
     }
     if !writable {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o500))?;
     }
     Ok(())
 }
@@ -496,6 +524,18 @@ mod tests {
 
             #[cfg(unix)]
             {
+                use std::os::unix::fs::PermissionsExt;
+                let dir_mode = fs::metadata(&checkout_path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(dir_mode, 0o500, "temp dir must be owner read-only (0500)");
+                let file_mode = fs::metadata(checkout_path.join("hello.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    file_mode, 0o400,
+                    "checked-out file must be owner read-only (0400)"
+                );
                 let write_attempt = fs::write(checkout_path.join("pwned.txt"), "nope");
                 assert!(
                     write_attempt.is_err(),
@@ -513,5 +553,129 @@ mod tests {
         assert!(matches!(err, CheckoutError::Git(_)));
 
         let _ = fs::remove_dir_all(&src);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_global_filters_hooks_auth_redaction_and_commit_mismatch_are_enforced() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("loupe-sec-guards-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("repo");
+        let fake_home = base.join("home");
+        let marker = base.join("filter-ran");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&fake_home).unwrap();
+
+        // Plant a malicious global gitconfig filter (simulating git-lfs smudge / arbitrary filter).
+        fs::write(
+            fake_home.join(".gitconfig"),
+            format!(
+                "[filter \"evil\"]\n\tsmudge = sh -c 'touch {} && cat'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&src)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        git(&["init", "-q"]);
+        fs::write(src.join(".gitattributes"), "*.bin filter=evil\n").unwrap();
+        fs::write(src.join("data.bin"), "payload\n").unwrap();
+        symlink("/etc/passwd", src.join("leak.txt")).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "symlink and filter attr"]);
+
+        let sha_out = Command::new("git")
+            .current_dir(&src)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_owned();
+
+        // Run hardened_git explicitly under fake_home to verify GIT_CONFIG_GLOBAL=/dev/null blocks global filters.
+        let dest = base.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let run_with_home = |args: &[&str]| {
+            let status = super::hardened_git(&dest, true)
+                .env("HOME", &fake_home)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "hardened git {args:?} failed");
+        };
+        run_with_home(&["init", "-q"]);
+        // Plant a repo post-checkout hook to verify core.hooksPath=/dev/null blocks it.
+        let hook_marker = base.join("hook-ran");
+        let hooks_dir = dest.join(".git/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join("post-checkout");
+        fs::write(
+            &hook_path,
+            format!("#!/bin/sh\ntouch {}\n", hook_marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        run_with_home(&["fetch", "--depth=1", src.to_str().unwrap(), &sha]);
+        run_with_home(&["checkout", "--detach", "-q", "FETCH_HEAD"]);
+
+        assert!(
+            !hook_marker.exists(),
+            "core.hooksPath=/dev/null must block repo post-checkout hooks"
+        );
+        assert!(
+            !marker.exists(),
+            "global git filter from HOME/.gitconfig must never execute during checkout"
+        );
+        let leak_meta = fs::symlink_metadata(dest.join("leak.txt")).unwrap();
+        assert!(
+            !leak_meta.file_type().is_symlink(),
+            "core.symlinks=false must materialize symlinks as plain files"
+        );
+
+        // Verify remove_all_symlinks deletes OS symlinks directly too.
+        let sym_dir = base.join("sym-dir");
+        fs::create_dir_all(&sym_dir).unwrap();
+        symlink("/etc/passwd", sym_dir.join("escape")).unwrap();
+        super::remove_all_symlinks(&sym_dir).unwrap();
+        assert!(!sym_dir.join("escape").exists());
+
+        // Verify verify_head catches commit mismatch.
+        let temp = TempCheckout {
+            dir: dest.clone(),
+            read_only_applied: false,
+        };
+        let mismatch = temp.verify_head("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(matches!(
+            mismatch,
+            Err(CheckoutError::CommitMismatch { .. })
+        ));
+        std::mem::forget(temp);
+
+        // Verify redact_auth strips Authorization lines.
+        let redacted =
+            super::redact_auth("fatal: error\nAuthorization: basic c2VjcmV0\nmore details");
+        assert!(!redacted.contains("c2VjcmV0"));
+        assert!(redacted.contains("fatal: error"));
+        assert!(redacted.contains("more details"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

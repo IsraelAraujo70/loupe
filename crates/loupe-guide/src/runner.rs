@@ -5,8 +5,12 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+/// Default wall-clock cap for one local Claude Code review guide run.
+pub const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(900);
 
 use crate::checkout::{CheckoutError, TempCheckout};
 use crate::claude::{
@@ -76,6 +80,8 @@ pub enum GuideRunError {
     Checkout(#[from] CheckoutError),
     #[error("Guide generation was cancelled.")]
     Cancelled,
+    #[error("Guide generation timed out.")]
+    TimedOut,
     #[error("Failed to launch Claude Code: {0}")]
     Spawn(String),
     #[error("Refused to continue: Claude Code exposed unexpected tools: {0}")]
@@ -122,19 +128,43 @@ pub fn generate_for_pr(
     )
     .map_err(|err| match err {
         CheckoutError::Cancelled => GuideRunError::Cancelled,
+        CheckoutError::TimedOut => GuideRunError::TimedOut,
         other => GuideRunError::Checkout(other),
     })?;
 
     run_in_checkout(&exe, checkout.path(), input, config, cancel, on_progress)
 }
 
-/// Runs the hardened Claude Code CLI inside an already-prepared read-only checkout.
+/// Runs the hardened Claude Code CLI inside an already-prepared read-only checkout
+/// with [`DEFAULT_AGENT_TIMEOUT`].
 pub fn run_in_checkout(
     exe: &Path,
     checkout_dir: &Path,
     input: &GuidePromptInput,
     config: &ClaudeConfig,
     cancel: &CancelToken,
+    on_progress: impl FnMut(ProgressEvent),
+) -> Result<GeneratedGuide, GuideRunError> {
+    run_in_checkout_with_timeout(
+        exe,
+        checkout_dir,
+        input,
+        config,
+        cancel,
+        DEFAULT_AGENT_TIMEOUT,
+        on_progress,
+    )
+}
+
+/// Runs the hardened Claude Code CLI inside an already-prepared read-only checkout
+/// with an explicit wall-clock `timeout`.
+pub fn run_in_checkout_with_timeout(
+    exe: &Path,
+    checkout_dir: &Path,
+    input: &GuidePromptInput,
+    config: &ClaudeConfig,
+    cancel: &CancelToken,
+    timeout: Duration,
     mut on_progress: impl FnMut(ProgressEvent),
 ) -> Result<GeneratedGuide, GuideRunError> {
     if cancel.is_cancelled() {
@@ -172,18 +202,29 @@ pub fn run_in_checkout(
         buf
     });
 
-    // Dedicated cancellation watcher so blocking `read_line` unblocks promptly on Cancel.
+    // Dedicated cancellation and timeout watcher so blocking `read_line` unblocks promptly.
     let done = Arc::new(AtomicBool::new(false));
+    let timed_out = Arc::new(AtomicBool::new(false));
     let child_pid = child.id();
     let watch_cancel = cancel.clone();
     let watch_done = done.clone();
+    let watch_timed_out = timed_out.clone();
+    let deadline = Instant::now() + timeout;
     let watcher = std::thread::spawn(move || {
         while !watch_done.load(Ordering::Relaxed) {
-            if watch_cancel.is_cancelled() {
+            let expired = Instant::now() >= deadline;
+            if watch_cancel.is_cancelled() || expired {
+                if expired {
+                    watch_timed_out.store(true, Ordering::Relaxed);
+                }
                 terminate_pid(child_pid);
+                std::thread::sleep(Duration::from_millis(300));
+                if !watch_done.load(Ordering::Relaxed) {
+                    force_kill_pid(child_pid);
+                }
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(75));
+            std::thread::sleep(Duration::from_millis(50));
         }
     });
 
@@ -241,6 +282,9 @@ pub fn run_in_checkout(
     if cancel.is_cancelled() {
         return Err(GuideRunError::Cancelled);
     }
+    if timed_out.load(Ordering::Relaxed) {
+        return Err(GuideRunError::TimedOut);
+    }
     if let Some(bad) = unsafe_tools {
         return Err(GuideRunError::UnsafeToolSurface(bad.join(", ")));
     }
@@ -286,16 +330,31 @@ fn terminate_pid(pid: u32) {
         .status();
 }
 
+#[cfg(unix)]
+fn force_kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 #[cfg(not(unix))]
 fn terminate_pid(_pid: u32) {}
+
+#[cfg(not(unix))]
+fn force_kill_pid(_pid: u32) {}
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::time::Duration;
 
-    use super::{CancelToken, GuideRunError, ProgressEvent, run_in_checkout};
+    use super::{
+        CancelToken, GuideRunError, ProgressEvent, run_in_checkout, run_in_checkout_with_timeout,
+    };
     use crate::checkout::{TempCheckout, snapshot_tree};
     use crate::claude::{
         ClaudeAvailability, ClaudeConfig, GuideEffort, GuideModel, check_availability,
@@ -424,12 +483,62 @@ mod tests {
         let _ = fs::remove_dir_all(&src);
     }
 
-    /// Live security test against the local Claude Code installation (skipped only
-    /// when Claude Code is not installed/logged in, such as on GitHub Actions).
+    #[cfg(unix)]
     #[test]
+    fn runner_times_out_stalled_agent_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (src, sha) = create_malicious_test_repo();
+        let stub = std::env::temp_dir().join(format!("loupe-stall-stub-{}.sh", std::process::id()));
+        fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let checkout_path;
+        {
+            let checkout = TempCheckout::from_local_repo(&src, &sha).unwrap();
+            checkout_path = checkout.path().to_path_buf();
+            let input = GuidePromptInput {
+                repo: "acme/app".into(),
+                pr_number: 2,
+                title: "Stall test".into(),
+                body: String::new(),
+                author: "alice".into(),
+                base_ref: "main".into(),
+                base_oid: sha.clone(),
+                head_ref: "feat".into(),
+                head_oid: sha.clone(),
+                commits: Vec::new(),
+                comments: Vec::new(),
+                files: Vec::new(),
+                previous_step_ids: Vec::new(),
+            };
+            let err = run_in_checkout_with_timeout(
+                &stub,
+                checkout.path(),
+                &input,
+                &ClaudeConfig::default(),
+                &CancelToken::new(),
+                Duration::from_millis(200),
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GuideRunError::TimedOut),
+                "expected TimedOut, got {err:?}"
+            );
+        }
+        assert!(!checkout_path.exists(), "temp checkout must be deleted");
+        let _ = fs::remove_file(&stub);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// Live security test against the local Claude Code installation.
+    /// Run explicitly with `cargo test -p loupe-guide -- --ignored`.
+    #[test]
+    #[ignore = "runs live against local claude CLI; invoke with --ignored"]
     fn malicious_prompt_injection_cannot_modify_checkout_and_checkout_is_cleaned_up() {
         let ClaudeAvailability::Ready { path: exe, .. } = check_availability(None) else {
-            return;
+            panic!("local claude CLI must be installed and logged in to run ignored live test");
         };
         let (src, sha) = create_malicious_test_repo();
         let hook_marker = PathBuf::from("/tmp/loupe-sec-hook-pwned");

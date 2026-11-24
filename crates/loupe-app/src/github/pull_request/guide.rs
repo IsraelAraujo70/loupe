@@ -153,6 +153,7 @@ impl GuideTab {
                     model,
                     effort,
                     generated_at: Utc::now(),
+                    changed_files: Vec::new(),
                     guide,
                 });
                 self.set_state(
@@ -472,6 +473,7 @@ impl GuideTab {
         let now = Utc::now();
         let viewed = self.read_state.viewed_count(guide);
         let total = guide.steps.len();
+        let uncovered = loupe_guide::uncovered_files(&stored.changed_files, guide);
 
         v_flex()
             .w_full()
@@ -487,6 +489,9 @@ impl GuideTab {
             .child(self.render_summary(guide, cx))
             .when(!guide.removed_tests.is_empty(), |col| {
                 col.child(self.render_removed_tests(&guide.removed_tests, cx))
+            })
+            .when(!uncovered.is_empty(), |col| {
+                col.child(self.render_uncovered_files(&uncovered, cx))
             })
             .child(self.render_steps(guide, changed_steps, viewed, total, cx))
             .into_any_element()
@@ -900,6 +905,60 @@ impl GuideTab {
                                     .child(test.reason.clone()),
                             )
                     })),
+            )
+            .into_any_element()
+    }
+
+    fn render_uncovered_files(&self, paths: &[String], cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let mono = cx.theme().mono_font_family.clone();
+        v_flex()
+            .debug_selector(|| "guide-uncovered-files".into())
+            .w_full()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::FileDiff)
+                            .with_size(scale::icon_sm())
+                            .text_color(tokens::pending()),
+                    )
+                    .child(
+                        div()
+                            .text_size(scale::title())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Files not covered by the guide"),
+                    )
+                    .child(ui::count_badge(paths.len(), cx)),
+            )
+            .child(
+                ui::card(cx)
+                    .p_3()
+                    .gap_2()
+                    .child(div().text_size(scale::meta()).text_color(muted).child(
+                        "Changed in this pull request without a cited snippet in the walkthrough:",
+                    ))
+                    .child(h_flex().w_full().flex_wrap().gap_2().children(
+                        paths.iter().enumerate().map(|(ix, path)| {
+                            let open_path = path.clone();
+                            Button::new(SharedString::from(format!("guide-uncovered-file-{ix}")))
+                                .debug_selector(move || format!("guide-uncovered-file-{ix}"))
+                                .outline()
+                                .xsmall()
+                                .icon(IconName::FileDiff)
+                                .child(
+                                    div()
+                                        .font_family(mono.clone())
+                                        .text_size(scale::code())
+                                        .child(path.clone()),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_file(open_path.clone(), None, Side::Right, cx);
+                                }))
+                        }),
+                    )),
             )
             .into_any_element()
     }
@@ -1506,7 +1565,16 @@ mod tests {
             model: "claude-sonnet-5-5".into(),
             effort: "medium".into(),
             generated_at: Utc::now(),
+            changed_files: vec!["src/auth.rs".into(), "src/uncovered.rs".into()],
             guide: fixture_guide(),
+        });
+        let emitted: Rc<RefCell<Vec<PrTabEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = emitted.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&tab, move |_, event: &PrTabEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
         });
         tab.update(&mut cx, |tab, cx| {
             tab.set_state(
@@ -1521,6 +1589,22 @@ mod tests {
         assert!(
             cx.debug_bounds("guide-stale-banner").is_some(),
             "guide for an older commit shows the stale banner"
+        );
+        assert!(
+            cx.debug_bounds("guide-uncovered-files").is_some(),
+            "changed files omitted from the guide are listed deterministically"
+        );
+        let uncovered_btn = cx
+            .debug_bounds("guide-uncovered-file-0")
+            .expect("uncovered file button is rendered");
+        cx.simulate_click(uncovered_btn.center(), Modifiers::none());
+        assert_eq!(
+            *emitted.borrow(),
+            vec![PrTabEvent::OpenFile {
+                path: "src/uncovered.rs".into(),
+                line: None,
+                side: Side::Right,
+            }]
         );
 
         // Invalid JSON shows the error state cleanly.

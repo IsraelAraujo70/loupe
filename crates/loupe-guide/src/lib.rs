@@ -16,11 +16,12 @@ pub use prompt::{
     GuidePromptInput, PromptComment, PromptCommit, PromptFile, SYSTEM_PROMPT, build_user_prompt,
 };
 pub use runner::{
-    CancelToken, GeneratedGuide, GuideRunError, ProgressEvent, generate_for_pr, run_in_checkout,
+    CancelToken, DEFAULT_AGENT_TIMEOUT, GeneratedGuide, GuideRunError, ProgressEvent,
+    generate_for_pr, run_in_checkout, run_in_checkout_with_timeout,
 };
 pub use schema::{
     DecisionCategory, DecisionPoint, DiffSnippet, FlowComparison, GuideReadState, GuideStep,
     GuideSummary, GuideValidationError, RemovedTest, ReviewGuide, SCHEMA_VERSION, SnippetSide,
-    StepChange, StepKind, StoredGuide, changed_steps_since, guide_json_schema, parse_and_validate,
-    validate,
+    StepChange, StepKind, StoredGuide, changed_steps_since, guide_json_schema, is_valid_slug,
+    parse_and_validate, uncovered_files, validate,
 };
