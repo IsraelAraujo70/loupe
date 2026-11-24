@@ -598,7 +598,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
     cx.new(|cx| {
         let weak = cx.weak_entity();
         let filter_menu = cx.new(|cx| FilterMenu::new(weak, window, cx));
-        let feed = super::checks_feed::feed(cx);
+        let feed = super::pr_feed::feed(cx);
         let checks = cx.subscribe(&feed, |view: &mut InboxView, _, loaded, cx| {
             if let Some(inbox) = view.inbox.value_mut()
                 && loaded.apply(inbox)
