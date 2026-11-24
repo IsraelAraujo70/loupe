@@ -1,0 +1,48 @@
+# Throwaway workflow for the live check of issue #121; this branch is
+# deleted afterwards.
+name: Run page demo
+on:
+  pull_request:
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare
+        run: echo "preparing the shards"
+  test:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Run shard
+        run: |
+          echo "::warning title=Deprecated runner::This runner image is deprecated"
+          echo "shard ${{ matrix.shard }} starts"
+          if [ "${{ matrix.shard }}" = "2" ]; then
+            echo "::error file=src/lib.rs,line=12::assertion failed: left == right"
+            exit 1
+          fi
+          for i in $(seq 1 $(( ${{ matrix.shard }} * 60 ))); do echo "tick $i"; sleep 5; done
+  lint:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lint
+        run: |
+          for i in 1 2 3; do echo "::warning file=src/main.rs,line=7::unused variable: x"; done
+          mkdir -p out && echo "lint report" > out/report.txt
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: out
+  publish:
+    needs: [test, lint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish
+        run: echo "done"
