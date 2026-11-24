@@ -369,8 +369,9 @@ impl ParsedQuery {
     }
 }
 
-/// The repositories the filters match against: the watched ones first, then
-/// the ones the viewer reaches, most recently pushed first.
+/// The repositories the filters match against: the sidebar's first (pinned,
+/// watched, and those of your pull requests), then the ones the viewer
+/// reaches, most recently pushed first.
 #[derive(Clone, Debug, Default)]
 struct RepoCatalog {
     watched: Vec<RepoRef>,
@@ -471,14 +472,17 @@ fn scope_owners(catalog: &RepoCatalog) -> Vec<String> {
     owners
 }
 
-/// The Repositories rows: the watched repositories for an empty query;
+/// The Repositories rows: the sidebar's repositories for an empty query;
 /// otherwise each catalog repository that holds every `repo:` value and
-/// every word, inside the `org:` accounts.
+/// every word, inside the `org:` accounts, followed by its Actions when the
+/// query has words and each of them is in the repository or in "actions"
+/// (so "web" finds acme/web and its Actions, "actions web" only the
+/// Actions).
 fn repo_rows(parsed: &ParsedQuery, catalog: &RepoCatalog) -> Vec<PaletteItem> {
     let row = |repo: &RepoRef| PaletteItem {
         title: repo.to_string().into(),
         subtitle: if catalog.watched.contains(repo) {
-            "Watched repository"
+            "Repository in the sidebar"
         } else {
             "Repository"
         }
@@ -486,23 +490,44 @@ fn repo_rows(parsed: &ParsedQuery, catalog: &RepoCatalog) -> Vec<PaletteItem> {
         route: Route::Repo(repo.clone()),
         comments: 0,
     };
+    let actions = |repo: &RepoRef| PaletteItem {
+        title: format!("Actions of {repo}").into(),
+        subtitle: "Workflow runs".into(),
+        route: Route::Actions {
+            repo: repo.clone(),
+            branch: None,
+        },
+        comments: 0,
+    };
     if !parsed.is_narrowed() && parsed.words.is_empty() {
         return catalog.watched.iter().take(MAX_REPOS).map(row).collect();
     }
     let owners = named_owners(parsed, catalog);
-    catalog
+    let in_repo = |repo: &RepoRef, needle: &String| holds(repo, needle);
+    let in_actions = |needle: &String| "actions".contains(&needle.to_lowercase());
+    let mut rows = Vec::new();
+    for repo in catalog
         .all()
-        .filter(|repo| {
-            parsed
-                .repos
-                .iter()
-                .chain(&parsed.words)
-                .all(|needle| holds(repo, needle))
-        })
+        .filter(|repo| parsed.repos.iter().all(|needle| in_repo(repo, needle)))
         .filter(|repo| owned_by(repo, &owners))
-        .take(MAX_REPOS)
-        .map(row)
-        .collect()
+    {
+        if parsed.words.iter().all(|word| in_repo(repo, word)) {
+            rows.push(row(repo));
+        }
+        if !parsed.words.is_empty()
+            && parsed
+                .words
+                .iter()
+                .all(|word| in_repo(repo, word) || in_actions(word))
+        {
+            rows.push(actions(repo));
+        }
+        if rows.len() >= MAX_REPOS {
+            break;
+        }
+    }
+    rows.truncate(MAX_REPOS);
+    rows
 }
 
 /// Where the results of a pull request search go.
@@ -605,6 +630,11 @@ fn local_items(cx: &App) -> Vec<PaletteItem> {
             Route::LinearProjects { team_id: None },
         ),
         item("Views", "Linear", Route::LinearViews { team_id: None }),
+        item(
+            "Actions",
+            "Workflow runs of your repositories",
+            Route::AllActions,
+        ),
         item("Settings", "Accounts and preferences", Route::Settings),
     ];
     items.extend(
@@ -680,6 +710,7 @@ impl Group {
             | Route::LinearProjects { .. }
             | Route::LinearProject { .. }
             | Route::LinearViews { .. }
+            | Route::AllActions
             | Route::Settings => Group::GoTo,
             Route::Repo(_) | Route::Actions { .. } => Group::Repositories,
             Route::LinearTeam { .. } => Group::Teams,
@@ -1031,7 +1062,10 @@ impl PaletteView {
             local: local_items(cx),
             tabs: Vec::new(),
             catalog: RepoCatalog {
-                watched: Settings::get(cx).watched_repos.clone(),
+                watched: crate::github::repos::listed(cx)
+                    .into_iter()
+                    .map(|listed| listed.repo)
+                    .collect(),
                 reachable: Vec::new(),
             },
             catalog_ready: false,
@@ -1324,7 +1358,7 @@ fn route_icon(route: &Route) -> IconName {
         Route::Notifications => IconName::Inbox,
         Route::Repo(_) => IconName::FolderGit2,
         Route::PullRequest(_) => IconName::GitPullRequest,
-        Route::Actions { .. } | Route::WorkflowRun { .. } => IconName::Workflow,
+        Route::Actions { .. } | Route::AllActions | Route::WorkflowRun { .. } => IconName::Workflow,
         Route::LinearMyIssues | Route::LinearIssue { .. } => IconName::CircleDot,
         Route::LinearTeam { .. } => IconName::Users,
         Route::LinearProjects { .. } | Route::LinearProject { .. } => IconName::Box,
@@ -2250,6 +2284,29 @@ mod tests {
             PrTarget::Repo(RepoRef::new("other", "thing"))
         );
         assert_eq!(full[0].query, "is:pr sort:updated-desc repo:other/thing");
+    }
+
+    #[test]
+    fn a_repository_word_finds_the_repository_and_its_actions() {
+        let titles = |query: &str| -> Vec<String> {
+            repo_rows(&ParsedQuery::parse(query), &catalog())
+                .iter()
+                .map(|row| row.title.to_string())
+                .collect()
+        };
+        assert_eq!(titles("tools"), ["octo/tools", "Actions of octo/tools"]);
+        assert_eq!(titles("actions tools"), ["Actions of octo/tools"]);
+        assert_eq!(titles("tools act"), ["Actions of octo/tools"]);
+        let rows = repo_rows(&ParsedQuery::parse("tools"), &catalog());
+        assert_eq!(
+            rows[1].route,
+            Route::Actions {
+                repo: RepoRef::new("octo", "tools"),
+                branch: None,
+            }
+        );
+        // An empty query lists the sidebar's repositories alone.
+        assert_eq!(titles(""), ["acme/web"]);
     }
 
     #[test]

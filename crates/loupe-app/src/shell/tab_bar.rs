@@ -138,7 +138,7 @@ pub(super) fn route_icon(route: &Route) -> IconName {
         Route::Notifications => IconName::Inbox,
         Route::Repo(_) => IconName::FolderGit2,
         Route::PullRequest(_) => IconName::GitPullRequest,
-        Route::Actions { .. } | Route::WorkflowRun { .. } => IconName::Workflow,
+        Route::Actions { .. } | Route::AllActions | Route::WorkflowRun { .. } => IconName::Workflow,
         Route::LinearMyIssues => IconName::CircleUser,
         Route::LinearTeam { .. } => IconName::Users,
         Route::LinearProjects { .. } | Route::LinearProject { .. } => IconName::Box,

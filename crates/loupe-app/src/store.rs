@@ -128,7 +128,15 @@ pub fn parse_github_target(text: &str) -> Option<String> {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Repositories the sidebar lists under Repositories, in the order the
+    /// user gave them (Watch on a repository's page).
     pub watched_repos: Vec<RepoRef>,
+    /// Repositories pinned to the top of the sidebar's Repositories, in the
+    /// order they show there.
+    pub pinned_repos: Vec<RepoRef>,
+    /// Repositories whose Pull requests and Actions rows the sidebar shows;
+    /// a repository's row starts folded.
+    pub open_repos: Vec<RepoRef>,
     /// The sidebar's Favorites, in the order they were starred.
     pub favorites: Vec<Favorite>,
     /// Sidebar sections the user folded, by key such as `workspace` or
@@ -366,6 +374,57 @@ impl Settings {
         self.favorites
             .iter()
             .any(|starred| starred.same_item(favorite))
+    }
+
+    /// Unpins `repo` when it is pinned, else pins it after the pinned ones.
+    pub fn toggle_pinned_repo(&mut self, repo: &RepoRef) {
+        toggle(&mut self.pinned_repos, repo);
+    }
+
+    /// Takes `repo` out of the repositories the user added to the sidebar:
+    /// unpinned and unwatched.
+    pub fn remove_repo(&mut self, repo: &RepoRef) {
+        self.pinned_repos.retain(|pinned| pinned != repo);
+        self.watched_repos.retain(|watched| watched != repo);
+    }
+
+    /// Moves `repo` to the place of `target`, as a dragged row takes the
+    /// place of the row it is dropped on, within the pinned or the watched
+    /// repositories. Nothing moves when they are not in the same list, so a
+    /// pinned repository never lands among the watched ones. Returns whether
+    /// anything moved.
+    pub fn move_repo(&mut self, repo: &RepoRef, target: &RepoRef) -> bool {
+        let pinned = self.pinned_repos.contains(repo);
+        if pinned != self.pinned_repos.contains(target) {
+            return false;
+        }
+        let list = if pinned {
+            &mut self.pinned_repos
+        } else {
+            &mut self.watched_repos
+        };
+        let (Some(from), Some(to)) = (
+            list.iter().position(|item| item == repo),
+            list.iter().position(|item| item == target),
+        ) else {
+            return false;
+        };
+        if from == to {
+            return false;
+        }
+        let item = list.remove(from);
+        list.insert(to, item);
+        true
+    }
+
+    /// Whether the sidebar shows `repo`'s Pull requests and Actions rows.
+    pub fn is_repo_open(&self, repo: &RepoRef) -> bool {
+        self.open_repos.contains(repo)
+    }
+
+    /// Folds `repo`'s row when it is open, else opens it.
+    pub fn toggle_open_repo(&mut self, repo: &RepoRef) {
+        toggle(&mut self.open_repos, repo);
     }
 
     /// Unstars `favorite` when it is starred, else appends it.
@@ -798,6 +857,15 @@ fn secrets_dir() -> PathBuf {
     data_dir().join("secrets")
 }
 
+/// Removes `repo` from `list` when it is there, else appends it.
+fn toggle(list: &mut Vec<RepoRef>, repo: &RepoRef) {
+    if let Some(index) = list.iter().position(|item| item == repo) {
+        list.remove(index);
+    } else {
+        list.push(repo.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -808,6 +876,7 @@ mod tests {
         Settings, SplitAxis, TabGroupColor, WorkspaceMapping, parse_github_target,
     };
     use crate::route::Route;
+    use loupe_github::RepoRef;
 
     fn mapping(github: &str, workspace_id: &str) -> WorkspaceMapping {
         WorkspaceMapping {
@@ -1198,6 +1267,48 @@ mod tests {
         assert!(settings.is_collapsed("workspace"));
         settings.toggle_collapsed("workspace");
         assert!(!settings.is_collapsed("workspace"));
+    }
+
+    #[test]
+    fn a_dragged_repository_takes_the_place_of_the_one_it_is_dropped_on() {
+        let repo = |name: &str| RepoRef::new("acme", name);
+        let mut settings = Settings {
+            watched_repos: vec![repo("a"), repo("b"), repo("c"), repo("d")],
+            ..Settings::default()
+        };
+        assert!(settings.move_repo(&repo("a"), &repo("c")));
+        assert_eq!(
+            settings.watched_repos,
+            [repo("b"), repo("c"), repo("a"), repo("d")]
+        );
+        assert!(settings.move_repo(&repo("d"), &repo("b")));
+        assert_eq!(
+            settings.watched_repos,
+            [repo("d"), repo("b"), repo("c"), repo("a")]
+        );
+        assert!(!settings.move_repo(&repo("d"), &repo("d")));
+
+        // Pinned and watched keep apart, even for a pinned repository that
+        // is also watched.
+        settings.toggle_pinned_repo(&repo("p"));
+        settings.toggle_pinned_repo(&repo("q"));
+        settings.watched_repos.push(repo("p"));
+        assert!(!settings.move_repo(&repo("q"), &repo("d")));
+        assert!(!settings.move_repo(&repo("d"), &repo("p")));
+        settings.watched_repos.pop();
+        assert!(settings.move_repo(&repo("q"), &repo("p")));
+        assert_eq!(settings.pinned_repos, [repo("q"), repo("p")]);
+        assert_eq!(
+            settings.watched_repos,
+            [repo("d"), repo("b"), repo("c"), repo("a")]
+        );
+
+        settings.toggle_pinned_repo(&repo("q"));
+        assert_eq!(settings.pinned_repos, [repo("p")]);
+        settings.watched_repos.push(repo("p"));
+        settings.remove_repo(&repo("p"));
+        assert!(settings.pinned_repos.is_empty());
+        assert!(!settings.watched_repos.contains(&repo("p")));
     }
 
     #[test]
