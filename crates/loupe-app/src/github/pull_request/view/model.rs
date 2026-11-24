@@ -3,7 +3,8 @@
 
 use loupe_github::{
     CheckRun, CheckStatus, ChecksState, MergeMethod, MergeStateStatus, Mergeable, PrState,
-    PullRequestDetail, ReviewDecision, ReviewEvent, ReviewerState, StackEntry, TimelineItem,
+    PullRequestDetail, ReviewDecision, ReviewEvent, ReviewerState, StackEntry, StackMergePlan,
+    TimelineItem,
 };
 
 use crate::github::pull_request::checks::format_duration;
@@ -79,6 +80,8 @@ pub(super) enum Panel {
     Review,
     ConfirmDiscard,
     ConfirmMerge(MergeMethod),
+    ConfirmStackMerge(MergeMethod),
+    StackMergeProgress,
     ConfirmClose,
 }
 
@@ -87,12 +90,17 @@ impl Panel {
     /// reload can remove the pending review or make merging unavailable.
     pub(super) fn still_valid(self, detail: &PullRequestDetail) -> bool {
         match self {
-            Panel::Closed | Panel::Review => true,
+            Panel::Closed | Panel::Review | Panel::StackMergeProgress => true,
             Panel::ConfirmDiscard => detail.pending_review.is_some(),
             Panel::ConfirmMerge(method) => matches!(
                 available_actions(detail).merge,
                 MergeAction::Available { methods, .. } if methods.contains(&method)
             ),
+            Panel::ConfirmStackMerge(method) => {
+                detail.state == PrState::Open
+                    && detail.viewer_can_update
+                    && detail.merge_methods.contains(&method)
+            }
             Panel::ConfirmClose => available_actions(detail).state == Some(StateAction::Close),
         }
     }
@@ -556,6 +564,59 @@ pub(super) fn stack_merge_confirm_text(
     format!(
         "This merges {count} pull requests into {base_ref} with {}:",
         method_label(method)
+    )
+}
+
+pub(super) fn stack_merge_button_label(count: usize) -> String {
+    format!("Merge stack ({count} PRs)")
+}
+
+pub(super) fn ready_subset_button_label(count: usize, shape: loupe_github::StackShape) -> String {
+    match shape {
+        loupe_github::StackShape::Chain => {
+            if count == 1 {
+                "Merge 1 ready PR".into()
+            } else {
+                format!("Merge {count} ready PRs")
+            }
+        }
+        loupe_github::StackShape::Tree => {
+            if count == 1 {
+                "Merge 1 ready child".into()
+            } else {
+                format!("Merge {count} ready children")
+            }
+        }
+    }
+}
+
+pub(super) fn stack_confirm_headline(plan: &StackMergePlan, method: MergeMethod) -> String {
+    let blocked = plan.blocking_steps();
+    if blocked.is_empty() {
+        return format!(
+            "Merge {} pull requests ({}) with {}:",
+            plan.steps.len(),
+            plan.shape.label().to_lowercase(),
+            method_label(method)
+        );
+    }
+    if blocked.len() == 1 {
+        let step = blocked[0];
+        let reasons: Vec<&str> = step.blockers.iter().map(|b| b.label()).collect();
+        return format!(
+            "Cannot merge full stack — #{} is not ready ({}):",
+            step.node.pr.number,
+            reasons.join(", ")
+        );
+    }
+    let nums: Vec<String> = blocked
+        .iter()
+        .map(|s| format!("#{}", s.node.pr.number))
+        .collect();
+    format!(
+        "Cannot merge full stack — {} pull requests are not ready ({}):",
+        blocked.len(),
+        nums.join(", ")
     )
 }
 

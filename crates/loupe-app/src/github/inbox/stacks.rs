@@ -175,8 +175,9 @@ pub(super) fn bases_to_count<'a>(
     bases
 }
 
-/// The chains of two or more pull requests among `prs`, each base first,
-/// in the order their bases come in `prs`.
+/// The branch stacks (linear chains and container trees) of two or more pull
+/// requests among `prs`, each root first (DFS order with siblings sorted by PR
+/// number), in the order their roots come in `prs`.
 fn branch_chains<'a>(prs: &[&'a PrSummary], open_by_base: &OpenByBase) -> Vec<Vec<&'a PrSummary>> {
     let mut heads: HashMap<(&RepoRef, &str), Vec<usize>> = HashMap::new();
     for (at, pr) in prs.iter().enumerate() {
@@ -187,8 +188,6 @@ fn branch_chains<'a>(prs: &[&'a PrSummary], open_by_base: &OpenByBase) -> Vec<Ve
                 .push(at);
         }
     }
-    let alone_on =
-        |pr: &PrSummary| open_by_base.get(&(pr.pr.repo.clone(), pr.base_ref.clone())) == Some(&1);
     // The one pull request each one is based on, if exactly one has its
     // base as head.
     let under: Vec<Option<usize>> = prs
@@ -202,7 +201,7 @@ fn branch_chains<'a>(prs: &[&'a PrSummary], open_by_base: &OpenByBase) -> Vec<Ve
         )
         .collect();
     // Following the bases from a pull request on a loop of branches, or
-    // above one, never reaches a bottom: it has no place in a chain.
+    // above one, never reaches a bottom: it has no place in a stack.
     let looped: Vec<bool> = (0..prs.len())
         .map(|start| {
             let mut at = start;
@@ -215,39 +214,70 @@ fn branch_chains<'a>(prs: &[&'a PrSummary], open_by_base: &OpenByBase) -> Vec<Ve
             true
         })
         .collect();
-    // A link holds when GitHub counts no other open pull request on the
-    // branch.
-    let parent: Vec<Option<usize>> = under
-        .iter()
-        .enumerate()
-        .map(|(at, under)| under.filter(|_| !looped[at] && alone_on(prs[at])))
-        .collect();
+    // Collect candidate children per parent (excluding loops).
+    let mut raw_children: Vec<Vec<usize>> = vec![Vec::new(); prs.len()];
+    for (at, parent) in under.iter().enumerate() {
+        if let Some(parent) = parent
+            && !looped[at]
+        {
+            raw_children[*parent].push(at);
+        }
+    }
+    // A parent's children join its stack only when GitHub counted the open PRs
+    // targeting the parent's head branch AND every open PR GitHub counted is
+    // present here: a long-lived branch (`develop` with 9 PRs when only 1 is
+    // loaded) or an uncounted branch joins nothing, while a complete chain
+    // (1 of 1) or container tree (N of N) forms one stack.
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); prs.len()];
-    for (at, under) in parent.iter().enumerate() {
-        if let Some(under) = under {
-            children[*under].push(at);
+    let mut has_parent = vec![false; prs.len()];
+    for (parent_idx, kids) in raw_children.into_iter().enumerate() {
+        if kids.is_empty() || looped[parent_idx] {
+            continue;
+        }
+        let parent = prs[parent_idx];
+        let Some(&github_count) =
+            open_by_base.get(&(parent.pr.repo.clone(), parent.head_ref.clone()))
+        else {
+            continue;
+        };
+        if github_count == 0 || (kids.len() as u32) < github_count {
+            continue;
+        }
+        let mut sorted = kids;
+        sorted.sort_by_key(|&ix| prs[ix].pr.number);
+        for &kid in &sorted {
+            has_parent[kid] = true;
+        }
+        children[parent_idx] = sorted;
+    }
+
+    fn collect<'a>(
+        at: usize,
+        prs: &[&'a PrSummary],
+        children: &[Vec<usize>],
+        placed: &mut [bool],
+        out: &mut Vec<&'a PrSummary>,
+    ) {
+        if placed[at] {
+            return;
+        }
+        placed[at] = true;
+        out.push(prs[at]);
+        for &kid in &children[at] {
+            collect(kid, prs, children, placed, out);
         }
     }
-    let linked_up = |at: usize| parent[at].is_some_and(|under| children[under].len() == 1);
+
     let mut placed = vec![false; prs.len()];
-    let mut chains = Vec::new();
-    for start in (0..prs.len()).filter(|&at| !looped[at] && !linked_up(at)) {
-        let mut chain = vec![prs[start]];
-        placed[start] = true;
-        let mut at = start;
-        while let [only] = children[at][..] {
-            if placed[only] {
-                break;
-            }
-            placed[only] = true;
-            chain.push(prs[only]);
-            at = only;
-        }
-        if chain.len() > 1 {
-            chains.push(chain);
+    let mut stacks = Vec::new();
+    for start in (0..prs.len()).filter(|&at| !looped[at] && !has_parent[at]) {
+        let mut stack = Vec::new();
+        collect(start, prs, &children, &mut placed, &mut stack);
+        if stack.len() > 1 {
+            stacks.push(stack);
         }
     }
-    chains
+    stacks
 }
 
 #[cfg(test)]
@@ -354,23 +384,24 @@ mod tests {
     }
 
     #[test]
-    fn a_fork_in_the_chain_or_a_fork_repository_ends_it() {
-        // Two pull requests build on `a`: neither joins 10.
-        let forked = [pr(10, "main", "a"), pr(11, "a", "b"), pr(12, "a", "c")];
-        assert!(chains(&forked).is_empty());
-        // Past the fork, a branch with one pull request on it is a stack.
-        let forked = [
+    fn a_container_tree_groups_all_children_under_its_root_while_forks_stay_out() {
+        // Two pull requests build on `a`, and all open PRs on `a` are loaded:
+        // forms one container tree rooted at 10.
+        let tree = [pr(10, "main", "a"), pr(11, "a", "b"), pr(12, "a", "c")];
+        assert_eq!(chains(&tree), vec![vec![10, 11, 12]]);
+        // Nested grandchild under child 11 joins the same tree.
+        let deep = [
             pr(10, "main", "a"),
             pr(11, "a", "b"),
             pr(12, "a", "c"),
             pr(13, "b", "d"),
         ];
-        assert_eq!(chains(&forked), vec![vec![11, 13]]);
-        // Counts read before the second pull request opened on `a` still
-        // say one: the loaded pull requests end the chain all the same.
-        let mut stale = counted(&forked);
-        stale.insert((RepoRef::new("acme", "web"), "a".into()), 1);
-        assert_eq!(chains_with(&forked, &stale), vec![vec![11, 13]]);
+        assert_eq!(chains(&deep), vec![vec![10, 11, 13, 12]]);
+        // If GitHub reports more open PRs on `a` than are loaded (e.g. a shared
+        // integration branch), 10 does not swallow 11 and 12, though 11 -> 13 still chains.
+        let mut partial = counted(&deep);
+        partial.insert((RepoRef::new("acme", "web"), "a".into()), 5);
+        assert_eq!(chains_with(&deep, &partial), vec![vec![11, 13]]);
         // A fork's head named like a branch of the repository is not it.
         let mut fork = pr(20, "main", "x");
         fork.cross_repository = true;

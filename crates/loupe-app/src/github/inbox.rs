@@ -24,7 +24,7 @@ use chrono::{DateTime, Local, Utc};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::skeleton::Skeleton;
@@ -2673,6 +2673,17 @@ impl InboxView {
             },
         );
         let key = stack.key.clone();
+        let root_pr = stack
+            .members
+            .first()
+            .cloned()
+            .or_else(|| members.first().cloned());
+        let all_routes: Vec<Route> = stack
+            .members
+            .iter()
+            .cloned()
+            .map(Route::PullRequest)
+            .collect();
         stack_row(
             StackRow {
                 id: SharedString::from(format!("reviews-{id}")),
@@ -2693,6 +2704,44 @@ impl InboxView {
                 this.toggle_stack(&key, cx);
             }
         }))
+        .context_menu(move |menu, _, _| {
+            let menu = menu.min_w(scale::dp(220.));
+            if let Some(root) = root_pr.clone() {
+                let open_root = root.clone();
+                let merge_root = root;
+                let routes = all_routes.clone();
+                menu.item(
+                    PopupMenuItem::new("Open root pull request")
+                        .icon(Icon::new(IconName::ArrowUpRight))
+                        .on_click(move |_, window, cx| {
+                            shell::navigate(Route::PullRequest(open_root.clone()), window, cx);
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Open stack in new tabs")
+                        .icon(Icon::new(IconName::AppWindow))
+                        .on_click(move |_, window, cx| {
+                            for route in routes.clone() {
+                                shell::open_in_new_tab(route, window, cx);
+                            }
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Merge stack")
+                        .icon(Icon::new(IconName::GitMerge))
+                        .on_click(move |_, window, cx| {
+                            super::pull_request::request_stack_merge_confirm(
+                                merge_root.clone(),
+                                cx,
+                            );
+                            shell::navigate(Route::PullRequest(merge_root.clone()), window, cx);
+                        }),
+                )
+            } else {
+                menu
+            }
+        })
         .into_any_element()
     }
 

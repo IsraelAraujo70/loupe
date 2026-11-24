@@ -6,21 +6,25 @@ mod merge_box;
 mod model;
 mod poll;
 mod side;
+mod stack_panel;
 mod toolbar;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
+use futures::StreamExt as _;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use loupe_github::stack_merge::run_stack_merge;
 use loupe_github::{
-    ActionsJob, ChecksEtag, ChecksPoll, GitHub, Label, MergeMethod, MergeOutcome, PrRef,
-    PullRequestDetail, PullRequestPoll, ReviewEvent,
+    ActionsJob, ChecksEtag, ChecksPoll, GitHub, Label, MergeMethod, MergeOutcome, PrRef, PrState,
+    PullRequestDetail, PullRequestPoll, ReviewEvent, StackGraph, StackMergeEvent, StackMergePlan,
+    StackMergeState, StackMergeStep, StepStatus,
 };
 
 use super::checks::{ChecksTab, Freshness};
@@ -121,11 +125,34 @@ impl Write {
     }
 }
 
+/// Live state of an in-progress, failed, or finished stack merge.
+pub(super) struct StackMergeRun {
+    pub plan: StackMergePlan,
+    pub selected: Vec<u64>,
+    pub steps: Vec<StackMergeStep>,
+    pub method: MergeMethod,
+    pub statuses: HashMap<u64, StepStatus>,
+    pub state: StackMergeState,
+    pub running: bool,
+    pub failed_pr: Option<u64>,
+    pub can_retry: bool,
+}
+
 pub struct PullRequestView {
     paint_started: std::time::Instant,
     paint_logged: bool,
     pr: PrRef,
     detail: Loadable<Arc<PullRequestDetail>>,
+    /// Loaded stack graph (populated asynchronously when the PR is open).
+    stack_graph: Option<StackGraph>,
+    /// True once the stack graph lookup for this PR has finished (even when
+    /// it returned `None`), so a pending Reviews "Merge stack" request is
+    /// always consumed or cleared.
+    stack_loaded: bool,
+    stack_task: Option<Task<()>>,
+    /// State of the active or most recent stack merge run.
+    stack_merge_run: Option<StackMergeRun>,
+    stack_merge_task: Option<Task<()>>,
     tab: PrTab,
     loaded: Option<Loaded>,
     /// A detail that arrived without a window to hand it to the tabs; the
@@ -232,6 +259,11 @@ impl PullRequestView {
             paint_logged: false,
             pr,
             detail: Loadable::Loading,
+            stack_graph: None,
+            stack_loaded: false,
+            stack_task: None,
+            stack_merge_run: None,
+            stack_merge_task: None,
             tab: PrTab::Conversation,
             loaded: None,
             incoming: None,
@@ -334,6 +366,13 @@ impl PullRequestView {
                         crate::cache::put(&key, &inbox);
                     }
                     view.settle_checks(&detail, _cx);
+                    if detail.state == PrState::Open {
+                        view.load_stack_graph(&detail, _cx);
+                    } else {
+                        view.stack_graph = None;
+                        view.stack_loaded = true;
+                        view.stack_task = None;
+                    }
                     let detail = Arc::new(detail);
                     view.incoming = Some(detail.clone());
                     view.detail.finish(Ok(detail));
@@ -725,6 +764,237 @@ impl PullRequestView {
         self.start_write(write, cx);
     }
 
+    fn load_stack_graph(&mut self, detail: &PullRequestDetail, cx: &mut Context<Self>) {
+        let pr = detail.pr.clone();
+        let base_ref = detail.base_ref.clone();
+        let head_ref = detail.head_ref.clone();
+        self.stack_loaded = false;
+        self.stack_task = Some(common::run(
+            cx,
+            move |gh| gh.pull_request_stack(&pr, &base_ref, &head_ref),
+            |view, result, cx| {
+                view.stack_loaded = true;
+                if let Ok(graph) = result {
+                    view.stack_graph = graph;
+                }
+                cx.notify();
+            },
+        ));
+    }
+
+    /// Consumes a pending "Merge stack" request from Reviews once this PR's
+    /// stack lookup finishes. Always clears the global for `&self.pr` so an
+    /// unfulfilled request never fires on a later visit. If Reviews opened a
+    /// non-root PR (e.g. the real root was not in the Reviews list), navigates
+    /// to the true root PR with the request forwarded.
+    fn maybe_open_requested_stack_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.stack_loaded || !super::take_stack_merge_confirm(&self.pr, cx) {
+            return;
+        }
+        let Some(graph) = &self.stack_graph else {
+            return;
+        };
+        if !graph.is_root(self.pr.number) {
+            let root_pr = PrRef::new(self.pr.repo.clone(), graph.root);
+            super::request_stack_merge_confirm(root_pr.clone(), cx);
+            crate::shell::navigate(crate::route::Route::PullRequest(root_pr), window, cx);
+            return;
+        }
+        let Some(detail) = self.detail.value() else {
+            return;
+        };
+        if detail.state != PrState::Open || !detail.viewer_can_update {
+            return;
+        }
+        if let Some(method) = model::resolve_method(&detail.merge_methods, self.merge_method) {
+            self.panel = Panel::ConfirmStackMerge(method);
+            cx.notify();
+        }
+    }
+
+    fn start_stack_merge(
+        &mut self,
+        method: MergeMethod,
+        selected: Vec<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.write.is_busy() || self.stack_merge_run.as_ref().is_some_and(|run| run.running) {
+            return;
+        }
+        let Some(graph) = &self.stack_graph else {
+            return;
+        };
+        let plan = graph.merge_plan();
+        let steps = plan.selected_steps(&selected);
+        if steps.is_empty() {
+            return;
+        }
+        let statuses: HashMap<u64, StepStatus> = steps
+            .iter()
+            .map(|step| (step.node.pr.number, StepStatus::Waiting))
+            .collect();
+        let state = StackMergeState::from_steps(&steps);
+        self.stack_merge_run = Some(StackMergeRun {
+            plan,
+            selected,
+            steps,
+            method,
+            statuses,
+            state,
+            running: true,
+            failed_pr: None,
+            can_retry: false,
+        });
+        self.panel = Panel::StackMergeProgress;
+        self.write = Submit::Busy;
+        self.write_note = None;
+        self.drive_stack_merge(None, cx);
+        cx.notify();
+    }
+
+    fn retry_stack_merge(&mut self, cx: &mut Context<Self>) {
+        if self.write.is_busy() || self.stack_merge_run.as_ref().is_some_and(|run| run.running) {
+            return;
+        }
+        let Some(run) = &mut self.stack_merge_run else {
+            return;
+        };
+        if !run.can_retry {
+            return;
+        }
+        let retry_from = run.failed_pr;
+        for step in &run.steps {
+            let num = step.node.pr.number;
+            if !run.state.merged.contains(&num) {
+                run.statuses.insert(num, StepStatus::Waiting);
+            }
+        }
+        run.running = true;
+        run.failed_pr = None;
+        run.can_retry = false;
+        self.write = Submit::Busy;
+        self.drive_stack_merge(retry_from, cx);
+        cx.notify();
+    }
+
+    fn dismiss_stack_merge_progress(&mut self, cx: &mut Context<Self>) {
+        if self.stack_merge_run.as_ref().is_some_and(|run| run.running) {
+            return;
+        }
+        self.stack_merge_run = None;
+        if self.panel == Panel::StackMergeProgress {
+            self.panel = Panel::Closed;
+        }
+        self.reload(cx);
+        cx.notify();
+    }
+
+    /// Drives the stack merge using `loupe_github::stack_merge::run_stack_merge`
+    /// on a background thread and streams [`StackMergeEvent`]s back to the view.
+    fn drive_stack_merge(&mut self, retry_from: Option<u64>, cx: &mut Context<Self>) {
+        let Some(github) = common::client(cx) else {
+            if let Some(run) = &mut self.stack_merge_run {
+                if let Some(first) = run
+                    .steps
+                    .iter()
+                    .find(|s| !run.state.merged.contains(&s.node.pr.number))
+                {
+                    let num = first.node.pr.number;
+                    run.statuses
+                        .insert(num, StepStatus::Failed("GitHub is not connected.".into()));
+                    run.failed_pr = Some(num);
+                    run.can_retry = true;
+                }
+                run.running = false;
+            }
+            self.write = Submit::Idle;
+            cx.notify();
+            return;
+        };
+        let Some(run) = &self.stack_merge_run else {
+            return;
+        };
+        let plan = run.plan.clone();
+        let selected = run.selected.clone();
+        let method = run.method;
+        let mut state = run.state.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<StackMergeEvent>();
+
+        let worker = cx.background_executor().spawn(async move {
+            let outcome = run_stack_merge(
+                &*github,
+                &plan,
+                &selected,
+                method,
+                &mut state,
+                retry_from,
+                |event| {
+                    let _ = tx.unbounded_send(event);
+                },
+            );
+            drop(tx);
+            (state, outcome)
+        });
+
+        self.stack_merge_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                if this
+                    .update(cx, |view, cx| {
+                        if let Some(run) = &mut view.stack_merge_run {
+                            match event {
+                                StackMergeEvent::Retargeting(num) => {
+                                    run.statuses.insert(num, StepStatus::Retargeting);
+                                }
+                                StackMergeEvent::WaitingForChecks(num) => {
+                                    run.statuses.insert(num, StepStatus::WaitingForChecks);
+                                }
+                                StackMergeEvent::Merging(num) => {
+                                    run.statuses.insert(num, StepStatus::Merging);
+                                }
+                                StackMergeEvent::Merged(num) => {
+                                    run.statuses.insert(num, StepStatus::Merged);
+                                }
+                                StackMergeEvent::Failed {
+                                    number,
+                                    reason,
+                                    can_retry,
+                                } => {
+                                    run.statuses.insert(number, StepStatus::Failed(reason));
+                                    run.failed_pr = Some(number);
+                                    run.can_retry = can_retry;
+                                }
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let (final_state, outcome) = worker.await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(run) = &mut view.stack_merge_run {
+                    run.state = final_state;
+                    run.running = false;
+                    match outcome {
+                        Ok(()) => {
+                            run.failed_pr = None;
+                            run.can_retry = false;
+                        }
+                        Err(failure) => {
+                            run.failed_pr = Some(failure.number);
+                            run.can_retry = failure.can_retry;
+                        }
+                    }
+                }
+                view.write = Submit::Idle;
+                view.reload(cx);
+                cx.notify();
+            });
+        }));
+    }
+
     fn set_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
         self.panel = if self.panel == panel {
             Panel::Closed
@@ -828,6 +1098,11 @@ impl PullRequestView {
                 v_flex()
                     .w_full()
                     .child(self.render_merge_box(detail, cx))
+                    .children(
+                        self.stack_graph
+                            .as_ref()
+                            .map(|graph| stack_panel::render_stack_panel(graph, &self.pr, cx)),
+                    )
                     .child(loaded.conversation.clone())
                     .into_any_element(),
             ),
@@ -880,6 +1155,7 @@ impl Render for PullRequestView {
         if let Some(detail) = self.incoming.take() {
             self.install(detail, window, cx);
         }
+        self.maybe_open_requested_stack_confirm(window, cx);
         if let Some(loaded) = &self.loaded {
             let freshness = self.freshness();
             loaded

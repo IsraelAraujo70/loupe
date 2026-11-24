@@ -103,6 +103,10 @@ fn every_mutation_reaches_node_resolution() {
             "update_pull_request".into(),
             github.update_pull_request(BOGUS_PR, Some("bogus"), Some("bogus")),
         ),
+        (
+            "update_pull_request_base".into(),
+            github.update_pull_request_base(BOGUS_PR, "main"),
+        ),
         ("add_labels".into(), github.add_labels(BOGUS_PR, &label_ids)),
         (
             "remove_labels".into(),

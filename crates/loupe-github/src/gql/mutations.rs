@@ -74,6 +74,11 @@ const UPDATE_PULL_REQUEST: &str = "mutation UpdatePullRequest($pullRequestId: ID
     updatePullRequest(input: {pullRequestId: $pullRequestId, title: $title, body: $body}) { \
     clientMutationId } }";
 
+const UPDATE_PULL_REQUEST_BASE: &str = "mutation UpdatePullRequestBase($pullRequestId: ID!, \
+    $baseRefName: String!) { \
+    updatePullRequest(input: {pullRequestId: $pullRequestId, baseRefName: $baseRefName}) { \
+    clientMutationId } }";
+
 const ADD_LABELS: &str = "mutation AddLabels($labelableId: ID!, $labelIds: [ID!]!) { \
     addLabelsToLabelable(input: {labelableId: $labelableId, labelIds: $labelIds}) { \
     clientMutationId } }";
@@ -101,6 +106,7 @@ pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("reopen_pull_request", REOPEN_PULL_REQUEST),
     ("request_reviewers", REQUEST_REVIEWERS),
     ("update_pull_request", UPDATE_PULL_REQUEST),
+    ("update_pull_request_base", UPDATE_PULL_REQUEST_BASE),
     ("add_labels", ADD_LABELS),
     ("remove_labels", REMOVE_LABELS),
 ];
@@ -279,6 +285,15 @@ impl GitHub {
         self.mutate(
             UPDATE_PULL_REQUEST,
             json!({ "pullRequestId": pull_request_id, "title": title, "body": body }),
+        )
+    }
+
+    /// Retargets a pull request onto `base_ref` (used when merging a chain of
+    /// stacked pull requests and GitHub did not automatically retarget).
+    pub fn update_pull_request_base(&self, pull_request_id: &str, base_ref: &str) -> Result<()> {
+        self.mutate(
+            UPDATE_PULL_REQUEST_BASE,
+            json!({ "pullRequestId": pull_request_id, "baseRefName": base_ref }),
         )
     }
 

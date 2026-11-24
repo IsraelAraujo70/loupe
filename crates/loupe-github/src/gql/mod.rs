@@ -6,12 +6,14 @@ mod mutations;
 mod pull_request;
 mod reads;
 mod stack;
+mod stack_graph;
 
 pub(crate) fn documents() -> Vec<(&'static str, &'static str)> {
     let mut all = vec![("viewer", crate::client::VIEWER_QUERY)];
     all.extend_from_slice(reads::DOCUMENTS);
     all.extend_from_slice(pull_request::DOCUMENTS);
     all.extend_from_slice(mutations::DOCUMENTS);
+    all.extend_from_slice(stack_graph::DOCUMENTS);
     all.extend_from_slice(crate::rest::DOCUMENTS);
     all.extend_from_slice(crate::suggestion::DOCUMENTS);
     all.extend_from_slice(crate::workflow::DOCUMENTS);
@@ -19,6 +21,10 @@ pub(crate) fn documents() -> Vec<(&'static str, &'static str)> {
     all.push((
         "open_pull_requests_by_base",
         Box::leak(reads::open_by_base_query(2).into_boxed_str()),
+    ));
+    all.push((
+        "pull_request_stack_children",
+        Box::leak(stack_graph::stack_children_query(2).into_boxed_str()),
     ));
     all.push((
         "changes_since",
