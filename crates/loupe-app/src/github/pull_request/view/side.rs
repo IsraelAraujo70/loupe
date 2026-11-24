@@ -13,7 +13,6 @@ use super::{Loaded, PullRequestView};
 use crate::github::common::Loadable;
 use crate::github::pr_row::hint;
 use crate::github::widgets;
-use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
 
@@ -40,58 +39,6 @@ fn reviewer_style(state: ReviewerState) -> (IconName, Hsla, &'static str) {
     }
 }
 
-fn section(title: &'static str, body: impl IntoElement, cx: &App) -> Div {
-    section_with(title, None::<Div>, body, cx)
-}
-
-/// A section whose heading carries its action at the trailing edge, such as
-/// the gear that edits the labels.
-fn section_with(
-    title: &'static str,
-    action: Option<impl IntoElement>,
-    body: impl IntoElement,
-    cx: &App,
-) -> Div {
-    // The heading carries the section's action (where there is one) at
-    // its trailing edge; `separated` draws the hairline between sections.
-    v_flex()
-        .gap_2()
-        .child(
-            h_flex()
-                .h_6()
-                .justify_between()
-                .items_center()
-                .child(ui::section_label(title, cx))
-                .children(action),
-        )
-        .child(body)
-}
-
-/// The side column's sections, 24 px apart with a hairline halfway: the
-/// first starts at the column's top, level with the merge box.
-fn separated(sections: Vec<AnyElement>) -> impl Iterator<Item = Div> {
-    sections.into_iter().enumerate().map(|(ix, section)| {
-        let slot = div().w_full();
-        if ix == 0 {
-            slot.child(section)
-        } else {
-            slot.mt_3()
-                .pt_3()
-                .border_t_1()
-                .border_color(crate::theme::tokens::border_subtle())
-                .child(section)
-        }
-    })
-}
-
-/// What an empty section says: "None", in the muted color.
-fn none(cx: &App) -> Div {
-    div()
-        .text_size(scale::body())
-        .text_color(cx.theme().muted_foreground)
-        .child("None")
-}
-
 /// One Activity counter: icon, name, and the count on the right.
 fn activity_row(
     id: &'static str,
@@ -110,15 +57,7 @@ fn activity_row(
         .text_size(scale::body())
         .child(Icon::new(icon).small().text_color(theme.muted_foreground))
         .child(div().flex_1().child(name))
-        .child(
-            div()
-                .px_1p5()
-                .rounded_full()
-                .bg(theme.secondary)
-                .text_size(scale::meta())
-                .text_color(theme.muted_foreground)
-                .child(count.to_string()),
-        )
+        .child(ui::count_badge(count, cx))
 }
 
 /// A person row: 20 px avatar with initials fallback, then the login.
@@ -131,7 +70,7 @@ fn person(avatar_url: &str, login: &str) -> Div {
         .child(ui::avatar_named(
             avatar_url.to_owned(),
             login.to_owned(),
-            dp(20.),
+            scale::avatar_md(),
         ))
         .child(div().min_w_0().truncate().child(login.to_owned()))
 }
@@ -270,7 +209,7 @@ impl PullRequestView {
                 .into_any_element()
         };
         let applied = if detail.labels.is_empty() {
-            none(cx).into_any_element()
+            ui::side_empty("None", cx).into_any_element()
         } else {
             h_flex()
                 .gap_1()
@@ -288,7 +227,7 @@ impl PullRequestView {
         };
         let labels = v_flex().gap_2().child(applied).children(editor);
         let assignees = if detail.assignees.is_empty() {
-            none(cx).into_any_element()
+            ui::side_empty("None", cx).into_any_element()
         } else {
             v_flex()
                 .gap_2()
@@ -300,20 +239,22 @@ impl PullRequestView {
                 )
                 .into_any_element()
         };
-        div()
-            .id("pr-side")
-            .w(scale::side_width())
-            .flex_none()
-            .h_full()
-            .overflow_y_scroll()
+        ui::side_panel("pr-side", ui::SideEdge::Trailing, scale::side_width())
             .track_scroll(&self.side_scroll)
-            .border_l_1()
-            .border_color(crate::theme::tokens::border_subtle())
-            .child(v_flex().p_4().children(separated(vec![
-                section("Activity", activity, cx).into_any_element(),
-                section("Reviewers", reviewers, cx).into_any_element(),
-                section_with("Labels", label_toggle, labels, cx).into_any_element(),
-                section("Assignees", assignees, cx).into_any_element(),
+            .child(v_flex().p_4().children(ui::side_sections(vec![
+                ui::side_section("Activity")
+                    .child(activity)
+                    .into_any_element(),
+                ui::side_section("Reviewers")
+                    .child(reviewers)
+                    .into_any_element(),
+                ui::side_section("Labels")
+                    .maybe_action(label_toggle)
+                    .child(labels)
+                    .into_any_element(),
+                ui::side_section("Assignees")
+                    .child(assignees)
+                    .into_any_element(),
                 loaded.linear.clone().into_any_element(),
                 loaded.t3.clone().into_any_element(),
             ])))

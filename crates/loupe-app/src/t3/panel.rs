@@ -263,12 +263,7 @@ impl LinkedThreads {
             .gap_2()
             .items_center()
             .child(ui::section_label("T3 threads", cx))
-            .children(count.map(|count| {
-                div()
-                    .text_size(scale::label())
-                    .text_color(cx.theme().muted_foreground)
-                    .child(count.to_string())
-            }))
+            .children(count.map(|count| ui::count_badge(count, cx)))
             .child(div().flex_1())
             .children(self.review_button(cx))
             .children(refresh)

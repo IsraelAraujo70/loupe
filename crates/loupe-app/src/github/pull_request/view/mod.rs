@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, Utc};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::skeleton::Skeleton;
-use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -778,34 +777,16 @@ impl PullRequestView {
     }
 
     fn render_tabs(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .flex_none()
-            .h(scale::toolbar_height())
-            .px(scale::content_inset())
-            .items_end()
-            .border_b_1()
-            .border_color(crate::theme::tokens::border_subtle())
-            .child(
-                TabBar::new("pr-tabs")
-                    .underline()
-                    .small()
-                    .selected_index(self.tab.index())
-                    .on_click(cx.listener(|this, index: &usize, _, cx| {
-                        if let Some(tab) = PrTab::from_index(*index) {
-                            this.tab = tab;
-                            cx.notify();
-                        }
-                    }))
-                    .children(PrTab::ALL.map(|tab| {
-                        Tab::new()
-                            // An icon prefix keeps the label; `Tab::icon` drops it.
-                            .prefix(gpui_kit::component::Icon::new(tab.icon()).small())
-                            .label(tab.title())
-                            .when_some(tab.count(detail), |item, count| {
-                                item.suffix(crate::ui::count_badge(count, cx).ml_1())
-                            })
-                    })),
-            )
+        let tabs = PrTab::ALL.into_iter().map(|tab| {
+            ui::section_tab(("pr-tab", tab.index()), tab.title())
+                .icon(tab.icon())
+                .maybe_count(tab.count(detail))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tab = tab;
+                    cx.notify();
+                }))
+        });
+        ui::section_tabs("pr-tabs", self.tab.index()).tabs(tabs)
     }
 
     fn render_tab_content(

@@ -26,6 +26,10 @@ const MAX_ZOOM: f32 = 2.;
 const ZOOM_STEP: f32 = 1.25;
 /// Room around the graph when it is fitted to the view.
 const FIT_MARGIN: f32 = 24.;
+/// Top clearance for the floating zoom controls so they never sit over a job box.
+const TOP_RESERVE: f32 = 52.;
+/// Bottom clearance for the drag/zoom hint.
+const BOTTOM_RESERVE: f32 = 34.;
 /// Inline, a wide graph shrinks to fit the width down to this zoom, which
 /// keeps its names readable; past it the graph is dragged sideways.
 const INLINE_MIN_ZOOM: f32 = 0.6;
@@ -136,10 +140,10 @@ impl GraphView {
         let shown_width = dp(self.layout.width).as_f32() * self.zoom;
         let shown_height = dp(self.layout.height).as_f32() * self.zoom;
         let top = if self.fullscreen {
-            ((height - shown_height) / 2.).max(FIT_MARGIN)
+            ((height - shown_height) / 2.).max(TOP_RESERVE)
         } else {
-            self.inline_height = Some(px(shown_height + 2. * FIT_MARGIN));
-            FIT_MARGIN
+            self.inline_height = Some(px(shown_height + TOP_RESERVE + BOTTOM_RESERVE));
+            TOP_RESERVE
         };
         self.pan = point(px((width - shown_width) / 2.), px(top));
         self.fitted = true;

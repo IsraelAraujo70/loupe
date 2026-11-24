@@ -241,36 +241,17 @@ impl PullRequestView {
     fn render_meta(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> Div {
         let head = head_label(detail);
         let theme = cx.theme();
-        // A branch is a 20 px chip in the accent's wash with the link color
-        // on it: it reads as a reference, apart from the plain text around.
-        let (muted, foreground, mono, chip_bg, chip_text, radius) = (
+        let (muted, foreground, mono) = (
             theme.muted_foreground,
             theme.foreground,
             theme.mono_font_family.clone(),
-            tokens::accent().opacity(0.16),
-            tokens::link(),
-            theme.radius,
         );
         let summary = ChecksSummary::of(&detail.checks.runs);
         let (login, avatar_url) = detail.author.as_ref().map_or_else(
             || ("ghost".to_owned(), String::new()),
             |author| (author.login.clone(), author.avatar_url.clone()),
         );
-        let branch = |text: String| {
-            div()
-                .min_w_0()
-                .max_w(dp(360.))
-                .h_5()
-                .truncate()
-                .px_1p5()
-                .rounded(radius)
-                .bg(chip_bg)
-                .font_family(mono.clone())
-                .text_size(scale::meta())
-                .line_height(rems(1.25))
-                .text_color(chip_text)
-                .child(text)
-        };
+        let branch = |text: String| ui::branch_chip(text, cx).max_w(dp(360.));
         let checks = match detail.checks.state {
             Some(state) => widgets::tinted_tag(widgets::checks_color(state))
                 .child(
@@ -330,7 +311,7 @@ impl PullRequestView {
                     .child(div().flex_none().child(ui::avatar_named(
                         avatar_url,
                         login.clone(),
-                        dp(16.),
+                        scale::avatar_xs(),
                     )))
                     .child(
                         div()

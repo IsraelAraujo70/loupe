@@ -6,7 +6,6 @@ use gpui_kit::*;
 use loupe_github::GitHub;
 
 use crate::services::{Services, background};
-use crate::theme::scale;
 use crate::ui;
 
 /// Why a screen could not load. `NotConnected` and `Unauthorized` point the
@@ -166,9 +165,5 @@ pub fn load_error(
     error: &LoadError,
     on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    div()
-        .w_full()
-        .px(scale::content_inset())
-        .py_4()
-        .child(ui::error_banner(error.message(), on_retry))
+    ui::load_error(error.message(), on_retry)
 }

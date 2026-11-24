@@ -8,7 +8,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{RepoRef, WorkflowRun};
 
-use super::{POLL_EVERY, branch_chip, status_style, status_word};
+use super::{POLL_EVERY, status_style, status_word};
 use crate::github::common::{self, Loadable};
 use crate::route::Route;
 use crate::shell::Refreshable as _;
@@ -129,7 +129,7 @@ impl RunsView {
                                 .text_color(cx.theme().muted_foreground)
                                 .child("Branch"),
                         )
-                        .child(branch_chip(branch.clone(), cx))
+                        .child(ui::branch_chip(branch.clone(), cx))
                         .child(
                             ui::icon_button(
                                 "runs-branch-remove",
@@ -153,13 +153,7 @@ impl RunsView {
                 .when(right, |cell| cell.text_right())
                 .child(text)
         };
-        h_flex()
-            .h_6()
-            .px_2()
-            .gap_3()
-            .items_center()
-            .text_size(scale::meta())
-            .text_color(cx.theme().muted_foreground)
+        ui::list_column_header(cx)
             .child(div().flex_none().w_4())
             .child(div().flex_1().child("Run"))
             .child(label("Workflow", WORKFLOW_LANE, false))
@@ -199,19 +193,10 @@ impl RunsView {
             run.number,
             status_word(run.status)
         );
-        let hover = theme.list_hover;
-        h_flex()
-            .id(("run-row", run.id as usize))
+        ui::list_row(("run-row", run.id as usize), cx)
             .role(Role::Link)
             .aria_label(name)
-            .w_full()
-            .h(scale::row_height())
-            .px_2()
-            .gap_3()
-            .items_center()
             .relative()
-            .rounded(theme.radius)
-            .hover(move |row| row.bg(hover))
             .child(
                 div()
                     .absolute()
@@ -258,14 +243,14 @@ impl RunsView {
                     .flex_none()
                     .w(dp(BRANCH_LANE))
                     .min_w_0()
-                    .children(run.branch.clone().map(|branch| branch_chip(branch, cx))),
+                    .children(run.branch.clone().map(|branch| ui::branch_chip(branch, cx))),
             )
             .child(
                 div()
                     .flex_none()
                     .w(dp(ACTOR_LANE))
                     .when(!login.is_empty(), |cell| {
-                        cell.child(ui::avatar_named(avatar_url, login, dp(20.)))
+                        cell.child(ui::avatar_named(avatar_url, login, scale::avatar_md()))
                     }),
             )
             .child(
@@ -304,7 +289,7 @@ impl Render for RunsView {
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
                     .into_any_element()
             }
-            Loadable::Loading => div().p_2().child(ui::skeleton_rows(10)).into_any_element(),
+            Loadable::Loading => ui::loading_rows(10).into_any_element(),
             Loadable::Loaded(runs) | Loadable::Refreshing(runs) if runs.is_empty() => {
                 ui::empty_state(
                     IconName::Workflow,
@@ -316,9 +301,7 @@ impl Render for RunsView {
                 )
                 .into_any_element()
             }
-            Loadable::Loaded(runs) | Loadable::Refreshing(runs) => v_flex()
-                .w_full()
-                .p_2()
+            Loadable::Loaded(runs) | Loadable::Refreshing(runs) => ui::list_container()
                 .child(self.heading(cx))
                 .children(runs.iter().map(|run| self.row(run, cx)))
                 .into_any_element(),

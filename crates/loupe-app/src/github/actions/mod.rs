@@ -10,11 +10,8 @@ mod runs;
 
 use std::time::Duration;
 
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 use loupe_github::{CheckStatus, RepoRef};
-
-use crate::theme::{scale, tokens};
 
 pub(super) use crate::github::pull_request::checks::{format_duration, status_style};
 
@@ -55,25 +52,6 @@ pub(super) fn job_duration_label(status: CheckStatus, seconds: Option<i64>) -> O
         CheckStatus::Skipped => None,
         _ => seconds.map(format_duration),
     }
-}
-
-/// A branch as a 20 px chip in the accent's wash with the link color, the
-/// way a pull request's band shows one; cut at the end when it is long.
-pub(super) fn branch_chip(branch: String, cx: &App) -> Div {
-    let theme = cx.theme();
-    div()
-        .min_w_0()
-        .max_w_full()
-        .h_5()
-        .truncate()
-        .px_1p5()
-        .rounded(theme.radius)
-        .bg(tokens::accent().opacity(0.16))
-        .font_family(theme.mono_font_family.clone())
-        .text_size(scale::code())
-        .line_height(rems(1.25))
-        .text_color(tokens::link())
-        .child(branch)
 }
 
 /// What a state is called in a sentence: "succeeded", "failed"…
