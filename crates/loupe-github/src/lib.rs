@@ -15,6 +15,7 @@ mod rate;
 mod rest;
 pub mod reviews;
 mod stack;
+pub mod stack_merge;
 pub mod suggestion;
 mod types;
 mod workflow;
@@ -24,10 +25,15 @@ pub use client::{GitHub, Viewer};
 pub use error::{Error, Result};
 pub use gql::{Changes, ChangesQuery, PrStamp};
 pub use ids::{PrRef, RepoRef};
-pub use merge::MergeOutcome;
+pub use merge::{MergeOutcome, MergeResult};
 pub use rate::{RateLimit, RateLimits};
 pub use rest::{ChecksEtag, ChecksPoll, NOTIFICATIONS_LIMIT, PullRequestPoll};
 pub use stack::{PrStack, StackEntry, StackMember, StackSummary};
+pub use stack_merge::{
+    RetryPolicy, StackBlocker, StackDisplayEntry, StackGraph, StackGraphNode, StackMergeBackend,
+    StackMergeEvent, StackMergeFailure, StackMergePlan, StackMergeState, StackMergeStep, StackNode,
+    StackShape, StepStatus,
+};
 pub use types::*;
 pub use workflow::{
     Annotation, AnnotationLevel, JobLog, JobStep, LogLine, LogLineKind, RUNS_PAGE, RunArtifact,

@@ -35,12 +35,22 @@ pub enum MergeOutcome {
     Pending,
 }
 
+/// The outcome of [`GitHub::merge_with_sha`], carrying the new head commit
+/// SHA GitHub created on the base branch when the merge completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeResult {
+    pub outcome: MergeOutcome,
+    /// Commit SHA created on the base branch, present when GitHub reported
+    /// `status: "merged"` with `details.sha`.
+    pub sha: Option<String>,
+}
+
 /// One state of an asynchronous merge request, parsed from GitHub's
 /// `{status, details}` answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AsyncMerge {
     Pending { uuid: String },
-    Merged,
+    Merged { sha: Option<String> },
     Enqueued,
     Failed { message: String },
 }
@@ -57,6 +67,19 @@ impl GitHub {
         method: MergeMethod,
         expected_head_oid: &str,
     ) -> Result<MergeOutcome> {
+        self.merge_with_sha(pr, method, expected_head_oid)
+            .map(|result| result.outcome)
+    }
+
+    /// Like [`GitHub::merge`], also returning the merge commit SHA GitHub
+    /// wrote to the base branch so a container stack merge can track its
+    /// parent pull request's new expected head commit.
+    pub fn merge_with_sha(
+        &self,
+        pr: &PrRef,
+        method: MergeMethod,
+        expected_head_oid: &str,
+    ) -> Result<MergeResult> {
         run_merge(
             pr,
             method,
@@ -77,7 +100,7 @@ fn run_merge(
     put: impl FnOnce(&str, &Value) -> Result<(u16, Vec<u8>)>,
     mut get: impl FnMut(&str) -> Result<Vec<u8>>,
     wait: impl FnMut(Duration),
-) -> Result<MergeOutcome> {
+) -> Result<MergeResult> {
     let path = format!(
         "/repos/{}/{}/pulls/{}/merge-async",
         pr.repo.owner, pr.repo.name, pr.number
@@ -156,6 +179,7 @@ fn parse_async_merge(body: &[u8]) -> Result<AsyncMerge> {
     struct Details {
         message: Option<String>,
         uuid: Option<String>,
+        sha: Option<String>,
     }
     #[derive(Deserialize)]
     struct Wire {
@@ -173,7 +197,9 @@ fn parse_async_merge(body: &[u8]) -> Result<AsyncMerge> {
                 .ok_or_else(|| Error::Decode("pending merge without a valid uuid".into()))?;
             AsyncMerge::Pending { uuid }
         }
-        Status::Merged => AsyncMerge::Merged,
+        Status::Merged => AsyncMerge::Merged {
+            sha: wire.details.sha.filter(|sha| !sha.is_empty()),
+        },
         Status::Enqueued => AsyncMerge::Enqueued,
         Status::Failed => AsyncMerge::Failed {
             message: wire
@@ -199,7 +225,7 @@ fn settle(
     mut state: AsyncMerge,
     mut fetch: impl FnMut(&str) -> Result<AsyncMerge>,
     mut wait: impl FnMut(Duration),
-) -> Result<MergeOutcome> {
+) -> Result<MergeResult> {
     let mut polls = 0;
     loop {
         match state {
@@ -208,9 +234,24 @@ fn settle(
                 polls += 1;
                 state = fetch(&uuid)?;
             }
-            AsyncMerge::Pending { .. } => return Ok(MergeOutcome::Pending),
-            AsyncMerge::Merged => return Ok(MergeOutcome::Merged),
-            AsyncMerge::Enqueued => return Ok(MergeOutcome::Enqueued),
+            AsyncMerge::Pending { .. } => {
+                return Ok(MergeResult {
+                    outcome: MergeOutcome::Pending,
+                    sha: None,
+                });
+            }
+            AsyncMerge::Merged { sha } => {
+                return Ok(MergeResult {
+                    outcome: MergeOutcome::Merged,
+                    sha,
+                });
+            }
+            AsyncMerge::Enqueued => {
+                return Ok(MergeResult {
+                    outcome: MergeOutcome::Enqueued,
+                    sha: None,
+                });
+            }
             AsyncMerge::Failed { message } => return Err(Error::MergeFailed(message)),
         }
     }
@@ -223,7 +264,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AsyncMerge, MAX_POLLS, MergeOutcome, POLL_INTERVAL, parse_async_merge,
+        AsyncMerge, MAX_POLLS, MergeOutcome, MergeResult, POLL_INTERVAL, parse_async_merge,
         parse_request_answer, request_body, rest_method_name, run_merge, settle,
     };
     use crate::{Error, MergeMethod, PrRef, RepoRef};
@@ -250,7 +291,7 @@ mod tests {
     fn merge_against(
         put_answer: (u16, &str),
         results: &[&str],
-    ) -> (crate::Result<MergeOutcome>, Vec<String>, u32) {
+    ) -> (crate::Result<MergeResult>, Vec<String>, u32) {
         let pr = PrRef::new(RepoRef::new("IsraelAraujo70", "loupe"), 43);
         let mut results = results.iter().rev().copied().collect::<Vec<_>>();
         let mut read = Vec::new();
@@ -281,7 +322,13 @@ mod tests {
     fn an_accepted_merge_is_read_by_its_uuid_until_merged() {
         let (outcome, read, waits) =
             merge_against((202, ACCEPTED), &[IN_PROGRESS, IN_PROGRESS, MERGED]);
-        assert_eq!(outcome.ok(), Some(MergeOutcome::Merged));
+        assert_eq!(
+            outcome.ok(),
+            Some(MergeResult {
+                outcome: MergeOutcome::Merged,
+                sha: Some("ca95d3affd12a93d6a60e8d84ac161fd448bc42a".into()),
+            })
+        );
         assert_eq!(
             read,
             vec![format!("{PATH}/11bee280-61dd-46b9-9b18-c9f9576bc67b"); 3]
@@ -292,7 +339,7 @@ mod tests {
     #[test]
     fn a_merge_already_running_with_the_same_method_is_followed() {
         let (outcome, read, _) = merge_against((409, ACCEPTED), &[MERGED]);
-        assert_eq!(outcome.ok(), Some(MergeOutcome::Merged));
+        assert_eq!(outcome.ok().map(|r| r.outcome), Some(MergeOutcome::Merged));
         assert_eq!(read.len(), 1);
     }
 
@@ -327,17 +374,20 @@ mod tests {
 
     #[test]
     fn asks_for_a_direct_merge_of_the_expected_head() {
+        let body = request_body(
+            MergeMethod::Squash,
+            "6b468bc965fc953b423d4c8519e6f88266f8c82a",
+        );
         assert_eq!(
-            request_body(
-                MergeMethod::Squash,
-                "6b468bc965fc953b423d4c8519e6f88266f8c82a"
-            ),
+            body,
             json!({
                 "sha": "6b468bc965fc953b423d4c8519e6f88266f8c82a",
                 "merge_method": "squash",
                 "merge_action": "direct_merge",
             })
         );
+        // Never requests admin branch-protection bypass.
+        assert!(body.get("bypass_rules").is_none());
     }
 
     #[test]
@@ -351,7 +401,9 @@ mod tests {
     fn reads_each_answer_to_the_merge_request() {
         assert_eq!(
             parse_request_answer(200, ALREADY_MERGED.as_bytes(), MergeMethod::Squash).ok(),
-            Some(AsyncMerge::Merged)
+            Some(AsyncMerge::Merged {
+                sha: Some("4a1ad49272b9be272d1c41af8e612511c25dc9b5".into())
+            })
         );
         assert_eq!(
             parse_request_answer(202, ACCEPTED.as_bytes(), MergeMethod::Squash).ok(),
@@ -416,7 +468,9 @@ mod tests {
         let never = |_: &str| -> crate::Result<AsyncMerge> { panic!("polled a final state") };
         let no_wait = |_: Duration| panic!("waited on a final state");
         assert_eq!(
-            settle(AsyncMerge::Merged, never, no_wait).ok(),
+            settle(AsyncMerge::Merged { sha: None }, never, no_wait)
+                .ok()
+                .map(|r| r.outcome),
             Some(MergeOutcome::Merged)
         );
         assert_eq!(
@@ -425,7 +479,8 @@ mod tests {
                 never,
                 no_wait
             )
-            .ok(),
+            .ok()
+            .map(|r| r.outcome),
             Some(MergeOutcome::Enqueued)
         );
     }
@@ -441,7 +496,7 @@ mod tests {
             },
             |_| {},
         );
-        assert_eq!(outcome.ok(), Some(MergeOutcome::Pending));
+        assert_eq!(outcome.ok().map(|r| r.outcome), Some(MergeOutcome::Pending));
         assert_eq!(polls, MAX_POLLS);
     }
 }

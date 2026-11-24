@@ -9,7 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{CheckRun, PullRequestDetail};
+use loupe_github::{CheckRun, PrState, PullRequestDetail};
 
 use super::model::{
     DraftAction, MergeAction, MergeTone, Panel, Progress, approvals, available_actions,
@@ -157,12 +157,26 @@ impl PullRequestView {
         let (icon, color) = tone_look(status.tone, cx);
         let busy = self.write.is_busy();
         let actions = available_actions(detail);
+        let root_stack = self.stack_graph.as_ref().filter(|graph| {
+            graph.is_root(detail.pr.number)
+                && detail.state == PrState::Open
+                && detail.viewer_can_update
+                && !detail.merge_methods.is_empty()
+        });
+        let root_plan = root_stack.map(|graph| graph.merge_plan());
+        let stack_ready = root_plan.as_ref().is_some_and(|plan| plan.all_ready());
         let merge = match actions.merge {
             MergeAction::Available { methods, .. } => {
-                Some(self.render_merge_controls(&methods, busy, cx))
+                // Keep at most one filled green button in the merge box: when
+                // the whole stack is ready, Merge stack takes the primary fill
+                // and single-PR merge steps back to outline.
+                Some(self.render_merge_controls(&methods, busy, !stack_ready, cx))
             }
             MergeAction::Hidden | MergeAction::Unavailable(_) => None,
         };
+        let merge_stack = root_stack.zip(root_plan.as_ref()).map(|(graph, plan)| {
+            self.render_stack_merge_controls(graph, plan, &detail.merge_methods, busy, cx)
+        });
         // A draft the viewer may change: the block's action takes it out of
         // draft, and says here when GitHub refuses.
         let marks_ready = actions.draft == Some(DraftAction::MarkReady);
@@ -188,8 +202,11 @@ impl PullRequestView {
             .error()
             .filter(|_| marks_ready)
             .map(str::to_owned);
-        let confirm =
-            matches!(self.panel, Panel::ConfirmMerge(_)).then(|| self.render_panel(detail, cx));
+        let confirm = matches!(
+            self.panel,
+            Panel::ConfirmMerge(_) | Panel::ConfirmStackMerge(_) | Panel::StackMergeProgress
+        )
+        .then(|| self.render_panel(detail, cx));
 
         let checks = check_tally(detail);
         let threads = resolved_threads(detail);
@@ -257,6 +274,7 @@ impl PullRequestView {
                             ),
                     )
                     .children(merge)
+                    .children(merge_stack)
                     .children(ready),
             )
             .children(ready_error.map(|message| {
@@ -621,6 +639,161 @@ mod tests {
         assert!(
             cx.debug_bounds("pr-ready-for-review").is_some(),
             "the button stays to try again"
+        );
+    }
+
+    fn stack_node(number: u64, base: &str, head: &str) -> loupe_github::StackNode {
+        loupe_github::StackNode {
+            id: format!("PR_{number}"),
+            pr: loupe_github::PrRef::new(loupe_github::RepoRef::new("acme", "app"), number),
+            title: format!("Layer {number}"),
+            state: PrState::Open,
+            is_draft: false,
+            base_ref: base.into(),
+            head_ref: head.into(),
+            head_oid: format!("sha_{number}"),
+            cross_repository: false,
+            mergeable: loupe_github::Mergeable::Mergeable,
+            merge_state: loupe_github::MergeStateStatus::Clean,
+            checks: Some(loupe_github::ChecksState::Passing),
+            review_decision: Some(loupe_github::ReviewDecision::Approved),
+            base_requires_review: false,
+            base_requires_checks: false,
+            viewer_can_update: true,
+            stack: None,
+        }
+    }
+
+    fn open_with_stack(
+        detail: PullRequestDetail,
+        graph: Option<loupe_github::StackGraph>,
+        panel: model::Panel,
+        cx: &mut TestAppContext,
+    ) -> VisualTestContext {
+        let detail = Arc::new(detail);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(Settings::default());
+            cx.set_global(Services::default());
+            cx.set_global(Accounts::default());
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1280.), px(900.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| PullRequestView::new(detail.pr.clone(), window, cx)),
+            )
+            .expect("open a window")
+        });
+        let mut cx = VisualTestContext::from_window(handle, cx);
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| {
+            view.incoming = Some(detail.clone());
+            view.detail = Loadable::Loaded(detail);
+            view.stack_graph = graph;
+            view.panel = panel;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx
+    }
+
+    #[gpui_kit::test]
+    fn root_pr_shows_merge_stack_button_and_stack_panel_and_disables_confirm_when_blocked(
+        cx: &mut TestAppContext,
+    ) {
+        let mut blocked_top = stack_node(14, "b", "c");
+        blocked_top.is_draft = true;
+        let graph = loupe_github::StackGraph::build(
+            12,
+            vec![
+                stack_node(12, "main", "a"),
+                stack_node(13, "a", "b"),
+                blocked_top,
+            ],
+            Some("main".into()),
+            vec![loupe_github::MergeMethod::Squash],
+        )
+        .expect("stack builds");
+
+        // Headline explicitly names #14 and why it is not ready.
+        let plan = graph.merge_plan();
+        let headline = model::stack_confirm_headline(&plan, loupe_github::MergeMethod::Squash);
+        assert!(headline.contains("#14"), "headline names #14: {headline}");
+        assert!(
+            headline.contains("Draft"),
+            "headline gives reason: {headline}"
+        );
+
+        let mut vcx = open_with_stack(
+            model::tests::detail(),
+            Some(graph),
+            model::Panel::ConfirmStackMerge(loupe_github::MergeMethod::Squash),
+            cx,
+        );
+        assert!(vcx.debug_bounds("pr-merge-stack").is_some());
+        assert!(vcx.debug_bounds("pr-stack-panel").is_some());
+        assert!(vcx.debug_bounds("pr-stack-row-12:current").is_some());
+        // Full stack confirm button is DISABLED because #14 is a draft,
+        // while the ready-bottom option (#12 + #13) is offered.
+        assert!(
+            vcx.debug_bounds("pr-stack-confirm:disabled").is_some(),
+            "Merge stack confirm must be disabled when any PR is not ready"
+        );
+        assert!(vcx.debug_bounds("pr-stack-confirm:enabled").is_none());
+        assert!(vcx.debug_bounds("pr-stack-step-14:blocked").is_some());
+        assert!(vcx.debug_bounds("pr-stack-confirm-partial").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn root_pr_enables_merge_stack_confirm_when_every_pr_is_ready(cx: &mut TestAppContext) {
+        let graph = loupe_github::StackGraph::build(
+            12,
+            vec![
+                stack_node(12, "main", "a"),
+                stack_node(13, "a", "b"),
+                stack_node(14, "b", "c"),
+            ],
+            Some("main".into()),
+            vec![loupe_github::MergeMethod::Squash],
+        )
+        .expect("stack builds");
+        let mut vcx = open_with_stack(
+            model::tests::detail(),
+            Some(graph),
+            model::Panel::ConfirmStackMerge(loupe_github::MergeMethod::Squash),
+            cx,
+        );
+        assert!(vcx.debug_bounds("pr-stack-confirm:enabled").is_some());
+        assert!(vcx.debug_bounds("pr-stack-confirm:disabled").is_none());
+        assert!(vcx.debug_bounds("pr-stack-confirm-partial").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn non_root_pr_shows_stack_panel_without_merge_stack_button(cx: &mut TestAppContext) {
+        let mut child_detail = model::tests::detail();
+        child_detail.pr = loupe_github::PrRef::new(loupe_github::RepoRef::new("acme", "app"), 13);
+        let graph = loupe_github::StackGraph::build(
+            12,
+            vec![stack_node(12, "main", "a"), stack_node(13, "a", "b")],
+            Some("main".into()),
+            vec![loupe_github::MergeMethod::Squash],
+        )
+        .expect("stack builds");
+        let mut vcx = open_with_stack(child_detail, Some(graph), model::Panel::Closed, cx);
+        assert!(vcx.debug_bounds("pr-stack-panel").is_some());
+        assert!(vcx.debug_bounds("pr-stack-row-13:current").is_some());
+        assert!(
+            vcx.debug_bounds("pr-merge-stack").is_none(),
+            "only the root PR offers Merge stack"
         );
     }
 }
