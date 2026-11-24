@@ -28,8 +28,8 @@ use super::commits;
 use super::conversation::ConversationTab;
 use super::files::FilesTab;
 use super::tab::{PrTabContext, PrTabEvent};
-use crate::github::checks_feed::{self, ChecksLoaded};
 use crate::github::common::{self, LoadError, Loadable, Submit};
+use crate::github::pr_feed::{self, PrLoaded};
 use crate::links::PrLinkContext;
 use crate::shell::item_menu::{self, Item, PrItem};
 use crate::theme::scale;
@@ -134,6 +134,9 @@ pub struct PullRequestView {
     panel: Panel,
     merge_method: Option<MergeMethod>,
     write: Submit,
+    /// Ready for review sent from the merge box's Draft block: in flight, or
+    /// why GitHub refused it, which the block shows.
+    ready: Submit,
     /// What a write that succeeded left to say, such as a merge GitHub was
     /// still running when Loupe stopped waiting.
     write_note: Option<&'static str>,
@@ -235,6 +238,7 @@ impl PullRequestView {
             panel: Panel::Closed,
             merge_method: None,
             write: Submit::Idle,
+            ready: Submit::Idle,
             write_note: None,
             title_edit: None,
             labels_picker: None,
@@ -439,7 +443,7 @@ impl PullRequestView {
     }
 
     /// After a load: keeps the ETags of the poll that asked for it, tells
-    /// the Reviews lists, and stamps the time.
+    /// the Reviews lists its checks and draft state, and stamps the time.
     fn settle_checks(&mut self, detail: &PullRequestDetail, cx: &mut Context<Self>) {
         let same_checks = self
             .detail
@@ -465,11 +469,12 @@ impl PullRequestView {
             }
         }
         self.checked_at = Some(Local::now());
-        let loaded = ChecksLoaded {
+        let loaded = PrLoaded {
             pr: self.pr.clone(),
             checks: detail.checks.state,
+            is_draft: detail.is_draft,
         };
-        checks_feed::feed(cx).update(cx, |_, cx| cx.emit(loaded));
+        pr_feed::feed(cx).update(cx, |_, cx| cx.emit(loaded));
     }
 
     fn since_rerun(&self) -> Option<Duration> {
@@ -601,7 +606,13 @@ impl PullRequestView {
         };
         let clears_review_body = matches!(write, Write::Review { .. });
         let is_merge = matches!(write, Write::Merge(_));
+        let marks_ready = matches!(write, Write::MarkReady);
         self.write = Submit::Busy;
+        self.ready = if marks_ready {
+            Submit::Busy
+        } else {
+            Submit::Idle
+        };
         self.write_note = None;
         self.write_task = Some(common::run(
             cx,
@@ -609,11 +620,16 @@ impl PullRequestView {
             move |view, result, cx| match result {
                 Ok(note) => {
                     view.write = Submit::Idle;
+                    view.ready = Submit::Idle;
                     view.write_note = note;
                     view.panel = Panel::Closed;
                     view.title_edit = None;
                     view.clear_review_body |= clears_review_body;
                     view.reload(cx);
+                }
+                Err(error) if marks_ready => {
+                    view.write = Submit::Idle;
+                    view.ready = Submit::Failed(error.detail());
                 }
                 Err(error) => {
                     view.write = Submit::Failed(error.detail());
