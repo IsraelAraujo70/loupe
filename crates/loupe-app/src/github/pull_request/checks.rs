@@ -387,7 +387,7 @@ impl ChecksTab {
         let theme = cx.theme();
         let (muted, danger) = (theme.muted_foreground, theme.danger);
         let panel = v_flex()
-            .mx(scale::content_inset())
+            .mx_2()
             .mb_2()
             .p(scale::card_padding())
             .gap_1()

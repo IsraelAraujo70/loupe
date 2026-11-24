@@ -253,23 +253,11 @@ impl PullRequestView {
         );
         let branch = |text: String| ui::branch_chip(text, cx).max_w(dp(360.));
         let checks = match detail.checks.state {
-            Some(state) => {
-                let tone = widgets::checks_color(state);
-                h_flex()
-                    .h(scale::chip_height())
-                    .px_2()
-                    .gap_1()
-                    .items_center()
-                    .rounded(theme.radius)
-                    .bg(tone.opacity(0.10))
-                    .border_1()
-                    .border_color(tone.opacity(0.24))
-                    .text_size(scale::meta())
-                    .text_color(foreground)
-                    .child(widgets::checks_icon(state))
-                    .child(summary.label())
-                    .into_any_element()
-            }
+            Some(state) => ui::status_chip(widgets::checks_color(state), cx)
+                .text_color(foreground)
+                .child(widgets::checks_icon(state))
+                .child(summary.label())
+                .into_any_element(),
             None => div()
                 .text_size(scale::meta())
                 .text_color(muted)

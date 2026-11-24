@@ -624,7 +624,7 @@ impl SettingsView {
                                 let id = id.clone();
                                 move || format!("theme-actions-{id}")
                             })
-                            .opacity(0.45)
+                            .opacity(0.65)
                             .group_hover("theme-card", |style| style.opacity(1.))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(actions),

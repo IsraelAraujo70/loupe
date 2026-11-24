@@ -18,8 +18,7 @@ pub enum SideEdge {
 
 /// A scrollable, fixed-width side column with a subtle hairline border on its
 /// inner edge. Pass a width token from [`crate::theme::scale`] (such as
-/// `scale::side_width()`, `scale::side_wide_width()`, `scale::nav_width()`, or
-/// `scale::jobs_width()`).
+/// `scale::side_width()`, `scale::side_wide_width()`, or `scale::nav_width()`).
 pub fn side_panel(id: impl Into<ElementId>, edge: SideEdge, width: Rems) -> Stateful<Div> {
     let border = tokens::border_subtle();
     v_flex()

@@ -1,4 +1,4 @@
-//! Issue #119's rule: screen code never writes loose numeric `px(...)` layout
+//! Layout scale guard: screen code never writes loose numeric `px(...)`
 //! sizes. Sizes in screens come from `theme::scale` (which zooms via `rem` or
 //! `scale::dp`), leaving raw `px(...)` only for 0/0.5/1/2 px hairlines and
 //! offsets, and for OS window chrome anchored to the macOS traffic lights.
@@ -41,23 +41,25 @@ fn writes_loose_px(line: &str) -> bool {
     false
 }
 
-/// `source` without its `#[cfg(test)]` modules.
-fn without_test_modules(source: &str) -> String {
-    let mut kept = String::new();
-    let mut lines = source.lines();
-    while let Some(line) = lines.next() {
+/// Lines of `source` outside `#[cfg(test)]` modules, with their 1-based line
+/// numbers preserved.
+fn non_test_lines(source: &str) -> Vec<(usize, &str)> {
+    let mut kept = Vec::new();
+    let mut lines = source.lines().enumerate();
+    while let Some((index, line)) = lines.next() {
         if line.trim() != "#[cfg(test)]" {
-            kept.push_str(line);
-            kept.push('\n');
+            kept.push((index + 1, line));
             continue;
         }
-        let Some(item) = lines.next() else { break };
+        let Some((_, item)) = lines.next() else {
+            break;
+        };
         if item.trim_end().ends_with(';') || !item.trim_end().ends_with('{') {
             continue;
         }
         let indent = item.len() - item.trim_start().len();
         let close = format!("{}}}", " ".repeat(indent));
-        for line in lines.by_ref() {
+        for (_, line) in lines.by_ref() {
             if line == close || line.strip_suffix(';') == Some(close.as_str()) {
                 break;
             }
@@ -88,9 +90,9 @@ fn loose_px_in_screens(src: &Path) -> Vec<String> {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read a source file");
-            for (index, line) in without_test_modules(&source).lines().enumerate() {
+            for (line_no, line) in non_test_lines(&source) {
                 if writes_loose_px(line) {
-                    found.push(format!("{}:{}: {}", rel, index + 1, line.trim()));
+                    found.push(format!("{}:{}: {}", rel, line_no, line.trim()));
                 }
             }
         }

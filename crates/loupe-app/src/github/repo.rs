@@ -185,14 +185,7 @@ impl RepoView {
                     })
                     .on_click(cx.listener(|view, _, _, cx| view.toggle_watch(cx))),
             )
-            .action(
-                div()
-                    .flex_none()
-                    .w(px(1.))
-                    .h_4()
-                    .mx_0p5()
-                    .bg(cx.theme().border),
-            )
+            .action(ui::vertical_divider(cx))
             .action(
                 ui::icon_button("add-repo", IconName::Plus, "Add repository…")
                     .on_click(|_, window, cx| open_add_repository(window, cx)),

@@ -2044,7 +2044,7 @@ impl InboxView {
                     .accessibility_label(label)
                     .when(unseen > 0, |tab| {
                         tab.child(
-                            ui::accent_badge(unseen, cx)
+                            ui::accent_badge(unseen)
                                 .ml_1p5()
                                 .debug_selector(move || format!("reviews-view-unseen-{ix}")),
                         )
@@ -2171,14 +2171,7 @@ impl InboxView {
                     .items_center()
                     .child(save_as)
                     .children(view_menu)
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(1.))
-                            .h_4()
-                            .mx_1()
-                            .bg(cx.theme().border),
-                    )
+                    .child(ui::vertical_divider(cx))
                     .child(self.filter_button(cx))
                     .child(self.sort_button(cx))
                     .when(dirty, |row| {
@@ -2516,7 +2509,6 @@ impl InboxView {
             ui::notice_bar(
                 "reviews-notice-dismiss",
                 text,
-                ui::NoticeTone::Error,
                 Some(Box::new(cx.listener(|this, _, _, cx| {
                     this.notice = None;
                     cx.notify();

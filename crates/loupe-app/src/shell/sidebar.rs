@@ -1008,10 +1008,14 @@ fn leading(leading: Leading, icon: Hsla) -> impl IntoElement {
         Leading::Colored(name, color) => slot.child(svg_icon(name, dp(16.), color.unwrap_or(icon))),
         Leading::Avatar { url, name } => slot.child(
             div()
+                .size_4()
+                .flex()
+                .items_center()
+                .justify_center()
                 .rounded_full()
                 .border_1()
                 .border_color(tokens::border_subtle())
-                .child(ui::avatar_named(url, name, dp(16.))),
+                .child(ui::avatar_named(url, name, dp(14.))),
         ),
     }
 }

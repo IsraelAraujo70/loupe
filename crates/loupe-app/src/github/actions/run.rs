@@ -497,16 +497,7 @@ impl RunView {
         );
         let artifacts = self.extras.artifacts.len();
         let separator = || div().text_color(tokens::text_faint()).child("·");
-        let status_pill = h_flex()
-            .h(scale::chip_height())
-            .px_2()
-            .gap_1()
-            .items_center()
-            .rounded(cx.theme().radius)
-            .bg(color.opacity(0.12))
-            .border_1()
-            .border_color(color.opacity(0.28))
-            .text_size(scale::meta())
+        let status_pill = ui::status_chip(color, cx)
             .text_color(color)
             .child(
                 Icon::new(icon)

@@ -172,7 +172,7 @@ pub fn count_badge(count: impl std::fmt::Display, cx: &App) -> Div {
 
 /// An emphasized count badge in the accent fill (such as unseen view
 /// notifications). Shares [`count_badge`]'s geometry.
-pub fn accent_badge(count: impl std::fmt::Display, _cx: &App) -> Div {
+pub fn accent_badge(count: impl std::fmt::Display) -> Div {
     h_flex()
         .flex_none()
         .h(scale::badge_height())
@@ -188,8 +188,7 @@ pub fn accent_badge(count: impl std::fmt::Display, _cx: &App) -> Div {
 }
 
 /// A Git branch pill: 20 px tall, monospace, quiet surface with subtle border
-/// and link text, sized to its label and truncated cleanly when narrow. Shared
-/// by pull request headers, Actions runs, and workflow run pages.
+/// and link text, sized to its label and truncated cleanly when narrow.
 pub fn branch_chip(branch: impl Into<SharedString>, cx: &App) -> Div {
     let theme = cx.theme();
     div()
@@ -207,6 +206,33 @@ pub fn branch_chip(branch: impl Into<SharedString>, cx: &App) -> Div {
         .line_height(rems(1.125))
         .text_color(tokens::link())
         .child(branch.into())
+}
+
+/// A compact 20 px status chip tinted with `color`: subtle wash, soft border,
+/// matching [`branch_chip`]'s height and corner radius for detail metadata
+/// bands (checks summary, workflow run status).
+pub fn status_chip(color: Hsla, cx: &App) -> Div {
+    h_flex()
+        .h(scale::chip_height())
+        .px_2()
+        .gap_1()
+        .items_center()
+        .rounded(cx.theme().radius)
+        .bg(color.opacity(0.12))
+        .border_1()
+        .border_color(color.opacity(0.26))
+        .text_size(scale::meta())
+}
+
+/// A 1 px vertical hairline separating adjacent control groups in a header or
+/// toolbar.
+pub fn vertical_divider(cx: &App) -> Div {
+    div()
+        .flex_none()
+        .w(px(1.))
+        .h_4()
+        .mx_1()
+        .bg(cx.theme().border)
 }
 
 /// The one chip geometry: 20 px tall, 12 px text, 8 px side padding, a pill.
@@ -515,30 +541,17 @@ pub fn meta_band(cx: &App) -> Div {
         .text_color(cx.theme().muted_foreground)
 }
 
-/// Visual tone for an inline [`notice_bar`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NoticeTone {
-    #[allow(dead_code)]
-    Info,
-    Error,
-}
-
 pub type DismissHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
-/// A full-width inline notice strip aligned to `content_inset`, with optional
-/// dismiss button. Replaces per-screen notice/error strips.
+/// A full-width inline error strip aligned to `content_inset`, with an
+/// optional dismiss button.
 pub fn notice_bar(
     id: impl Into<ElementId>,
     text: impl Into<SharedString>,
-    tone: NoticeTone,
     on_dismiss: Option<DismissHandler>,
     cx: &App,
 ) -> Div {
-    let theme = cx.theme();
-    let color = match tone {
-        NoticeTone::Info => theme.muted_foreground,
-        NoticeTone::Error => theme.danger,
-    };
+    let color = cx.theme().danger;
     let dismiss_id = id.into();
     h_flex()
         .flex_none()

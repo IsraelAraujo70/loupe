@@ -1074,11 +1074,13 @@ impl NotificationsView {
             )
             .child(
                 div()
+                    .id(SharedString::from(format!("notification-age-{id}")))
                     .flex_none()
                     .w(dp(AGE_LANE))
                     .text_right()
                     .text_size(scale::meta())
                     .text_color(muted)
+                    .tooltip(move |window, cx| Tooltip::new(exact.clone()).build(window, cx))
                     .child(ui::relative_time(notification.updated_at, Utc::now())),
             );
         match item {

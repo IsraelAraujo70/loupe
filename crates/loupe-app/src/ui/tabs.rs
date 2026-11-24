@@ -116,6 +116,7 @@ impl RenderOnce for SectionTabs {
             tokens::border_subtle(),
         );
         let active = self.active;
+        let tab_count = self.tabs.len();
         h_flex()
             .id(self.id)
             .role(Role::TabList)
@@ -145,6 +146,9 @@ impl RenderOnce for SectionTabs {
                             .id(tab.id)
                             .role(Role::Tab)
                             .aria_label(aria)
+                            .aria_selected(selected)
+                            .aria_position_in_set(ix + 1)
+                            .aria_size_of_set(tab_count)
                             .when_some(tab.debug_selector, |el, sel| {
                                 el.debug_selector(move || sel())
                             })
@@ -153,7 +157,6 @@ impl RenderOnce for SectionTabs {
                             .px_2()
                             .gap_1p5()
                             .items_center()
-                            .cursor_pointer()
                             .text_size(scale::body())
                             .text_color(if selected { fg } else { muted })
                             .when(selected, |el| el.font_weight(FontWeight::MEDIUM))

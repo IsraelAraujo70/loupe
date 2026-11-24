@@ -339,24 +339,14 @@ impl GraphView {
                 ui::icon_button("graph-zoom-in", IconName::Plus, "Zoom in")
                     .on_click(cx.listener(|this, _, _, cx| this.zoom_center(ZOOM_STEP, cx))),
             )
+            .child(ui::vertical_divider(cx))
             .child(
-                div()
-                    .flex_none()
-                    .w(px(1.))
-                    .h_3p5()
-                    .mx_1()
-                    .bg(cx.theme().border),
-            )
-            .child(
-                ui::icon_button(
-                    "graph-fit",
-                    IconName::Focus,
-                    "Fit to view (drag to pan, Cmd/Ctrl + scroll to zoom)",
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.fitted = false;
-                    cx.notify();
-                })),
+                ui::icon_button("graph-fit", IconName::Focus, "Fit to view").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.fitted = false;
+                        cx.notify();
+                    },
+                )),
             )
             .child(
                 ui::icon_button(
@@ -462,12 +452,14 @@ impl Render for GraphView {
             },
             move |_, bounds, window, _| {
                 // Subtle dot grid signals an interactive pan/zoom canvas.
-                let step = (20. * zoom).clamp(12., 36.);
+                let step = dp(20. * zoom)
+                    .as_f32()
+                    .clamp(dp(16.).as_f32(), dp(36.).as_f32());
                 let width = f32::from(bounds.size.width);
                 let height = f32::from(bounds.size.height);
                 let ox = f32::from(pan.x).rem_euclid(step);
                 let oy = f32::from(pan.y).rem_euclid(step);
-                let dot = size(px(1.5), px(1.5));
+                let dot = size(dp(1.5), dp(1.5));
                 let mut y = oy;
                 while y < height {
                     let mut x = ox;
