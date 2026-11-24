@@ -20,14 +20,20 @@ use gpui_kit::*;
 
 use crate::theme::{scale, tokens};
 
+mod list;
 mod menu;
 mod reading;
 mod scroll_row;
 mod segmented;
+mod side;
+mod tabs;
+pub use list::{list_column_header, list_container, list_group_header, list_row, nav_row};
 pub use menu::{MenuRow, menu_row};
 pub use reading::{READING_WIDTH, markdown};
 pub use scroll_row::ScrollRow;
 pub use segmented::segmented;
+pub use side::{SideEdge, SideSection, side_empty, side_panel, side_section, side_sections};
+pub use tabs::{SectionTab, SectionTabs, section_tab, section_tabs};
 
 /// Height of every page header and of the sidebar header beside it. It is
 /// window chrome: it lines up with the macOS traffic lights, so it stays in
@@ -144,22 +150,59 @@ pub struct PageHeader {
     actions: Vec<AnyElement>,
 }
 
-/// The one count badge: 18 px tall, 6 px side padding, a 9 px radius, a
+/// The one count badge: 18 px tall, 6 px side padding, a pill radius, and a
 /// neutral fill. Every count beside a title, a tab, or a row uses it.
 pub fn count_badge(count: impl std::fmt::Display, cx: &App) -> Div {
     let theme = cx.theme();
     h_flex()
         .flex_none()
-        .h(rems(1.125))
-        .min_w(rems(1.125))
+        .h(scale::badge_height())
+        .min_w(scale::badge_height())
         .px_1p5()
         .justify_center()
-        .rounded(px(9.))
+        .rounded(scale::pill_radius())
         .bg(theme.secondary)
         .text_size(scale::meta())
         .line_height(rems(1.))
         .text_color(theme.muted_foreground)
         .child(count.to_string())
+}
+
+/// An emphasized count badge in the accent fill (such as unseen view
+/// notifications). Shares [`count_badge`]'s geometry.
+pub fn accent_badge(count: impl std::fmt::Display, _cx: &App) -> Div {
+    h_flex()
+        .flex_none()
+        .h(scale::badge_height())
+        .min_w(scale::badge_height())
+        .px_1p5()
+        .justify_center()
+        .rounded(scale::pill_radius())
+        .bg(tokens::accent())
+        .text_size(scale::meta())
+        .line_height(rems(1.))
+        .text_color(tokens::on_accent())
+        .child(count.to_string())
+}
+
+/// A Git branch pill: 20 px tall, monospace, accent wash with link text,
+/// truncated cleanly when narrow. Shared by pull request headers, Actions
+/// runs, and workflow run pages.
+pub fn branch_chip(branch: impl Into<SharedString>, cx: &App) -> Div {
+    let theme = cx.theme();
+    div()
+        .min_w_0()
+        .max_w_full()
+        .h(scale::chip_height())
+        .truncate()
+        .px_1p5()
+        .rounded(theme.radius)
+        .bg(tokens::accent().opacity(0.16))
+        .font_family(theme.mono_font_family.clone())
+        .text_size(scale::code())
+        .line_height(rems(1.25))
+        .text_color(tokens::link())
+        .child(branch.into())
 }
 
 /// The one chip geometry: 20 px tall, 12 px text, 8 px side padding, a pill.
@@ -171,12 +214,12 @@ pub trait ChipExt {
 
 impl ChipExt for Tag {
     fn chip(self) -> Self {
-        self.h_5()
+        self.h(scale::chip_height())
             .px_2()
             .py_0()
             .flex_none()
             .text_size(scale::meta())
-            .rounded(px(9999.))
+            .rounded(scale::pill_radius())
     }
 }
 
@@ -225,10 +268,10 @@ pub fn chip_button(
             .h_6()
             .my(rems(-0.125)),
         pill: h_flex()
-            .h_5()
+            .h(scale::chip_height())
             .px_2()
             .border_1()
-            .rounded(px(9999.))
+            .rounded(scale::pill_radius())
             .text_size(scale::meta())
             .line_height(relative(1.25))
             .bg(theme.secondary)
@@ -291,7 +334,7 @@ pub trait ControlSize {
 
 impl ControlSize for Button {
     fn control(self) -> Self {
-        self.small().h(rems(1.75)).px_2p5()
+        self.small().h(scale::control_height()).px_2p5()
     }
 }
 
@@ -425,7 +468,7 @@ impl RenderOnce for PageHeader {
             .when_some(self.count, |row, count| row.child(count_badge(count, cx)))
             .children(self.after_title)
             .child(div().flex_1().min_w_4())
-            .child(h_flex().flex_none().gap_1().children(self.actions))
+            .child(h_flex().flex_none().gap_1p5().items_center().children(self.actions))
     }
 }
 
@@ -441,6 +484,67 @@ pub fn toolbar() -> Div {
         .items_center()
         .border_b_1()
         .border_color(tokens::border_subtle())
+}
+
+/// A compact metadata band under a detail header (pull request, Actions run):
+/// 36 px min-height, wraps cleanly on narrow viewports, subtle bottom border.
+pub fn meta_band(cx: &App) -> Div {
+    h_flex()
+        .flex_none()
+        .w_full()
+        .min_h(scale::band_height())
+        .px(scale::content_inset())
+        .py_1p5()
+        .gap_x_2()
+        .gap_y_1p5()
+        .flex_wrap()
+        .items_center()
+        .border_b_1()
+        .border_color(tokens::border_subtle())
+        .text_size(scale::meta())
+        .text_color(cx.theme().muted_foreground)
+}
+
+/// Visual tone for an inline [`notice_bar`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeTone {
+    Info,
+    Error,
+}
+
+/// A full-width inline notice strip aligned to `content_inset`, with optional
+/// dismiss button. Replaces per-screen notice/error strips.
+pub fn notice_bar(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    tone: NoticeTone,
+    on_dismiss: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    let color = match tone {
+        NoticeTone::Info => theme.muted_foreground,
+        NoticeTone::Error => theme.danger,
+    };
+    let dismiss_id = id.into();
+    h_flex()
+        .flex_none()
+        .w_full()
+        .px(scale::content_inset())
+        .py_2()
+        .gap_2()
+        .items_center()
+        .border_b_1()
+        .border_color(tokens::border_subtle())
+        .text_size(scale::meta())
+        .child(div().flex_1().min_w_0().text_color(color).child(text.into()))
+        .when_some(on_dismiss, |row, dismiss| {
+            row.child(
+                icon_button(dismiss_id, IconName::Close, "Dismiss")
+                    .xsmall()
+                    .on_click(move |event, window, cx| dismiss(event, window, cx)),
+            )
+        })
 }
 
 /// A section label, the heading of a group of controls or facts (a side
@@ -487,7 +591,7 @@ pub fn outline_icon_button(
     Button::new(id)
         .outline()
         .control()
-        .w(rems(1.75))
+        .w(scale::control_height())
         .px_0()
         .icon(icon)
         .tooltip(name.clone())
@@ -601,6 +705,24 @@ pub fn skeleton_rows(count: usize) -> impl IntoElement {
             .child(div().flex_1())
             .child(Skeleton::new().secondary().h_3().w_10())
     }))
+}
+
+/// `count` loading rows inside [`list_container`] padding, matching every list
+/// screen's inset.
+pub fn loading_rows(count: usize) -> Div {
+    div().w_full().p_2().child(skeleton_rows(count))
+}
+
+/// A failed load as an inline alert with Retry, inset to `content_inset`.
+pub fn load_error(
+    message: impl Into<SharedString>,
+    on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w_full()
+        .px(scale::content_inset())
+        .py_4()
+        .child(error_banner(message, on_retry))
 }
 
 /// An inline error with the message and a Retry button.
