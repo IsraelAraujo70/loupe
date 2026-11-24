@@ -4,6 +4,7 @@
 //! under the checks' bar the list of checks it opens.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -14,8 +15,9 @@ use super::model::{
     MergeAction, MergeTone, Panel, Progress, approvals, available_actions, check_groups,
     check_outcome, check_tally, checks_open_at_first, merge_status, resolved_threads,
 };
-use crate::github::pull_request::checks::status_style;
+use crate::github::pull_request::checks::{check_route, status_style};
 use crate::route::Route;
+use crate::shell::OpenOnClick as _;
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
@@ -347,14 +349,40 @@ impl PullRequestView {
                 list = list.children(
                     members
                         .into_iter()
-                        .map(|ix| self.render_check_row(ix, &runs[ix], cx)),
+                        .map(|ix| self.render_check_row(ix, &runs[ix], &detail.head_ref, cx)),
                 );
             }
         }
-        div().border_t_1().border_color(theme.border).child(list)
+        let workflow_runs = Route::Actions {
+            repo: self.pr.repo.clone(),
+            branch: Some(detail.head_ref.clone()),
+        };
+        div()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(list)
+            .child(
+                h_flex().px_2().pb_2().child(
+                    Button::new("merge-box-workflow-runs")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Workflow)
+                        .label("View workflow runs")
+                        .tooltip("The workflow runs of this pull request's branch")
+                        .on_click(move |event, window, cx| {
+                            crate::shell::open(workflow_runs.clone(), event, window, cx)
+                        }),
+                ),
+            )
     }
 
-    fn render_check_row(&self, ix: usize, run: &CheckRun, cx: &App) -> Stateful<Div> {
+    fn render_check_row(
+        &self,
+        ix: usize,
+        run: &CheckRun,
+        head_ref: &str,
+        cx: &App,
+    ) -> Stateful<Div> {
         let theme = cx.theme();
         let (muted, foreground, hover) =
             (theme.muted_foreground, theme.foreground, theme.list_hover);
@@ -364,16 +392,16 @@ impl PullRequestView {
             None => run.name.clone(),
         };
         let outcome = check_outcome(run);
-        let actions = run.actions.map(|job| Route::WorkflowRun {
-            repo: self.pr.repo.clone(),
-            run_id: job.run_id,
-            job_id: Some(job.job_id),
-            title: run.workflow.clone().unwrap_or_else(|| run.name.clone()),
-        });
+        let actions = check_route(&self.pr.repo, head_ref, run);
         h_flex()
             .id(("merge-box-check", ix))
             .role(Role::ListItem)
             .aria_label(format!("{name}: {outcome}"))
+            .when_some(actions.clone(), |row, route| {
+                row.role(Role::Button)
+                    .aria_label(format!("{name}: {outcome}, open its run"))
+                    .opens(route)
+            })
             .h(scale::row_height())
             .px_2()
             .gap_2()

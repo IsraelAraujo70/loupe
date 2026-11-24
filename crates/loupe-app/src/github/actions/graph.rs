@@ -1,22 +1,27 @@
-//! The run graph on screen: the boxes of [`layout`] from top to bottom with a
-//! smooth curve from each box to the boxes that need it, a duration on every
-//! job, and a canvas that zooms (the buttons, or Cmd/Ctrl and the wheel),
-//! moves when dragged (and with the wheel in full screen), and fills the
-//! panel in full screen. A click on a job opens its log.
+//! The run graph on screen: the boxes of [`layout`] in columns from left to
+//! right with a smooth curve from each box to the boxes that need it, a
+//! duration on every job, and a canvas that zooms (the buttons, or Cmd/Ctrl
+//! and the wheel), moves when dragged (and with the wheel in full screen),
+//! and fills the panel in full screen. A matrix folds to one line that
+//! counts its finished jobs and opens on a click. A click on a job opens its
+//! log; every name cut short has its whole text in a tooltip.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::jobs::group_status;
 use super::layout::{
     GraphJob, GraphNode, JOB_HEIGHT, Layout, Placed, TITLE_HEIGHT, edge_curve, layout,
 };
-use super::{job_duration_label, status_style};
+use super::{job_duration_label, status_style, status_word};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
@@ -46,6 +51,11 @@ pub struct GraphView {
     file_name: Option<String>,
     trigger: Option<String>,
     selected: Option<u64>,
+    /// Matrices the user opened (`true`) or folded (`false`), by key; any
+    /// other matrix is open while it holds the open job.
+    folds: HashMap<String, bool>,
+    /// Whether each box shows its jobs, as the layout was made.
+    open: Vec<bool>,
     fullscreen: bool,
     zoom: f32,
     /// Where the graph's top-left corner is, from the view's.
@@ -71,6 +81,8 @@ impl GraphView {
             file_name: None,
             trigger: None,
             selected: None,
+            folds: HashMap::new(),
+            open: Vec::new(),
             fullscreen: false,
             zoom: 1.,
             pan: point(px(0.), px(0.)),
@@ -90,18 +102,59 @@ impl GraphView {
                 .iter()
                 .map(|node| {
                     (
-                        node.title.clone(),
+                        node.title(),
                         node.jobs.iter().map(|job| job.id).collect(),
                         node.needs.clone(),
                     )
                 })
                 .collect()
         };
-        if shape(&nodes) != shape(&self.nodes) {
-            self.layout = layout(&nodes);
+        let changed = shape(&nodes) != shape(&self.nodes);
+        self.nodes = nodes;
+        if changed {
+            self.open.clear();
+        }
+        self.relayout();
+        cx.notify();
+    }
+
+    /// Whether each box shows its jobs now.
+    fn open_boxes(&self) -> Vec<bool> {
+        self.nodes
+            .iter()
+            .map(|node| {
+                !node.foldable()
+                    || node
+                        .group_name()
+                        .and_then(|name| self.folds.get(name).copied())
+                        .unwrap_or_else(|| self.selected.is_some_and(|job| node.contains(job)))
+            })
+            .collect()
+    }
+
+    /// Lays the graph out again when a box opened or folded, or the shape
+    /// changed; the view then fits it again.
+    fn relayout(&mut self) {
+        let open = self.open_boxes();
+        if open != self.open {
+            self.layout = layout(&self.nodes, &open);
+            self.open = open;
             self.fitted = false;
         }
-        self.nodes = nodes;
+    }
+
+    fn toggle_box(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(name) = self
+            .nodes
+            .get(ix)
+            .and_then(|node| node.group_name())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let open = self.open.get(ix).copied().unwrap_or(true);
+        self.folds.insert(name, !open);
+        self.relayout();
         cx.notify();
     }
 
@@ -118,6 +171,7 @@ impl GraphView {
     pub fn set_selected(&mut self, job: Option<u64>, cx: &mut Context<Self>) {
         if self.selected != job {
             self.selected = job;
+            self.relayout();
             cx.notify();
         }
     }
@@ -227,10 +281,15 @@ impl GraphView {
             theme.border
         };
         let id = job.id;
+        let mut tip = format!("{} · {}", job.name, status_word(job.status));
+        if let Some(time) = job_duration_label(job.status, job.seconds) {
+            tip.push_str(&format!(" · {time}"));
+        }
         h_flex()
             .id(SharedString::from(format!("graph-job-{id}")))
             .role(Role::Button)
             .aria_label(format!("{}, open its log", job.name))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .h(z(JOB_HEIGHT - if in_box { 6. } else { 0. }))
             .when(in_box, |row| row.mx(z(6.)).mt(z(6.)))
             .px(z(10.))
@@ -274,43 +333,124 @@ impl GraphView {
             .left(self.pan.x + z(placed.x))
             .top(self.pan.y + z(placed.y))
             .w(z(placed.width));
-        match &node.title {
-            None => positioned
+        let Some(title) = node.title() else {
+            return positioned
                 .children(node.jobs.iter().map(|job| self.job_row(job, false, cx)))
-                .into_any_element(),
-            Some(title) => {
-                let rows: Vec<Stateful<Div>> = node
-                    .jobs
-                    .iter()
-                    .map(|job| self.job_row(job, true, cx))
-                    .collect();
-                let theme = cx.theme();
-                positioned
-                    .child(
-                        v_flex()
-                            .id(("graph-box", ix))
-                            .role(Role::Group)
-                            .aria_label(title.clone())
-                            .h(z(placed.height))
-                            .rounded(z(8.))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(tokens::panel())
-                            .child(
-                                div()
-                                    .h(z(TITLE_HEIGHT - 6.))
-                                    .mt(z(6.))
-                                    .px(z(10.))
-                                    .truncate()
-                                    .text_size(z(12.))
-                                    .text_color(theme.muted_foreground)
-                                    .child(title.clone()),
-                            )
-                            .children(rows),
-                    )
-                    .into_any_element()
-            }
-        }
+                .into_any_element();
+        };
+        let foldable = node.foldable();
+        let open = self.open.get(ix).copied().unwrap_or(true);
+        let (muted, hover) = (cx.theme().muted_foreground, cx.theme().list_hover);
+        let heading = h_flex()
+            .id(("graph-box-title", ix))
+            .h(z(TITLE_HEIGHT - 6.))
+            .mt(z(6.))
+            .mx(z(4.))
+            .px(z(6.))
+            .gap(z(4.))
+            .items_center()
+            .rounded(z(4.))
+            .text_size(z(12.))
+            .text_color(muted)
+            .when(foldable, |row| {
+                row.child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(z(12.))
+                    .flex_none()
+                    .text_color(muted),
+                )
+            })
+            .child(div().flex_1().min_w_0().truncate().child(title.clone()))
+            .tooltip({
+                let title = title.clone();
+                move |window, cx| Tooltip::new(title.clone()).build(window, cx)
+            })
+            .when(foldable, |row| {
+                row.role(Role::Button)
+                    .aria_label(format!(
+                        "{title}, {}",
+                        if open {
+                            "fold its jobs"
+                        } else {
+                            "show its jobs"
+                        }
+                    ))
+                    .aria_expanded(open)
+                    .hover(move |row| row.bg(hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_box(ix, cx)))
+            });
+        let body: Vec<AnyElement> = if open || !foldable {
+            node.jobs
+                .iter()
+                .map(|job| self.job_row(job, true, cx).into_any_element())
+                .collect()
+        } else {
+            vec![self.folded_row(ix, node, cx).into_any_element()]
+        };
+        let theme = cx.theme();
+        positioned
+            .child(
+                v_flex()
+                    .id(("graph-box", ix))
+                    .role(Role::Group)
+                    .aria_label(title)
+                    .h(z(placed.height))
+                    .rounded(z(8.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(tokens::panel())
+                    .child(heading)
+                    .children(body),
+            )
+            .into_any_element()
+    }
+
+    /// A folded matrix's one line: its state as one, and how many of its
+    /// jobs finished. A click shows its jobs.
+    fn folded_row(&self, ix: usize, node: &GraphNode, cx: &mut Context<Self>) -> Stateful<Div> {
+        let zoom = self.zoom;
+        let z = |size: f32| dp(size * zoom);
+        let theme = cx.theme();
+        let (border, fill, hover, muted) = (
+            theme.border,
+            theme.group_box,
+            theme.list_hover,
+            theme.muted_foreground,
+        );
+        let (icon, color) = status_style(group_status(&node.jobs));
+        let selected = self.selected.is_some_and(|job| node.contains(job));
+        let text = format!("{}/{} jobs completed", node.completed(), node.jobs.len());
+        h_flex()
+            .id(("graph-box-folded", ix))
+            .role(Role::Button)
+            .aria_label(format!("{text}, show its jobs"))
+            .h(z(JOB_HEIGHT - 6.))
+            .mx(z(6.))
+            .mt(z(6.))
+            .px(z(10.))
+            .gap(z(8.))
+            .items_center()
+            .rounded(z(6.))
+            .border_1()
+            .border_color(if selected { tokens::accent() } else { border })
+            .bg(fill)
+            .hover(move |row| row.bg(hover))
+            .text_size(z(12.))
+            .child(Icon::new(icon).size(z(14.)).flex_none().text_color(color))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(text),
+            )
+            .child(div().flex_none().text_color(muted).child("Show all"))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_box(ix, cx)))
     }
 
     fn controls(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -1,16 +1,21 @@
-//! `Route::WorkflowRun`: one run. The header names it and holds its actions
-//! (re-run, cancel, the workflow file); the band under it says what started
-//! it, on which branch, by whom, how long it took, and what it uploaded.
-//! The jobs are listed at the leading edge under Summary, which shows the
-//! graph, the annotations, and the artifacts; a job (from the list or the
-//! graph) shows its steps and log. A run in progress reloads on its own.
+//! `Route::WorkflowRun`: one run, laid out as GitHub's run page. The header
+//! names it and holds its actions (re-run, cancel, the workflow file); the
+//! blocks under it say what started it and who, on which branch, its state,
+//! how long it took, and what it uploaded. The jobs are listed at the
+//! leading edge under Summary, grouped by matrix, what runs first, with a
+//! filter; Summary shows the graph, the annotations by job, and the
+//! artifacts, and a job (from the list or the graph) shows its steps and
+//! log. A run in progress reloads on its own and its clocks tick.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::Utc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -22,7 +27,8 @@ use loupe_github::{
 };
 
 use super::graph::{GraphEvent, GraphView};
-use super::layout::graph_nodes;
+use super::jobs::{AnnotationEntry, JobFilter, annotation_groups, job_groups};
+use super::layout::{GraphNode, graph_nodes};
 use super::log::JobPane;
 use super::{POLL_EVERY, format_duration, job_duration_label, status_style, status_word};
 use crate::github::common::{self, Loadable, Submit};
@@ -51,6 +57,11 @@ pub struct RunView {
     run_id: u64,
     run: Loadable<WorkflowRun>,
     jobs: Vec<WorkflowJob>,
+    /// The jobs as the graph boxes them, which the jobs column groups by.
+    nodes: Vec<GraphNode>,
+    filter: JobFilter,
+    /// Groups of the jobs column the user folded, by name.
+    folded: HashSet<String>,
     /// `None` until read; `Some(None)` when the file could not be read and
     /// the graph has no edges.
     spec: Option<Option<WorkflowSpec>>,
@@ -78,6 +89,8 @@ pub struct RunView {
     scroll: ScrollHandle,
     _load: Option<Task<()>>,
     _poll: Option<Task<()>>,
+    /// Repaints every second while the run goes, so its times tick.
+    _tick: Option<Task<()>>,
     _action: Option<Task<()>>,
     _download: Option<Task<()>>,
     _graph: Subscription,
@@ -116,6 +129,9 @@ impl RunView {
             run_id,
             run: Loadable::Loading,
             jobs: Vec::new(),
+            nodes: Vec::new(),
+            filter: JobFilter::All,
+            folded: HashSet::new(),
             spec: None,
             extras: Extras::default(),
             extras_read: None,
@@ -134,6 +150,7 @@ impl RunView {
             scroll: ScrollHandle::new(),
             _load: None,
             _poll: None,
+            _tick: None,
             _action: None,
             _download: None,
             _graph: subscription,
@@ -229,25 +246,14 @@ impl RunView {
             &jobs,
             Utc::now(),
         );
-        // Keep the sidebar job list in the same topological order as the graph
-        // so both views walk jobs identically.
-        let mut order = std::collections::HashMap::new();
-        for (ix, id) in nodes
-            .iter()
-            .flat_map(|node| node.jobs.iter().map(|job| job.id))
-            .enumerate()
-        {
-            order.entry(id).or_insert(ix);
-        }
-        let mut jobs = jobs;
-        jobs.sort_by_key(|job| order.get(&job.id).copied().unwrap_or(usize::MAX));
         self.jobs = jobs;
+        self.nodes = nodes.clone();
         self.run.finish(Ok(run));
         let selected = self.selected;
         self.graph.update(cx, |graph, cx| {
             graph.set_meta(file_name, trigger, cx);
-            graph.set_nodes(nodes, cx);
             graph.set_selected(selected, cx);
+            graph.set_nodes(nodes, cx);
         });
         self.update_pane(cx);
     }
@@ -282,6 +288,19 @@ impl RunView {
                 this.update(cx, |view, cx| view.reload(cx)).ok();
             })
         });
+        let going = self.run.value().is_some_and(|run| !run.is_finished());
+        if !going {
+            self._tick = None;
+        } else if self._tick.is_none() {
+            self._tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
     }
 
     fn select(&mut self, job: Option<u64>, cx: &mut Context<Self>) {
@@ -487,113 +506,235 @@ impl RunView {
             .into_any_element()
     }
 
-    /// What started the run, where, by whom, how long, and what it made.
-    fn band(&self, run: &WorkflowRun, cx: &mut Context<Self>) -> impl IntoElement {
+    /// What started the run and who, on which branch and commit, its state,
+    /// how long it took, and what it uploaded: one block each, as on GitHub.
+    fn blocks(&self, run: &WorkflowRun, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Utc::now();
+        let theme = cx.theme();
+        let (muted, foreground) = (theme.muted_foreground, theme.foreground);
         let (icon, color) = status_style(run.status);
-        let (login, avatar_url) = run.actor.as_ref().map_or_else(
-            || (String::new(), String::new()),
-            |actor| (actor.login.clone(), actor.avatar_url.clone()),
-        );
-        let artifacts = self.extras.artifacts.len();
-        let separator = || div().text_color(tokens::text_faint()).child("·");
-        let status_pill = ui::status_chip(color, cx)
-            .text_color(color)
-            .child(
-                Icon::new(icon)
-                    .with_size(scale::icon_sm())
-                    .text_color(color),
+        let block = |label: String| {
+            v_flex().flex_none().gap_1().child(
+                div()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(label),
             )
-            .child(capitalized(status_word(run.status)));
-        ui::meta_band(cx)
-            .child(div().flex_none().child(status_pill))
+        };
+        let value = || {
+            h_flex()
+                .h(scale::chip_height())
+                .gap_2()
+                .items_center()
+                .text_size(scale::title())
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(foreground)
+        };
+        let trigger = format!(
+            "Triggered via {} {} ago",
+            run.event.replace('_', " "),
+            ui::relative_time(run.created_at, now)
+        );
+        let short_sha: String = run.head_sha.chars().take(7).collect();
+        let who = value()
+            .min_w_0()
+            .text_size(scale::body())
+            .font_weight(FontWeight::NORMAL)
+            .children(run.actor.as_ref().map(|actor| {
+                h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .items_center()
+                    .child(ui::avatar_named(
+                        actor.avatar_url.clone(),
+                        actor.login.clone(),
+                        scale::avatar_xs(),
+                    ))
+                    .child(actor.login.clone())
+            }))
+            .children(run.branch.clone().map(|branch| {
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(ui::branch_chip(branch, cx))
+            }))
             .child(
                 div()
                     .flex_none()
-                    .child(format!("Triggered by {}", run.event)),
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(scale::code())
+                    .text_color(muted)
+                    .child(short_sha),
+            );
+        let artifacts = match self.extras.artifacts.len() {
+            0 => "None".to_owned(),
+            count => count.to_string(),
+        };
+        let divider = || div().flex_none().w_px().h_10().bg(tokens::border_subtle());
+        ui::meta_band(cx)
+            .id("run-blocks")
+            .role(Role::Group)
+            .aria_label(format!(
+                "{trigger}. Status {}. Total duration {}.",
+                status_word(run.status),
+                format_duration(run.duration_seconds(now))
+            ))
+            .py_3()
+            .gap_x_6()
+            .gap_y_3()
+            .child(block(trigger).flex_1().min_w_0().child(who))
+            .child(divider())
+            .child(
+                block("Status".into()).child(
+                    value()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(color)
+                        .child(
+                            Icon::new(icon)
+                                .with_size(scale::icon_md())
+                                .text_color(color),
+                        )
+                        .child(capitalized(status_word(run.status))),
+                ),
             )
-            .when(!login.is_empty(), |band| {
-                band.child(separator()).child(
-                    h_flex()
-                        .flex_none()
-                        .gap_1p5()
-                        .items_center()
-                        .child(ui::avatar_named(
-                            avatar_url,
-                            login.clone(),
-                            scale::avatar_xs(),
-                        ))
-                        .child(div().text_color(cx.theme().foreground).child(login)),
+            .child(divider())
+            .child(
+                block("Total duration".into())
+                    .child(value().child(format_duration(run.duration_seconds(now)))),
+            )
+            .child(divider())
+            .child(block("Artifacts".into()).child(value().child(artifacts)))
+            .when(run.attempt > 1, |row| {
+                row.child(divider()).child(
+                    block("Attempt".into()).child(value().child(format!("#{}", run.attempt))),
                 )
             })
-            .children(run.branch.clone().map(|branch| {
-                h_flex()
-                    .min_w_0()
-                    .gap_2()
-                    .items_center()
-                    .child(separator())
-                    .child(ui::branch_chip(branch, cx))
-            }))
-            .child(separator())
-            .child(div().flex_none().child(format!(
-                "Total {}",
-                format_duration(run.duration_seconds(now))
-            )))
-            .when(artifacts > 0, |band| {
-                band.child(separator())
-                    .child(div().flex_none().child(match artifacts {
-                        1 => "1 artifact".to_owned(),
-                        count => format!("{count} artifacts"),
-                    }))
-            })
-            .when(run.attempt > 1, |band| {
-                band.child(separator())
-                    .child(div().flex_none().child(format!("Attempt {}", run.attempt)))
-            })
-            .child(div().flex_1())
-            .child(div().flex_none().child(format!(
-                "Started {} ago",
-                ui::relative_time(run.created_at, now)
-            )))
+    }
+
+    /// A job's time now: a running job's grows between two loads.
+    fn job_time(&self, id: u64, status: CheckStatus) -> Option<String> {
+        let seconds = self
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .and_then(|job| job.duration_seconds(Utc::now()));
+        job_duration_label(status, seconds)
     }
 
     fn jobs_column(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let now = Utc::now();
+        let muted = theme.muted_foreground;
         let summary = ui::nav_row("run-summary", self.selected.is_none(), cx)
             .aria_label("Summary")
-            .child(
-                Icon::new(IconName::Workflow)
-                    .small()
-                    .text_color(theme.muted_foreground),
-            )
+            .child(Icon::new(IconName::Workflow).small().text_color(muted))
             .child("Summary")
             .on_click(cx.listener(|view, _, _, cx| view.select(None, cx)));
-        let jobs: Vec<AnyElement> = self
-            .jobs
-            .iter()
-            .map(|job| {
+        let this = cx.entity().downgrade();
+        let filter = ui::segmented(
+            "run-job-filter",
+            "Show jobs",
+            JobFilter::ALL.map(|filter| (None, filter.label())),
+            JobFilter::ALL
+                .iter()
+                .position(|filter| *filter == self.filter)
+                .unwrap_or(0),
+            move |ix, _, cx| {
+                this.update(cx, |view, cx| {
+                    view.filter = JobFilter::ALL[ix];
+                    cx.notify();
+                })
+                .ok();
+            },
+        );
+        let job_row =
+            |view: &Self, job: &super::layout::GraphJob, nested: bool, cx: &mut Context<Self>| {
                 let (icon, color) = status_style(job.status);
                 let id = job.id;
                 ui::nav_row(
                     SharedString::from(format!("run-job-{id}")),
-                    self.selected == Some(id),
+                    view.selected == Some(id),
                     cx,
                 )
+                .when(nested, |row| row.pl_8())
                 .aria_label(format!("{}, {}", job.name, status_word(job.status)))
                 .child(Icon::new(icon).small().flex_none().text_color(color))
-                .child(div().flex_1().min_w_0().truncate().child(job.name.clone()))
+                .child(div().flex_1().min_w_0().truncate().child(if nested {
+                    job.label.clone()
+                } else {
+                    job.name.clone()
+                }))
                 .child(
                     div()
                         .flex_none()
                         .text_size(scale::meta())
-                        .text_color(theme.muted_foreground)
-                        .children(job_duration_label(job.status, job.duration_seconds(now))),
+                        .text_color(muted)
+                        .children(view.job_time(id, job.status)),
                 )
+                .tooltip({
+                    let name = job.name.clone();
+                    move |window, cx| Tooltip::new(name.clone()).build(window, cx)
+                })
                 .on_click(cx.listener(move |view, _, _, cx| view.select(Some(id), cx)))
                 .into_any_element()
-            })
-            .collect();
+            };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (ix, group) in job_groups(&self.nodes, self.filter).into_iter().enumerate() {
+            let Some(name) = group.name.clone() else {
+                rows.extend(group.jobs.iter().map(|job| job_row(self, job, false, cx)));
+                continue;
+            };
+            let folded = self.folded.contains(&name);
+            let (icon, color) = status_style(group.status);
+            let key = name.clone();
+            rows.push(
+                ui::nav_row(("run-job-group", ix), false, cx)
+                    .aria_label(format!(
+                        "{name}, {} of {} jobs completed",
+                        group.completed, group.total
+                    ))
+                    .aria_expanded(!folded)
+                    .child(
+                        Icon::new(if folded {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .small()
+                        .flex_none()
+                        .text_color(muted),
+                    )
+                    .child(Icon::new(icon).small().flex_none().text_color(color))
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(scale::meta())
+                            .text_color(muted)
+                            .child(format!("{}/{}", group.completed, group.total)),
+                    )
+                    .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if !view.folded.remove(&key) {
+                            view.folded.insert(key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if !folded {
+                rows.extend(group.jobs.iter().map(|job| job_row(self, job, true, cx)));
+            }
+        }
+        let empty = rows.is_empty().then(|| {
+            ui::side_empty(
+                match self.filter {
+                    JobFilter::All => "No jobs yet.",
+                    JobFilter::Failing => "No job failed.",
+                    JobFilter::Running => "No job is running.",
+                },
+                cx,
+            )
+        });
         ui::side_panel("run-jobs", ui::SideEdge::Leading, scale::nav_width())
             .p_2()
             .gap_2()
@@ -602,7 +743,7 @@ impl RunView {
                 v_flex()
                     .w_full()
                     .pt_2()
-                    .gap_1()
+                    .gap_2()
                     .border_t_1()
                     .border_color(tokens::border_subtle())
                     .child(
@@ -610,95 +751,71 @@ impl RunView {
                             .px_2()
                             .child(ui::side_section("Jobs").count(self.jobs.len())),
                     )
-                    .child(v_flex().w_full().gap_0p5().children(jobs)),
+                    .child(div().px_1().child(filter))
+                    .child(
+                        v_flex()
+                            .id("run-job-list")
+                            .w_full()
+                            .gap_0p5()
+                            .overflow_y_scroll()
+                            .children(rows)
+                            .children(empty),
+                    ),
             )
     }
 
+    /// The annotations by job, each message once with how many times the
+    /// job left it; a job's name opens it.
     fn annotations(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let annotations = &self.extras.annotations;
         if annotations.is_empty() {
             return None;
         }
         let theme = cx.theme();
-        let count = |level: AnnotationLevel, one: &str, many: &str| {
-            let n = annotations.iter().filter(|a| a.level == level).count();
-            match n {
-                0 => None,
-                1 => Some(format!("1 {one}")),
-                n => Some(format!("{n} {many}")),
+        let (muted, hover, radius) = (theme.muted_foreground, theme.list_hover, theme.radius);
+        let groups = annotation_groups(annotations);
+        let summary = level_tally(|level| groups.iter().map(|group| group.count(level)).sum());
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (group_ix, group) in groups.into_iter().enumerate() {
+            let job = group
+                .job_id
+                .filter(|id| self.jobs.iter().any(|job| job.id == *id));
+            let tally = level_tally(|level| group.count(level));
+            rows.push(
+                h_flex()
+                    .id(("run-annotation-job", group_ix))
+                    .h(scale::row_height())
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(radius)
+                    .when_some(job, |row, id| {
+                        row.role(Role::Button)
+                            .aria_label(format!("{}, open its log", group.job))
+                            .hover(move |row| row.bg(hover))
+                            .on_click(cx.listener(move |view, _, _, cx| view.select(Some(id), cx)))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(scale::body())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(group.job.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(scale::meta())
+                            .text_color(muted)
+                            .child(tally),
+                    )
+                    .into_any_element(),
+            );
+            for (ix, entry) in group.entries.iter().enumerate() {
+                rows.push(annotation_row(group_ix, ix, entry, cx).into_any_element());
             }
-        };
-        let summary: Vec<String> = [
-            count(AnnotationLevel::Failure, "error", "errors"),
-            count(AnnotationLevel::Warning, "warning", "warnings"),
-            count(AnnotationLevel::Notice, "notice", "notices"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let rows = annotations.iter().enumerate().map(|(ix, annotation)| {
-            let (icon, color) = match annotation.level {
-                AnnotationLevel::Failure => (IconName::CircleX, tokens::closed()),
-                AnnotationLevel::Warning => (IconName::TriangleAlert, tokens::pending()),
-                AnnotationLevel::Notice => (IconName::Info, tokens::link()),
-            };
-            let place = match annotation.line {
-                Some(line) => format!("{}:{line}", annotation.path),
-                None => annotation.path.clone(),
-            };
-            let url = annotation.url.clone();
-            let headline = annotation.title.clone().unwrap_or_else(|| {
-                annotation
-                    .message
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned()
-            });
-            h_flex()
-                .id(("run-annotation", ix))
-                .role(Role::Link)
-                .aria_label(format!(
-                    "{headline}, {} in {}, open {place}",
-                    annotation.job, place
-                ))
-                .px_2()
-                .py_1p5()
-                .gap_2()
-                .items_start()
-                .rounded(theme.radius)
-                .hover(|row| row.bg(theme.list_hover))
-                .cursor_pointer()
-                .child(
-                    div()
-                        .pt_0p5()
-                        .child(Icon::new(icon).small().text_color(color)),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(div().text_size(scale::body()).child(headline.clone()))
-                        .when(annotation.title.is_some(), |column| {
-                            column.child(
-                                div()
-                                    .text_size(scale::meta())
-                                    .text_color(theme.muted_foreground)
-                                    .child(annotation.message.clone()),
-                            )
-                        })
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .text_size(scale::meta())
-                                .text_color(theme.muted_foreground)
-                                .child(annotation.job.clone())
-                                .child("·")
-                                .child(div().text_color(tokens::link()).child(place)),
-                        ),
-                )
-                .on_click(move |_, _, cx| cx.open_url(&url))
-        });
+        }
         Some(
             v_flex()
                 .gap_1()
@@ -710,8 +827,8 @@ impl RunView {
                         .child(
                             div()
                                 .text_size(scale::meta())
-                                .text_color(theme.muted_foreground)
-                                .child(summary.join(", ")),
+                                .text_color(muted)
+                                .child(summary),
                         ),
                 )
                 .children(rows),
@@ -796,7 +913,7 @@ impl RunView {
             .children(rows)
     }
 
-    /// Re-run, cancel, and download outcomes, under the band.
+    /// Re-run, cancel, and download outcomes, under the blocks.
     fn notice(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let theme = cx.theme();
         let (text, color) = if let Some(error) = self.action.error() {
@@ -934,7 +1051,7 @@ impl Render for RunView {
                 v_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.band(run, cx))
+                    .child(self.blocks(run, cx))
                     .children(self.notice(cx))
                     .child(
                         h_flex()
@@ -948,6 +1065,95 @@ impl Render for RunView {
         };
         v_flex().size_full().child(header).child(body)
     }
+}
+
+/// `2 errors, 1 warning`: how many messages of each level, by `count`,
+/// leaving out the levels with none.
+fn level_tally(count: impl Fn(AnnotationLevel) -> usize) -> String {
+    [
+        (AnnotationLevel::Failure, "error", "errors"),
+        (AnnotationLevel::Warning, "warning", "warnings"),
+        (AnnotationLevel::Notice, "notice", "notices"),
+    ]
+    .into_iter()
+    .filter_map(|(level, one, many)| match count(level) {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// One message of a job's annotations: its level, its text, how many times
+/// the job left it, and where; a click opens the place on GitHub.
+fn annotation_row(group: usize, ix: usize, entry: &AnnotationEntry, cx: &App) -> Stateful<Div> {
+    let theme = cx.theme();
+    let (muted, hover, radius) = (theme.muted_foreground, theme.list_hover, theme.radius);
+    let annotation = &entry.annotation;
+    let (icon, color) = match annotation.level {
+        AnnotationLevel::Failure => (IconName::CircleX, tokens::closed()),
+        AnnotationLevel::Warning => (IconName::TriangleAlert, tokens::pending()),
+        AnnotationLevel::Notice => (IconName::Info, tokens::link()),
+    };
+    let place = match annotation.line {
+        Some(line) => format!("{}:{line}", annotation.path),
+        None => annotation.path.clone(),
+    };
+    let url = annotation.url.clone();
+    let headline = annotation.title.clone().unwrap_or_else(|| {
+        annotation
+            .message
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    });
+    h_flex()
+        .id(("run-annotation", group * 1000 + ix))
+        .role(Role::Link)
+        .aria_label(format!("{headline}, open {place}"))
+        .pl_6()
+        .pr_2()
+        .py_1p5()
+        .gap_2()
+        .items_start()
+        .rounded(radius)
+        .hover(move |row| row.bg(hover))
+        .cursor_pointer()
+        .child(
+            div()
+                .pt_0p5()
+                .child(Icon::new(icon).small().text_color(color)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(div().text_size(scale::body()).child(headline))
+                .when(annotation.title.is_some(), |column| {
+                    column.child(
+                        div()
+                            .text_size(scale::meta())
+                            .text_color(muted)
+                            .child(annotation.message.clone()),
+                    )
+                })
+                .child(
+                    div()
+                        .text_size(scale::meta())
+                        .text_color(tokens::link())
+                        .child(place),
+                ),
+        )
+        .when(entry.times > 1, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .child(ui::count_badge(format!("×{}", entry.times), cx)),
+            )
+        })
+        .on_click(move |_, _, cx| cx.open_url(&url))
 }
 
 /// Whether the run is worth reading again: it is queued or going, or a
