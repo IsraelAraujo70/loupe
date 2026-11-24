@@ -9,6 +9,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -16,6 +17,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use loupe_github::CheckStatus;
 
 use super::jobs::group_status;
 use super::layout::{
@@ -47,6 +49,8 @@ pub enum GraphEvent {
 
 pub struct GraphView {
     nodes: Vec<GraphNode>,
+    /// When `nodes` came: a running job's time grows from there.
+    loaded_at: Instant,
     layout: Layout,
     file_name: Option<String>,
     trigger: Option<String>,
@@ -77,6 +81,7 @@ impl GraphView {
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
+            loaded_at: Instant::now(),
             layout: Layout::default(),
             file_name: None,
             trigger: None,
@@ -111,6 +116,7 @@ impl GraphView {
         };
         let changed = shape(&nodes) != shape(&self.nodes);
         self.nodes = nodes;
+        self.loaded_at = Instant::now();
         if changed {
             self.open.clear();
         }
@@ -281,8 +287,14 @@ impl GraphView {
             theme.border
         };
         let id = job.id;
+        let seconds = match job.status {
+            CheckStatus::Running => job
+                .seconds
+                .map(|seconds| seconds + self.loaded_at.elapsed().as_secs() as i64),
+            _ => job.seconds,
+        };
         let mut tip = format!("{} · {}", job.name, status_word(job.status));
-        if let Some(time) = job_duration_label(job.status, job.seconds) {
+        if let Some(time) = job_duration_label(job.status, seconds) {
             tip.push_str(&format!(" · {time}"));
         }
         h_flex()
@@ -314,7 +326,7 @@ impl GraphView {
                 div()
                     .flex_none()
                     .text_color(theme.muted_foreground)
-                    .children(job_duration_label(job.status, job.seconds)),
+                    .children(job_duration_label(job.status, seconds)),
             )
             .on_click(cx.listener(move |_, _, _, cx| cx.emit(GraphEvent::OpenJob(id))))
     }
