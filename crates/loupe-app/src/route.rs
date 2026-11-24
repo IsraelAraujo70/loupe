@@ -23,6 +23,9 @@ pub enum Route {
         #[serde(default)]
         branch: Option<String>,
     },
+    /// GitHub Actions runs of every repository the sidebar lists, newest
+    /// first, with filters by repository, workflow, branch, and status.
+    AllActions,
     /// One workflow run: its graph, jobs, and logs, with job `job_id` open
     /// when given. `title` names the tab, such as `Release #57`.
     WorkflowRun {
@@ -145,6 +148,7 @@ impl Route {
             Route::Repo(repo) => repo.to_string(),
             Route::PullRequest(pr) => format!("#{} {}", pr.number, pr.repo.name),
             Route::Actions { repo, .. } => format!("{} · Actions", repo.name),
+            Route::AllActions => "Actions".into(),
             Route::WorkflowRun { title, .. } if !title.is_empty() => title.clone(),
             Route::WorkflowRun { repo, .. } => format!("{} run", repo.name),
             Route::LinearMyIssues => "My issues".into(),
@@ -178,6 +182,7 @@ mod tests {
                 repo: RepoRef::new("acme", "web"),
                 branch: Some("feat/x".into()),
             },
+            Route::AllActions,
             Route::WorkflowRun {
                 repo: RepoRef::new("acme", "web"),
                 run_id: 43012008138,

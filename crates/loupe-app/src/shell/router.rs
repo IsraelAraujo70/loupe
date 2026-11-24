@@ -19,6 +19,7 @@ pub fn build(route: &Route, window: &mut Window, cx: &mut App) -> AnyView {
         Route::Repo(repo) => github::repo_view(repo, window, cx),
         Route::PullRequest(pr) => github::pull_request_view(pr, window, cx),
         Route::Actions { repo, branch } => github::actions_view(repo, branch, window, cx),
+        Route::AllActions => github::all_actions_view(window, cx),
         Route::WorkflowRun {
             repo,
             run_id,

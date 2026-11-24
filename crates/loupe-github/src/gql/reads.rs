@@ -21,6 +21,9 @@ const INBOX_REVIEW_REQUESTED: &str =
 const INBOX_AUTHORED: &str = "is:open is:pr archived:false author:@me sort:updated-desc";
 const INBOX_INVOLVED: &str =
     "is:open is:pr archived:false involves:@me -author:@me -review-requested:@me sort:updated-desc";
+/// Every open pull request of the Reviews page: yours, asked of you, or
+/// that involve you.
+const INBOX_ANY: &str = "is:open is:pr archived:false involves:@me sort:updated-desc";
 
 macro_rules! pr_row_fragment {
     () => {
@@ -135,6 +138,10 @@ const SEARCH_REPOSITORIES_QUERY: &str = concat!(
     repo_fragment!()
 );
 
+const PULL_REQUEST_REPOSITORIES_QUERY: &str = "query PullRequestRepositories($query: String!) { \
+    search(type: ISSUE, first: 100, query: $query) { \
+    nodes { ... on PullRequest { repository { owner { login } name } } } } }";
+
 const REVIEW_REQUESTED_COUNT_QUERY: &str = "query ReviewRequestedCount($query: String!) { \
     search(type: ISSUE, query: $query) { issueCount } }";
 
@@ -185,6 +192,7 @@ pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("search_repositories", SEARCH_REPOSITORIES_QUERY),
     ("repository_labels", REPOSITORY_LABELS_QUERY),
     ("review_requested_count", REVIEW_REQUESTED_COUNT_QUERY),
+    ("pull_request_repositories", PULL_REQUEST_REPOSITORIES_QUERY),
     ("pull_request_rows", PULL_REQUEST_ROWS_QUERY),
 ];
 
@@ -221,6 +229,25 @@ impl GitHub {
             json!({ "query": INBOX_REVIEW_REQUESTED }),
         )?;
         Ok(data.search.issue_count)
+    }
+
+    /// The repositories of the open pull requests that involve you (the
+    /// Reviews page's), each once, in the order of their latest update: one
+    /// search of 100 pull requests that reads only their repository.
+    pub fn pull_request_repositories(&self) -> Result<Vec<RepoRef>> {
+        #[derive(Deserialize)]
+        struct Search {
+            nodes: Option<Vec<Value>>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            search: Search,
+        }
+        let data: Data = self.graphql(
+            PULL_REQUEST_REPOSITORIES_QUERY,
+            json!({ "query": INBOX_ANY }),
+        )?;
+        repositories_of_pull_requests(data.search.nodes.unwrap_or_default())
     }
 
     /// The list rows of the pull requests with node ids `ids`, as a search
@@ -846,6 +873,25 @@ struct WireRepository {
     pushed_at: Option<DateTime<Utc>>,
 }
 
+/// The repository of each pull request node, each once, in node order.
+fn repositories_of_pull_requests(nodes: Vec<Value>) -> Result<Vec<RepoRef>> {
+    #[derive(Deserialize)]
+    struct Node {
+        repository: Option<WireRepoRef>,
+    }
+    let mut repos: Vec<RepoRef> = Vec::new();
+    for node in decode_nodes::<Node>(nodes)? {
+        let Some(repository) = node.repository else {
+            continue;
+        };
+        let repo = RepoRef::new(repository.owner.login, repository.name);
+        if !repos.contains(&repo) {
+            repos.push(repo);
+        }
+    }
+    Ok(repos)
+}
+
 fn repositories_from_nodes(nodes: Vec<Value>) -> Result<Vec<RepoSummary>> {
     Ok(decode_nodes::<WireRepository>(nodes)?
         .into_iter()
@@ -865,7 +911,7 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::{Value, json};
 
-    use super::{DOCUMENTS, repositories_from_nodes};
+    use super::{DOCUMENTS, repositories_from_nodes, repositories_of_pull_requests};
     use super::{InboxData, SearchData, ViewerRepositoriesData, repo_search_query, with_pr_type};
     use crate::{
         Actor, ChecksState, Error, Mergeable, PrListFilter, PrRef, PrState, RepoRef,
@@ -1226,6 +1272,23 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_repositories_come_once_each_in_search_order() {
+        let pr = |owner: &str, name: &str| json!({ "repository": { "owner": { "login": owner }, "name": name } });
+        let repos = repositories_of_pull_requests(vec![
+            pr("acme", "web"),
+            json!({}),
+            pr("acme", "api"),
+            pr("acme", "web"),
+            json!({ "repository": null }),
+        ])
+        .unwrap();
+        assert_eq!(
+            repos,
+            [RepoRef::new("acme", "web"), RepoRef::new("acme", "api")]
+        );
+    }
+
+    #[test]
     fn registers_every_document_once() {
         let names: Vec<_> = DOCUMENTS.iter().map(|(name, _)| *name).collect();
         assert_eq!(
@@ -1237,6 +1300,7 @@ mod tests {
                 "search_repositories",
                 "repository_labels",
                 "review_requested_count",
+                "pull_request_repositories",
                 "pull_request_rows"
             ]
         );

@@ -1,5 +1,6 @@
 //! GitHub Actions: `Route::Actions` lists a repository's (or a branch's)
-//! workflow runs, and `Route::WorkflowRun` shows one run: its graph, jobs,
+//! workflow runs, `Route::AllActions` those of every repository the sidebar
+//! lists, and `Route::WorkflowRun` shows one run: its graph, jobs,
 //! steps and logs, annotations and artifacts, and its actions.
 
 mod graph;
@@ -29,7 +30,12 @@ pub fn runs_view(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyView {
-    cx.new(|cx| runs::RunsView::new(repo, branch, window, cx))
+    cx.new(|cx| runs::RunsView::new(runs::Scope::Repo { repo, branch }, window, cx))
+        .into()
+}
+
+pub fn all_runs_view(window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|cx| runs::RunsView::new(runs::Scope::All, window, cx))
         .into()
 }
 

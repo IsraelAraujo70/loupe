@@ -1,4 +1,6 @@
-//! `Route::Repo`: one repository's pull requests, watch toggle, add repository.
+//! `Route::Repo`: one repository's pull requests, watch toggle, add
+//! repository; and the header and tabs (Pull requests · Actions) every page
+//! of a repository shares.
 
 use std::time::Duration;
 
@@ -42,6 +44,58 @@ fn filter_icon(filter: PrListFilter) -> IconName {
 fn search_text(raw: &str) -> Option<String> {
     let text = raw.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The pages of a repository, as the tabs under its header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepoTab {
+    PullRequests,
+    Actions,
+}
+
+/// A repository page's header: the repository's full name. Its pages add
+/// their own actions.
+pub(crate) fn repo_header(repo: &RepoRef) -> ui::PageHeader {
+    ui::page_header(repo.to_string()).icon(IconName::FolderGit2)
+}
+
+/// The tabs under a repository's header, Pull requests and Actions, with
+/// `count` beside the open one. Each is a page of its own, opened in place.
+pub(crate) fn repo_tabs(repo: &RepoRef, active: RepoTab, count: Option<usize>) -> impl IntoElement {
+    let tab =
+        |id: &'static str, label: &'static str, icon: IconName, which: RepoTab, route: Route| {
+            ui::section_tab(id, label)
+                .icon(icon)
+                .maybe_count(if which == active { count } else { None })
+                .debug_selector(move || id.to_owned())
+                .on_click(move |_, window, cx| navigate(route.clone(), window, cx))
+        };
+    ui::section_tabs(
+        "repo-tabs",
+        match active {
+            RepoTab::PullRequests => 0,
+            RepoTab::Actions => 1,
+        },
+    )
+    .tabs([
+        tab(
+            "repo-tab-pull-requests",
+            "Pull requests",
+            IconName::GitPullRequest,
+            RepoTab::PullRequests,
+            Route::Repo(repo.clone()),
+        ),
+        tab(
+            "repo-tab-actions",
+            "Actions",
+            IconName::Workflow,
+            RepoTab::Actions,
+            Route::Actions {
+                repo: repo.clone(),
+                branch: None,
+            },
+        ),
+    ])
 }
 
 pub struct RepoView {
@@ -147,27 +201,7 @@ impl RepoView {
         let watching = Settings::get(cx).watched_repos.contains(&self.repo);
         let url = self.repo.url();
         let busy = self.list.is_busy();
-        let header = ui::page_header(self.repo.to_string()).icon(IconName::FolderGit2);
-        let header = match self.list.value() {
-            Some(page) => header.count(page.total_count as usize),
-            None => header,
-        };
-        let actions = Route::Actions {
-            repo: self.repo.clone(),
-            branch: None,
-        };
-        header
-            .action(
-                Button::new("repo-actions")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Workflow)
-                    .label("Actions")
-                    .tooltip("Workflow runs of this repository")
-                    .on_click(move |event, window, cx| {
-                        crate::shell::open(actions.clone(), event, window, cx)
-                    }),
-            )
+        repo_header(&self.repo)
             .action(
                 Button::new("watch")
                     .ghost()
@@ -309,6 +343,11 @@ impl Render for RepoView {
         v_flex()
             .size_full()
             .child(self.header(cx))
+            .child(repo_tabs(
+                &self.repo,
+                RepoTab::PullRequests,
+                self.list.value().map(|page| page.total_count as usize),
+            ))
             .child(self.filters(cx))
             .child(
                 div()

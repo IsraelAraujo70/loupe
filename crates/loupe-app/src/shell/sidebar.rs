@@ -1,7 +1,8 @@
 //! The sidebar, after Linear's: the workspace row with Search and New issue;
 //! Inbox, My issues, and Reviews with their counts; then foldable sections
 //! (Workspace, Favorites, Your teams with each team's issues, projects, and
-//! views, and Repositories); and the account footer. Expanded, at the width
+//! views, and Repositories with Actions and each repository's pull requests
+//! and runs); and the account footer. Expanded, at the width
 //! its right edge was dragged to, or collapsed to an icon rail (Cmd+B).
 //!
 //! The rail is the same sidebar with its texts hidden: the same entries in
@@ -14,16 +15,18 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{GitHub, NOTIFICATIONS_LIMIT, Notification, Viewer};
+use loupe_github::{GitHub, NOTIFICATIONS_LIMIT, Notification, RepoRef, Viewer};
 use loupe_linear::{Linear, TeamSummary};
 
 use crate::github::notification_filter;
+use crate::github::repos::{self, ListedRepo, RepoSource};
 use crate::linear::{self, SavedView};
 use crate::route::Route;
 use crate::services::{Accounts, Connection, Services};
@@ -95,6 +98,7 @@ pub(super) struct SidebarData {
     _counts: Option<Task<()>>,
     _teams: Option<Task<()>>,
     _services: Subscription,
+    _repos: Subscription,
 }
 
 impl SidebarData {
@@ -106,6 +110,7 @@ impl SidebarData {
             _counts: None,
             _teams: None,
             _services: cx.observe_global::<Services>(Self::sync),
+            _repos: cx.observe_global::<repos::PullRequestRepos>(|_, cx| cx.notify()),
         };
         data.sync(cx);
         data
@@ -212,6 +217,11 @@ enum Target {
         section: String,
         open: bool,
     },
+    /// Folds or opens a repository's Pull requests and Actions rows.
+    FoldRepo {
+        repo: RepoRef,
+        open: bool,
+    },
     /// Loads the teams again after a failure.
     RetryTeams,
     Url(String),
@@ -226,9 +236,21 @@ struct Row {
     leading: Leading,
     /// Trailing text, such as a count or a team name.
     meta: Option<SharedString>,
-    /// Indented under a team.
+    /// Indented under a team or a repository.
     nested: bool,
     target: Target,
+    /// A repository's own row: its menu, and its drag when the user added
+    /// it to the list.
+    repo: Option<RepoRow>,
+}
+
+/// What a repository's row knows to reorder it: the repository, why it is
+/// listed, and its neighbors in the part of the list it can move within.
+#[derive(Clone, Debug, PartialEq)]
+struct RepoRow {
+    listed: ListedRepo,
+    above: Option<RepoRef>,
+    below: Option<RepoRef>,
 }
 
 enum Entry {
@@ -262,6 +284,7 @@ fn row(
         meta: None,
         nested: false,
         target,
+        repo: None,
     }
 }
 
@@ -297,7 +320,12 @@ fn counted(row: Row, count: Option<SharedString>) -> Row {
 }
 
 /// The sidebar's entries, in order: the same expanded and on the rail.
-fn entries(settings: &Settings, loaded: &Loaded, views: &[SavedView]) -> Vec<Entry> {
+fn entries(
+    settings: &Settings,
+    loaded: &Loaded,
+    views: &[SavedView],
+    repos: &[ListedRepo],
+) -> Vec<Entry> {
     let mut entries = vec![
         Entry::from(counted(
             link("inbox", "Inbox", IconName::Inbox, Route::Notifications),
@@ -372,23 +400,84 @@ fn entries(settings: &Settings, loaded: &Loaded, views: &[SavedView]) -> Vec<Ent
         }
     }
 
-    if !settings.watched_repos.is_empty() && section(&mut entries, "repositories", "Repositories") {
-        entries.extend(settings.watched_repos.iter().map(|repo| {
-            Entry::from(Row {
-                leading: Leading::Avatar {
-                    url: format!("https://github.com/{}.png?size=40", repo.owner).into(),
-                    name: repo.owner.clone().into(),
-                },
-                ..link(
-                    format!("repo-{repo}"),
-                    repo.to_string(),
-                    IconName::FolderGit,
-                    Route::Repo(repo.clone()),
-                )
-            })
+    if !repos.is_empty() && section(&mut entries, "repositories", "Repositories") {
+        entries.push(Entry::from(Row {
+            name: Some("Actions of every repository".into()),
+            ..link("actions", "Actions", IconName::Workflow, Route::AllActions)
         }));
+        for (index, listed) in repos.iter().enumerate() {
+            repo_rows(&mut entries, repos, index, listed, settings);
+        }
     }
     entries
+}
+
+/// A repository's row, and under it, once opened, its Pull requests and
+/// Actions. Its neighbors are the rows of the same source, the ones it can
+/// trade places with.
+fn repo_rows(
+    entries: &mut Vec<Entry>,
+    repos: &[ListedRepo],
+    index: usize,
+    listed: &ListedRepo,
+    settings: &Settings,
+) {
+    let repo = &listed.repo;
+    let neighbor = |at: Option<usize>| {
+        at.and_then(|at| repos.get(at))
+            .filter(|other| listed.source.is_added() && other.source == listed.source)
+            .map(|other| other.repo.clone())
+    };
+    let open = settings.is_repo_open(repo);
+    let full = repo.to_string();
+    entries.push(Entry::from(Row {
+        name: Some(full.clone().into()),
+        leading: Leading::Avatar {
+            url: format!("https://github.com/{}.png?size=40", repo.owner).into(),
+            name: repo.owner.clone().into(),
+        },
+        repo: Some(RepoRow {
+            listed: listed.clone(),
+            above: neighbor(index.checked_sub(1)),
+            below: neighbor(Some(index + 1)),
+        }),
+        ..row(
+            format!("repo-{full}"),
+            repo.name.clone(),
+            IconName::FolderGit2,
+            Target::FoldRepo {
+                repo: repo.clone(),
+                open,
+            },
+        )
+    }));
+    if !open {
+        return;
+    }
+    let pages = [
+        (
+            "pulls",
+            "Pull requests",
+            IconName::GitPullRequest,
+            Route::Repo(repo.clone()),
+        ),
+        (
+            "actions",
+            "Actions",
+            IconName::Workflow,
+            Route::Actions {
+                repo: repo.clone(),
+                branch: None,
+            },
+        ),
+    ];
+    entries.extend(pages.into_iter().map(|(page, label, icon, route)| {
+        Entry::from(Row {
+            name: Some(format!("{full} {label}").into()),
+            nested: true,
+            ..link(format!("repo-{full}-{page}"), label, icon, route)
+        })
+    }));
 }
 
 /// A team's row, and under it, unless folded, its Issues, Projects, and Views.
@@ -596,6 +685,8 @@ fn same_page(row: &Route, current: &Route) -> bool {
                 ..
             },
         ) => a == b && view_a == view_b,
+        // A repository's Actions row stays marked while a branch narrows it.
+        (Route::Actions { repo: a, .. }, Route::Actions { repo: b, .. }) => a == b,
         _ => row == current,
     }
 }
@@ -644,7 +735,8 @@ pub(super) fn render(
         mark_text: theme.primary_foreground,
     };
 
-    let rows = entries(Settings::get(cx), &loaded, &views)
+    let listed = repos::listed(cx);
+    let rows = entries(Settings::get(cx), &loaded, &views, &listed)
         .into_iter()
         .map(|entry| match entry {
             Entry::Section { key, label, open } => {
@@ -881,19 +973,23 @@ fn nav_row(
     collapsed: bool,
     colors: Palette,
     data: &Entity<SidebarData>,
-) -> impl IntoElement {
+) -> AnyElement {
     let is_selected = matches!(&row.target, Target::Route(route) if same_page(route, current));
     let fold = match &row.target {
-        Target::Fold { open, .. } => Some(*open),
+        Target::Fold { open, .. } | Target::FoldRepo { open, .. } => Some(*open),
         _ => None,
     };
-    let name = match (&row.name, fold) {
-        (Some(name), _) => name.clone(),
-        (None, Some(open)) => {
-            format!("{} {}", if open { "Collapse" } else { "Expand" }, row.label).into()
-        }
+    let verb = |open: bool| if open { "Collapse" } else { "Expand" };
+    let name: SharedString = match (&row.name, fold) {
+        (Some(name), Some(open)) => format!("{} {name}", verb(open)).into(),
+        (Some(name), None) => name.clone(),
+        (None, Some(open)) => format!("{} {}", verb(open), row.label).into(),
         (None, None) => row.label.clone(),
     };
+    let pinned = row
+        .repo
+        .as_ref()
+        .is_some_and(|repo| repo.listed.source == RepoSource::Pinned);
     let label = row.label;
     let target = row.target;
     let hint = name.clone();
@@ -903,7 +999,8 @@ fn nav_row(
     };
     let data = data.downgrade();
     let selector = format!("sidebar-{}", row.id);
-    h_flex()
+    let repo = row.repo;
+    let item = h_flex()
         .id(row.id)
         .debug_selector(|| selector)
         .role(if matches!(target, Target::Label) {
@@ -942,6 +1039,10 @@ fn nav_row(
                 let section = section.clone();
                 store::update_settings(cx, move |settings| settings.toggle_collapsed(&section));
             }
+            Target::FoldRepo { repo, .. } => {
+                let repo = repo.clone();
+                store::update_settings(cx, move |settings| settings.toggle_open_repo(&repo));
+            }
             Target::Label => {}
             Target::Url(url) => cx.open_url(url),
             Target::RetryTeams => {
@@ -969,6 +1070,9 @@ fn nav_row(
                     .gap_1()
                     .items_center()
                     .child(div().min_w_0().truncate().child(label))
+                    .when(pinned, |label| {
+                        label.child(svg_icon(IconName::Pin, dp(12.), colors.faint))
+                    })
                     .when_some(fold, |label, open| {
                         label.child(svg_icon(
                             if open {
@@ -992,7 +1096,151 @@ fn nav_row(
                         .child(meta),
                 )
             })
-        })
+        });
+    match repo {
+        Some(repo) => repo_menu_and_drag(item, repo, colors),
+        None => item.into_any_element(),
+    }
+}
+
+/// A repository row being dragged to a new place in the list.
+#[derive(Clone)]
+struct DraggedRepo {
+    repo: RepoRef,
+    source: RepoSource,
+}
+
+impl Render for DraggedRepo {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        // The drag layer is drawn outside the window's tree, so it inherits
+        // no text color.
+        h_flex()
+            .h(scale::nav_row_height())
+            .px_2()
+            .items_center()
+            .rounded(dp(6.))
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.ring)
+            .shadow_lg()
+            .text_size(scale::body())
+            .text_color(theme.foreground)
+            .child(self.repo.name.clone())
+    }
+}
+
+/// A repository row's right-click menu (open its pages, pin, move, remove,
+/// open on GitHub) and, for a repository the user added, its drag: dropped
+/// on another row of the same part of the list, it takes that row's place.
+fn repo_menu_and_drag(item: Stateful<Div>, repo: RepoRow, colors: Palette) -> AnyElement {
+    let RepoRow {
+        listed,
+        above,
+        below,
+    } = repo;
+    let ListedRepo { repo, source } = listed;
+    let item = if source.is_added() {
+        let dragged = DraggedRepo {
+            repo: repo.clone(),
+            source,
+        };
+        let target = repo.clone();
+        item.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .drag_over::<DraggedRepo>(move |style, dragged, _, _| {
+                if dragged.source == source {
+                    style.bg(colors.hover)
+                } else {
+                    style
+                }
+            })
+            .on_drop(move |dragged: &DraggedRepo, _, cx| {
+                let (repo, target) = (dragged.repo.clone(), target.clone());
+                store::update_settings(cx, move |settings| {
+                    settings.move_repo(&repo, &target);
+                });
+            })
+    } else {
+        item
+    };
+    let menu_repo = repo.clone();
+    item.context_menu(move |menu: PopupMenu, _, _| {
+        let repo = menu_repo.clone();
+        let edit = |label: &'static str, icon: IconName, change: Box<dyn Fn(&mut Settings)>| {
+            PopupMenuItem::new(label)
+                .icon(icon)
+                .on_click(move |_, _, cx| {
+                    store::update_settings(cx, |settings| change(settings));
+                })
+        };
+        let go = |label: &'static str, icon: IconName, route: Route| {
+            PopupMenuItem::new(label)
+                .icon(icon)
+                .on_click(move |_, window, cx| navigate(route.clone(), window, cx))
+        };
+        let step = |label: &'static str, icon: IconName, to: Option<RepoRef>| {
+            let repo = repo.clone();
+            let enabled = to.is_some();
+            edit(
+                label,
+                icon,
+                Box::new(move |settings: &mut Settings| {
+                    if let Some(to) = &to {
+                        settings.move_repo(&repo, to);
+                    }
+                }),
+            )
+            .disabled(!enabled)
+        };
+        let pin_repo = repo.clone();
+        let mut menu = menu
+            .min_w(scale::menu_min_width())
+            .item(go(
+                "Pull requests",
+                IconName::GitPullRequest,
+                Route::Repo(repo.clone()),
+            ))
+            .item(go(
+                "Actions",
+                IconName::Workflow,
+                Route::Actions {
+                    repo: repo.clone(),
+                    branch: None,
+                },
+            ))
+            .item(PopupMenuItem::separator())
+            .item(edit(
+                if source == RepoSource::Pinned {
+                    "Unpin"
+                } else {
+                    "Pin to top"
+                },
+                if source == RepoSource::Pinned {
+                    IconName::PinOff
+                } else {
+                    IconName::Pin
+                },
+                Box::new(move |settings: &mut Settings| settings.toggle_pinned_repo(&pin_repo)),
+            ));
+        if source.is_added() {
+            let removed = repo.clone();
+            menu = menu
+                .item(step("Move up", IconName::ArrowUp, above.clone()))
+                .item(step("Move down", IconName::ArrowDown, below.clone()))
+                .item(edit(
+                    "Remove from sidebar",
+                    IconName::EyeOff,
+                    Box::new(move |settings: &mut Settings| settings.remove_repo(&removed)),
+                ));
+        }
+        let url = repo.url();
+        menu.item(PopupMenuItem::separator()).item(
+            PopupMenuItem::new("Open on GitHub")
+                .icon(IconName::ExternalLink)
+                .on_click(move |_, _, cx| cx.open_url(&url)),
+        )
+    })
+    .into_any_element()
 }
 
 /// A 16 px slot, so labels line up whatever leads them.
@@ -1094,6 +1342,7 @@ mod tests {
         COLLAPSED_WIDTH, DEFAULT_WIDTH, Entry, Loaded, Target, entries, expanded_width, same_page,
         width,
     };
+    use crate::github::repos;
     use crate::linear::SavedView;
     use crate::route::Route;
     use crate::store::{Favorite, Settings};
@@ -1203,7 +1452,7 @@ mod tests {
             name: "Meus issues".into(),
             team_id: Some("fe".into()),
         }];
-        let built = entries(&settings, &loaded(), &views);
+        let built = entries(&settings, &loaded(), &views, &[]);
         assert_eq!(
             outline(&built),
             [
@@ -1247,7 +1496,7 @@ mod tests {
             ))),
             ..loaded()
         };
-        let lines = outline(&entries(&Settings::default(), &loaded, &[]));
+        let lines = outline(&entries(&Settings::default(), &loaded, &[], &[]));
         assert_eq!(
             lines[0],
             format!(
@@ -1270,11 +1519,11 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            outline(&entries(&settings, &loaded, &[]))[0],
+            outline(&entries(&settings, &loaded, &[], &[]))[0],
             "Inbox, 3 [3]"
         );
         assert_eq!(
-            outline(&entries(&Settings::default(), &loaded, &[]))[0],
+            outline(&entries(&Settings::default(), &loaded, &[], &[]))[0],
             "Inbox, 129 [129]"
         );
     }
@@ -1284,7 +1533,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.toggle_collapsed("workspace");
         settings.toggle_collapsed("team:be");
-        let lines = outline(&entries(&settings, &loaded(), &[]));
+        let lines = outline(&entries(&settings, &loaded(), &[], &[]));
         assert_eq!(
             lines,
             [
@@ -1295,6 +1544,46 @@ mod tests {
                 "## Your teams",
                 "Back-end",
             ]
+        );
+    }
+
+    #[test]
+    fn repositories_list_watched_and_pull_request_ones_once_with_actions_first() {
+        let repo = |slug: &str| RepoRef::parse(slug).expect("slug");
+        let mut settings = Settings {
+            watched_repos: vec![repo("IsraelAraujo70/loupe")],
+            ..Settings::default()
+        };
+        settings.toggle_collapsed("workspace");
+        settings.toggle_collapsed("teams");
+        let listed = repos::list(
+            &settings.pinned_repos,
+            &settings.watched_repos,
+            &[
+                repo("IsraelAraujo70/dotfiles"),
+                repo("IsraelAraujo70/loupe"),
+            ],
+        );
+        settings.toggle_open_repo(&repo("IsraelAraujo70/dotfiles"));
+        let lines = outline(&entries(&settings, &loaded(), &[], &listed));
+        assert_eq!(
+            lines[5..],
+            [
+                "## Repositories",
+                "Actions of every repository",
+                "IsraelAraujo70/loupe",
+                "IsraelAraujo70/dotfiles",
+                "  IsraelAraujo70/dotfiles Pull requests",
+                "  IsraelAraujo70/dotfiles Actions",
+            ]
+        );
+        let Entry::Row(watched) = &entries(&settings, &loaded(), &[], &listed)[7] else {
+            panic!("a row")
+        };
+        let menu = watched.repo.as_ref().expect("a repository row");
+        assert_eq!(
+            menu.below, None,
+            "a pull request's repository is not a watched one to swap with"
         );
     }
 

@@ -14,6 +14,7 @@ mod palette;
 mod pr_row;
 mod pull_request;
 mod repo;
+pub(crate) mod repos;
 mod widgets;
 
 use gpui_kit::{AnyView, App, SharedString, Task, Window};
@@ -70,6 +71,11 @@ pub fn actions_view(
     cx: &mut App,
 ) -> AnyView {
     actions::runs_view(repo, branch, window, cx)
+}
+
+/// The Actions page: the runs of every repository the sidebar lists.
+pub fn all_actions_view(window: &mut Window, cx: &mut App) -> AnyView {
+    actions::all_runs_view(window, cx)
 }
 
 pub fn workflow_run_view(
