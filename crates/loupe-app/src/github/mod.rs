@@ -4,6 +4,7 @@
 
 mod actions;
 mod common;
+pub(crate) mod guide_service;
 pub(crate) mod highlight;
 mod inbox;
 pub(crate) mod live;

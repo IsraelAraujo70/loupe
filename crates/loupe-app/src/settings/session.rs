@@ -167,6 +167,7 @@ pub fn sign_in_github(token: String, viewer: Viewer, cx: &mut App) -> anyhow::Re
 pub fn sign_out_github(cx: &mut App) -> anyhow::Result<()> {
     store::delete_secret(Secret::GitHubToken)?;
     crate::updater::set_token(None, cx);
+    crate::github::guide_service::set_github_token(None, cx);
     crate::cache::remove("offline/github-viewer");
     apply(cx, |services, accounts| {
         services.github = None;
@@ -457,6 +458,7 @@ pub fn set_t3(
 
 fn connect_github(token: String, viewer: Viewer, cx: &mut App) {
     crate::updater::set_token(Some(token.clone()), cx);
+    crate::github::guide_service::set_github_token(Some(token.clone()), cx);
     crate::cache::put("offline/github-viewer", &viewer);
     let client = Arc::new(GitHub::new(token));
     apply(cx, |services, accounts| {

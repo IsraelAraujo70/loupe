@@ -109,6 +109,7 @@ impl PullRequestView {
                     .accessibility_label("Open in browser")
                     .on_click(move |_, _, cx| cx.open_url(&url)),
             )
+            .child(self.render_summarize_button(detail, cx))
             .child(self.render_review_controls(detail, review_is_primary, cx))
             .child(self.render_action_controls(&pr_actions, detail, can_edit, cx));
         let meta = self.render_meta(detail, cx);
@@ -161,6 +162,33 @@ impl PullRequestView {
                     .items_center()
                     .child(meta)
                     .child(actions),
+            )
+    }
+
+    /// Summarize: opens the Guide tab and generates a guided review with local
+    /// Claude Code (or shows the cached guide when already up to date).
+    fn render_summarize_button(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> Div {
+        let busy = crate::github::guide_service::is_generating(cx, &detail.pr);
+        let fresh = crate::github::guide_service::has_fresh_guide(cx, &detail.pr, &detail.head_oid);
+        let tooltip = if busy {
+            "Generating guided review with Claude Code"
+        } else if fresh {
+            "Open the guided review for this commit"
+        } else {
+            "Generate a guided review using local Claude Code"
+        };
+        div()
+            .flex_none()
+            .debug_selector(|| "pr-summarize".into())
+            .child(
+                Button::new("pr-summarize")
+                    .outline()
+                    .control()
+                    .icon(IconName::Sparkles)
+                    .label(if busy { "Summarizing…" } else { "Summarize" })
+                    .tooltip(tooltip)
+                    .loading(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.summarize_pull_request(cx))),
             )
     }
 

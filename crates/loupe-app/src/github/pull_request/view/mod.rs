@@ -31,7 +31,7 @@ use super::checks::{ChecksTab, Freshness};
 use super::commits;
 use super::conversation::ConversationTab;
 use super::files::FilesTab;
-use super::guide::GuideTab;
+use super::guide::{GuideAction, GuideTab};
 use super::tab::{PrTabContext, PrTabEvent};
 use crate::github::common::{self, LoadError, Loadable, Submit};
 use crate::github::pr_feed::{self, PrLoaded};
@@ -444,6 +444,32 @@ impl PullRequestView {
         };
         let conversation = cx.new(|cx| ConversationTab::new(context.clone(), window, cx));
         let guide = cx.new(|cx| GuideTab::new(context.clone(), window, cx));
+        {
+            let pr_view = cx.entity().downgrade();
+            guide.update(cx, |tab, _| {
+                tab.set_action_handler(move |action, window, cx| match action {
+                    GuideAction::Generate => {
+                        pr_view
+                            .update(cx, |view, cx| view.trigger_guide_generation(cx))
+                            .ok();
+                    }
+                    GuideAction::Cancel => {
+                        pr_view
+                            .update(cx, |view, cx| {
+                                crate::github::guide_service::cancel_generation(&view.pr, cx);
+                            })
+                            .ok();
+                    }
+                    GuideAction::OpenSettings => {
+                        crate::shell::navigate(crate::route::Route::Settings, window, cx);
+                    }
+                    GuideAction::RecheckClaude => {
+                        crate::github::guide_service::recheck_availability(cx);
+                    }
+                });
+            });
+        }
+        crate::github::guide_service::probe_availability_if_needed(cx);
         let files = cx.new(|cx| FilesTab::new(context.clone(), window, cx));
         let checks = cx.new(|_| ChecksTab::new(context));
         self.subscriptions.push(cx.subscribe_in(
@@ -1018,6 +1044,23 @@ impl PullRequestView {
         }));
     }
 
+    pub(super) fn summarize_pull_request(&mut self, cx: &mut Context<Self>) {
+        self.tab = PrTab::Guide;
+        if let Some(detail) = self.detail.value().cloned()
+            && !crate::github::guide_service::is_generating(cx, &detail.pr)
+            && !crate::github::guide_service::has_fresh_guide(cx, &detail.pr, &detail.head_oid)
+        {
+            crate::github::guide_service::start_generation(detail, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn trigger_guide_generation(&mut self, cx: &mut Context<Self>) {
+        if let Some(detail) = self.detail.value().cloned() {
+            crate::github::guide_service::start_generation(detail, cx);
+        }
+    }
+
     fn set_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
         self.panel = if self.panel == panel {
             Panel::Closed
@@ -1197,6 +1240,13 @@ impl Render for PullRequestView {
             loaded
                 .checks
                 .update(cx, |tab, cx| tab.set_freshness(freshness, cx));
+            if let Some(detail) = self.detail.value() {
+                let guide_state =
+                    crate::github::guide_service::view_state(cx, &detail.pr, &detail.head_oid);
+                loaded
+                    .guide
+                    .update(cx, |tab, cx| tab.set_state(guide_state, cx));
+            }
         }
         if std::mem::take(&mut self.focus_review_body) {
             let summary = self.review_body.read(cx).focus_handle(cx);

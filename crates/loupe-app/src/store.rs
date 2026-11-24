@@ -66,6 +66,41 @@ pub enum CommentBoxPlace {
     Bottom,
 }
 
+/// Local Claude Code guided review preferences.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuideSettings {
+    pub model: loupe_guide::GuideModel,
+    pub effort: loupe_guide::GuideEffort,
+    /// Optional explicit path to the `claude` CLI executable.
+    pub executable: Option<String>,
+    /// Maximum automatic guides generated per rolling hour across saved views.
+    pub auto_max_per_hour: u32,
+}
+
+impl Default for GuideSettings {
+    fn default() -> Self {
+        Self {
+            model: loupe_guide::GuideModel::Sonnet,
+            effort: loupe_guide::GuideEffort::Medium,
+            executable: None,
+            auto_max_per_hour: 6,
+        }
+    }
+}
+
+impl GuideSettings {
+    pub const AUTO_LIMIT_OPTIONS: [u32; 5] = [2, 4, 6, 10, 20];
+
+    pub fn claude_config(&self) -> loupe_guide::ClaudeConfig {
+        loupe_guide::ClaudeConfig {
+            model: self.model.clone(),
+            effort: self.effort,
+            executable: self.executable.clone(),
+        }
+    }
+}
+
 /// A GitHub org (or user) or one repository whose pull requests link to
 /// issues of one Linear workspace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +188,8 @@ pub struct Settings {
     /// Where the new-comment box sits, once chosen; until then it follows
     /// [`Settings::comment_order`] (see [`Settings::comment_box_place`]).
     pub comment_box: Option<CommentBoxPlace>,
+    /// Local Claude Code guided PR review preferences.
+    pub guide: GuideSettings,
     /// Base URL of the T3 Code server, such as `https://t3.example.com:3774`.
     pub t3_server_url: Option<String>,
     /// The request template and the risk rules of "Review with T3 Code".

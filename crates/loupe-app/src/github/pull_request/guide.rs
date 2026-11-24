@@ -31,7 +31,6 @@ use crate::ui::{self, ControlSize as _};
 
 /// What the Guide tab currently displays.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum GuideViewState {
     /// No guide has been generated for this pull request yet.
     Empty,
@@ -92,7 +91,6 @@ impl GuideTab {
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_action_handler(
         &mut self,
         handler: impl Fn(GuideAction, &mut Window, &mut App) + 'static,
@@ -110,8 +108,10 @@ impl GuideTab {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub fn set_state(&mut self, state: GuideViewState, cx: &mut Context<Self>) {
+        if self.state == state {
+            return;
+        }
         if let GuideViewState::Ready { stored, .. } = &state
             && self.read_state_commit.as_deref() != Some(stored.head_oid.as_str())
         {
@@ -122,11 +122,6 @@ impl GuideTab {
         }
         self.state = state;
         cx.notify();
-    }
-
-    #[allow(dead_code)]
-    pub fn state(&self) -> &GuideViewState {
-        &self.state
     }
 
     /// Number of steps in the active guide, shown on the tab badge when ready.
