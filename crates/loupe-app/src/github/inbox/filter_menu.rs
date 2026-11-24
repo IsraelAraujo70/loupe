@@ -358,7 +358,11 @@ impl Render for FilterMenu {
                     .border_b_1()
                     .border_color(border)
                     .when(back.is_none(), |row| {
-                        row.child(svg_icon(IconName::Search, crate::theme::scale::icon_md(), muted))
+                        row.child(svg_icon(
+                            IconName::Search,
+                            crate::theme::scale::icon_md(),
+                            muted,
+                        ))
                     })
                     .when_some(back, |row, field| {
                         row.child(

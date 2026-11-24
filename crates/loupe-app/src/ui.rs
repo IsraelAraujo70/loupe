@@ -32,8 +32,8 @@ pub use menu::{MenuRow, menu_row};
 pub use reading::{READING_WIDTH, markdown};
 pub use scroll_row::ScrollRow;
 pub use segmented::segmented;
-pub use side::{SideEdge, SideSection, side_empty, side_panel, side_section, side_sections};
-pub use tabs::{SectionTab, SectionTabs, section_tab, section_tabs};
+pub use side::{SideEdge, side_empty, side_panel, side_section, side_sections};
+pub use tabs::{section_tab, section_tabs};
 
 /// Height of every page header and of the sidebar header beside it. It is
 /// window chrome: it lines up with the macOS traffic lights, so it stays in
@@ -468,7 +468,13 @@ impl RenderOnce for PageHeader {
             .when_some(self.count, |row, count| row.child(count_badge(count, cx)))
             .children(self.after_title)
             .child(div().flex_1().min_w_4())
-            .child(h_flex().flex_none().gap_1p5().items_center().children(self.actions))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .items_center()
+                    .children(self.actions),
+            )
     }
 }
 
@@ -508,9 +514,12 @@ pub fn meta_band(cx: &App) -> Div {
 /// Visual tone for an inline [`notice_bar`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeTone {
+    #[allow(dead_code)]
     Info,
     Error,
 }
+
+pub type DismissHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// A full-width inline notice strip aligned to `content_inset`, with optional
 /// dismiss button. Replaces per-screen notice/error strips.
@@ -518,7 +527,7 @@ pub fn notice_bar(
     id: impl Into<ElementId>,
     text: impl Into<SharedString>,
     tone: NoticeTone,
-    on_dismiss: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
+    on_dismiss: Option<DismissHandler>,
     cx: &App,
 ) -> Div {
     let theme = cx.theme();
@@ -537,7 +546,13 @@ pub fn notice_bar(
         .border_b_1()
         .border_color(tokens::border_subtle())
         .text_size(scale::meta())
-        .child(div().flex_1().min_w_0().text_color(color).child(text.into()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(color)
+                .child(text.into()),
+        )
         .when_some(on_dismiss, |row, dismiss| {
             row.child(
                 icon_button(dismiss_id, IconName::Close, "Dismiss")

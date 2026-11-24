@@ -18,6 +18,8 @@ pub mod themes;
 
 #[cfg(test)]
 mod fixed_colors;
+#[cfg(test)]
+mod fixed_sizes;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -513,10 +515,6 @@ pub mod scale {
     pub fn dialog_sm() -> Pixels {
         dp(400.)
     }
-    /// Medium dialog width (forms with multiple fields), 440 px.
-    pub fn dialog_md() -> Pixels {
-        dp(440.)
-    }
     /// Standard dropdown/popover menu width, 280 px.
     pub fn popover_width() -> Pixels {
         dp(280.)
@@ -548,10 +546,6 @@ pub mod scale {
     /// Side panel person avatar, 20 px.
     pub fn avatar_md() -> Pixels {
         dp(20.)
-    }
-    /// Header / comment author avatar, 24 px.
-    pub fn avatar_lg() -> Pixels {
-        dp(24.)
     }
     /// Full pill corner radius for badges and chips.
     pub fn pill_radius() -> Pixels {

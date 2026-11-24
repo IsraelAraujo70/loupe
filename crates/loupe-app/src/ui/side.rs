@@ -61,11 +61,6 @@ impl SideSection {
         self
     }
 
-    pub fn action(mut self, action: impl IntoElement) -> Self {
-        self.action = Some(action.into_any_element());
-        self
-    }
-
     pub fn maybe_action(mut self, action: Option<impl IntoElement>) -> Self {
         self.action = action.map(IntoElement::into_any_element);
         self

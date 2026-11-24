@@ -78,7 +78,12 @@ pub fn list_group_header(id: impl Into<ElementId>, collapsed: bool, cx: &App) ->
 /// Actions jobs column).
 pub fn nav_row(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<Div> {
     let theme = cx.theme();
-    let (active, hover) = (theme.list_active, theme.list_hover);
+    let (fg, muted, active, hover) = (
+        theme.foreground,
+        theme.muted_foreground,
+        theme.list_active,
+        theme.list_hover,
+    );
     h_flex()
         .id(id)
         .role(Role::Button)
@@ -89,6 +94,9 @@ pub fn nav_row(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<D
         .items_center()
         .rounded(theme.radius)
         .text_size(scale::body())
-        .when(selected, move |row| row.bg(active))
-        .hover(move |row| row.bg(hover))
+        .when(selected, move |row| row.bg(active).text_color(fg))
+        .when(!selected, move |row| {
+            row.text_color(muted)
+                .hover(move |style| style.bg(hover).text_color(fg))
+        })
 }

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, Utc};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::skeleton::Skeleton;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{

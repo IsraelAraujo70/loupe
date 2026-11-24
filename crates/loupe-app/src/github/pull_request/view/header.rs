@@ -13,8 +13,7 @@ use super::PullRequestView;
 use super::model::{MergeAction, available_actions, head_label};
 use crate::github::pull_request::checks::ChecksSummary;
 use crate::github::widgets;
-use crate::theme::scale::dp;
-use crate::theme::{scale, tokens};
+use crate::theme::scale::{self, dp};
 use crate::ui::{self, ControlSize as _, WindowDragArea as _};
 
 /// How long Copy link says "Copied" after a click.

@@ -27,8 +27,6 @@ pub fn settings_view(window: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|cx| SettingsView::new(window, cx)).into()
 }
 
-/// The width of the nav beside the page.
-const NAV_WIDTH: f32 = 220.;
 /// The width of the page's column of cards.
 const PAGE_WIDTH: f32 = 640.;
 
@@ -621,28 +619,10 @@ impl SettingsView {
             }
             let selected = reading == Some(section);
             list = list.child(
-                h_flex()
-                    .id(("settings-nav", index))
+                ui::nav_row(("settings-nav", index), selected, cx)
                     .debug_selector(move || format!("settings-nav-{}", section.id()))
                     .role(Role::Link)
                     .aria_label(section.title())
-                    .h(scale::nav_row_height())
-                    .px_2()
-                    .gap_2()
-                    .items_center()
-                    .rounded(dp(6.))
-                    .text_size(scale::body())
-                    .when(selected, |row| {
-                        row.bg(tokens::glass_selected())
-                            .text_color(colors.foreground)
-                    })
-                    .when(!selected, |row| {
-                        row.text_color(colors.muted).hover(|style| {
-                            style
-                                .bg(tokens::glass_hover())
-                                .text_color(colors.foreground)
-                        })
-                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.go_to(index, cx)))
                     .child(
                         svg()
@@ -659,17 +639,10 @@ impl SettingsView {
             );
         }
         let search_empty = self.search.read(cx).value().is_empty();
-        v_flex()
-            .id("settings-nav")
-            .flex_none()
-            .w(dp(NAV_WIDTH))
-            .h_full()
+        ui::side_panel("settings-nav", ui::SideEdge::Leading, scale::nav_width())
             .px_2()
             .py_3()
             .gap_1()
-            .border_r_1()
-            .border_color(tokens::border_subtle())
-            .overflow_y_scroll()
             .child(
                 Input::new(&self.search)
                     .small()

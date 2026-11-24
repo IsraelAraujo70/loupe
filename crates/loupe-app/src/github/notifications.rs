@@ -1022,7 +1022,11 @@ impl NotificationsView {
                         })
                         .text_color(muted),
                     ),
-                    None => slot.child(Icon::new(icon).with_size(scale::icon_sm()).text_color(icon_color)),
+                    None => slot.child(
+                        Icon::new(icon)
+                            .with_size(scale::icon_sm())
+                            .text_color(icon_color),
+                    ),
                 }
             }))
             .child(

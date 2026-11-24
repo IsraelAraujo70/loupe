@@ -811,7 +811,7 @@ pub(super) fn state_chip_trigger(issue: &IssueSummary, selected: bool, cx: &App)
         .compact()
         .h_6()
         .px_2()
-        .rounded(px(9999.))
+        .rounded(scale::pill_radius())
         .selected(selected)
         .child(
             h_flex()

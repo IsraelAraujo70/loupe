@@ -24,9 +24,7 @@ use loupe_github::{
 use super::graph::{GraphEvent, GraphView};
 use super::layout::graph_nodes;
 use super::log::JobPane;
-use super::{
-    POLL_EVERY, format_duration, job_duration_label, status_style, status_word,
-};
+use super::{POLL_EVERY, format_duration, job_duration_label, status_style, status_word};
 use crate::github::common::{self, Loadable, Submit};
 use crate::shell::Refreshable as _;
 use crate::theme::{scale, tokens};
@@ -482,7 +480,11 @@ impl RunView {
             h_flex()
                 .gap_1()
                 .items_center()
-                .child(Icon::new(icon).with_size(scale::icon_sm()).text_color(color))
+                .child(
+                    Icon::new(icon)
+                        .with_size(scale::icon_sm())
+                        .text_color(color),
+                )
                 .child(capitalized(status_word(run.status))),
         );
         ui::meta_band(cx)
@@ -934,7 +936,10 @@ fn keeps_polling(run: Option<&WorkflowRun>, awaited: Option<u32>) -> bool {
 fn confirm_cancel(view: WeakEntity<RunView>, window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, move |dialog, _, cx| {
         let view = view.clone();
-        dialog.title("Cancel this run?").w(scale::dialog_sm()).child(
+        dialog
+            .title("Cancel this run?")
+            .w(scale::dialog_sm())
+            .child(
             v_flex()
                 .gap_3()
                 .child(

@@ -490,7 +490,7 @@ impl Render for ProjectView {
             self.focus.focus(window, cx);
         }
         let body = match (&self.project, self.tab) {
-            (Loadable::Loading, _) => div().py_2().child(ui::skeleton_rows(8)).into_any_element(),
+            (Loadable::Loading, _) => ui::loading_rows(8).into_any_element(),
             (Loadable::Failed(message), _) => {
                 widgets::load_error(message.clone(), cx.listener(|view, _, _, cx| view.load(cx)))
             }
@@ -515,15 +515,12 @@ impl Render for ProjectView {
                     .min_h_0()
                     .child(overview::render(&project, cx))
                     .child(
-                        v_flex()
-                            .id("project-side")
-                            .w(dp(360.))
-                            .flex_none()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .border_l_1()
-                            .border_color(crate::theme::tokens::border_subtle())
-                            .child(side),
+                        ui::side_panel(
+                            "project-side",
+                            ui::SideEdge::Trailing,
+                            crate::theme::scale::side_wide_width(),
+                        )
+                        .child(side),
                     )
                     .into_any_element()
             }

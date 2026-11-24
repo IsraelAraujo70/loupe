@@ -2330,17 +2330,18 @@ impl InboxView {
                             view.update(cx, |this, cx| this.set_sort(next, cx)).ok();
                         })
                 };
-                let menu = SortKey::ALL
-                    .iter()
-                    .fold(menu.min_w(scale::menu_min_width()), |menu, &key| {
-                        // A new field keeps the direction already picked.
-                        let dir = sort.map_or(SortDir::Ascending, |sort| sort.dir);
-                        menu.item(set(
-                            key.label(),
-                            sort.is_some_and(|sort| sort.key == key),
-                            Some(Sort { key, dir }),
-                        ))
-                    });
+                let menu =
+                    SortKey::ALL
+                        .iter()
+                        .fold(menu.min_w(scale::menu_min_width()), |menu, &key| {
+                            // A new field keeps the direction already picked.
+                            let dir = sort.map_or(SortDir::Ascending, |sort| sort.dir);
+                            menu.item(set(
+                                key.label(),
+                                sort.is_some_and(|sort| sort.key == key),
+                                Some(Sort { key, dir }),
+                            ))
+                        });
                 let menu = match sort {
                     Some(sort) => {
                         let (ascending, descending) = sort.key.directions();

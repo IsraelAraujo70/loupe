@@ -103,7 +103,10 @@ fn open_name_dialog(
         if focus_once.replace(false) {
             input.focus_handle(cx).focus(window, cx);
         }
-        dialog.title(title).w(scale::dialog_sm()).child(form.clone())
+        dialog
+            .title(title)
+            .w(scale::dialog_sm())
+            .child(form.clone())
     });
 }
 

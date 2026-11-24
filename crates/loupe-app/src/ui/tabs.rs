@@ -64,7 +64,10 @@ impl SectionTab {
         self
     }
 
-    pub fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_click(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_click = Some(Rc::new(handler));
         self
     }
@@ -90,18 +93,8 @@ pub fn section_tabs(id: impl Into<ElementId>, active: usize) -> SectionTabs {
 }
 
 impl SectionTabs {
-    pub fn tab(mut self, tab: SectionTab) -> Self {
-        self.tabs.push(tab);
-        self
-    }
-
     pub fn tabs(mut self, tabs: impl IntoIterator<Item = SectionTab>) -> Self {
         self.tabs.extend(tabs);
-        self
-    }
-
-    pub fn trailing(mut self, element: impl IntoElement) -> Self {
-        self.trailing.push(element.into_any_element());
         self
     }
 
@@ -167,10 +160,11 @@ impl RenderOnce for SectionTabs {
                             .when(!selected, |el| el.hover(move |s| s.text_color(fg)))
                             .when_some(tab.icon, |el, icon| {
                                 el.child(
-                                    Icon::new(icon)
-                                        .small()
-                                        .flex_none()
-                                        .text_color(if selected { fg } else { muted }),
+                                    Icon::new(icon).small().flex_none().text_color(if selected {
+                                        fg
+                                    } else {
+                                        muted
+                                    }),
                                 )
                             })
                             .child(div().flex_none().child(tab.label))
