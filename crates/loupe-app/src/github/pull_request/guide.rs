@@ -154,6 +154,7 @@ impl GuideTab {
                     effort,
                     generated_at: Utc::now(),
                     changed_files: Vec::new(),
+                    language: loupe_guide::GuideLanguage::english(),
                     guide,
                 });
                 self.set_state(
@@ -518,6 +519,18 @@ impl GuideTab {
             .border_b_1()
             .border_color(tokens::border_subtle())
             .child(ui::chip().child(stored.model.clone()))
+            .child(
+                div()
+                    .id("guide-language")
+                    .debug_selector(|| "guide-language".into())
+                    .child(ui::chip().child(stored.language.name().to_owned()))
+                    .tooltip(|window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(
+                            "Language this guide was written in",
+                        )
+                        .build(window, cx)
+                    }),
+            )
             .child(
                 ui::chip().child(
                     div()
@@ -1566,6 +1579,7 @@ mod tests {
             effort: "medium".into(),
             generated_at: Utc::now(),
             changed_files: vec!["src/auth.rs".into(), "src/uncovered.rs".into()],
+            language: loupe_guide::GuideLanguage::portuguese_brazil(),
             guide: fixture_guide(),
         });
         let emitted: Rc<RefCell<Vec<PrTabEvent>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1589,6 +1603,10 @@ mod tests {
         assert!(
             cx.debug_bounds("guide-stale-banner").is_some(),
             "guide for an older commit shows the stale banner"
+        );
+        assert!(
+            cx.debug_bounds("guide-language").is_some(),
+            "the guide says which language it was written in"
         );
         assert!(
             cx.debug_bounds("guide-uncovered-files").is_some(),

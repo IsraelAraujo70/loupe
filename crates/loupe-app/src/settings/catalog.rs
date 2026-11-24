@@ -149,6 +149,7 @@ pub enum Item {
     CommentBox,
     GuideModel,
     GuideEffort,
+    GuideLanguage,
     GuideExecutable,
     GuideAutoLimit,
     Repositories,
@@ -362,6 +363,14 @@ pub fn entries() -> Vec<Entry> {
             "Guide effort",
             "How deeply Claude Code reasons when building a guided PR review.",
             "guide summarize reasoning effort low medium high",
+        ),
+        entry(
+            GuideLanguage,
+            S::GitHub,
+            "Review guide",
+            "Guide language",
+            "The language guide text is written in. Code, paths, and names stay as they are.",
+            "guide summarize language english portuguese brazil translate locale",
         ),
         entry(
             GuideExecutable,

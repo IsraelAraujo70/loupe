@@ -221,8 +221,8 @@ pub struct PullRequestView {
     /// Runs while the header's Copy link button says "Copied", and puts its
     /// label back when it ends.
     link_copied: Option<Task<()>>,
-    /// Last `(head_oid, guide_service::revision)` synchronized into `GuideTab`.
-    guide_sync: Option<(String, u64)>,
+    /// Last `(head_oid, guide_service::revision, language)` synchronized into `GuideTab`.
+    guide_sync: Option<(String, u64, loupe_guide::GuideLanguage)>,
     _ticker: Task<()>,
 }
 
@@ -1052,11 +1052,23 @@ impl PullRequestView {
         self.tab = PrTab::Guide;
         if let Some(detail) = self.detail.value().cloned()
             && !crate::github::guide_service::is_generating(cx, &detail.pr)
-            && !crate::github::guide_service::has_fresh_guide(cx, &detail.pr, &detail.head_oid)
+            && !crate::github::guide_service::has_fresh_guide(cx, &detail)
         {
             crate::github::guide_service::start_generation(detail, cx);
         }
         cx.notify();
+    }
+
+    /// Summarize in `language` for this pull request, without changing Settings.
+    pub(super) fn summarize_in(
+        &mut self,
+        language: loupe_guide::GuideLanguage,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(detail) = self.detail.value().cloned() {
+            crate::github::guide_service::set_language_for(&detail, language, cx);
+        }
+        self.summarize_pull_request(cx);
     }
 
     pub(super) fn trigger_guide_generation(&mut self, cx: &mut Context<Self>) {
@@ -1248,10 +1260,10 @@ impl Render for PullRequestView {
                 let sync_key = (
                     detail.head_oid.clone(),
                     crate::github::guide_service::revision(cx),
+                    crate::github::guide_service::wanted_language(cx, detail),
                 );
                 if self.guide_sync.as_ref() != Some(&sync_key) {
-                    let guide_state =
-                        crate::github::guide_service::view_state(cx, &detail.pr, &detail.head_oid);
+                    let guide_state = crate::github::guide_service::view_state(cx, detail);
                     loaded
                         .guide
                         .update(cx, |tab, cx| tab.set_state(guide_state, cx));
