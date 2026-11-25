@@ -47,3 +47,4 @@
 - Entry 047: a one-line change, so the pull request has more than 250 commits.
 - Entry 048: a one-line change, so the pull request has more than 250 commits.
 - Entry 049: a one-line change, so the pull request has more than 250 commits.
+- Entry 050: a one-line change, so the pull request has more than 250 commits.
