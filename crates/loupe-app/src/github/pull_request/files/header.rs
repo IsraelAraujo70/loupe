@@ -21,7 +21,7 @@ use gpui_kit::*;
 use crate::github::widgets;
 
 /// What stands for the folders a shortened path leaves out.
-const ELLIPSIS: &str = "…";
+pub(super) const ELLIPSIS: &str = "…";
 
 /// `path` shortened to at most `max` wide, as `width` measures text.
 ///
@@ -66,7 +66,7 @@ fn fold(folders: &[&str], kept: usize, name: &str) -> String {
 
 /// The longest start of `name` that fits with `…` and the extension after
 /// it, or without the extension when even one character and it do not fit.
-fn cut_name(name: &str, max: f32, width: &impl Fn(&str) -> f32) -> String {
+pub(super) fn cut_name(name: &str, max: f32, width: &impl Fn(&str) -> f32) -> String {
     let (stem, extension) = match name.rfind('.') {
         Some(dot) if dot > 0 => name.split_at(dot),
         _ => (name, ""),
@@ -100,6 +100,35 @@ fn cut_name(name: &str, max: f32, width: &impl Fn(&str) -> f32) -> String {
 /// What a click on Viewed does, with the new state.
 pub type OnViewed = Rc<dyn Fn(bool, &mut Window, &mut App)>;
 
+/// Told, each frame the header is drawn, where it is and where the part of
+/// the diff on screen is.
+pub type OnDrawn = Rc<dyn Fn(Bounds<Pixels>, Bounds<Pixels>)>;
+
+/// How wide `text` is in the window's current text style at `weight`.
+pub(super) fn text_width(window: &Window, weight: FontWeight) -> impl Fn(&str) -> f32 + '_ {
+    let style = window.text_style();
+    let font = Font {
+        weight,
+        ..style.font()
+    };
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    move |text: &str| -> f32 {
+        let run = TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(text.to_owned().into(), font_size, &[run], None)
+            .width
+            .into()
+    }
+}
+
 /// Everything a file's header shows besides the component's collapse
 /// control.
 pub struct HeaderContent {
@@ -116,6 +145,7 @@ pub struct HeaderContent {
     /// fades while long lines scroll.
     pub fade: Pixels,
     pub on_viewed: OnViewed,
+    pub on_drawn: Option<OnDrawn>,
 }
 
 /// A file's header: the path at the leading edge of what is on screen and
@@ -126,6 +156,9 @@ pub fn file_header(content: HeaderContent) -> impl IntoElement {
             // The clip of the rows that scroll sideways is the part of the
             // diff on screen.
             let mask = window.content_mask().bounds;
+            if let Some(on_drawn) = &content.on_drawn {
+                on_drawn(bounds, mask);
+            }
             // Scrolled past its start, the path keeps 8 px off the panel's edge.
             let left = bounds.left().max(mask.left() + window.rem_size() * 0.5);
             let right = bounds.right().min(mask.right());
@@ -137,32 +170,14 @@ pub fn file_header(content: HeaderContent) -> impl IntoElement {
             let gap = window.rem_size() * 0.75;
             let room = (end - left - band_size.width - gap).max(px(0.));
 
-            let style = window.text_style();
-            let font = Font {
-                weight: FontWeight::MEDIUM,
-                ..style.font()
-            };
-            let font_size = style.font_size.to_pixels(window.rem_size());
-            let measure = |text: &str| -> f32 {
-                let run = TextRun {
-                    len: text.len(),
-                    font: font.clone(),
-                    color: style.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                window
-                    .text_system()
-                    .shape_line(text.to_owned().into(), font_size, &[run], None)
-                    .width
-                    .into()
-            };
-            let room_f = f32::from(room);
-            let label: SharedString = if measure(&content.title) <= room_f {
-                content.title.clone()
-            } else {
-                abbreviate_path(&content.path, room_f, measure).into()
+            let label: SharedString = {
+                let measure = text_width(window, FontWeight::MEDIUM);
+                let room = f32::from(room);
+                if measure(&content.title) <= room {
+                    content.title.clone()
+                } else {
+                    abbreviate_path(&content.path, room, measure).into()
+                }
             };
             let mut title = path_label(label, content.title.clone());
             let title_size = title.layout_as_root(
@@ -236,6 +251,7 @@ fn trailing_band(content: &HeaderContent, cx: &App) -> AnyElement {
                     content.path
                 )))
                 .label("Viewed")
+                .accessibility_label(format!("Viewed {}", content.path))
                 .checked(content.viewed)
                 .on_change(move |checked, window, cx| on_viewed(*checked, window, cx)),
             ),
