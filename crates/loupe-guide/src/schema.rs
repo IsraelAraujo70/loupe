@@ -8,6 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::language::GuideLanguage;
+
 /// The only guide schema version supported by this build.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -183,6 +185,10 @@ pub struct StoredGuide {
     /// used to show files the guide did not cover with any snippet.
     #[serde(default)]
     pub changed_files: Vec<String>,
+    /// Language the guide's prose was written in. Guides saved before Loupe
+    /// asked for a language were written in English.
+    #[serde(default = "GuideLanguage::english")]
+    pub language: GuideLanguage,
     pub guide: ReviewGuide,
 }
 
@@ -919,6 +925,7 @@ mod tests {
                 "crates/api/src/auth.rs".into(),
                 "crates/api/src/telemetry.rs".into(),
             ],
+            language: crate::GuideLanguage::english(),
             guide: guide_v1.clone(),
         };
         assert_eq!(
@@ -978,5 +985,34 @@ mod tests {
                 "removed_tests"
             ]
         );
+    }
+
+    #[test]
+    fn stored_guide_records_its_language_and_loads_guides_saved_without_one() {
+        let mut stored = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "repo": "IsraelAraujo70/loupe",
+            "pr_number": 140,
+            "head_oid": "aaaa1111bbbb2222",
+            "base_oid": "0000111122223333",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium",
+            "generated_at": "2026-11-20T12:00:00Z",
+            "changed_files": [],
+            "guide": sample_guide(),
+        });
+        let legacy: StoredGuide =
+            serde_json::from_value(stored.clone()).expect("a guide saved before #143 loads");
+        assert_eq!(legacy.language, crate::GuideLanguage::english());
+
+        stored["language"] = "Português (Brasil)".into();
+        let localized: StoredGuide = serde_json::from_value(stored).expect("loads");
+        assert_eq!(
+            localized.language,
+            crate::GuideLanguage::portuguese_brazil()
+        );
+        let round_trip: StoredGuide =
+            serde_json::from_str(&serde_json::to_string(&localized).unwrap()).unwrap();
+        assert_eq!(round_trip.language, localized.language);
     }
 }

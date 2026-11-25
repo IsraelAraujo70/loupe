@@ -2,6 +2,7 @@
 
 pub mod checkout;
 pub mod claude;
+pub mod language;
 pub mod prompt;
 pub mod runner;
 pub mod schema;
@@ -13,6 +14,7 @@ pub use claude::{
     PERMITTED_INIT_TOOLS, READ_ONLY_TOOLS, StreamEvent, build_command, check_availability,
     parse_stream_line, resolve_executable, unexpected_init_tools,
 };
+pub use language::{GuideLanguage, LanguagePreference, detect_language};
 pub use prompt::{
     GuidePromptInput, PromptComment, PromptCommit, PromptFile, SYSTEM_PROMPT, build_user_prompt,
 };

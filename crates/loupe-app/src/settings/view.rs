@@ -62,6 +62,8 @@ pub struct SettingsView {
     pub(super) guide_executable: Entity<InputState>,
     /// The Model row's free-form name, for a model outside the presets.
     pub(super) guide_model_name: Entity<InputState>,
+    /// The language typed for "Other" under Guide language.
+    pub(super) guide_language_other: Entity<InputState>,
     pub(super) github_error: Option<SharedString>,
     pub(super) appearance: AppearanceState,
     pub(super) review: ReviewFields,
@@ -108,6 +110,11 @@ impl SettingsView {
         });
         // The Connection row shows the last check; make sure there is one.
         crate::github::guide_service::probe_availability_if_needed(cx);
+        let guide_language_other = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Language, e.g. Español")
+                .default_value(other_language(&Settings::get(cx).guide.language))
+        });
         let (review, review_subscriptions) = ReviewFields::new(window, cx);
         let mut subscriptions = vec![
             cx.observe_global::<crate::services::Accounts>(|_, cx| cx.notify()),
@@ -137,6 +144,14 @@ impl SettingsView {
                 };
                 if next != current {
                     store::update_settings(cx, |settings| settings.guide.model = next);
+                }
+            }),
+            cx.subscribe(&guide_language_other, |_, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let raw = input.read(cx).value().to_string();
+                    store::update_settings(cx, |settings| {
+                        settings.guide.language = loupe_guide::LanguagePreference::Other(raw);
+                    });
                 }
             }),
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
@@ -181,6 +196,7 @@ impl SettingsView {
             t3_notice: Notice::None,
             guide_executable,
             guide_model_name,
+            guide_language_other,
             github_error: None,
             appearance,
             review,
@@ -239,6 +255,9 @@ impl SettingsView {
             self.guide_model_name.update(cx, |input, cx| {
                 input.set_value(custom_model_name(&guide.model), window, cx)
             });
+            let other = other_language(&guide.language);
+            self.guide_language_other
+                .update(cx, |input, cx| input.set_value(other, window, cx));
             crate::github::guide_service::recheck_availability(cx);
         }
         if section == Section::T3 {
@@ -651,6 +670,64 @@ impl SettingsView {
                             },
                         )
                     })
+                    .into_any_element())
+            }
+            Item::GuideLanguage => {
+                let current = settings.guide.language.clone();
+                let typed = self.guide_language_other.read(cx).value().to_string();
+                let is_other = matches!(current, loupe_guide::LanguagePreference::Other(_));
+                let menu_current = current.clone();
+                row(h_flex()
+                    .gap_2()
+                    .items_center()
+                    .when(is_other, |this| {
+                        this.child(
+                            div().w(dp(180.)).child(
+                                Input::new(&self.guide_language_other)
+                                    .small()
+                                    .aria_label("Other guide language"),
+                            ),
+                        )
+                    })
+                    .child(
+                        Button::new("guide-language")
+                            .outline()
+                            .control()
+                            .label(current.label())
+                            .dropdown_caret(true)
+                            .accessibility_label(format!("Guide language: {}", current.label()))
+                            .menu_trigger()
+                            .dropdown_menu(move |menu, _, _| {
+                                [
+                                    loupe_guide::LanguagePreference::SameAsPullRequest,
+                                    loupe_guide::LanguagePreference::English,
+                                    loupe_guide::LanguagePreference::PortugueseBrazil,
+                                    loupe_guide::LanguagePreference::Other(typed.clone()),
+                                ]
+                                .into_iter()
+                                .fold(
+                                    menu.min_w(scale::menu_min_width()),
+                                    |menu, choice| {
+                                        let selected = std::mem::discriminant(&choice)
+                                            == std::mem::discriminant(&menu_current);
+                                        let label = match choice {
+                                            loupe_guide::LanguagePreference::Other(_) => "Other…",
+                                            _ => choice.label(),
+                                        };
+                                        menu.item(
+                                            PopupMenuItem::new(label).checked(selected).on_click(
+                                                move |_, _, cx| {
+                                                    let choice = choice.clone();
+                                                    store::update_settings(cx, move |settings| {
+                                                        settings.guide.language = choice;
+                                                    });
+                                                },
+                                            ),
+                                        )
+                                    },
+                                )
+                            }),
+                    )
                     .into_any_element())
             }
             Item::GuideExecutable => row(div()
@@ -1087,6 +1164,14 @@ impl Render for SettingsView {
                     .child(self.nav(&shown, reading, colors, cx))
                     .child(page),
             )
+    }
+}
+
+/// The language typed for "Other", kept in the field while another choice is picked.
+fn other_language(preference: &loupe_guide::LanguagePreference) -> String {
+    match preference {
+        loupe_guide::LanguagePreference::Other(raw) => raw.clone(),
+        _ => String::new(),
     }
 }
 

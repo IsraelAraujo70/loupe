@@ -482,6 +482,7 @@ mod tests {
                     patch: Some("+pub fn add(a: i32, b: i32) -> i32 { a + b }".into()),
                 }],
                 previous_step_ids: Vec::new(),
+                language: crate::GuideLanguage::english(),
             };
             let err = run_in_checkout(
                 &stub,
@@ -535,6 +536,7 @@ mod tests {
                 comments: Vec::new(),
                 files: Vec::new(),
                 previous_step_ids: Vec::new(),
+                language: crate::GuideLanguage::english(),
             };
             let err = run_in_checkout_with_timeout(
                 &stub,
@@ -600,6 +602,7 @@ mod tests {
                     patch: Some("+pub fn add(a: i32, b: i32) -> i32 { a + b }".into()),
                 }],
                 previous_step_ids: Vec::new(),
+                language: crate::GuideLanguage::english(),
             };
 
             let config = ClaudeConfig {
