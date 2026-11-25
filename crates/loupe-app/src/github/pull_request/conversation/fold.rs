@@ -1,6 +1,6 @@
 //! Long and noisy comments, as on GitHub: a comment folds to its header, a
-//! tall body shows cut with "Show more", `<details>` blocks start closed, and
-//! long code blocks scroll on their own.
+//! body taller than the window shows cut with "Show more", `<details>`
+//! blocks start closed, and long code blocks scroll on their own.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,11 +16,6 @@ use crate::github::widgets;
 use crate::theme::{scale, tokens};
 use crate::ui;
 
-/// Bodies taller than this show cut, with "Show more": low enough that
-/// a long description leaves the comments and the comment box in view.
-fn max_body_height() -> Pixels {
-    scale::dp(360.)
-}
 /// The fade over the bottom of a cut body.
 fn fade_height() -> Pixels {
     scale::dp(72.)
@@ -36,6 +31,9 @@ pub(super) struct Folds {
     uncapped: HashSet<NodeId>,
     /// Each body's full height in the last layout.
     heights: HashMap<NodeId, Pixels>,
+    /// The window's height in the last layout: a body taller than this is
+    /// cut. Until the first layout nothing is.
+    viewport: Option<Pixels>,
     /// `<details>` blocks toggled away from how they start, by
     /// `{node}/{index path}`.
     details: HashSet<String>,
@@ -100,9 +98,10 @@ impl ConversationTab {
         }))
     }
 
-    /// A Markdown body cut at [`MAX_BODY_HEIGHT`] with "Show more" when it
-    /// is taller. Its full height is measured after layout, so the button
-    /// shows from the next frame on.
+    /// A Markdown body cut at the window's height with "Show more" when it
+    /// is taller, so a description that fits on one screen reads whole. Its
+    /// full height and the window's are measured after layout, so the cut
+    /// and the button show from the next frame on.
     pub(super) fn capped_body(
         &self,
         id: &NodeId,
@@ -111,28 +110,34 @@ impl ConversationTab {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let uncapped = self.folds.uncapped.contains(id);
-        let cap = max_body_height();
-        let tall = self
-            .folds
-            .heights
-            .get(id)
-            .is_some_and(|height| *height > cap);
+        let cap = self.folds.viewport;
+        let tall = cap.is_some_and(|cap| {
+            self.folds
+                .heights
+                .get(id)
+                .is_some_and(|height| *height > cap)
+        });
         let content = self.markdown(id, &segments::split(body), "", cx);
         let view = cx.entity().downgrade();
         let measured = id.clone();
         let mut frame = v_flex()
             .relative()
             .w_full()
-            .on_children_prepainted(move |bounds, _, cx| {
+            .on_children_prepainted(move |bounds, window, cx| {
                 let Some(height) = bounds.first().map(|bounds| bounds.size.height) else {
                     return;
                 };
+                let viewport = window.viewport_size().height;
                 let view = view.clone();
                 let key = measured.clone();
                 cx.defer(move |cx| {
                     view.update(cx, |this, cx| {
-                        if this.folds.heights.get(&key) != Some(&height) {
-                            this.folds.heights.insert(key, height);
+                        let folds = &mut this.folds;
+                        if folds.heights.get(&key) != Some(&height)
+                            || folds.viewport != Some(viewport)
+                        {
+                            folds.heights.insert(key, height);
+                            folds.viewport = Some(viewport);
                             cx.notify();
                         }
                     })
@@ -140,7 +145,7 @@ impl ConversationTab {
                 });
             })
             .child(div().flex_none().w_full().child(content));
-        if !uncapped {
+        if let Some(cap) = cap.filter(|_| !uncapped) {
             frame = frame.max_h(cap).overflow_hidden();
         }
         if tall && !uncapped {
