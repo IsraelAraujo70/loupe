@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use ureq::RequestBuilder;
 
 use crate::{
-    BranchCi, BranchPullRequest, ChangedFile, Error, FailedRun, FileStatus, GitHub, Notification,
-    NotificationSubject, PrRef, PrState, RepoRef, Result, Timestamp, ViewedState,
+    BranchCi, BranchPullRequest, ChangedFile, CommitFiles, Error, FailedRun, FileStatus, GitHub,
+    Notification, NotificationSubject, PrRef, PrState, RepoRef, Result, Timestamp, ViewedState,
 };
 
 pub(crate) const REST_URL: &str = "https://api.github.com";
@@ -78,6 +78,49 @@ impl GitHub {
     pub fn refresh_viewed_states(&self, pr: &PrRef, files: &mut [ChangedFile]) -> Result<()> {
         let facts = self.file_facts(pr)?;
         merge_file_facts(files, &facts);
+        Ok(())
+    }
+
+    /// The files commit `sha` changes against its first parent, with their
+    /// patches (REST, all pages). As for a pull request, GitHub leaves the
+    /// patch out of a file too large to show but keeps its line counts;
+    /// [`GitHub::omitted_patch`] with the parent as the base loads it. Every
+    /// file starts `Unviewed`: see [`GitHub::merge_viewed_states`].
+    pub fn commit_files(&self, repo: &RepoRef, sha: &str) -> Result<CommitFiles> {
+        if sha.is_empty() || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Decode(format!("invalid commit sha {sha:?}")));
+        }
+        let mut commit = CommitFiles {
+            parent_oid: None,
+            files: Vec::new(),
+        };
+        for page in 1..=MAX_FILE_PAGES {
+            let path = format!(
+                "/repos/{}/{}/commits/{sha}?per_page={FILES_PER_PAGE}&page={page}",
+                repo.owner, repo.name
+            );
+            let body = self.rest(RestMethod::Get, &path)?;
+            let (parent, batch) = parse_commit_page(&body)?;
+            commit.parent_oid = commit.parent_oid.or(parent);
+            let full_page = batch.len() == FILES_PER_PAGE;
+            commit.files.extend(batch);
+            if !full_page {
+                break;
+            }
+        }
+        Ok(commit)
+    }
+
+    /// Sets each file's viewed state in pull request `pr` from GraphQL and
+    /// leaves its line counts alone: for files that are not the pull
+    /// request's own list, such as one commit's.
+    pub fn merge_viewed_states(&self, pr: &PrRef, files: &mut [ChangedFile]) -> Result<()> {
+        let facts = self.file_facts(pr)?;
+        for file in files {
+            file.viewed = facts
+                .get(&file.path)
+                .map_or(ViewedState::Unviewed, |facts| facts.viewed);
+        }
         Ok(())
     }
 
@@ -642,18 +685,41 @@ fn file_status(status: &str) -> FileStatus {
 fn parse_files_page(body: &str) -> Result<Vec<ChangedFile>> {
     let wire: Vec<WireFile> =
         serde_json::from_str(body).map_err(|error| Error::Decode(error.to_string()))?;
-    Ok(wire
-        .into_iter()
-        .map(|file| ChangedFile {
-            path: file.filename,
-            previous_path: file.previous_filename,
-            status: file_status(&file.status),
-            additions: file.additions,
-            deletions: file.deletions,
-            patch: file.patch,
-            viewed: ViewedState::Unviewed,
-        })
-        .collect())
+    Ok(wire.into_iter().map(changed_file).collect())
+}
+
+#[derive(Deserialize)]
+struct WireCommitPage {
+    #[serde(default)]
+    parents: Vec<WireParent>,
+    #[serde(default)]
+    files: Vec<WireFile>,
+}
+
+#[derive(Deserialize)]
+struct WireParent {
+    sha: String,
+}
+
+/// Parses one page of `GET /commits/{sha}`: the first parent and the
+/// page's files, every one `Unviewed`.
+fn parse_commit_page(body: &str) -> Result<(Option<String>, Vec<ChangedFile>)> {
+    let wire: WireCommitPage =
+        serde_json::from_str(body).map_err(|error| Error::Decode(error.to_string()))?;
+    let parent = wire.parents.into_iter().next().map(|parent| parent.sha);
+    Ok((parent, wire.files.into_iter().map(changed_file).collect()))
+}
+
+fn changed_file(file: WireFile) -> ChangedFile {
+    ChangedFile {
+        path: file.filename,
+        previous_path: file.previous_filename,
+        status: file_status(&file.status),
+        additions: file.additions,
+        deletions: file.deletions,
+        patch: file.patch,
+        viewed: ViewedState::Unviewed,
+    }
 }
 
 /// What GraphQL knows of a changed file that REST may not tell.
@@ -893,6 +959,32 @@ mod tests {
 
         assert_eq!(files[2].status, FileStatus::Modified);
         assert!(files.iter().all(|f| f.viewed == ViewedState::Unviewed));
+    }
+
+    #[test]
+    fn a_commit_page_has_its_first_parent_and_its_files() {
+        let body = r#"{"sha":"c0ffee","parents":[{"sha":"aaa1"},{"sha":"bbb2"}],
+            "files":[
+                {"filename":"Cargo.lock","status":"added","additions":9557,"deletions":0},
+                {"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,
+                 "patch":"@@ -1 +1 @@\n-a\n+b"}
+            ]}"#;
+        let (parent, files) = parse_commit_page(body).expect("fixture parses");
+        assert_eq!(parent.as_deref(), Some("aaa1"), "the first parent");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].patch, None, "a patch GitHub left out stays out");
+        assert_eq!(
+            (files[0].additions, files[0].deletions),
+            (9557, 0),
+            "with its line counts"
+        );
+        assert_eq!(files[1].patch.as_deref(), Some("@@ -1 +1 @@\n-a\n+b"));
+        assert!(files.iter().all(|f| f.viewed == ViewedState::Unviewed));
+
+        let (parent, files) =
+            parse_commit_page(r#"{"sha":"root","parents":[]}"#).expect("a root commit parses");
+        assert_eq!(parent, None);
+        assert!(files.is_empty());
     }
 
     #[test]

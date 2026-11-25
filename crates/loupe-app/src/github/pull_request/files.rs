@@ -29,7 +29,9 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::diff::{Hunk, anchor_for_range, find_line, git_patch, parse_patch};
-use loupe_github::{ChangedFile, NodeId, PullRequestDetail, ViewedFailure, ViewedState};
+use loupe_github::{
+    ChangedFile, CommitFiles, NodeId, PullRequestDetail, ViewedFailure, ViewedState,
+};
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
 use self::model::{
@@ -61,6 +63,9 @@ const LONG_LINE: usize = 100;
 const LONG_LINES_HINT: &str = "These files have lines longer than the view. Scroll sideways with Shift + wheel or ← →, or choose Wrap.";
 /// What the toolbar's note about diffs GitHub left out explains.
 const OMITTED_HINT: &str = "GitHub leaves some diffs out of a pull request this large. Their line counts are included; choose Load diff on a file to see it.";
+/// The same note and hint for one commit.
+const COMMIT_OMITTED_NOTE: &str = "GitHub left this diff out because the commit is too large.";
+const COMMIT_OMITTED_HINT: &str = "GitHub leaves some diffs out of a commit this large. Their line counts are included; choose Load diff on a file to see it.";
 const FILE_LIST_MIN: f32 = 220.;
 const FILE_LIST_MAX: f32 = 640.;
 /// How wide the diff's trailing edge fades while long lines run past it.
@@ -80,8 +85,16 @@ struct ComposerSlot {
     _events: Subscription,
 }
 
+/// The one commit a tab shows instead of the whole pull request.
+struct CommitSource {
+    oid: String,
+    /// Its first parent, once its files load.
+    parent: Option<String>,
+}
+
 pub struct FilesTab {
     context: PrTabContext,
+    commit: Option<CommitSource>,
     load: Loadable<()>,
     _load: Option<Task<()>>,
     files: Vec<ChangedFile>,
@@ -114,6 +127,29 @@ pub struct FilesTab {
 
 impl FilesTab {
     pub fn new(context: PrTabContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(context, None, window, cx)
+    }
+
+    /// The tab for what commit `oid` of the pull request changes against its
+    /// first parent. Its Viewed marks are the pull request's, as on GitHub;
+    /// it takes no threads or new comments, which belong to the pull
+    /// request's whole diff.
+    pub fn for_commit(
+        context: PrTabContext,
+        oid: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let commit = CommitSource { oid, parent: None };
+        Self::build(context, Some(commit), window, cx)
+    }
+
+    fn build(
+        context: PrTabContext,
+        commit: Option<CommitSource>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
         let filter_changes = cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -122,6 +158,7 @@ impl FilesTab {
         });
         let mut tab = Self {
             context,
+            commit,
             load: Loadable::Loading,
             _load: None,
             files: Vec::new(),
@@ -159,6 +196,16 @@ impl FilesTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A commit's changes stay what they are whatever the pull request
+        // does next.
+        if self.commit.is_some() {
+            self.context.detail = detail;
+            if matches!(self.load, Loadable::Failed(_)) {
+                self.load_files(cx);
+            }
+            cx.notify();
+            return;
+        }
         let head_changed = detail.head_oid != self.context.detail.head_oid
             || detail.base_oid != self.context.detail.base_oid
             || detail.base_ref != self.context.detail.base_ref;
@@ -182,6 +229,10 @@ impl FilesTab {
     }
 
     fn load_files(&mut self, cx: &mut Context<Self>) {
+        if self.commit.is_some() {
+            self.load_commit_files(cx);
+            return;
+        }
         let key = crate::cache::github_key(
             cx,
             &format!(
@@ -269,6 +320,48 @@ impl FilesTab {
         ));
     }
 
+    /// Loads the commit's files, kept by commit since they never change, and
+    /// reads their viewed marks in the pull request every time.
+    fn load_commit_files(&mut self, cx: &mut Context<Self>) {
+        let Some(oid) = self.commit.as_ref().map(|commit| commit.oid.clone()) else {
+            return;
+        };
+        let pr = self.context.pr.clone();
+        let key = crate::cache::github_key(cx, &format!("commit-files/{}/{oid}", pr.repo.url()));
+        self.load.start_refresh();
+        let read_key = key.clone();
+        self._load = Some(common::run(
+            cx,
+            move |gh| {
+                let mut commit = match read_key
+                    .as_deref()
+                    .and_then(crate::cache::get::<CommitFiles>)
+                {
+                    Some(commit) => commit,
+                    None => gh.commit_files(&pr.repo, &oid)?,
+                };
+                gh.merge_viewed_states(&pr, &mut commit.files)?;
+                let loaded =
+                    build_files(into_tree_order(commit.files.clone()), git_patch, |patch| {
+                        parse_patch(patch).ok()
+                    });
+                Ok((commit, loaded))
+            },
+            move |this, result, cx| {
+                let loaded = result.map(|(commit, loaded)| {
+                    if let Some(key) = &key {
+                        crate::cache::put(key, &commit);
+                    }
+                    if let Some(source) = &mut this.commit {
+                        source.parent = commit.parent_oid;
+                    }
+                    loaded
+                });
+                this.finish_load(loaded, cx);
+            },
+        ));
+    }
+
     fn finish_load(&mut self, result: Result<LoadedFiles, LoadError>, cx: &mut Context<Self>) {
         let loaded = match result {
             Ok(loaded) => loaded,
@@ -304,15 +397,60 @@ impl FilesTab {
     }
 
     /// Collapses viewed files, and files whose diff GitHub left out so the
-    /// header stands alone with its Load diff note.
+    /// header stands alone with its Load diff note. A commit keeps viewed
+    /// files open: one viewed in the pull request may change again in it.
     fn collapse_viewed(&self, cx: &mut Context<Self>) {
         let Some(state) = &self.diff else { return };
+        let collapse_viewed = self.commit.is_none();
         state.update(cx, |state, cx| {
             for file in &self.files {
                 let omitted = self.missing.get(&file.path) == Some(&Missing::Omitted);
-                state.set_file_collapsed(&file.path, is_viewed(file.viewed) || omitted, cx);
+                let viewed = collapse_viewed && is_viewed(file.viewed);
+                state.set_file_collapsed(&file.path, viewed || omitted, cx);
             }
         });
+    }
+
+    /// Whether a Viewed mark was set here, so another view of the same pull
+    /// request should read the marks again.
+    pub fn wrote_viewed(&self) -> bool {
+        self.viewed_writes > 0
+    }
+
+    /// Reads the viewed marks again after another view of the pull request
+    /// changed them, and collapses or opens the files whose mark changed.
+    pub fn refresh_viewed(&mut self, cx: &mut Context<Self>) {
+        if self.commit.is_some() || self.load.value().is_none() || self.load.is_busy() {
+            return;
+        }
+        let pr = self.context.pr.clone();
+        let mut files = self.files.clone();
+        let expected_head = self.context.detail.head_oid.clone();
+        self._load = Some(common::run(
+            cx,
+            move |gh| {
+                gh.merge_viewed_states(&pr, &mut files)?;
+                Ok(files)
+            },
+            move |this, result, cx| {
+                let Ok(files) = result else { return };
+                if this.context.detail.head_oid != expected_head {
+                    return;
+                }
+                for fresh in files {
+                    let viewed = is_viewed(fresh.viewed);
+                    let changed = this.files.iter_mut().find(|file| {
+                        file.path == fresh.path
+                            && is_viewed(file.viewed) != viewed
+                            && !this.viewed_pending.contains(&file.path)
+                    });
+                    if let Some(file) = changed {
+                        file.viewed = fresh.viewed;
+                        this.set_collapsed(&fresh.path, viewed, cx);
+                    }
+                }
+            },
+        ));
     }
 
     /// Loads the diff GitHub left out of `path` and puts it in the viewer in
@@ -326,16 +464,27 @@ impl FilesTab {
         };
         self.patch_errors.remove(path);
         let pr = self.context.pr.clone();
-        let base = self.context.detail.base_oid.clone();
-        let head = self.context.detail.head_oid.clone();
-        let expected_head = head.clone();
+        // A commit's diff is against its first parent; a root commit only
+        // adds files, so it needs no older side.
+        let (base, head) = match &self.commit {
+            Some(commit) => (
+                commit.parent.clone().unwrap_or_else(|| commit.oid.clone()),
+                commit.oid.clone(),
+            ),
+            None => (
+                self.context.detail.base_oid.clone(),
+                self.context.detail.head_oid.clone(),
+            ),
+        };
+        let follows_head = self.commit.is_none();
+        let expected_head = self.context.detail.head_oid.clone();
         let owned_path = path.to_owned();
         let task = common::run(
             cx,
             move |gh| gh.omitted_patch(&pr, &base, &head, &file),
             move |this, result, cx| {
                 this.patch_loads.remove(&owned_path);
-                if this.context.detail.head_oid != expected_head {
+                if follows_head && this.context.detail.head_oid != expected_head {
                     return;
                 }
                 match result {
@@ -413,7 +562,7 @@ impl FilesTab {
     /// thread, so drafts and expanded state survive a reload.
     fn sync_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.threads_dirty = false;
-        if self.load.value().is_none() {
+        if self.load.value().is_none() || self.commit.is_some() {
             return;
         }
         let paths: HashSet<&str> = self.files.iter().map(|file| file.path.as_str()).collect();
@@ -771,6 +920,11 @@ impl FilesTab {
             .values()
             .filter(|reason| **reason == Missing::Omitted)
             .count();
+        let omitted_hint = if self.commit.is_some() {
+            COMMIT_OMITTED_HINT
+        } else {
+            OMITTED_HINT
+        };
         let tree_right = Settings::get(cx).file_tree_position == FileTreePosition::Right;
         let mut parts = vec![
             h_flex()
@@ -810,7 +964,7 @@ impl FilesTab {
                     .flex_none()
                     .text_size(scale::meta())
                     .text_color(muted)
-                    .tooltip(|window, cx| Tooltip::new(OMITTED_HINT).build(window, cx))
+                    .tooltip(move |window, cx| Tooltip::new(omitted_hint).build(window, cx))
                     .child(match omitted {
                         1 => "1 diff not loaded".to_owned(),
                         omitted => format!("{omitted} diffs not loaded"),
@@ -1206,6 +1360,9 @@ impl FilesTab {
             annotations.push(DiffAnnotation::file(id.clone(), path.clone()));
             let note = match self.patch_errors.get(path) {
                 Some(error) => error.clone().into(),
+                None if self.commit.is_some() && *reason == Missing::Omitted => {
+                    COMMIT_OMITTED_NOTE.into()
+                }
                 None => reason.note().into(),
             };
             let load = (*reason == Missing::Omitted)
@@ -1347,15 +1504,17 @@ impl FilesTab {
                     // The path, the size, and Viewed in the part of the
                     // header on screen, whether lines wrap or scroll.
                     .render_header(header)
-                    .on_add_annotation(move |range, window, cx| {
-                        let range = range.clone();
-                        add_weak
-                            .update(cx, |_, cx| {
-                                cx.defer_in(window, move |this, window, cx| {
-                                    this.open_composer(&range, window, cx)
-                                });
-                            })
-                            .ok();
+                    .when(self.commit.is_none(), |diff| {
+                        diff.on_add_annotation(move |range, window, cx| {
+                            let range = range.clone();
+                            add_weak
+                                .update(cx, |_, cx| {
+                                    cx.defer_in(window, move |this, window, cx| {
+                                        this.open_composer(&range, window, cx)
+                                    });
+                                })
+                                .ok();
+                        })
                     }),
             )
             .when(runs_on, |panel| {
@@ -1491,7 +1650,11 @@ impl Render for FilesTab {
                 ui::empty_state(
                     IconName::FileDiff,
                     "No changed files",
-                    "This pull request does not change any files.",
+                    if self.commit.is_some() {
+                        "This commit does not change any files."
+                    } else {
+                        "This pull request does not change any files."
+                    },
                 )
                 .into_any_element()
             }

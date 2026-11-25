@@ -499,6 +499,14 @@ pub struct ChangedFile {
     pub viewed: ViewedState,
 }
 
+/// What one commit changes against its first parent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitFiles {
+    /// `None` for a commit with no parent.
+    pub parent_oid: Option<String>,
+    pub files: Vec<ChangedFile>,
+}
+
 /// What GitHub knows about a branch whose workflow run failed: the pull
 /// request the branch belongs to, and its failed runs. A notification about
 /// a workflow run names only the workflow and the branch.
