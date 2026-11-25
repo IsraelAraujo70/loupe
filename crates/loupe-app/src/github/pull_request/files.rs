@@ -60,7 +60,7 @@ use self::sticky::HeaderWatch;
 use self::tree::{
     GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
     file_tint, filter_keeps, folder_tint, initial_collapsed, into_tree_order, move_down, move_left,
-    move_right, move_up, tree_rows, viewed_mark,
+    move_right, move_up, shown_row, tree_rows, viewed_mark,
 };
 use self::tree_view::{RowView, StickyFolders};
 use super::tab::{PrTabContext, PrTabEvent};
@@ -86,7 +86,11 @@ const OMITTED_HINT: &str = "GitHub leaves some diffs out of a pull request this 
 /// The same note and hint for one commit.
 const COMMIT_OMITTED_NOTE: &str = "GitHub left this diff out because the commit is too large.";
 const COMMIT_OMITTED_HINT: &str = "GitHub leaves some diffs out of a commit this large. Their line counts are included; choose Load diff on a file, or Load all, to see them.";
-const FILE_LIST_MIN: f32 = 220.;
+/// Wide enough for a whole file name five folders deep.
+const FILE_LIST_MIN: f32 = 320.;
+/// The most of the window the tree takes, so a width dragged in a wide
+/// window leaves the diff its room in a narrow one.
+const FILE_LIST_SHARE: f32 = 1. / 3.;
 const FILE_LIST_MAX: f32 = 640.;
 /// How wide the diff's trailing edge fades while long lines run past it.
 pub(super) const FADE_WIDTH: f32 = 32.;
@@ -2182,9 +2186,17 @@ impl FilesTab {
         cx: &mut Context<Self>,
     ) {
         self.tree_focus.focus(window, cx);
-        self.selected = Some(path.to_owned());
         let rows = self.current_rows(cx);
-        if let Some(ix) = rows.iter().position(|row| row.path == path) {
+        let ix = rows.iter().position(|row| row.path == path);
+        // A closed folder standing for the selected file keeps the file
+        // selected, so opening it lands on the file.
+        let stands_for_selection = self.selected.as_deref().is_some_and(|selected| {
+            selected != path && ix.is_some() && shown_row(&rows, selected) == ix
+        });
+        if !stands_for_selection {
+            self.selected = Some(path.to_owned());
+        }
+        if let Some(ix) = ix {
             if sticky {
                 // Below the folders that stay pinned above it.
                 self.tree_scroll.scroll_to_item_strict_with_offset(
@@ -2193,17 +2205,19 @@ impl FilesTab {
                     rows[ix].depth,
                 );
             } else {
-                self.open_row(&rows[ix], cx);
+                self.open_row(&rows, ix, cx);
             }
         }
         cx.notify();
     }
 
     /// Selects the file whose lines reached the top of the diff, scrolling
-    /// the tree only as far as it takes to show it.
+    /// the tree only as far as it takes to show it. While a closed folder
+    /// hides the file, the folder on screen that holds it is highlighted
+    /// instead, without opening, and opening it shows the file selected.
     fn follow_diff(&mut self, path: &str, cx: &mut Context<Self>) {
         let rows = self.current_rows(cx);
-        let Some(ix) = rows.iter().position(|row| row.path == path) else {
+        let Some(ix) = shown_row(&rows, path) else {
             return;
         };
         self.selected = Some(path.to_owned());
@@ -2211,10 +2225,33 @@ impl FilesTab {
         cx.notify();
     }
 
-    fn open_row(&mut self, row: &TreeRow, cx: &mut Context<Self>) {
-        match row.kind {
-            RowKind::Dir(_) => self.toggle_folder(&row.path, cx),
-            RowKind::File { .. } => self.scroll_to(&row.path, cx),
+    fn open_row(&mut self, rows: &[TreeRow], ix: usize, cx: &mut Context<Self>) {
+        match &rows[ix].kind {
+            RowKind::Dir(dir) if !dir.expanded => self.open_folder(rows, ix, cx),
+            RowKind::Dir(_) => self.toggle_folder(&rows[ix].path, cx),
+            RowKind::File { .. } => self.scroll_to(&rows[ix].path, cx),
+        }
+    }
+
+    /// Opens the closed folder at `ix`. When it stands for the selected file
+    /// (`shown_row`), the folders down to that file open too, and the tree
+    /// scrolls to show the file selected.
+    fn open_folder(&mut self, rows: &[TreeRow], ix: usize, cx: &mut Context<Self>) {
+        self.collapsed.remove(&rows[ix].path);
+        cx.notify();
+        let Some(file) = self.selected.clone() else {
+            return;
+        };
+        if file == rows[ix].path || shown_row(rows, &file) != Some(ix) {
+            return;
+        }
+        self.collapsed.retain(|folder| {
+            !file
+                .strip_prefix(folder.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        });
+        if let Some(at) = shown_row(&self.current_rows(cx), &file) {
+            self.tree_scroll.scroll_to_item(at, ScrollStrategy::Nearest);
         }
     }
 
@@ -2253,7 +2290,7 @@ impl FilesTab {
         let selected = self
             .selected
             .as_deref()
-            .and_then(|path| rows.iter().position(|row| row.path == path));
+            .and_then(|path| shown_row(&rows, path));
         let step = match event.keystroke.key.as_str() {
             "down" => move_down(&rows, selected),
             "up" => move_up(&rows, selected),
@@ -2261,7 +2298,7 @@ impl FilesTab {
             "left" => selected.and_then(|ix| move_left(&rows, ix)),
             "enter" | "space" => {
                 if let Some(ix) = selected {
-                    self.open_row(&rows[ix], cx);
+                    self.open_row(&rows, ix, cx);
                 }
                 cx.stop_propagation();
                 cx.notify();
@@ -2275,9 +2312,7 @@ impl FilesTab {
                 self.selected = Some(rows[ix].path.clone());
                 self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
             }
-            Some(Move::Expand(ix)) => {
-                self.collapsed.remove(&rows[ix].path);
-            }
+            Some(Move::Expand(ix)) => self.open_folder(&rows, ix, cx),
             Some(Move::Collapse(ix)) => {
                 self.collapsed.insert(rows[ix].path.clone());
                 self.selected = Some(rows[ix].path.clone());
@@ -2292,7 +2327,7 @@ impl FilesTab {
         let selected = self
             .selected
             .as_deref()
-            .and_then(|path| rows.iter().position(|row| row.path == path));
+            .and_then(|path| shown_row(rows, path));
         let active = selected.and_then(|ix| active_folder(rows, ix));
         let starts = distinct_starts(rows);
         let muted = cx.theme().muted_foreground;
@@ -2945,7 +2980,7 @@ impl FilesTab {
                 div().flex_1().min_h_0().w_full().child({
                     let tree_right =
                         Settings::get(cx).file_tree_position == FileTreePosition::Right;
-                    let width = dp(self.tree_width(cx));
+                    let width = dp(self.tree_width(window, cx));
                     let tree = div()
                         .flex_none()
                         .h_full()
@@ -2993,13 +3028,16 @@ impl FilesTab {
             .into_any_element()
     }
 
-    /// The tree's width in points: the one being dragged, else the saved one.
-    fn tree_width(&self, cx: &App) -> f32 {
+    /// The tree's width in points: the one being dragged, else the saved
+    /// one, within the limits and at most [`FILE_LIST_SHARE`] of the window.
+    fn tree_width(&self, window: &Window, cx: &App) -> f32 {
+        let settings = Settings::get(cx);
+        let window_width = f32::from(window.viewport_size().width) / settings.zoom.factor();
+        let max = (window_width * FILE_LIST_SHARE).clamp(FILE_LIST_MIN, FILE_LIST_MAX);
         self.tree_drag
-            .or(Settings::get(cx).file_tree_width)
-            .map_or(FILE_LIST_WIDTH, |width| {
-                width.clamp(FILE_LIST_MIN, FILE_LIST_MAX)
-            })
+            .or(settings.file_tree_width)
+            .unwrap_or(FILE_LIST_WIDTH)
+            .clamp(FILE_LIST_MIN, max)
     }
 
     fn drag_tree_edge(
@@ -3220,7 +3258,9 @@ pub(super) mod tests {
     use super::emphasis::PLAIN;
     use super::expand::{Direction, Source};
     use super::model::build_files;
-    use super::{FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_WIDTH, FilesTab, PrTabContext};
+    use super::{
+        FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab, PrTabContext,
+    };
     use crate::services::{Accounts, Services};
     use crate::store::{FileTreePosition, Settings, update_settings};
 
@@ -3466,9 +3506,9 @@ pub(super) mod tests {
 
         // The same drag, mirrored: pulling the edge away from the tree's
         // side widens the tree, within the same limits.
-        drag_divider(cx, tree.left(), -60.);
+        drag_divider(cx, tree.left(), -20.);
         let (tree, diff) = panes(cx);
-        assert_eq!(width(tree), FILE_LIST_WIDTH + 120.);
+        assert_eq!(width(tree), FILE_LIST_WIDTH + 80.);
         assert_eq!(f32::from(tree.right()).round(), WINDOW_WIDTH);
         assert!(tree.left() >= diff.right());
 
@@ -3478,12 +3518,20 @@ pub(super) mod tests {
 
         drag_divider(cx, tree.left(), -900.);
         let (tree, diff) = panes(cx);
-        assert_eq!(width(tree), FILE_LIST_MAX, "no wider than the maximum");
+        assert_eq!(
+            width(tree),
+            (WINDOW_WIDTH * FILE_LIST_SHARE).round(),
+            "no wider than a third of the window"
+        );
         assert_eq!(f32::from(tree.right()).round(), WINDOW_WIDTH);
         assert!(
             (f32::from(diff.right()) - f32::from(tree.left())).abs() <= 1.,
             "the diff fills what the tree leaves"
         );
+
+        cx.simulate_resize(size(px(1920.), px(800.)));
+        let (tree, _) = panes(cx);
+        assert_eq!(width(tree), FILE_LIST_MAX, "no wider than the maximum");
     }
 
     /// A path far wider than the diff beside the tree at its opening width.
@@ -3720,6 +3768,61 @@ pub(super) mod tests {
             tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
             Some("src/next.rs"),
             "the tree selects the file that reached the top"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_closed_folder_stands_for_the_file_the_diff_reached(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_files_tab_with_files(
+            cx,
+            vec![
+                added("a/long.rs", 300),
+                added("b/c/next.rs", 100),
+                added("b/other.rs", 1),
+            ],
+        );
+        let cx = &mut cx;
+        panes(cx);
+        tab.update(cx, |tab, _| {
+            tab.collapsed.insert("b".to_owned());
+        });
+        for _ in 0..10 {
+            scroll_diff(cx, 600.);
+        }
+        let highlighted = |cx: &mut VisualTestContext| {
+            tab.read_with(cx, |tab, cx| {
+                let rows = tab.current_rows(cx);
+                let views = tab.row_views(&rows, false, cx);
+                views
+                    .iter()
+                    .filter(|view| view.selected)
+                    .map(|view| view.path.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
+            Some("b/c/next.rs")
+        );
+        assert_eq!(
+            highlighted(cx),
+            ["b"],
+            "the closed folder holding the file is highlighted"
+        );
+        assert!(
+            tab.read_with(cx, |tab, _| tab.collapsed.contains("b")),
+            "and stays closed"
+        );
+        tab.update(cx, |tab, cx| {
+            tab.collapsed.insert("b/c".to_owned());
+            let rows = tab.current_rows(cx);
+            let folder = rows.iter().position(|row| row.path == "b").unwrap();
+            tab.open_row(&rows, folder, cx);
+        });
+        assert_eq!(
+            highlighted(cx),
+            ["b/c/next.rs"],
+            "opening it opens the way to the file and shows it selected"
         );
     }
 

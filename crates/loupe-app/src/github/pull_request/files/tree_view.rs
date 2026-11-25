@@ -161,23 +161,7 @@ pub fn row(
                 })
                 .child(icon(view.icon, view.icon_color))
                 .child(if folder_row {
-                    let (head, between, tail) = split_label(&view.label);
-                    // A folder's name is whole at the tree's opening width;
-                    // in a narrower tree it is cut at its end, and the lanes
-                    // beside it keep their place.
-                    h_flex()
-                        .min_w_0()
-                        .ml(dp(4.))
-                        .text_size(scale::body())
-                        .text_color(view.label_color)
-                        .flex_shrink(1.)
-                        .overflow_hidden()
-                        .child(div().flex_none().child(head))
-                        .when(!between.is_empty(), |label| {
-                            label.child(div().flex_none().text_color(muted).child(between))
-                        })
-                        .child(div().flex_none().child(tail))
-                        .into_any_element()
+                    folder_label(view, muted).into_any_element()
                 } else {
                     name_and_size(
                         view.label.clone(),
@@ -188,32 +172,7 @@ pub fn row(
                     .text_color(view.label_color)
                     .into_any_element()
                 })
-                .when(folder_row, |item| {
-                    item.child(file_count(view.files))
-                        // What is left of a folder's row, so its lanes sit
-                        // at the trailing edge like a file's.
-                        .child(div().flex_1())
-                        .child(
-                            // A fixed band at the trailing edge: the size,
-                            // then the status letter's lane, each of its
-                            // own width and 8 px from the next, so they
-                            // form columns down the tree with the files'.
-                            h_flex()
-                                .flex_none()
-                                .ml(dp(LANE_GAP))
-                                .gap(dp(LANE_GAP))
-                                .child(
-                                    h_flex()
-                                        .w(dp(STAT_LANE))
-                                        .justify_end()
-                                        .child(size_label(view.additions, view.deletions)),
-                                )
-                                .child(status_lane(None)),
-                        )
-                })
-                .when(!folder_row, |item| {
-                    item.child(status_lane(view.status).ml(dp(LANE_GAP)))
-                }),
+                .child(status_lane(view.status).ml(dp(LANE_GAP))),
         )
         .child(viewed_box(
             ElementId::NamedInteger(format!("{id_prefix}-viewed").into(), ix as u64),
@@ -232,8 +191,6 @@ pub fn row(
         .into_any_element()
 }
 
-/// Width of the lane for `+added −removed`.
-const STAT_LANE: f32 = 56.;
 /// The space between the lanes of a row's trailing band (the size, the
 /// status letter, and the viewed box) and after the last one. With the
 /// tree at its opening width, a folded folder name still fits whole.
@@ -352,6 +309,92 @@ fn name_and_size(name: SharedString, from: usize, additions: u32, deletions: u32
                     text.paint(window, cx);
                     if let Some(mut size) = size {
                         size.paint(window, cx);
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
+
+/// Which of a folder row's file count and size fit in `room` beside its
+/// whole label, as (count, size): the size gives way first, then the count,
+/// so the name is the last thing a narrow tree loses.
+fn fit_folder_row(label: f32, count: f32, size: f32, room: f32) -> (bool, bool) {
+    if label + count + size <= room {
+        (true, true)
+    } else if label + count <= room {
+        (true, false)
+    } else {
+        (false, false)
+    }
+}
+
+/// A folder's label, its file count after it, and its size at the trailing
+/// edge, in the room its row leaves (`fit_folder_row`). A label wider than
+/// the whole room is cut at its end.
+fn folder_label(view: &RowView, muted: Hsla) -> Div {
+    let label = view.label.clone();
+    let color = view.label_color;
+    let (files, additions, deletions) = (view.files, view.additions, view.deletions);
+    div()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .ml(dp(4.))
+        .text_size(scale::body())
+        .text_color(color)
+        .child(
+            canvas(
+                move |bounds, window, cx| {
+                    let room = f32::from(bounds.size.width);
+                    let (head, between, tail) = split_label(&label);
+                    let mut name = h_flex()
+                        .whitespace_nowrap()
+                        .child(head.clone())
+                        .when(!between.is_empty(), |name| {
+                            name.child(div().text_color(muted).child(between.clone()))
+                        })
+                        .child(tail.clone())
+                        .into_any_element();
+                    let name_box = name.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let mut count = file_count(files).into_any_element();
+                    let count_box = count.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let mut size = size_label(additions, deletions).into_any_element();
+                    let size_box = size.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let name_width = f32::from(name_box.width);
+                    let (with_count, with_size) = fit_folder_row(
+                        name_width,
+                        f32::from(count_box.width),
+                        f32::from(size_box.width + dp(LANE_GAP)),
+                        room,
+                    );
+                    if name_width > room {
+                        let text = format!("{head}{between}{tail}");
+                        let cut: SharedString = {
+                            let measure = text_width(window, FontWeight::NORMAL);
+                            cut_name(&text, room, &measure).into()
+                        };
+                        name = div().whitespace_nowrap().child(cut).into_any_element();
+                        name.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    }
+                    let middle = |height: Pixels| bounds.top() + (bounds.size.height - height) / 2.;
+                    name.prepaint_at(point(bounds.left(), middle(name_box.height)), window, cx);
+                    let count = with_count.then(|| {
+                        let left = bounds.left() + name_box.width;
+                        count.prepaint_at(point(left, middle(count_box.height)), window, cx);
+                        count
+                    });
+                    let size = with_size.then(|| {
+                        let left = bounds.right() - size_box.width;
+                        size.prepaint_at(point(left, middle(size_box.height)), window, cx);
+                        size
+                    });
+                    (name, count, size)
+                },
+                |_, (mut name, count, size), window, cx| {
+                    name.paint(window, cx);
+                    for mut part in count.into_iter().chain(size) {
+                        part.paint(window, cx);
                     }
                 },
             )
@@ -543,7 +586,7 @@ impl UniformListDecoration for StickyFolders {
 
 #[cfg(test)]
 mod tests {
-    use super::{abbreviate_name, fit_file_row, indent, split_label};
+    use super::{abbreviate_name, fit_file_row, fit_folder_row, indent, split_label};
 
     fn parts(label: &str) -> String {
         let (head, between, tail) = split_label(label);
@@ -612,6 +655,14 @@ mod tests {
             fit_file_row(name, 0, 15., 9., chars),
             ("repository_….rs".to_owned(), false)
         );
+    }
+
+    #[test]
+    fn a_folder_keeps_its_name_before_its_size_and_count() {
+        assert_eq!(fit_folder_row(10., 3., 6., 19.), (true, true));
+        assert_eq!(fit_folder_row(10., 3., 6., 18.), (true, false));
+        assert_eq!(fit_folder_row(10., 3., 6., 12.), (false, false));
+        assert_eq!(fit_folder_row(10., 3., 6., 8.), (false, false));
     }
 
     #[test]

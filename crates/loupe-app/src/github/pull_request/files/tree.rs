@@ -358,6 +358,25 @@ pub fn sticky_folders(rows: &[TreeRow], top: usize) -> Option<Sticky> {
     None
 }
 
+/// The row that stands for `path`: its own, or while a closed folder hides
+/// it, the innermost folder on screen that holds it, so the tree still
+/// shows where the diff is.
+pub fn shown_row(rows: &[TreeRow], path: &str) -> Option<usize> {
+    if let Some(ix) = rows.iter().position(|row| row.path == path) {
+        return Some(ix);
+    }
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.dir().is_some()
+                && path
+                    .strip_prefix(row.path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|(_, row)| row.path.len())
+        .map(|(ix, _)| ix)
+}
+
 /// The folders holding `ix`, outermost first.
 pub fn ancestors(rows: &[TreeRow], ix: usize) -> Vec<usize> {
     let mut chain = Vec::new();
@@ -508,7 +527,7 @@ mod tests {
     use super::{
         GitTint, LARGE_TREE, Move, RowKind, Sticky, TreeRow, ViewedMark, active_folder,
         distinct_starts, folder_tint, initial_collapsed, into_tree_order, move_down, move_left,
-        move_right, move_up, sticky_folders, tree_rows, viewed_mark,
+        move_right, move_up, shown_row, sticky_folders, tree_rows, viewed_mark,
     };
 
     fn file(path: &str, additions: u32, deletions: u32) -> ChangedFile {
@@ -807,6 +826,21 @@ mod tests {
         );
         // Past `src`, the root-level files pin nothing.
         assert_eq!(sticky_folders(&rows, find(&rows, "Cargo.toml")), None);
+    }
+
+    #[test]
+    fn a_hidden_file_shows_as_the_innermost_folder_on_screen() {
+        let files = sample();
+        let client = "src/lib/http/client.rs";
+        let rows = tree_rows(&files, "", &HashSet::new());
+        assert_eq!(shown_row(&rows, client), Some(find(&rows, client)));
+        let rows = tree_rows(&files, "", &HashSet::from(["src/lib/http".to_owned()]));
+        assert_eq!(shown_row(&rows, client), Some(find(&rows, "src/lib/http")));
+        let collapsed = HashSet::from(["src".to_owned(), "src/lib/http".to_owned()]);
+        let rows = tree_rows(&files, "", &collapsed);
+        assert_eq!(shown_row(&rows, client), Some(find(&rows, "src")));
+        // `src` is not a folder of `srcs/a.rs`.
+        assert_eq!(shown_row(&rows, "srcs/a.rs"), None);
     }
 
     #[test]
