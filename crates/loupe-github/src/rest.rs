@@ -32,7 +32,7 @@ pub const NOTIFICATIONS_LIMIT: usize = NOTIFICATIONS_PER_PAGE * MAX_NOTIFICATION
 const FAILED_RUNS: usize = 10;
 const RUNS_WITH_JOBS: usize = 5;
 
-const FILE_VIEWED_STATES_QUERY: &str = "query PullRequestFileViewedStates($owner: String!, $name: String!, $number: Int!, $cursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { files(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { path viewerViewedState } } } } }";
+const FILE_VIEWED_STATES_QUERY: &str = "query PullRequestFileViewedStates($owner: String!, $name: String!, $number: Int!, $cursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { files(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { path viewerViewedState additions deletions } } } } }";
 
 pub(crate) const DOCUMENTS: &[(&str, &str)] = &[("file_viewed_states", FILE_VIEWED_STATES_QUERY)];
 
@@ -47,6 +47,11 @@ pub(crate) enum RestMethod<'a> {
 impl GitHub {
     /// Every changed file with its patch (REST, all pages), with the viewer's
     /// viewed state merged in from GraphQL.
+    ///
+    /// When a pull request's diff passes GitHub's size limit, REST leaves the
+    /// patch out of some files and counts them as +0 −0. Their line counts
+    /// come from GraphQL, which reports them all; the patch itself is
+    /// [`GitHub::omitted_patch`].
     pub fn pull_request_files(&self, pr: &PrRef) -> Result<Vec<ChangedFile>> {
         let mut files = Vec::new();
         for page in 1..=MAX_FILE_PAGES {
@@ -66,13 +71,68 @@ impl GitHub {
         Ok(files)
     }
 
-    /// Sets each file's viewed state from GraphQL, without downloading the
-    /// patches again: for a file list kept from an earlier load of the same
-    /// head commit.
+    /// Sets each file's viewed state from GraphQL, and the line counts of a
+    /// file REST sent without a patch, without downloading the patches
+    /// again: for a file list kept from an earlier load of the same head
+    /// commit.
     pub fn refresh_viewed_states(&self, pr: &PrRef, files: &mut [ChangedFile]) -> Result<()> {
-        let viewed = self.viewed_states(pr)?;
-        merge_viewed_states(files, &viewed);
+        let facts = self.file_facts(pr)?;
+        merge_file_facts(files, &facts);
         Ok(())
+    }
+
+    /// The hunks GitHub left out of `file` because the pull request's diff
+    /// is too large: both versions are read, the base at the merge base of
+    /// `base_oid` and `head_oid` as GitHub's own diff does, and diffed here.
+    /// `None` when either version is binary.
+    pub fn omitted_patch(
+        &self,
+        pr: &PrRef,
+        base_oid: &str,
+        head_oid: &str,
+        file: &ChangedFile,
+    ) -> Result<Option<String>> {
+        let compare = self.rest(
+            RestMethod::Get,
+            &format!(
+                "/repos/{}/{}/compare/{}...{}?per_page=1",
+                pr.repo.owner,
+                pr.repo.name,
+                query_value(base_oid),
+                query_value(head_oid)
+            ),
+        )?;
+        let merge_base = parse_merge_base(&compare)?;
+        let old_path = match file.status {
+            FileStatus::Renamed | FileStatus::Copied => {
+                file.previous_path.as_deref().unwrap_or(&file.path)
+            }
+            _ => &file.path,
+        };
+        let old = match file.status {
+            FileStatus::Added => Vec::new(),
+            _ => self.raw_contents(&pr.repo, old_path, &merge_base)?,
+        };
+        let new = match file.status {
+            FileStatus::Removed => Vec::new(),
+            _ => self.raw_contents(&pr.repo, &file.path, head_oid)?,
+        };
+        Ok(crate::diff::text_patch(&old, &new))
+    }
+
+    /// The bytes of the file at `path` at commit `sha`.
+    pub(crate) fn raw_contents(&self, repo: &RepoRef, path: &str, sha: &str) -> Result<Vec<u8>> {
+        let path = format!(
+            "/repos/{}/{}/contents/{}?ref={}",
+            repo.owner,
+            repo.name,
+            path.split('/')
+                .map(query_value)
+                .collect::<Vec<_>>()
+                .join("/"),
+            query_value(sha)
+        );
+        self.rest_bytes(RestMethod::Get, &path, "application/vnd.github.raw+json")
     }
 
     /// The viewer's notifications, unread first and then newest first. `all`
@@ -144,7 +204,7 @@ impl GitHub {
         })
     }
 
-    fn viewed_states(&self, pr: &PrRef) -> Result<HashMap<String, ViewedState>> {
+    fn file_facts(&self, pr: &PrRef) -> Result<HashMap<String, FileFacts>> {
         let mut states = HashMap::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_FILE_PAGES {
@@ -168,7 +228,7 @@ impl GitHub {
                     .into_iter()
                     .flatten()
                     .flatten()
-                    .map(|node| (node.path, node.viewer_viewed_state.into())),
+                    .map(|node| (node.path.clone(), FileFacts::from(node))),
             );
             match files.page_info {
                 PageInfo {
@@ -596,13 +656,51 @@ fn parse_files_page(body: &str) -> Result<Vec<ChangedFile>> {
         .collect())
 }
 
-fn merge_viewed_states(files: &mut [ChangedFile], states: &HashMap<String, ViewedState>) {
-    for file in files {
-        file.viewed = states
-            .get(&file.path)
-            .copied()
-            .unwrap_or(ViewedState::Unviewed);
+/// What GraphQL knows of a changed file that REST may not tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileFacts {
+    viewed: ViewedState,
+    additions: u32,
+    deletions: u32,
+}
+
+impl From<ViewedStateNode> for FileFacts {
+    fn from(node: ViewedStateNode) -> Self {
+        FileFacts {
+            viewed: node.viewer_viewed_state.into(),
+            additions: node.additions,
+            deletions: node.deletions,
+        }
     }
+}
+
+fn merge_file_facts(files: &mut [ChangedFile], facts: &HashMap<String, FileFacts>) {
+    for file in files {
+        let found = facts.get(&file.path);
+        file.viewed = found.map_or(ViewedState::Unviewed, |facts| facts.viewed);
+        if file.patch.is_none()
+            && let Some(facts) = found
+        {
+            file.additions = facts.additions;
+            file.deletions = facts.deletions;
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireCompare {
+    merge_base_commit: WireCommitSha,
+}
+
+#[derive(Deserialize)]
+struct WireCommitSha {
+    sha: String,
+}
+
+fn parse_merge_base(body: &str) -> Result<String> {
+    let compare: WireCompare =
+        serde_json::from_str(body).map_err(|error| Error::Decode(error.to_string()))?;
+    Ok(compare.merge_base_commit.sha)
 }
 
 #[derive(Deserialize)]
@@ -641,6 +739,10 @@ struct ViewedStateNode {
     path: String,
     #[serde(rename = "viewerViewedState")]
     viewer_viewed_state: WireViewedState,
+    #[serde(default)]
+    additions: u32,
+    #[serde(default)]
+    deletions: u32,
 }
 
 #[derive(Deserialize)]
@@ -808,10 +910,10 @@ mod tests {
             "repository":{"pullRequest":{"files":{
                 "pageInfo":{"hasNextPage":false,"endCursor":"Y3Vyc29y"},
                 "nodes":[
-                    {"path":"README.md","viewerViewedState":"VIEWED"},
+                    {"path":"README.md","viewerViewedState":"VIEWED","additions":1,"deletions":1},
                     null,
-                    {"path":"src/new_name.rs","viewerViewedState":"DISMISSED"},
-                    {"path":"elsewhere.rs","viewerViewedState":"UNVIEWED"}
+                    {"path":"src/new_name.rs","viewerViewedState":"DISMISSED","additions":3,"deletions":1},
+                    {"path":"elsewhere.rs","viewerViewedState":"UNVIEWED","additions":0,"deletions":0}
                 ]}}}
         }"#;
         let data: ViewedStatesData = serde_json::from_str(page).expect("fixture parses");
@@ -821,15 +923,15 @@ mod tests {
             .expect("pull request present")
             .files;
         assert!(!files_page.page_info.has_next_page);
-        let states: HashMap<String, ViewedState> = files_page
+        let states: HashMap<String, FileFacts> = files_page
             .nodes
             .into_iter()
             .flatten()
             .flatten()
-            .map(|node| (node.path, node.viewer_viewed_state.into()))
+            .map(|node| (node.path.clone(), FileFacts::from(node)))
             .collect();
 
-        merge_viewed_states(&mut files, &states);
+        merge_file_facts(&mut files, &states);
 
         let merged: Vec<_> = files.iter().map(|f| (f.path.as_str(), f.viewed)).collect();
         assert_eq!(
@@ -840,6 +942,42 @@ mod tests {
                 ("README.md", ViewedState::Viewed),
             ]
         );
+    }
+
+    #[test]
+    fn a_file_sent_without_a_patch_takes_its_line_counts_from_graphql() {
+        let mut files = parse_files_page(
+            r#"[
+            {"filename":"src/big.ts","status":"modified","additions":0,"deletions":0,"changes":0},
+            {"filename":"src/small.ts","status":"modified","additions":2,"deletions":1,"changes":3,
+             "patch":"@@ -1 +1,2 @@\n-a\n+b\n+c"}
+        ]"#,
+        )
+        .expect("fixture parses");
+        let facts = |additions, deletions| FileFacts {
+            viewed: ViewedState::Unviewed,
+            additions,
+            deletions,
+        };
+        let graphql = HashMap::from([
+            ("src/big.ts".to_owned(), facts(120, 40)),
+            ("src/small.ts".to_owned(), facts(9, 9)),
+        ]);
+
+        merge_file_facts(&mut files, &graphql);
+
+        let counts: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.additions, f.deletions))
+            .collect();
+        assert_eq!(counts, [("src/big.ts", 120, 40), ("src/small.ts", 2, 1)]);
+    }
+
+    #[test]
+    fn reads_the_merge_base_of_a_comparison() {
+        let body = r#"{"merge_base_commit":{"sha":"abc123","commit":{}},"files":[]}"#;
+        assert_eq!(parse_merge_base(body).expect("parses"), "abc123");
+        assert!(parse_merge_base("{}").is_err());
     }
 
     #[test]

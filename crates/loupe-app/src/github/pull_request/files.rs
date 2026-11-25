@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffFile, DiffFileStatus, DiffHoverHighlight, DiffLinePosition,
     DiffLineRange, DiffState,
@@ -24,7 +25,7 @@ use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::diff::{Hunk, anchor_for_range, find_line, git_patch, parse_patch};
@@ -33,8 +34,8 @@ use loupe_github::{ChangedFile, NodeId, PullRequestDetail};
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
 use self::model::{
     LoadedFiles, Missing, PlacedThread, Placement, anchor_error_message, build_files, diff_mode,
-    is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter, to_diff_side,
-    to_side, viewed_counts,
+    file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
+    to_diff_side, to_side, viewed_counts,
 };
 use self::tree::{
     GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, file_tint, folder_tint,
@@ -58,10 +59,16 @@ const FILE_LIST_WIDTH: f32 = 340.;
 const LONG_LINE: usize = 100;
 /// What the toolbar's note about long lines explains.
 const LONG_LINES_HINT: &str = "These files have lines longer than the view. Scroll sideways with Shift + wheel or ← →, or choose Wrap.";
+/// What the toolbar's note about diffs GitHub left out explains.
+const OMITTED_HINT: &str = "GitHub leaves some diffs out of a pull request this large. Their line counts are included; choose Load diff on a file to see it.";
 const FILE_LIST_MIN: f32 = 220.;
 const FILE_LIST_MAX: f32 = 640.;
 /// How wide the diff's trailing edge fades while long lines run past it.
 const FADE_WIDTH: f32 = 32.;
+
+/// The note under a file with no diff, and for a diff GitHub left out, the
+/// path to load and whether it is loading.
+type NoDiffNote = (ElementId, SharedString, Option<(String, bool)>);
 
 struct ThreadSlot {
     view: Entity<ThreadView>,
@@ -88,6 +95,10 @@ pub struct FilesTab {
     _filter_changes: Subscription,
     hunks: HashMap<String, Arc<Vec<Hunk>>>,
     missing: HashMap<String, Missing>,
+    /// Diffs GitHub left out that are being loaded, by path.
+    patch_loads: HashMap<String, Task<()>>,
+    /// Why loading a left-out diff failed, by path.
+    patch_errors: HashMap<String, String>,
     diff: Option<Entity<DiffState>>,
     layout: DiffLayout,
     viewed_error: Option<String>,
@@ -120,6 +131,8 @@ impl FilesTab {
             _filter_changes: filter_changes,
             hunks: HashMap::new(),
             missing: HashMap::new(),
+            patch_loads: HashMap::new(),
+            patch_errors: HashMap::new(),
             diff: None,
             layout: Settings::get(cx).diff_layout,
             viewed_error: None,
@@ -153,6 +166,8 @@ impl FilesTab {
             self.load = Loadable::Loading;
             self.files.clear();
             self.hunks.clear();
+            self.patch_loads.clear();
+            self.patch_errors.clear();
             self.diff = None;
         }
         if head_changed || matches!(self.load, Loadable::Failed(_)) {
@@ -284,13 +299,110 @@ impl FilesTab {
         }
     }
 
+    /// Collapses viewed files, and files whose diff GitHub left out so the
+    /// header stands alone with its Load diff note.
     fn collapse_viewed(&self, cx: &mut Context<Self>) {
         let Some(state) = &self.diff else { return };
         state.update(cx, |state, cx| {
             for file in &self.files {
-                state.set_file_collapsed(&file.path, is_viewed(file.viewed), cx);
+                let omitted = self.missing.get(&file.path) == Some(&Missing::Omitted);
+                state.set_file_collapsed(&file.path, is_viewed(file.viewed) || omitted, cx);
             }
         });
+    }
+
+    /// Loads the diff GitHub left out of `path` and puts it in the viewer in
+    /// place of the file's placeholder.
+    fn load_omitted_patch(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.patch_loads.contains_key(path) {
+            return;
+        }
+        let Some(file) = self.files.iter().find(|file| file.path == path).cloned() else {
+            return;
+        };
+        self.patch_errors.remove(path);
+        let pr = self.context.pr.clone();
+        let base = self.context.detail.base_oid.clone();
+        let head = self.context.detail.head_oid.clone();
+        let expected_head = head.clone();
+        let owned_path = path.to_owned();
+        let task = common::run(
+            cx,
+            move |gh| gh.omitted_patch(&pr, &base, &head, &file),
+            move |this, result, cx| {
+                this.patch_loads.remove(&owned_path);
+                if this.context.detail.head_oid != expected_head {
+                    return;
+                }
+                match result {
+                    Ok(patch) => this.apply_omitted_patch(&owned_path, patch, cx),
+                    Err(error) => {
+                        this.patch_errors.insert(owned_path, error.message());
+                    }
+                }
+            },
+        );
+        self.patch_loads.insert(path.to_owned(), task);
+        cx.notify();
+    }
+
+    /// Puts a loaded diff (`None` for a binary file) in the viewer, opens the
+    /// file, and keeps it on screen.
+    fn apply_omitted_patch(&mut self, path: &str, patch: Option<String>, cx: &mut Context<Self>) {
+        let Some(file) = self.files.iter_mut().find(|file| file.path == path) else {
+            return;
+        };
+        file.patch = patch;
+        let viewed = is_viewed(file.viewed);
+        let file = file.clone();
+        let (doc, reason) = match git_patch(&file) {
+            Some(patch) => file_doc(&file, Some(patch)),
+            // Binary: GitHub's counts say lines changed, but there is no
+            // text to show, so the placeholder says binary.
+            None => file_doc(
+                &ChangedFile {
+                    additions: 0,
+                    deletions: 0,
+                    ..file.clone()
+                },
+                None,
+            ),
+        };
+        match reason {
+            Some(reason) => {
+                self.missing.insert(file.path.clone(), reason);
+            }
+            None => {
+                self.missing.remove(&file.path);
+            }
+        }
+        if reason.is_none()
+            && let Some(hunks) = file
+                .patch
+                .as_deref()
+                .and_then(|patch| parse_patch(patch).ok())
+        {
+            self.hunks.insert(file.path.clone(), Arc::new(hunks));
+        }
+        if let (Some(state), Some(doc)) = (&self.diff, doc) {
+            state.update(cx, |state, cx| {
+                let docs = state
+                    .files()
+                    .iter()
+                    .map(|existing| {
+                        if existing.path().as_ref() == path {
+                            doc.clone()
+                        } else {
+                            existing.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                state.set_files(docs, cx);
+                state.set_file_collapsed(path, viewed, cx);
+                state.scroll_to_file(path, cx);
+            });
+        }
+        self.threads_dirty = true;
     }
 
     /// Places the pull request's threads in the diff and keeps one entity per
@@ -607,6 +719,11 @@ impl FilesTab {
         });
         let this = cx.entity().downgrade();
         let long = if wrap { 0 } else { self.long_files().count() };
+        let omitted = self
+            .missing
+            .values()
+            .filter(|reason| **reason == Missing::Omitted)
+            .count();
         let tree_right = Settings::get(cx).file_tree_position == FileTreePosition::Right;
         let mut parts = vec![
             h_flex()
@@ -639,6 +756,21 @@ impl FilesTab {
         // past the edge. The edge's fade alone is dark on dark and says
         // nothing on a line with no tint, and the component shows its
         // own horizontal bar only while it scrolls.
+        if omitted > 0 {
+            parts.push(
+                div()
+                    .id("omitted-diffs-note")
+                    .flex_none()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .tooltip(|window, cx| Tooltip::new(OMITTED_HINT).build(window, cx))
+                    .child(match omitted {
+                        1 => "1 diff not loaded".to_owned(),
+                        omitted => format!("{omitted} diffs not loaded"),
+                    })
+                    .into_any_element(),
+            );
+        }
         if long > 0 {
             parts.push(
                 div()
@@ -888,7 +1020,11 @@ impl FilesTab {
                         let file = &self.files[*index];
                         let viewed = is_viewed(file.viewed);
                         let tint = tint_color(file_tint(file.status));
-                        let missing = self.missing.contains_key(&file.path);
+                        let missing = match self.missing.get(&file.path) {
+                            Some(Missing::Omitted) => " · diff not loaded",
+                            Some(Missing::Unreadable) => " · diff not shown",
+                            None => "",
+                        };
                         RowView {
                             depth: row.depth,
                             folder: None,
@@ -909,10 +1045,7 @@ impl FilesTab {
                             guides,
                             tooltip: format!(
                                 "{} · +{} −{}{}",
-                                file.path,
-                                file.additions,
-                                file.deletions,
-                                if missing { " · diff not shown" } else { "" }
+                                file.path, file.additions, file.deletions, missing
                             )
                             .into(),
                             accessible_name: format!(
@@ -993,7 +1126,7 @@ impl FilesTab {
         let weak = cx.entity().downgrade();
         let mut annotations = Vec::new();
         let mut views: Vec<(ElementId, AnyView)> = Vec::new();
-        let mut notes: Vec<(ElementId, SharedString)> = Vec::new();
+        let mut notes: Vec<NoDiffNote> = Vec::new();
         for placed in &self.placed {
             let Some(slot) = self.threads.get(&placed.thread_id) else {
                 continue;
@@ -1024,7 +1157,13 @@ impl FilesTab {
         for (path, reason) in &self.missing {
             let id = ElementId::Name(SharedString::from(format!("no-diff:{path}")));
             annotations.push(DiffAnnotation::file(id.clone(), path.clone()));
-            notes.push((id, reason.note().into()));
+            let note = match self.patch_errors.get(path) {
+                Some(error) => error.clone().into(),
+                None => reason.note().into(),
+            };
+            let load = (*reason == Missing::Omitted)
+                .then(|| (path.clone(), self.patch_loads.contains_key(path)));
+            notes.push((id, note, load));
         }
 
         // Each file's size, for its header, as GitHub counts it.
@@ -1050,6 +1189,7 @@ impl FilesTab {
             theme.radius_lg,
         );
         let add_weak = weak.clone();
+        let load_weak = weak.clone();
         // While lines scroll, whether some line runs past the panel: the
         // toolbar says so in words and the panel's edge fades. The
         // component draws its own horizontal bar only while it scrolls and
@@ -1123,10 +1263,12 @@ impl FilesTab {
                         {
                             return card.child(view.clone()).into_any_element();
                         }
-                        let note = notes
+                        let (note, load) = notes
                             .iter()
-                            .find(|(id, _)| id == annotation.id())
-                            .map(|(_, note)| note.clone());
+                            .find(|(id, _, _)| id == annotation.id())
+                            .map(|(_, note, load)| (Some(note.clone()), load.clone()))
+                            .unwrap_or_default();
+                        let weak = load_weak.clone();
                         h_flex()
                             .mx_3()
                             .my_2()
@@ -1136,6 +1278,23 @@ impl FilesTab {
                             .text_color(muted)
                             .child(Icon::new(IconName::FileX).xsmall())
                             .children(note)
+                            .when_some(load, |row, (path, busy)| {
+                                row.child(
+                                    Button::new(SharedString::from(format!("load-diff:{path}")))
+                                        .outline()
+                                        .xsmall()
+                                        .label("Load diff")
+                                        .accessibility_label(format!("Load diff of {path}"))
+                                        .loading(busy)
+                                        .disabled(busy)
+                                        .on_click(move |_, _, cx| {
+                                            weak.update(cx, |this, cx| {
+                                                this.load_omitted_patch(&path, cx)
+                                            })
+                                            .ok();
+                                        }),
+                                )
+                            })
                             .into_any_element()
                     })
                     // The path, the size, and Viewed in the part of the

@@ -301,17 +301,7 @@ impl GitHub {
     /// The jobs of the workflow file at `path` at commit `sha`, with what each
     /// one needs: what the run's graph is drawn from.
     pub fn workflow_spec(&self, repo: &RepoRef, path: &str, sha: &str) -> Result<WorkflowSpec> {
-        let path = format!(
-            "/repos/{}/{}/contents/{}?ref={}",
-            repo.owner,
-            repo.name,
-            path.split('/')
-                .map(query_value)
-                .collect::<Vec<_>>()
-                .join("/"),
-            query_value(sha)
-        );
-        let raw = self.rest_bytes(RestMethod::Get, &path, "application/vnd.github.raw+json")?;
+        let raw = self.raw_contents(repo, path, sha)?;
         let text = String::from_utf8(raw).map_err(|error| Error::Decode(error.to_string()))?;
         Ok(parse_workflow(&text))
     }
