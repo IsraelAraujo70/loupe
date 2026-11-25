@@ -465,8 +465,8 @@ impl GitHub {
         Ok(body)
     }
 
-    /// Records the rate limit and reads the status and body. A 401 is the
-    /// only status it turns into an error.
+    /// Records the rate limit and reads the status and body. A 401 and a
+    /// refusal for a rate limit are the only statuses it turns into an error.
     fn read_response(
         &self,
         mut response: ureq::http::Response<ureq::Body>,
@@ -481,6 +481,10 @@ impl GitHub {
             .map_err(|error| Error::Decode(error.to_string()))?;
         if status == 401 {
             return Err(Error::Unauthorized);
+        }
+        if let Some(refusal) = crate::rate::refusal(status, response.headers(), &message_of(&body))
+        {
+            return Err(refusal);
         }
         Ok((status, body))
     }
@@ -601,13 +605,20 @@ pub enum PullRequestPoll {
     Changed(Option<String>),
 }
 
-/// The error a non-2xx REST response stands for, with GitHub's `message`.
-pub(crate) fn http_error(status: u16, body: &[u8]) -> Error {
-    let message = serde_json::from_slice::<Value>(body)
+/// The `message` GitHub put in an error body, or an empty text.
+fn message_of(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|value| value["message"].as_str().map(str::to_owned))
-        .unwrap_or_default();
-    Error::Http { status, message }
+        .unwrap_or_default()
+}
+
+/// The error a non-2xx REST response stands for, with GitHub's `message`.
+pub(crate) fn http_error(status: u16, body: &[u8]) -> Error {
+    Error::Http {
+        status,
+        message: message_of(body),
+    }
 }
 
 /// Whether a failed request goes out again: a read that met a gateway error

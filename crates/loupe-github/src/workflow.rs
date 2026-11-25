@@ -272,7 +272,8 @@ impl GitHub {
                 .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
                 .and_then(|body| body["message"].as_str().map(str::to_owned))
                 .unwrap_or_default();
-            return Err(Error::Http { status, message });
+            return Err(crate::rate::refusal(status, response.headers(), &message)
+                .unwrap_or(Error::Http { status, message }));
         }
         let mut body = response.into_body().into_reader();
         std::io::copy(&mut body, out).map_err(|error| Error::Transport(error.to_string()))
