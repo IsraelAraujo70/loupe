@@ -1,22 +1,24 @@
-//! Counts the requests behind marking files viewed on the scratch fixture
-//! pull request (IsraelAraujo70/loupe#1). It WRITES to GitHub: it sets the
-//! viewed mark of the fixture's one file and puts it back. Needs
+//! Counts the requests behind marking files viewed on the test fixture's
+//! writable pull request (docs/TEST_FIXTURE.md). It WRITES to GitHub: it sets
+//! the viewed mark of the fixture's README.md and puts it back. Needs
 //! `GITHUB_TOKEN` and `LOUPE_E2E=1`; run each test alone with
 //! `LOUPE_TRACE_GITHUB=1 --nocapture` and count the `github-call` lines.
 
-use loupe_github::{GitHub, PrRef, RepoRef, ViewedState};
+use loupe_github::{GitHub, PrRef, ViewedState};
+
+mod fixture;
 
 const FILE: &str = "README.md";
 const FILES: usize = 120;
 
-fn fixture() -> (GitHub, PrRef, String) {
+fn connect() -> (GitHub, PrRef, String) {
     assert_eq!(
         std::env::var("LOUPE_E2E").as_deref(),
         Ok("1"),
         "set LOUPE_E2E=1"
     );
     let github = GitHub::new(std::env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN"));
-    let pr = PrRef::new(RepoRef::new("IsraelAraujo70", "loupe"), 1);
+    let pr = fixture::pr(fixture::STACK_1);
     let id = github.pull_request(&pr).expect("detail").id.to_string();
     (github, pr, id)
 }
@@ -33,7 +35,7 @@ fn viewed(github: &GitHub, pr: &PrRef) -> ViewedState {
 #[test]
 #[ignore = "writes to the fixture PR; needs GITHUB_TOKEN and LOUPE_E2E=1"]
 fn one_request_per_file() {
-    let (github, pr, id) = fixture();
+    let (github, pr, id) = connect();
     let before = viewed(&github, &pr);
     assert_ne!(before, ViewedState::Dismissed, "cannot restore Dismissed");
     for _ in 0..FILES {
@@ -48,7 +50,7 @@ fn one_request_per_file() {
 #[test]
 #[ignore = "writes to the fixture PR; needs GITHUB_TOKEN and LOUPE_E2E=1"]
 fn batched_requests() {
-    let (github, pr, id) = fixture();
+    let (github, pr, id) = connect();
     let before = viewed(&github, &pr);
     assert_ne!(before, ViewedState::Dismissed, "cannot restore Dismissed");
     let paths = vec![FILE.to_owned(); FILES];
@@ -68,7 +70,7 @@ fn batched_requests() {
 #[test]
 #[ignore = "writes to the fixture PR; needs GITHUB_TOKEN and LOUPE_E2E=1"]
 fn a_refused_file_fails_alone() {
-    let (github, pr, id) = fixture();
+    let (github, pr, id) = connect();
     let before = viewed(&github, &pr);
     assert_ne!(before, ViewedState::Dismissed, "cannot restore Dismissed");
     let paths = vec![

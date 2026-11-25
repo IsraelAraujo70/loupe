@@ -1,14 +1,15 @@
-//! End-to-end review flow against the scratch fixture PR
-//! (IsraelAraujo70/loupe#1), through the same methods the app
-//! calls. It WRITES to GitHub: run it on purpose, once per verification.
+//! End-to-end review flow against the test fixture's writable pull request
+//! (docs/TEST_FIXTURE.md), through the same methods the app calls. It WRITES to GitHub: run it on purpose, once per verification.
 //! Needs `GITHUB_TOKEN` and `LOUPE_E2E=1`.
 
 use loupe_github::diff::{LineKind, anchor_for_range, parse_patch};
-use loupe_github::{GitHub, NewThread, PrRef, RepoRef, ReviewEvent, Side, ViewedState};
+use loupe_github::{GitHub, NewThread, PrRef, ReviewEvent, Side, ViewedState};
 
-const PREFIX: &str = "🤖 Loupe test:";
-const FILE: &str = "loupe-fixture/calculator.rs";
-const VIEWED_FILE: &str = "loupe-fixture/added.ts";
+mod fixture;
+
+const PREFIX: &str = fixture::WRITE_PREFIX;
+const FILE: &str = "src/recipe/scale.rs";
+const VIEWED_FILE: &str = "web/src/components/IngredientList.tsx";
 
 #[test]
 #[ignore = "writes to the fixture PR; needs GITHUB_TOKEN and LOUPE_E2E=1"]
@@ -19,15 +20,12 @@ fn review_flow_on_the_fixture() {
         "set LOUPE_E2E=1"
     );
     let github = GitHub::new(std::env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN"));
-    let pr = PrRef::new(RepoRef::new("IsraelAraujo70", "loupe"), 1);
+    let pr = fixture::pr(fixture::STACK_1);
     let detail = github.pull_request(&pr).expect("detail");
     assert!(detail.is_draft, "the fixture must stay a draft");
 
     let files = github.pull_request_files(&pr).expect("files");
-    let calculator = files
-        .iter()
-        .find(|f| f.path == FILE)
-        .expect("calculator.rs");
+    let calculator = files.iter().find(|f| f.path == FILE).expect("scale.rs");
     let hunks = parse_patch(calculator.patch.as_deref().expect("patch")).expect("hunks");
 
     let added = hunks
