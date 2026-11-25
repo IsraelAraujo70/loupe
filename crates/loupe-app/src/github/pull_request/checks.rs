@@ -273,7 +273,7 @@ impl ChecksTab {
             folded: HashSet::new(),
             scroll,
             rows: ScrollHandle::new(),
-            focus: cx.focus_handle(),
+            focus: crate::shell::page_focus(cx),
             cursor: None,
         }
     }

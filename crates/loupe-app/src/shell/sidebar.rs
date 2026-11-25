@@ -37,7 +37,7 @@ use crate::shell::{OpenOnClick as _, navigate, open, svg_icon};
 use crate::store::{self, Favorite, Settings};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
-use crate::ui;
+use crate::ui::{self, TabStopRow as _};
 
 const DEFAULT_WIDTH: f32 = 248.;
 /// The narrowest and widest the expanded sidebar can be dragged, in points
@@ -755,6 +755,7 @@ pub(super) fn render(
     data: &Entity<SidebarData>,
     collapsed: bool,
     expanded: f32,
+    window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
     let mut loaded = data.read(cx).loaded.clone();
@@ -781,14 +782,24 @@ pub(super) fn render(
     };
 
     let listed = repos::listed(cx);
-    let rows = entries(Settings::get(cx), &loaded, &views, &listed, current)
+    let rows: Vec<AnyElement> = entries(Settings::get(cx), &loaded, &views, &listed, current)
         .into_iter()
         .map(|entry| match entry {
             Entry::Section { key, label, open } => {
-                section_header(key, label, open, collapsed, colors).into_any_element()
+                section_header(key, label, open, collapsed, colors, window, cx).into_any_element()
             }
-            Entry::Row(row) => nav_row(*row, current, collapsed, colors, data).into_any_element(),
-        });
+            Entry::Row(row) => nav_row(*row, current, collapsed, colors, data, window, cx),
+        })
+        .collect();
+    let workspace = workspace_row(
+        organization,
+        logo,
+        current_team,
+        collapsed,
+        colors,
+        window,
+        cx,
+    );
 
     v_flex()
         .id("sidebar")
@@ -799,14 +810,7 @@ pub(super) fn render(
         .flex_none()
         .overflow_hidden()
         .text_color(colors.foreground)
-        .child(workspace_row(
-            organization,
-            logo,
-            current_team,
-            collapsed,
-            colors,
-            cx,
-        ))
+        .child(workspace)
         .child(
             v_flex()
                 .id("sidebar-nav")
@@ -835,7 +839,8 @@ fn workspace_row(
     current_team: Option<String>,
     collapsed: bool,
     colors: Palette,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
 ) -> impl IntoElement {
     let connected = organization.is_some();
     let name = organization.unwrap_or_else(|| "Loupe".into());
@@ -891,7 +896,14 @@ fn workspace_row(
                 mark.role(Role::Button)
                     .aria_label("Switch workspace")
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(SwitchWorkspace), cx))
-                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .tab_stop_row(
+                        "sidebar-workspace-switcher",
+                        colors.hover,
+                        dp(MARK_RADIUS),
+                        window,
+                        cx,
+                    ),
             )
             .into_any_element();
     }
@@ -934,6 +946,13 @@ fn workspace_row(
                 .rounded(dp(6.))
                 .hover(|style| style.bg(colors.hover))
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(SwitchWorkspace), cx))
+                .tab_stop_row(
+                    "sidebar-workspace-switcher",
+                    colors.hover,
+                    dp(6.),
+                    window,
+                    cx,
+                )
                 .child(workspace_menu::track_header())
                 .child(
                     h_flex()
@@ -969,6 +988,8 @@ fn section_header(
     open: bool,
     collapsed: bool,
     colors: Palette,
+    window: &mut Window,
+    cx: &mut App,
 ) -> impl IntoElement {
     let header = h_flex()
         .id(SharedString::from(format!("section-{key}")))
@@ -985,7 +1006,8 @@ fn section_header(
         .rounded(dp(6.))
         .on_click(move |_, _, cx| {
             store::update_settings(cx, |settings| settings.toggle_collapsed(key));
-        });
+        })
+        .tab_stop_row(format!("section-{key}"), colors.hover, dp(6.), window, cx);
     if collapsed {
         return header
             .w(scale::nav_row_height())
@@ -1024,6 +1046,8 @@ fn nav_row(
     collapsed: bool,
     colors: Palette,
     data: &Entity<SidebarData>,
+    window: &mut Window,
+    cx: &mut App,
 ) -> AnyElement {
     let is_selected = matches!(&row.target, Target::Route(route) if same_page(route, current));
     let fold = match &row.target {
@@ -1050,6 +1074,13 @@ fn nav_row(
     };
     let data = data.downgrade();
     let selector = format!("sidebar-{}", row.id);
+    let focus_key = SharedString::from(selector.clone());
+    let clickable = !matches!(target, Target::Label);
+    let focus_fill = if is_selected {
+        colors.selected
+    } else {
+        colors.hover
+    };
     let repo = row.repo;
     let item = h_flex()
         .id(row.id)
@@ -1102,6 +1133,9 @@ fn nav_row(
         })
         .when_some(route, |item, route| {
             item.on_middle_click(move |event, window, cx| open(route.clone(), event, window, cx))
+        })
+        .when(clickable, |item| {
+            item.tab_stop_row(focus_key, focus_fill, dp(6.), window, cx)
         })
         // The open page's icon takes the accent, so the selection is not
         // one more grey fill beside the open tab and the open view.
