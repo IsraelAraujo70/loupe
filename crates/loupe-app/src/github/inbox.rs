@@ -1977,15 +1977,10 @@ impl InboxView {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.inbox.is_busy();
+        // No count beside the title: the tabs under it carry every count,
+        // and a second number with another meaning next to them reads as a
+        // mismatch.
         let header = ui::page_header(self.title(cx)).icon(IconName::GitPullRequest);
-        let waiting = self.inbox.value().map_or(0, |inbox| {
-            shown(&inbox.review_requested, &self.page.draft).count
-        });
-        let header = if waiting > 0 {
-            header.count(waiting)
-        } else {
-            header
-        };
         let freshness = self.pace.label().map(|label| {
             div()
                 .debug_selector(|| "inbox-freshness".into())
