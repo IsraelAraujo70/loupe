@@ -53,11 +53,35 @@ const FORWARDED_ENV_KEYS: [&str; 26] = [
 /// error messages.
 const SECRET_MARKERS: [&str; 5] = ["TOKEN", "KEY", "SECRET", "PASSWORD", "PASSPHRASE"];
 
+/// `ANTHROPIC_*` keys that are not connection settings: debug logging prints
+/// request headers, credentials included.
+const DENIED_ENV_KEYS: [&str; 1] = ["ANTHROPIC_LOG"];
+
 fn is_forwarded_env(key: &str) -> bool {
-    FORWARDED_ENV_PREFIXES
-        .iter()
-        .any(|prefix| key.starts_with(prefix))
-        || FORWARDED_ENV_KEYS.contains(&key)
+    !DENIED_ENV_KEYS.contains(&key)
+        && (FORWARDED_ENV_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+            || FORWARDED_ENV_KEYS.contains(&key))
+}
+
+/// Where the forwarded `apiKeyHelper` runs: the user's home, as in a new
+/// terminal, else `/`. Never the working directory Claude Code would give it,
+/// which during a guide run is the pull request's checkout.
+pub fn helper_dir(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    env("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute() && home.is_dir())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// `helper` as a `/bin/sh` script that first moves to `dir`. Claude Code runs
+/// the helper with its own working directory, the pull request's checkout, so
+/// a helper that resolves anything relative to it (a relative path, Python's
+/// `sys.path[0]`, `node_modules`, `npx`) would run code from the pull request.
+fn helper_in(dir: &Path, helper: &str) -> String {
+    let quoted = dir.to_string_lossy().replace('\'', r"'\''");
+    format!("cd -- '{quoted}' || exit 1\n{helper}")
 }
 
 /// The user-level Claude Code settings file: `$CLAUDE_CONFIG_DIR/settings.json`,
@@ -70,16 +94,20 @@ pub fn user_settings_path(env: impl Fn(&str) -> Option<OsString>) -> Option<Path
     non_empty("HOME").map(|home| PathBuf::from(home).join(".claude/settings.json"))
 }
 
-/// The settings Loupe forwards from `user`: its `apiKeyHelper` and the
-/// connection variables of its `env`. `None` when there is nothing to forward.
-pub fn connection_settings(user: &Value) -> Option<Value> {
+/// The settings Loupe forwards from `user`: its `apiKeyHelper` (run from
+/// `helper_dir`, see [`helper_in`]) and the connection variables of its `env`.
+/// `None` when there is nothing to forward.
+pub fn connection_settings(user: &Value, helper_dir: &Path) -> Option<Value> {
     let mut forwarded = Map::new();
     if let Some(helper) = user
         .get("apiKeyHelper")
         .and_then(Value::as_str)
         .filter(|helper| !helper.trim().is_empty())
     {
-        forwarded.insert("apiKeyHelper".into(), Value::String(helper.to_owned()));
+        forwarded.insert(
+            "apiKeyHelper".into(),
+            Value::String(helper_in(helper_dir, helper)),
+        );
     }
     let env: Map<String, Value> = user
         .get("env")
@@ -131,13 +159,14 @@ impl UserSettings {
 impl ForwardedSettings {
     /// Reads the user-level settings file this process would use.
     pub(crate) fn load() -> UserSettings {
-        match user_settings_path(|key| std::env::var_os(key)) {
-            Some(path) => Self::load_from(&path),
+        let env = |key: &str| std::env::var_os(key);
+        match user_settings_path(env) {
+            Some(path) => Self::load_from(&path, &helper_dir(env)),
             None => UserSettings::None,
         }
     }
 
-    pub(crate) fn load_from(path: &Path) -> UserSettings {
+    pub(crate) fn load_from(path: &Path, helper_dir: &Path) -> UserSettings {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return UserSettings::None,
@@ -154,7 +183,7 @@ impl ForwardedSettings {
                 reason: "not valid JSON".into(),
             };
         };
-        let Some(forwarded) = connection_settings(&user) else {
+        let Some(forwarded) = connection_settings(&user, helper_dir) else {
             return UserSettings::None;
         };
         match Self::write(&forwarded) {
@@ -239,11 +268,15 @@ fn secret_values(forwarded: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use serde_json::json;
 
-    use super::{ForwardedSettings, UserSettings, connection_settings, user_settings_path};
+    use super::{
+        ForwardedSettings, UserSettings, connection_settings, helper_dir, user_settings_path,
+    };
+
+    const HOME: &str = "/home/me";
 
     #[test]
     fn only_the_helper_and_connection_variables_are_forwarded() {
@@ -259,6 +292,7 @@ mod tests {
                 "CLAUDE_CODE_RESTRICTED": "0",
                 "CLAUDE_CODE_SAFE_MODE": "0",
                 "PATH": "/evil/bin",
+                "ANTHROPIC_LOG": "debug",
                 "ANTHROPIC_NUMBER": 1
             },
             "permissions": { "allow": ["Bash", "Write"], "defaultMode": "bypassPermissions" },
@@ -268,9 +302,9 @@ mod tests {
             "model": "opus"
         });
         assert_eq!(
-            connection_settings(&user),
+            connection_settings(&user, Path::new(HOME)),
             Some(json!({
-                "apiKeyHelper": "cat ~/.config/proxy/key",
+                "apiKeyHelper": "cd -- '/home/me' || exit 1\ncat ~/.config/proxy/key",
                 "env": {
                     "ANTHROPIC_BASE_URL": "http://127.0.0.1:4141",
                     "ANTHROPIC_AUTH_TOKEN": "sk-proxy",
@@ -278,8 +312,66 @@ mod tests {
                 }
             }))
         );
-        assert_eq!(connection_settings(&json!({"model": "opus"})), None);
-        assert_eq!(connection_settings(&json!({"apiKeyHelper": "  "})), None);
+        assert_eq!(
+            connection_settings(&json!({"model": "opus"}), Path::new(HOME)),
+            None
+        );
+        assert_eq!(
+            connection_settings(&json!({"apiKeyHelper": "  "}), Path::new(HOME)),
+            None
+        );
+    }
+
+    /// Claude Code runs `apiKeyHelper` with `/bin/sh -c` in its own working
+    /// directory, which during a guide run is the pull request's checkout.
+    /// The forwarded helper must still resolve relative names from the
+    /// user's directory, so a script the pull request adds never runs.
+    #[cfg(unix)]
+    #[test]
+    fn the_forwarded_helper_never_runs_from_the_checkout() {
+        let root = std::env::temp_dir().join(format!("loupe-helper-cwd-{}", std::process::id()));
+        let checkout = root.join("checkout");
+        // A quote and a space in the trusted path exercise the quoting.
+        let trusted = root.join("user's home");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&trusted).unwrap();
+        let marker = root.join("pwned");
+        let evil = checkout.join("key.sh");
+        std::fs::write(&evil, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let forwarded =
+            connection_settings(&json!({"apiKeyHelper": "pwd; ./key.sh"}), &trusted).unwrap();
+        let script = forwarded["apiKeyHelper"].as_str().unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&output.stdout);
+        let trusted_real = std::fs::canonicalize(&trusted).unwrap();
+        assert_eq!(printed.lines().next(), Some(trusted_real.to_str().unwrap()));
+        assert!(!marker.exists(), "a script from the checkout ran");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_helper_runs_from_home_or_the_root() {
+        let home = std::env::temp_dir();
+        let env = |home: Option<&Path>| {
+            let home = home.map(|h| OsString::from(h.as_os_str()));
+            move |key: &str| (key == "HOME").then(|| home.clone()).flatten()
+        };
+        assert_eq!(helper_dir(env(Some(&home))), home);
+        assert_eq!(helper_dir(env(None)), PathBuf::from("/"));
+        assert_eq!(
+            helper_dir(env(Some(Path::new("relative/home")))),
+            PathBuf::from("/")
+        );
     }
 
     #[test]
@@ -314,7 +406,9 @@ mod tests {
         )
         .unwrap();
 
-        let UserSettings::Forwarded(forwarded) = ForwardedSettings::load_from(&source) else {
+        let UserSettings::Forwarded(forwarded) =
+            ForwardedSettings::load_from(&source, Path::new(HOME))
+        else {
             panic!("expected forwarded settings");
         };
         let path = forwarded.path().to_path_buf();
@@ -322,7 +416,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             written,
-            serde_json::json!({"apiKeyHelper":"cat key","env":{"ANTHROPIC_AUTH_TOKEN":"sk-very-secret"}})
+            serde_json::json!({
+                "apiKeyHelper": "cd -- '/home/me' || exit 1\ncat key",
+                "env": {"ANTHROPIC_AUTH_TOKEN": "sk-very-secret"}
+            })
         );
         #[cfg(unix)]
         {
@@ -340,12 +437,14 @@ mod tests {
         assert!(!path.exists(), "the forwarded settings must be removed");
 
         std::fs::write(&source, "{not json").unwrap();
-        let UserSettings::Unreadable { reason, .. } = ForwardedSettings::load_from(&source) else {
+        let UserSettings::Unreadable { reason, .. } =
+            ForwardedSettings::load_from(&source, Path::new(HOME))
+        else {
             panic!("expected unreadable");
         };
         assert!(!reason.contains("not json"));
         assert!(matches!(
-            ForwardedSettings::load_from(&dir.join("missing.json")),
+            ForwardedSettings::load_from(&dir.join("missing.json"), Path::new(HOME)),
             UserSettings::None
         ));
         let _ = std::fs::remove_dir_all(&dir);
