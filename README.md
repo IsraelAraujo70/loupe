@@ -11,6 +11,7 @@ dates, and a web client that shows recipe cards. The code is generic example cod
 - `src/recipe`: recipes, parsing, and scaling to a number of servings.
 - `src/pantry`: what is in stock, when it was bought, and when it expires.
 - `src/catalog`: the ingredient catalog.
+- `src/shopping`: shopping lists and their export.
 - `web`: the browser client.
 
 ## Running
