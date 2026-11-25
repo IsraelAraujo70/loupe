@@ -153,9 +153,14 @@ impl GitHub {
                 .ok()
                 .and_then(|body| body["message"].as_str().map(str::to_owned))
                 .unwrap_or_default();
-            return Err(Error::Http { status, message });
+            return Err(crate::rate::refusal(status, response.headers(), &message)
+                .unwrap_or(Error::Http { status, message }));
         }
-        parsed.map_err(|error| Error::Decode(error.to_string()))
+        let body = parsed.map_err(|error| Error::Decode(error.to_string()))?;
+        match crate::rate::graphql_refusal(&body, response.headers()) {
+            Some(refusal) => Err(refusal),
+            None => Ok(body),
+        }
     }
 }
 
