@@ -3,7 +3,7 @@
 //! query; this module runs it and shapes the rows.
 
 use gpui_kit::{App, SharedString, Task};
-use loupe_github::{PrState, PrSummary, RepoRef};
+use loupe_github::{PrRef, PrState, PrSummary, RepoRef};
 
 use super::common::client;
 use crate::route::Route;
@@ -51,6 +51,22 @@ pub fn search(query: &str, first: u32, cx: &mut App) -> Task<Vec<PaletteItem>> {
                 eprintln!("github palette search failed: {error}");
                 Vec::new()
             }
+        }
+    })
+}
+
+/// The row of pull request `pr`, read by its number, for a query that names
+/// it exactly. Empty without a client, when the pull request is not found,
+/// or when the read fails.
+pub fn find(pr: PrRef, cx: &mut App) -> Task<Vec<PaletteItem>> {
+    let Some(github) = client(cx) else {
+        return Task::ready(Vec::new());
+    };
+    background(cx, move || match github.pull_request_row(&pr) {
+        Ok(found) => found.iter().map(palette_item).collect(),
+        Err(error) => {
+            eprintln!("github palette lookup failed: {error}");
+            Vec::new()
         }
     })
 }

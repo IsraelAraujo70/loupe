@@ -38,6 +38,25 @@ pub fn search(query: &str, team_key: Option<&str>, cx: &mut App) -> Task<Vec<Pal
     })
 }
 
+/// The row of the issue `identifier` names, read by that identifier, for a
+/// query that names it exactly. Empty when Linear is not connected, no issue
+/// has it, or the read fails.
+pub fn find(identifier: &str, cx: &mut App) -> Task<Vec<PaletteItem>> {
+    let Some(client) = data::client(cx) else {
+        return Task::ready(Vec::new());
+    };
+    let identifier = identifier.to_owned();
+    crate::services::background(cx, move || {
+        match client.issues_by_identifiers(&[identifier]) {
+            Ok(issues) => palette_items(&issues),
+            Err(error) => {
+                eprintln!("linear palette lookup failed: {}", data::error_text(&error));
+                Vec::new()
+            }
+        }
+    })
+}
+
 fn palette_items(issues: &[IssueSummary]) -> Vec<PaletteItem> {
     issues.iter().map(palette_item).collect()
 }

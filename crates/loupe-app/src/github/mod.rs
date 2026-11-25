@@ -117,6 +117,11 @@ pub fn palette_search(query: &str, first: u32, cx: &mut App) -> Task<Vec<Palette
     palette::search(query, first, cx)
 }
 
+/// The palette row of the pull request a query names exactly, with its title.
+pub fn palette_pull_request(pr: PrRef, cx: &mut App) -> Task<Vec<PaletteItem>> {
+    palette::find(pr, cx)
+}
+
 /// The repositories the viewer reaches, for the command palette's `repo:`
 /// and `org:` filters.
 pub fn palette_repositories(cx: &mut App) -> Task<Vec<RepoRef>> {

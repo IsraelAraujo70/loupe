@@ -7,6 +7,7 @@ mod emphasis;
 mod expand;
 mod header;
 mod model;
+mod on_screen;
 mod search;
 mod sticky;
 mod tree;
@@ -46,14 +47,15 @@ use loupe_github::{
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
-use self::emphasis::{Emphasis, SharedEmphasis};
+use self::emphasis::{Emphasis, SharedEmphasis, SyntaxCache};
 use self::expand::{Direction, Gap, Source};
 use self::model::{
     LoadedFiles, Missing, PlacedThread, Placement, anchor_error_message, build_files, diff_mode,
     file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
     to_diff_side, to_side, viewed_counts,
 };
-use self::search::Match;
+use self::on_screen::{CardWidth, on_screen};
+use self::search::{Match, Needle};
 use self::sticky::HeaderWatch;
 use self::tree::{
     GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
@@ -157,6 +159,9 @@ struct Find {
     open: bool,
     /// The text the matches are for.
     query: SharedString,
+    /// The text the diff's highlighter marks: the query while the bar is
+    /// open, else nothing.
+    marked: SharedString,
     matches: Vec<Match>,
     current: Option<usize>,
 }
@@ -221,11 +226,15 @@ pub struct FilesTab {
     diff: Option<Entity<DiffState>>,
     /// The changed words the diff marks, read by its highlighter.
     emphasis: SharedEmphasis,
+    /// The syntax colors the highlighter worked out, kept for the next one.
+    syntax: SyntaxCache,
     /// The syntax colors the diff's highlighter was made with.
     syntax_theme: Arc<HighlightTheme>,
     _theme_changes: Subscription,
     /// Where the diff drew its file headers, to tell the file at its top.
     headers: Rc<RefCell<HeaderWatch>>,
+    /// How wide the threads and the composer are in the diff on screen.
+    card_width: CardWidth,
     layout: DiffLayout,
     viewed_error: Option<String>,
     viewed_pending: HashSet<String>,
@@ -243,26 +252,29 @@ pub struct FilesTab {
 
 impl FilesTab {
     pub fn new(context: PrTabContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::build(context, None, window, cx)
+        Self::build(context, None, None, window, cx)
     }
 
     /// The tab for what commit `oid` of the pull request changes against its
     /// first parent. Its Viewed marks are the pull request's, as on GitHub;
     /// it takes no threads or new comments, which belong to the pull
-    /// request's whole diff.
+    /// request's whole diff. `find`, the text of the find bar open in the
+    /// commit shown before, opens the bar with it.
     pub fn for_commit(
         context: PrTabContext,
         oid: String,
+        find: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let commit = CommitSource { oid, parent: None };
-        Self::build(context, Some(commit), window, cx)
+        Self::build(context, Some(commit), find, window, cx)
     }
 
     fn build(
         context: PrTabContext,
         commit: Option<CommitSource>,
+        find: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -272,7 +284,13 @@ impl FilesTab {
                 cx.notify();
             }
         });
-        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in diff"));
+        let find_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Find in diff");
+            if let Some(text) = &find {
+                input.set_value(text.clone(), window, cx);
+            }
+            input
+        });
         let find_events =
             cx.subscribe(&find_input, |this, _, event: &InputEvent, cx| match event {
                 // Enter also reports a change; only a new text starts over.
@@ -307,9 +325,11 @@ impl FilesTab {
             expansions: HashMap::new(),
             diff: None,
             emphasis: SharedEmphasis::default(),
+            syntax: SyntaxCache::default(),
             syntax_theme: cx.theme().highlight_theme.clone(),
             _theme_changes: cx.observe_global::<Theme>(Self::theme_changed),
             headers: Rc::default(),
+            card_width: CardWidth::default(),
             layout: Settings::get(cx).diff_layout,
             viewed_error: None,
             viewed_pending: HashSet::new(),
@@ -324,8 +344,9 @@ impl FilesTab {
             find: Find {
                 input: find_input,
                 _events: find_events,
-                open: false,
+                open: find.is_some(),
                 query: SharedString::default(),
+                marked: find.unwrap_or_default(),
                 matches: Vec::new(),
                 current: None,
             },
@@ -520,6 +541,7 @@ impl FilesTab {
             }
         };
         self.load.finish(Ok(()));
+        let first_load = self.diff.is_none();
         self.files = loaded.files;
         eprintln!(
             "review-files-ready pr={} files={} timestamp={}",
@@ -530,6 +552,10 @@ impl FilesTab {
         self.hunks = loaded.hunks;
         self.missing = loaded.missing;
         self.expansions.clear();
+        self.syntax
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         self.refresh_emphasis();
         let mode = diff_mode(self.layout);
         match &self.diff {
@@ -572,10 +598,13 @@ impl FilesTab {
             self.composer = None;
         }
         self.threads_dirty = true;
-        if let Some((path, line, side)) = self.pending_reveal.take() {
+        let reveal = self.pending_reveal.take();
+        // A find carried from the commit shown before goes to its first match.
+        let jump = first_load && reveal.is_none();
+        if let Some((path, line, side)) = reveal {
             self.apply_reveal(&path, line, side, cx);
         }
-        self.run_find(false, cx);
+        self.run_find(jump, cx);
     }
 
     /// Collapses viewed files, and files whose diff GitHub left out so the
@@ -963,19 +992,37 @@ impl FilesTab {
             .unwrap_or_else(PoisonError::into_inner) = Arc::new(shown);
     }
 
-    /// The diff's highlighter, in the current theme's syntax colors and the
-    /// component's own wash for changed words.
+    /// The diff's highlighter, in the current theme's syntax colors, the
+    /// component's own wash for changed words, and the find's mark over the
+    /// text found.
     fn highlighter(
         &self,
         cx: &App,
     ) -> impl Fn(&str, &str) -> Vec<(Range<usize>, HighlightStyle)> + Send + Sync + 'static {
         let theme = cx.theme();
-        emphasis::highlighter(
+        let words = emphasis::highlighter(
             self.emphasis.clone(),
+            self.syntax.clone(),
             theme.highlight_theme.clone(),
             theme.success.opacity(0.3),
             theme.danger.opacity(0.3),
-        )
+        );
+        let needle = Needle::new(&self.find.marked);
+        let found = HighlightStyle {
+            background_color: Some(theme.warning.opacity(0.4)),
+            ..Default::default()
+        };
+        move |language, text| {
+            let mut styles = words(language, text);
+            if let Some(needle) = &needle {
+                styles.extend(
+                    search::marks(needle, text)
+                        .into_iter()
+                        .map(|range| (range, found)),
+                );
+            }
+            styles
+        }
     }
 
     /// The highlighter keeps the styles it returned, so a new palette needs a
@@ -985,6 +1032,7 @@ impl FilesTab {
             return;
         }
         self.syntax_theme = cx.theme().highlight_theme.clone();
+        self.syntax = SyntaxCache::default();
         if let Some(state) = self.diff.clone() {
             let highlighter = self.highlighter(cx);
             state.update(cx, |state, cx| {
@@ -1302,8 +1350,35 @@ impl FilesTab {
         self.find.open = false;
         self.find.matches.clear();
         self.find.current = None;
+        self.mark_found(cx);
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// The find bar's text while it is open, for the commit shown next.
+    pub fn open_find_text(&self, cx: &App) -> Option<SharedString> {
+        self.find.open.then(|| self.find.input.read(cx).value())
+    }
+
+    /// Gives the diff a highlighter that marks the text to find, when that
+    /// text changed: the query while the bar is open, else none. A new
+    /// highlighter paints every file again.
+    fn mark_found(&mut self, cx: &mut Context<Self>) {
+        let marked = if self.find.open {
+            self.find.query.clone()
+        } else {
+            SharedString::default()
+        };
+        if marked == self.find.marked {
+            return;
+        }
+        self.find.marked = marked;
+        if let Some(state) = self.diff.clone() {
+            let highlighter = self.highlighter(cx);
+            state.update(cx, |state, cx| {
+                state.set_syntax_highlighter(highlighter, cx)
+            });
+        }
     }
 
     /// Finds the bar's text in the diffs loaded. A new text goes to its first
@@ -1329,6 +1404,7 @@ impl FilesTab {
         });
         self.find.matches = search::find(files, &query);
         self.find.query = query.clone();
+        self.mark_found(cx);
         if !query.is_empty() {
             let lines: usize = self
                 .files
@@ -1349,6 +1425,8 @@ impl FilesTab {
                 found.path == previous.path
                     && found.line == previous.line
                     && found.side == previous.side
+                    && found.range == previous.range
+                    && found.in_header == previous.in_header
             })
         });
         self.find.current =
@@ -1399,46 +1477,33 @@ impl FilesTab {
             .position(|file| file.path == path.as_ref())
     }
 
-    /// The marks of the lines found: a quiet one on each, a stronger one on
-    /// the current match. A split diff marks both halves of an unchanged line.
+    /// The mark of the current match's line, on both halves of an unchanged
+    /// line in a split diff; the highlighter marks the text found in every
+    /// line. A match in a hunk's header has no line to mark.
     fn find_decorations(&self, cx: &App) -> Vec<DiffDecoration> {
-        if !self.find.open {
-            return Vec::new();
-        }
-        let current = cx.theme().warning.opacity(0.5);
-        let marks = |found: &Match| {
-            let mut marks = vec![DiffDecoration::new(DiffLineRange::new(
-                found.path.clone(),
-                to_diff_side(found.side),
-                found.line as usize,
-                found.line as usize,
-            ))];
-            if let Some(old) = found.old_line {
-                marks.push(DiffDecoration::new(DiffLineRange::new(
-                    found.path.clone(),
-                    to_diff_side(loupe_github::Side::Left),
-                    old as usize,
-                    old as usize,
-                )));
-            }
-            marks
-        };
-        let mut decorations: Vec<DiffDecoration> = self
+        let Some(found) = self
             .find
-            .matches
-            .iter()
-            .enumerate()
-            .filter(|(ix, _)| Some(*ix) != self.find.current)
-            .flat_map(|(_, found)| marks(found))
-            .collect();
-        // The last decoration on a line is the one shown.
-        if let Some(found) = self.find.current.and_then(|ix| self.find.matches.get(ix)) {
-            decorations.extend(
-                marks(found)
-                    .into_iter()
-                    .map(|mark| mark.with_background(current)),
-            );
-        }
+            .current
+            .and_then(|ix| self.find.matches.get(ix))
+            .filter(|found| self.find.open && !found.in_header)
+        else {
+            return Vec::new();
+        };
+        let line = |side, line: u32| {
+            DiffDecoration::new(DiffLineRange::new(
+                found.path.clone(),
+                to_diff_side(side),
+                line as usize,
+                line as usize,
+            ))
+            .with_background(cx.theme().warning.opacity(0.2))
+        };
+        let mut decorations = vec![line(found.side, found.line)];
+        decorations.extend(
+            found
+                .old_line
+                .map(|old| line(loupe_github::Side::Left, old)),
+        );
         decorations
     }
 
@@ -1452,9 +1517,9 @@ impl FilesTab {
             _ if !searching => None,
             Some(ix) => Some((
                 format!("{} of {total}", ix + 1),
-                format!("Line {} of {total} with the text", ix + 1),
+                format!("Match {} of {total}", ix + 1),
             )),
-            None => Some(("No results".to_owned(), "No line has the text".to_owned())),
+            None => Some(("No results".to_owned(), "No match in the diff".to_owned())),
         };
         let not_searched = self
             .missing
@@ -2397,9 +2462,10 @@ impl FilesTab {
         // keeps the scroll offset to itself (`DiffState::horizontal_scroll`
         // is crate-private), so a bar of Loupe's own could not be true.
         let runs_on = !wrap && self.long_files().next().is_some();
+        let fade = if runs_on { dp(FADE_WIDTH) } else { px(0.) };
+        let card_width = self.card_width.clone();
         let content: HeaderFor = {
             let (viewed, sizes, weak) = (viewed.clone(), sizes.clone(), weak.clone());
-            let fade = if runs_on { dp(FADE_WIDTH) } else { px(0.) };
             Rc::new(move |file: &DiffFile| {
                 let path = file.path().clone();
                 let title = match (file.original_path(), file.modified_path()) {
@@ -2466,8 +2532,9 @@ impl FilesTab {
                 // Long lines scroll sideways by default, so a line keeps its
                 // indentation (the component has no hanging indent for a
                 // wrapped line); the toolbar's Wrap option wraps them. Threads and the composer anchor under a
-                // line in a card at most 760 px wide from the leading edge,
-                // so their buttons stay in reach however wide the file is.
+                // line in a card at most 760 px wide that stays on the part
+                // of the diff on screen, so their buttons stay in reach
+                // however wide the file or narrow the window is.
                 Diff::new(state)
                     .size_full()
                     .soft_wrap(wrap)
@@ -2481,6 +2548,7 @@ impl FilesTab {
                         // Threads and the composer sit in a card under their
                         // line, inset from the gutter like a review comment.
                         let card = div()
+                            .debug_selector(|| "diff-card".into())
                             .mx_3()
                             .my_2()
                             .p(scale::card_padding())
@@ -2491,7 +2559,8 @@ impl FilesTab {
                             .bg(surface);
                         if let Some((_, view)) = views.iter().find(|(id, _)| id == annotation.id())
                         {
-                            return card.child(view.clone()).into_any_element();
+                            return on_screen(card.child(view.clone()), card_width.clone(), fade)
+                                .into_any_element();
                         }
                         let (note, load) = notes
                             .iter()
@@ -2895,11 +2964,12 @@ pub(super) mod tests {
     use std::sync::Arc;
 
     use chrono::{DateTime, Utc};
+    use gpui_kit::component::ActiveTheme as _;
     use gpui_kit::component::diff::{DiffLineRange, DiffSide};
     use gpui_kit::{
-        AppContext as _, Bounds, Entity, InputEvent as _, Modifiers, MouseButton, MouseDownEvent,
-        MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, TestAppContext,
-        VisualTestContext, WindowBounds, WindowOptions, point, px, size,
+        AppContext as _, Bounds, Context, Entity, InputEvent as _, Modifiers, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent,
+        TestAppContext, VisualTestContext, Window, WindowBounds, WindowOptions, point, px, size,
     };
     use loupe_github::diff::{git_patch, parse_patch};
     use loupe_github::{
@@ -2907,6 +2977,7 @@ pub(super) mod tests {
         PullRequestDetail, RepoRef, ViewedState,
     };
 
+    use super::emphasis::PLAIN;
     use super::expand::{Direction, Source};
     use super::model::build_files;
     use super::{FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_WIDTH, FilesTab, PrTabContext};
@@ -2990,6 +3061,15 @@ pub(super) mod tests {
         cx: &mut TestAppContext,
         files: Vec<ChangedFile>,
     ) -> (VisualTestContext, Entity<FilesTab>) {
+        open_tab(cx, files, FilesTab::new)
+    }
+
+    /// The tab `build` makes, alone in a window, with `files` loaded.
+    fn open_tab(
+        cx: &mut TestAppContext,
+        files: Vec<ChangedFile>,
+        build: impl FnOnce(PrTabContext, &mut Window, &mut Context<FilesTab>) -> FilesTab + 'static,
+    ) -> (VisualTestContext, Entity<FilesTab>) {
         let (handle, tab) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::init(cx);
@@ -3010,7 +3090,7 @@ pub(super) mod tests {
                         pr: PrRef::new(RepoRef::new("acme", "app"), 12),
                         detail: Arc::new(detail()),
                     };
-                    cx.new(|cx| FilesTab::new(context, window, cx))
+                    cx.new(|cx| build(context, window, cx))
                 },
             )
             .expect("open the window")
@@ -3269,6 +3349,68 @@ pub(super) mod tests {
         assert_viewed_on_screen(cx, "lines wrap");
     }
 
+    fn assert_card_on_screen(cx: &mut VisualTestContext, case: &str) -> Bounds<Pixels> {
+        let (_, diff) = panes(cx);
+        let card = cx
+            .debug_bounds("diff-card")
+            .expect("the composer's card is drawn");
+        assert!(
+            card.left() >= diff.left() && card.right() <= diff.right(),
+            "{case}: the card {card:?} is outside the diff {diff:?}"
+        );
+        card
+    }
+
+    #[gpui_kit::test]
+    fn a_card_under_a_line_stays_on_screen_while_lines_scroll(cx: &mut TestAppContext) {
+        let line = "x".repeat(400);
+        let (mut cx, tab) = open_files_tab_with(
+            cx,
+            ChangedFile {
+                path: "src/main.rs".into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 1,
+                patch: Some(format!("@@ -1 +1 @@\n-old\n+{line}")),
+                viewed: ViewedState::Unviewed,
+            },
+        );
+        let cx = &mut cx;
+        cx.update(|window, cx| {
+            tab.update(cx, |tab, cx| {
+                let range = DiffLineRange::new("src/main.rs", DiffSide::Modified, 1, 1);
+                tab.open_composer(&range, window, cx);
+            })
+        });
+
+        let before = assert_card_on_screen(cx, "lines scroll");
+        let (_, diff) = panes(cx);
+        dispatch(
+            cx,
+            ScrollEvent {
+                position: point(diff.left() + px(200.), diff.top() + px(60.)),
+                delta: ScrollDelta::Pixels(point(px(-300.), px(0.))),
+                ..ScrollEvent::default()
+            }
+            .to_platform_input(),
+        );
+        let after = assert_card_on_screen(cx, "scrolled sideways");
+        assert_eq!(
+            after.left(),
+            before.left(),
+            "the card stays put while the lines scroll"
+        );
+
+        // The diff beside the tree is narrower than a card at its widest.
+        cx.simulate_resize(size(px(960.), px(800.)));
+        let narrow = assert_card_on_screen(cx, "narrow window");
+        assert!(narrow.size.width < before.size.width, "the card narrows");
+
+        cx.update(|_, cx| update_settings(cx, |settings| settings.diff_wrap = true));
+        assert_card_on_screen(cx, "lines wrap");
+    }
+
     fn added(path: &str, lines: usize) -> ChangedFile {
         let body: String = (1..=lines).map(|line| format!("+line {line}\n")).collect();
         ChangedFile {
@@ -3447,6 +3589,83 @@ pub(super) mod tests {
             current_match(cx, &tab).map(|(_, path, line)| (path, line)),
             before,
             "the current match stays where it was"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn find_marks_the_text_found_and_only_the_current_line(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_files_tab_with_files(cx, vec![added("src/long.rs", 300)]);
+        let cx = &mut cx;
+        draw(cx);
+        let marked = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let found = cx.theme().warning.opacity(0.4);
+                let highlight = tab.read(cx).highlighter(cx);
+                highlight(PLAIN, "line 25\nline 250\nline 3\n")
+                    .into_iter()
+                    .filter(|(_, style)| style.background_color == Some(found))
+                    .map(|(range, _)| range)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(marked(cx).is_empty(), "nothing is marked before a find");
+
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.open_find(window, cx)));
+        cx.simulate_input("LINE 25");
+        draw(cx);
+        assert_eq!(
+            marked(cx),
+            [0..7, 8..15],
+            "the text found, not the whole line"
+        );
+        let lines: Vec<_> = cx.update(|_, cx| {
+            tab.read(cx)
+                .find_decorations(cx)
+                .iter()
+                .map(|mark| (mark.range().start(), mark.range().end()))
+                .collect()
+        });
+        assert_eq!(lines, [(25, 25)], "only the current match's line");
+        assert_eq!(
+            cx.update(|_, cx| tab.read(cx).open_find_text(cx))
+                .as_deref(),
+            Some("LINE 25")
+        );
+
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.close_find(window, cx)));
+        assert!(
+            marked(cx).is_empty(),
+            "closing the bar takes the marks away"
+        );
+        assert_eq!(cx.update(|_, cx| tab.read(cx).open_find_text(cx)), None);
+    }
+
+    #[gpui_kit::test]
+    fn the_next_commit_opens_with_the_find_on_its_first_match(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_tab(
+            cx,
+            vec![added("src/long.rs", 300)],
+            |context, window, cx| {
+                FilesTab::for_commit(context, "c0ffee".into(), Some("LINE 25".into()), window, cx)
+            },
+        );
+        let cx = &mut cx;
+        draw(cx);
+        assert!(cx.debug_bounds("files-find").is_some(), "the bar is open");
+        assert_eq!(
+            tab.read_with(cx, |tab, cx| tab.find.input.read(cx).value().to_string()),
+            "LINE 25"
+        );
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 11);
+        assert_eq!(
+            current_match(cx, &tab),
+            Some((0, "src/long.rs".into(), 25)),
+            "the first match"
+        );
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
+            Some("src/long.rs"),
+            "the diff went to it"
         );
     }
 
