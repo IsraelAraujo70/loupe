@@ -14,6 +14,7 @@ use loupe_github::{PrRef, PullRequestDetail, Side};
 
 pub use files::FindInDiff;
 use view::PullRequestView;
+pub use view::{NEXT_UNVIEWED_KEYS, NextUnviewedFile};
 
 /// One-shot intent set when the user picks "Merge stack" from a stack row's
 /// context menu in Reviews: the root PR view consumes it once the stack loads
