@@ -16,11 +16,14 @@ use chrono::{DateTime, Utc};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{PrRef, PullRequestDetail, Side, StackNode};
+use loupe_github::{PrRef, PrState, PullRequestDetail, ReviewEvent, Side, StackNode};
 use loupe_guide::{
     ChapterChange, DecisionCategory, DecisionPoint, DiffSnippet, FlowComparison, GuideLanguage,
     GuideReadState, GuideStep, RemovedTest, ReviewGuide, SnippetSide, StepChange, StoredGuide,
@@ -29,6 +32,7 @@ use loupe_guide::{
 
 use super::files::{FADE_WIDTH, LONG_LINE};
 use super::tab::{PrTabContext, PrTabEvent};
+use super::view::{ReviewButton, can_approve, pending_comments_label, review_button};
 use crate::github::highlight::{highlight_lines, language_for_path};
 use crate::github::widgets;
 use crate::store::Settings;
@@ -85,6 +89,26 @@ pub enum GuideAction {
 
 type GuideActionHandler = Arc<dyn Fn(GuideAction, &mut Window, &mut App)>;
 
+/// The pull request the review at the end of the Guide goes to: the one on
+/// screen, or the stack chapter's.
+struct ReviewTarget {
+    number: u64,
+    /// The chapter's title, for a chapter of another pull request.
+    title: Option<String>,
+    /// False when the viewer wrote it: GitHub then takes only a comment.
+    may_approve: bool,
+    /// Inline comments of the viewer's pending review, sent with it.
+    pending_comments: u32,
+}
+
+/// A review sent from the Guide to one pull request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GuideReview {
+    Sending(ReviewEvent),
+    Sent(ReviewEvent),
+    Failed(String),
+}
+
 pub struct GuideTab {
     context: PrTabContext,
     state: GuideViewState,
@@ -100,12 +124,38 @@ pub struct GuideTab {
     selected_chapter: Option<u64>,
     /// Optional action handler registered by the owning pull request view (wired in stage 4).
     on_action: Option<GuideActionHandler>,
+    review_body: Entity<TextareaState>,
+    /// Empty the review comment on the next render: its review went out.
+    clear_review_body: bool,
+    /// Reviews sent from this tab, by pull request number.
+    reviews: HashMap<u64, GuideReview>,
+    _submit_on_secondary_enter: Subscription,
 }
 
 impl EventEmitter<PrTabEvent> for GuideTab {}
 
 impl GuideTab {
-    pub fn new(context: PrTabContext, _window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(context: PrTabContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let review_body = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(3, 10)
+                .placeholder("Leave a comment")
+        });
+        let submit_on_secondary_enter = cx.subscribe_in(
+            &review_body,
+            window,
+            |this, _, event: &InputEvent, _window, cx| {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: true,
+                        ..
+                    }
+                ) {
+                    this.submit_review(ReviewEvent::Comment, cx);
+                }
+            },
+        );
         Self {
             context,
             state: GuideViewState::Empty,
@@ -115,6 +165,10 @@ impl GuideTab {
             read_target: None,
             selected_chapter: None,
             on_action: None,
+            review_body,
+            clear_review_body: false,
+            reviews: HashMap::new(),
+            _submit_on_secondary_enter: submit_on_secondary_enter,
         }
     }
 
@@ -217,6 +271,96 @@ impl GuideTab {
         self.read_target
             .as_ref()
             .map_or(self.context.pr.number, |target| target.pr.number)
+    }
+
+    /// Where the review at the end of the Guide goes, while GitHub takes one
+    /// there: the rules of the header's Review changes for this pull request,
+    /// and an open pull request for another chapter of its stack.
+    fn review_target(&self) -> Option<ReviewTarget> {
+        let number = match &self.state {
+            GuideViewState::Ready { .. } => self.context.pr.number,
+            GuideViewState::StackReady { .. } => self.selected_chapter?,
+            _ => return None,
+        };
+        if number == self.context.pr.number {
+            let detail = &self.context.detail;
+            return (review_button(detail) != ReviewButton::Hidden).then(|| ReviewTarget {
+                number,
+                title: None,
+                may_approve: can_approve(detail),
+                pending_comments: detail
+                    .pending_review
+                    .as_ref()
+                    .map_or(0, |review| review.comment_count),
+            });
+        }
+        let GuideViewState::StackReady { stored, nodes, .. } = &self.state else {
+            return None;
+        };
+        nodes
+            .iter()
+            .find(|node| node.pr.number == number && node.state == PrState::Open)
+            .map(|node| ReviewTarget {
+                number,
+                title: Some(
+                    stored
+                        .chapter(number)
+                        .map_or_else(|| node.title.clone(), |(_, chapter)| chapter.title.clone()),
+                ),
+                // Its author is known only once it loads; the send checks.
+                may_approve: true,
+                pending_comments: 0,
+            })
+    }
+
+    fn submit_review(&mut self, event: ReviewEvent, cx: &mut Context<Self>) {
+        let Some(target) = self.review_target() else {
+            return;
+        };
+        if matches!(
+            self.reviews.get(&target.number),
+            Some(GuideReview::Sending(_) | GuideReview::Sent(_))
+        ) {
+            return;
+        }
+        let body = self.review_body.read(cx).value().trim_end().to_owned();
+        self.reviews
+            .insert(target.number, GuideReview::Sending(event));
+        cx.emit(PrTabEvent::SubmitReview {
+            pr: PrRef::new(self.context.pr.repo.clone(), target.number),
+            event,
+            body,
+        });
+        cx.notify();
+    }
+
+    /// Shows how the review sent to pull request `number` ended.
+    pub fn finish_review(
+        &mut self,
+        number: u64,
+        event: ReviewEvent,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let review = match result {
+            Ok(()) => {
+                self.clear_review_body = true;
+                GuideReview::Sent(event)
+            }
+            Err(message) => GuideReview::Failed(message),
+        };
+        self.reviews.insert(number, review);
+        cx.notify();
+    }
+
+    /// A chapter button's label, which says when the chapter is this pull
+    /// request's: its number alone reads as a link to the page on screen.
+    fn chapter_label(&self, direction: &str, number: u64) -> String {
+        if number == self.context.pr.number {
+            format!("{direction} chapter: #{number} (this pull request)")
+        } else {
+            format!("{direction} chapter: #{number}")
+        }
     }
 
     /// Validates raw JSON at the boundary and transitions to `Ready` or `Invalid`.
@@ -622,7 +766,218 @@ impl GuideTab {
                 col.child(self.render_uncovered_files(&uncovered, cx))
             })
             .child(self.render_steps(guide, changed_steps, viewed, total, cx))
+            .when_some(self.review_target(), |col, target| {
+                col.child(self.render_review(target, total > 0 && viewed == total, None, cx))
+            })
             .into_any_element()
+    }
+
+    /// The review at the end of the Guide: a comment and Comment, Request
+    /// changes, or Approve, sent the way the header's Review changes sends
+    /// it. It stands out once every step is viewed. Once sent, it says what
+    /// went to which pull request and offers the next chapter.
+    fn render_review(
+        &self,
+        target: ReviewTarget,
+        all_viewed: bool,
+        next: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let number = target.number;
+        let muted = cx.theme().muted_foreground;
+        let review = self.reviews.get(&number);
+        let card = ui::card(cx)
+            .id("guide-review")
+            .debug_selector(|| "guide-review".into())
+            .role(Role::Group)
+            .aria_label(format!("Review #{number}"))
+            .p_4()
+            .gap_3()
+            .when(all_viewed, |card| card.border_color(tokens::accent()));
+
+        if let Some(GuideReview::Sent(event)) = review {
+            let (icon, color, label) = match event {
+                ReviewEvent::Approve => (IconName::CircleCheck, tokens::open(), "Approved"),
+                ReviewEvent::RequestChanges => {
+                    (IconName::CircleX, tokens::closed(), "Changes requested on")
+                }
+                ReviewEvent::Comment => (IconName::MessageSquare, muted, "Commented on"),
+            };
+            let label = format!("{label} #{number}");
+            return card
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            h_flex()
+                                .id("guide-review-status")
+                                .debug_selector(|| "guide-review-status".into())
+                                .role(Role::Status)
+                                .aria_label(label.clone())
+                                .flex_1()
+                                .min_w_0()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(icon)
+                                        .with_size(scale::icon_md())
+                                        .text_color(color),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(scale::title())
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(label),
+                                ),
+                        )
+                        .child(
+                            Button::new("guide-review-again")
+                                .debug_selector(|| "guide-review-again".into())
+                                .ghost()
+                                .control()
+                                .label("New review")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reviews.remove(&number);
+                                    cx.notify();
+                                })),
+                        )
+                        .when_some(next, |row, next| {
+                            row.child(
+                                Button::new("guide-review-next")
+                                    .debug_selector(|| "guide-review-next".into())
+                                    .primary()
+                                    .control()
+                                    .icon(IconName::ArrowRight)
+                                    .label(self.chapter_label("Next", next))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_chapter(next, cx);
+                                    })),
+                            )
+                        }),
+                )
+                .into_any_element();
+        }
+
+        let busy = matches!(review, Some(GuideReview::Sending(_)));
+        let error = match review {
+            Some(GuideReview::Failed(message)) => Some(message.clone()),
+            _ => None,
+        };
+        let may_approve = target.may_approve;
+        let submit = |id: &'static str, label: &'static str, event: ReviewEvent, allowed: bool| {
+            Button::new(id)
+                .debug_selector(move || id.into())
+                .control()
+                .label(label)
+                .disabled(busy || !allowed)
+                .when(!allowed, |button| {
+                    button.tooltip("You cannot approve or request changes on your own pull request")
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.submit_review(event, cx)))
+        };
+        let hint = if busy {
+            "Submitting…".to_owned()
+        } else if may_approve {
+            format!("{} submits as a comment.", ui::shortcut("cmd-enter"))
+        } else {
+            "You are the author, so you can only comment.".to_owned()
+        };
+        card.child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(scale::title())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("Review #{number}")),
+                )
+                .when_some(target.title, |row, title| {
+                    row.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(scale::body())
+                            .text_color(muted)
+                            .child(title),
+                    )
+                })
+                .when(target.pending_comments > 0, |row| {
+                    row.child(
+                        widgets::tinted_tag(tokens::pending())
+                            .child(pending_comments_label(target.pending_comments)),
+                    )
+                }),
+        )
+        .child(
+            Textarea::new(&self.review_body)
+                .aria_label(format!("Review comment for #{number}"))
+                .disabled(busy),
+        )
+        .when_some(error, |card, message| {
+            card.child(Alert::error("guide-review-error", message))
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .flex_wrap()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .child(hint),
+                )
+                .child(
+                    submit(
+                        "guide-review-comment",
+                        "Comment",
+                        ReviewEvent::Comment,
+                        true,
+                    )
+                    .outline(),
+                )
+                .child(
+                    submit(
+                        "guide-review-changes",
+                        "Request changes",
+                        ReviewEvent::RequestChanges,
+                        may_approve,
+                    )
+                    .map(|button| {
+                        if all_viewed {
+                            button.danger()
+                        } else {
+                            button.outline()
+                        }
+                    }),
+                )
+                .child(
+                    submit(
+                        "guide-review-approve",
+                        "Approve",
+                        ReviewEvent::Approve,
+                        may_approve,
+                    )
+                    .map(|button| {
+                        if all_viewed {
+                            button.primary()
+                        } else {
+                            button.outline()
+                        }
+                    }),
+                ),
+        )
+        .into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1432,7 +1787,12 @@ impl GuideTab {
         let stack_tag = ui::chip()
             .child(format!("Stack · {} PRs", stored.chapters.len()))
             .into_any_element();
-
+        let next = stored.chapters.get(chapter_ix + 1).map(|c| c.pr_number);
+        let target = self.review_target();
+        // Once the chapter's review went out, its card offers the next chapter.
+        let next_in_review = target.as_ref().is_some_and(|target| {
+            matches!(self.reviews.get(&target.number), Some(GuideReview::Sent(_)))
+        }) && next.is_some();
         v_flex()
             .w_full()
             .px(scale::content_inset())
@@ -1468,7 +1828,15 @@ impl GuideTab {
                 col.child(self.render_uncovered_files(&uncovered, cx))
             })
             .child(self.render_steps(guide, &HashMap::new(), viewed, total, cx))
-            .child(self.render_chapter_nav(stored, chapter_ix, cx))
+            .when_some(target, |col, target| {
+                col.child(self.render_review(target, total > 0 && viewed == total, next, cx))
+            })
+            .child(self.render_chapter_nav(
+                stored,
+                chapter_ix,
+                next.filter(|_| !next_in_review),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -1821,13 +2189,13 @@ impl GuideTab {
         &self,
         stored: &StoredStackGuide,
         chapter_ix: usize,
+        next: Option<u64>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let previous = chapter_ix
             .checked_sub(1)
             .and_then(|ix| stored.chapters.get(ix))
             .map(|c| c.pr_number);
-        let next = stored.chapters.get(chapter_ix + 1).map(|c| c.pr_number);
         h_flex()
             .w_full()
             .gap_2()
@@ -1839,7 +2207,7 @@ impl GuideTab {
                         .outline()
                         .control()
                         .icon(IconName::ArrowLeft)
-                        .label(format!("Previous chapter: #{number}"))
+                        .label(self.chapter_label("Previous", number))
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.select_chapter(number, cx)),
                         ),
@@ -1853,7 +2221,7 @@ impl GuideTab {
                         .outline()
                         .control()
                         .icon(IconName::ArrowRight)
-                        .label(format!("Next chapter: #{number}"))
+                        .label(self.chapter_label("Next", number))
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.select_chapter(number, cx)),
                         ),
@@ -1873,7 +2241,11 @@ struct MapRow<'a> {
 }
 
 impl Render for GuideTab {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.clear_review_body) {
+            self.review_body
+                .update(cx, |state, cx| state.set_value("", window, cx));
+        }
         match &self.state {
             GuideViewState::Empty => self.render_empty(cx),
             GuideViewState::Unavailable { reason } => self.render_unavailable(reason, cx),
@@ -2034,7 +2406,7 @@ mod tests {
     };
     use loupe_github::{
         Actor, Checks, MergeMethod, MergeStateStatus, Mergeable, PrRef, PrState, PullRequestDetail,
-        RepoRef, Side,
+        RepoRef, ReviewEvent, Side,
     };
     use loupe_guide::{
         DecisionCategory, DecisionPoint, DiffSnippet, FlowComparison, GuideStep, GuideSummary,
@@ -2146,7 +2518,15 @@ mod tests {
         cx: &mut TestAppContext,
         height: f32,
     ) -> (VisualTestContext, gpui_kit::Entity<GuideTab>) {
-        let d = Arc::new(detail());
+        open_guide_with(cx, height, detail())
+    }
+
+    fn open_guide_with(
+        cx: &mut TestAppContext,
+        height: f32,
+        detail: PullRequestDetail,
+    ) -> (VisualTestContext, gpui_kit::Entity<GuideTab>) {
+        let d = Arc::new(detail);
         let (handle, tab) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::init(cx);
@@ -2457,5 +2837,268 @@ mod tests {
             })
         );
         assert_eq!(tab.read_with(&cx, |tab, _| tab.step_count()), Some(3));
+    }
+
+    fn record_events(
+        cx: &mut VisualTestContext,
+        tab: &gpui_kit::Entity<GuideTab>,
+    ) -> Rc<RefCell<Vec<PrTabEvent>>> {
+        let emitted: Rc<RefCell<Vec<PrTabEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = emitted.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(tab, move |_, event: &PrTabEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        emitted
+    }
+
+    fn load_fixture_guide(cx: &mut VisualTestContext, tab: &gpui_kit::Entity<GuideTab>) {
+        let raw = serde_json::to_string(&fixture_guide()).unwrap();
+        tab.update(cx, |tab, cx| {
+            tab.load_raw_json(
+                &raw,
+                "abc1234567890".into(),
+                "claude-sonnet-5-5".into(),
+                "medium".into(),
+                cx,
+            );
+        });
+        paint(cx);
+    }
+
+    fn type_review(cx: &mut VisualTestContext, tab: &gpui_kit::Entity<GuideTab>, text: &str) {
+        let text = text.to_owned();
+        cx.update(|window, cx| {
+            tab.update(cx, |tab, cx| {
+                tab.review_body
+                    .update(cx, |state, cx| state.set_value(text, window, cx));
+            });
+        });
+    }
+
+    fn review_text(cx: &mut VisualTestContext, tab: &gpui_kit::Entity<GuideTab>) -> String {
+        tab.read_with(cx, |tab, cx| tab.review_body.read(cx).value().to_string())
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is shown"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        paint(cx);
+    }
+
+    fn submitted(number: u64, event: ReviewEvent, body: &str) -> PrTabEvent {
+        PrTabEvent::SubmitReview {
+            pr: PrRef::new(RepoRef::new("acme", "app"), number),
+            event,
+            body: body.into(),
+        }
+    }
+
+    /// ISR-55: the review at the end of the Guide asks the view to send it to
+    /// this pull request, keeps the comment while it is out or refused, and
+    /// once sent says what went where.
+    #[gpui_kit::test]
+    fn guide_review_submits_to_this_pull_request_and_shows_what_went(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_guide_with_height(cx, 2400.);
+        let emitted = record_events(&mut cx, &tab);
+        load_fixture_guide(&mut cx, &tab);
+        for selector in [
+            "guide-review",
+            "guide-review-comment",
+            "guide-review-changes",
+            "guide-review-approve",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
+        }
+
+        type_review(&mut cx, &tab, "Looks good");
+        click(&mut cx, "guide-review-approve");
+        assert_eq!(
+            emitted.borrow().last(),
+            Some(&submitted(42, ReviewEvent::Approve, "Looks good"))
+        );
+        click(&mut cx, "guide-review-approve");
+        assert_eq!(emitted.borrow().len(), 1, "one review in flight at a time");
+
+        tab.update(&mut cx, |tab, cx| {
+            tab.finish_review(42, ReviewEvent::Approve, Err("GitHub said no".into()), cx);
+        });
+        paint(&mut cx);
+        assert_eq!(
+            review_text(&mut cx, &tab),
+            "Looks good",
+            "a refusal keeps the comment"
+        );
+        click(&mut cx, "guide-review-approve");
+        assert_eq!(
+            emitted.borrow().len(),
+            2,
+            "a refused review can be sent again"
+        );
+
+        tab.update(&mut cx, |tab, cx| {
+            tab.finish_review(42, ReviewEvent::Approve, Ok(()), cx);
+        });
+        paint(&mut cx);
+        assert!(cx.debug_bounds("guide-review-status").is_some());
+        assert!(cx.debug_bounds("guide-review-approve").is_none());
+        assert!(
+            cx.debug_bounds("guide-review-next").is_none(),
+            "a single pull request's guide has no next chapter"
+        );
+        assert_eq!(
+            review_text(&mut cx, &tab),
+            "",
+            "the sent comment is cleared"
+        );
+
+        click(&mut cx, "guide-review-again");
+        assert!(cx.debug_bounds("guide-review-approve").is_some());
+    }
+
+    /// The keyboard sends the review as a comment from its field, as the
+    /// header's Review changes does.
+    #[gpui_kit::test]
+    fn guide_review_secondary_enter_sends_a_comment(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_guide_with_height(cx, 2400.);
+        let emitted = record_events(&mut cx, &tab);
+        load_fixture_guide(&mut cx, &tab);
+        type_review(&mut cx, &tab, "One question inline");
+        cx.update(|window, cx| {
+            let field = tab.read(cx).review_body.read(cx).focus_handle(cx);
+            field.focus(window, cx);
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        });
+        assert_eq!(
+            *emitted.borrow(),
+            vec![submitted(42, ReviewEvent::Comment, "One question inline")]
+        );
+    }
+
+    /// The Guide follows the header's rules: an author only comments, and a
+    /// closed pull request takes no review.
+    #[gpui_kit::test]
+    fn guide_review_lets_the_author_only_comment(cx: &mut TestAppContext) {
+        let mut own = detail();
+        own.viewer_login = "Alice".into();
+        let (mut cx, tab) = open_guide_with(cx, 2400., own);
+        let emitted = record_events(&mut cx, &tab);
+        load_fixture_guide(&mut cx, &tab);
+        type_review(&mut cx, &tab, "Ready for a look");
+        click(&mut cx, "guide-review-approve");
+        click(&mut cx, "guide-review-changes");
+        assert!(emitted.borrow().is_empty(), "the author cannot approve");
+        click(&mut cx, "guide-review-comment");
+        assert_eq!(
+            *emitted.borrow(),
+            vec![submitted(42, ReviewEvent::Comment, "Ready for a look")]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn guide_review_hides_on_a_closed_pull_request(cx: &mut TestAppContext) {
+        let mut closed = detail();
+        closed.state = PrState::Closed;
+        let (mut cx, tab) = open_guide_with(cx, 2400., closed);
+        load_fixture_guide(&mut cx, &tab);
+        assert!(cx.debug_bounds("guide-summary").is_some());
+        assert!(cx.debug_bounds("guide-review").is_none());
+    }
+
+    fn node(number: u64) -> loupe_github::StackNode {
+        loupe_github::StackNode {
+            id: format!("PR_{number}"),
+            pr: PrRef::new(RepoRef::new("acme", "app"), number),
+            title: format!("Part {number}"),
+            state: PrState::Open,
+            is_draft: false,
+            base_ref: if number == 41 {
+                "main".into()
+            } else {
+                format!("feat/{}", number - 1)
+            },
+            head_ref: format!("feat/{number}"),
+            head_oid: format!("head{number}"),
+            cross_repository: false,
+            mergeable: Mergeable::Mergeable,
+            merge_state: MergeStateStatus::Clean,
+            checks: None,
+            review_decision: None,
+            base_requires_review: false,
+            base_requires_checks: false,
+            viewer_can_update: true,
+            stack: None,
+        }
+    }
+
+    /// ISR-55: in a stack guide the review goes to the chapter on screen,
+    /// names it, and once sent offers the next chapter in place of the
+    /// chapter row's button. A chapter whose pull request left the stack
+    /// takes no review.
+    #[gpui_kit::test]
+    fn stack_guide_review_goes_to_the_chapter_on_screen_and_offers_the_next(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, tab) = open_guide_with_height(cx, 2400.);
+        let emitted = record_events(&mut cx, &tab);
+        tab.update(&mut cx, |tab, cx| {
+            tab.set_state(
+                GuideViewState::StackReady {
+                    stored: Box::new(stack_guide()),
+                    changes: std::collections::BTreeMap::new(),
+                    nodes: vec![node(41), node(42)],
+                },
+                cx,
+            );
+        });
+        paint(&mut cx);
+        assert!(
+            cx.debug_bounds("guide-review").is_some(),
+            "#42 is this pull request"
+        );
+
+        click(&mut cx, "guide-stack-map-row-41");
+        type_review(&mut cx, &tab, "Nit: rename the flag");
+        click(&mut cx, "guide-review-comment");
+        assert_eq!(
+            emitted.borrow().last(),
+            Some(&submitted(41, ReviewEvent::Comment, "Nit: rename the flag"))
+        );
+        tab.update(&mut cx, |tab, cx| {
+            tab.finish_review(41, ReviewEvent::Comment, Ok(()), cx);
+        });
+        paint(&mut cx);
+        assert!(cx.debug_bounds("guide-review-status").is_some());
+        assert!(cx.debug_bounds("guide-review-next").is_some());
+        assert!(
+            cx.debug_bounds("guide-chapter-next").is_none(),
+            "the review card offers the next chapter, once"
+        );
+        assert_eq!(
+            tab.read_with(&cx, |tab, _| tab.chapter_label("Next", 42)),
+            "Next chapter: #42 (this pull request)"
+        );
+
+        click(&mut cx, "guide-review-next");
+        assert_eq!(tab.read_with(&cx, |tab, _| tab.selected_chapter), Some(42));
+        assert!(
+            cx.debug_bounds("guide-review-approve").is_some(),
+            "#42's review is its own"
+        );
+
+        click(&mut cx, "guide-chapter-next");
+        assert_eq!(tab.read_with(&cx, |tab, _| tab.selected_chapter), Some(43));
+        assert!(
+            cx.debug_bounds("guide-review").is_none(),
+            "#43 left the stack"
+        );
     }
 }

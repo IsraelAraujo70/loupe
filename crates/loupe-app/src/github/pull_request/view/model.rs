@@ -216,7 +216,7 @@ pub(super) fn available_actions(detail: &PullRequestDetail) -> PrActions {
 
 /// How the header shows Review changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ReviewButton {
+pub(in crate::github::pull_request) enum ReviewButton {
     /// A merged or closed pull request with no pending review: there is
     /// nothing left to review.
     Hidden,
@@ -228,7 +228,7 @@ pub(super) enum ReviewButton {
     Outline,
 }
 
-pub(super) fn review_button(detail: &PullRequestDetail) -> ReviewButton {
+pub(in crate::github::pull_request) fn review_button(detail: &PullRequestDetail) -> ReviewButton {
     if detail.state != PrState::Open {
         return match detail.pending_review {
             Some(_) => ReviewButton::Outline,
@@ -689,7 +689,7 @@ pub(super) fn stack_entry_problems(entry: &StackEntry) -> Vec<&'static str> {
     problems
 }
 
-pub(super) fn pending_comments_label(count: u32) -> String {
+pub(in crate::github::pull_request) fn pending_comments_label(count: u32) -> String {
     match count {
         0 => "No pending comments".into(),
         1 => "1 pending comment".into(),
@@ -713,7 +713,7 @@ pub(super) fn head_label(detail: &PullRequestDetail) -> String {
 }
 
 /// GitHub rejects approving or requesting changes on your own pull request.
-pub(super) fn can_approve(detail: &PullRequestDetail) -> bool {
+pub(in crate::github::pull_request) fn can_approve(detail: &PullRequestDetail) -> bool {
     detail
         .author
         .as_ref()
