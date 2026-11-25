@@ -126,8 +126,32 @@ pub fn avatar_named(
     url: impl Into<SharedString>,
     name: impl Into<SharedString>,
     size: Pixels,
-) -> impl IntoElement {
-    base_avatar(url.into(), size).name(name)
+) -> AnyElement {
+    let url: SharedString = url.into();
+    let name: SharedString = name.into();
+    // The kit sizes the initials' box for a custom size but not their text,
+    // which then overflows the box; the text size and line height here keep
+    // them centered in the circle.
+    let initials = move || {
+        Avatar::new()
+            .with_size(size)
+            .name(name.clone())
+            .text_size(size * 0.45)
+            .line_height(size * 0.5)
+            .into_any_element()
+    };
+    if url.is_empty() {
+        return initials();
+    }
+    // The kit's image slot leaves an empty circle while the picture loads and
+    // when it cannot load; the initials stand in for it in both cases.
+    img(url)
+        .flex_none()
+        .size(size)
+        .rounded_full()
+        .with_loading(initials.clone())
+        .with_fallback(initials)
+        .into_any_element()
 }
 
 fn base_avatar(url: SharedString, size: Pixels) -> Avatar {
