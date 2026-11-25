@@ -3,7 +3,7 @@
 import re
 import unicodedata
 
-MAX_SLUG_LENGTH = 48
+MAX_SLUG_LENGTH = 40
 
 
 def slugify(title: str, max_length: int = MAX_SLUG_LENGTH) -> str:
