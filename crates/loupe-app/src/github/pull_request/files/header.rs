@@ -146,7 +146,13 @@ pub struct HeaderContent {
     pub fade: Pixels,
     pub on_viewed: OnViewed,
     pub on_drawn: Option<OnDrawn>,
+    /// What goes before the size, such as a folded file's kind and the
+    /// button that opens it.
+    pub note: Option<Note>,
 }
+
+/// Draws a header's note.
+pub type Note = Rc<dyn Fn(&App) -> AnyElement>;
 
 /// A file's header: the path at the leading edge of what is on screen and
 /// the size, the status, and Viewed at its trailing edge, 12 px apart.
@@ -235,6 +241,7 @@ fn trailing_band(content: &HeaderContent, cx: &App) -> AnyElement {
     h_flex()
         .gap_3()
         .items_center()
+        .when_some(content.note.as_ref(), |band, note| band.child(note(cx)))
         .child(widgets::diff_stat(content.additions, content.deletions))
         .when_some(content.status, |band, status| {
             band.child(

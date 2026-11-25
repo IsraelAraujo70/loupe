@@ -2,13 +2,14 @@
 //! plus the pure rules of a Zed-style project panel: keyboard moves, pinned
 //! ("sticky") folders, and the indent guide that holds the selection.
 //!
-//! The tree reads in review order: at each level code comes first, then
-//! tests, then docs (a folder sorts by the first kind it holds), and within
-//! a kind folders come before files, both sorted by name ignoring case. The
-//! low-signal files (`signal::Signal::Low`) leave their folders for one
-//! group at the end, [`LOW_SIGNAL`], with a tree of their own inside. A
-//! chain of folders with a single child folder and no files shows as one
-//! compact row (`src/lib/http`).
+//! The tree reads in review order: all the code, then all the tests, then
+//! all the docs, then the low-signal files (`signal::Signal::Low`). The
+//! first kind the pull request has fills the tree at the top; each kind
+//! after it leaves its folders for a group of its own ([`TESTS`], [`DOCS`],
+//! [`LOW_SIGNAL`]) with a tree of its own inside, so a test never reads
+//! between two files of code. Within a tree folders come before files, both
+//! sorted by name ignoring case. A chain of folders with a single child
+//! folder and no files shows as one compact row (`src/lib/http`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -17,10 +18,37 @@ use loupe_github::{ChangedFile, FileStatus};
 use super::signal::Signal;
 
 /// The low-signal group: its row's label and the key the tree opens and
-/// closes it by, and the path of the divider over its files in the diff.
-/// The folders inside it are keyed under it (`Low signal/data`), so closing
-/// one never closes the folder of the same name among the code.
+/// closes it by. The folders inside a group are keyed under it
+/// (`Low signal/data`), so closing one never closes the folder of the same
+/// name among the code.
 pub const LOW_SIGNAL: &str = "Low signal";
+/// The group of the tests, when the pull request has code.
+pub const TESTS: &str = "Tests";
+/// The group of the docs, when the pull request has code or tests.
+pub const DOCS: &str = "Docs";
+/// The groups in the order they follow the tree at the top.
+pub const GROUPS: [&str; 3] = [TESTS, DOCS, LOW_SIGNAL];
+
+/// The group each file sits in, from the kinds `signals` holds in file
+/// order: `None` for the tree at the top, which holds the first kind the
+/// pull request has.
+pub fn file_groups(signals: &[Signal]) -> Vec<Option<&'static str>> {
+    let lead = signals
+        .iter()
+        .filter(|signal| !signal.is_low())
+        .map(|signal| signal.rank())
+        .min();
+    signals
+        .iter()
+        .map(|signal| match signal {
+            Signal::Low(_) => Some(LOW_SIGNAL),
+            _ if Some(signal.rank()) == lead => None,
+            Signal::Code => None,
+            Signal::Test => Some(TESTS),
+            Signal::Docs => Some(DOCS),
+        })
+        .collect()
+}
 
 /// One visible row of the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,23 +173,37 @@ pub fn filter_keeps(path: &str, filter: &str) -> bool {
     filter.is_empty() || path.to_lowercase().contains(&filter)
 }
 
-/// The tree of the code, tests, and docs, and the tree of the low-signal
-/// files. `signals` holds each file's kind, in file order.
-fn build(files: &[ChangedFile], signals: &[Signal], filter: &str) -> (Dir, Dir) {
-    let (mut main, mut low) = (Dir::default(), Dir::default());
+/// The tree at the top, and each group with files and its tree, in reading
+/// order. `signals` holds each file's kind, in file order.
+fn build(
+    files: &[ChangedFile],
+    signals: &[Signal],
+    filter: &str,
+) -> (Dir, Vec<(&'static str, Dir)>) {
+    let mut main = Dir::default();
+    let mut groups: Vec<(&'static str, Dir)> =
+        GROUPS.iter().map(|name| (*name, Dir::default())).collect();
+    let file_groups = file_groups(signals);
     for (index, file) in files.iter().enumerate() {
         if !filter_keeps(&file.path, filter) {
             continue;
         }
         let signal = signals.get(index).copied().unwrap_or(Signal::Code);
-        let tree = if signal.is_low() { &mut low } else { &mut main };
+        let tree = match file_groups.get(index).copied().flatten() {
+            Some(name) => match groups.iter_mut().find(|(group, _)| *group == name) {
+                Some((_, tree)) => tree,
+                None => &mut main,
+            },
+            None => &mut main,
+        };
         tree.insert(&file.path, index, signal.rank());
     }
-    (main, low)
+    groups.retain(|(_, tree)| !tree.is_empty());
+    (main, groups)
 }
 
 /// The rows to draw for `files`, whose kinds `signals` holds in file order:
-/// the code, tests, and docs, then the low-signal group. A folder in
+/// the tree at the top, then each group. A folder in
 /// `collapsed` hides its children, except while a filter is set: then every
 /// folder opens so each match shows.
 pub fn tree_rows(
@@ -176,12 +218,12 @@ pub fn tree_rows(
         force_open: !filter.trim().is_empty(),
         rows: Vec::new(),
     };
-    let (main, low) = build(files, signals, filter);
+    let (main, groups) = build(files, signals, filter);
     emitter.emit(&main, "", 0, None);
-    if !low.is_empty() {
-        let row = emitter.push_dir(&low, LOW_SIGNAL.to_owned(), LOW_SIGNAL.to_owned(), 0, None);
+    for (name, tree) in &groups {
+        let row = emitter.push_dir(tree, (*name).to_owned(), (*name).to_owned(), 0, None);
         if let Some(row) = row {
-            emitter.emit(&low, LOW_SIGNAL, 1, Some(row));
+            emitter.emit(tree, name, 1, Some(row));
         }
     }
     emitter.rows
@@ -331,17 +373,19 @@ fn overview_collapsed(files: &[ChangedFile], signals: &[Signal]) -> HashSet<Stri
         .collect()
 }
 
-/// Reorders `files` and their kinds into the tree's order (the code, tests,
-/// and docs, then the low-signal files), so the diff below reads in the same
-/// order as the list beside it.
+/// Reorders `files` and their kinds into the tree's order (all the code,
+/// then the tests, then the docs, then the low-signal files), so the diff
+/// below reads in the same order as the list beside it.
 pub fn into_tree_order(
     files: Vec<ChangedFile>,
     signals: Vec<Signal>,
 ) -> (Vec<ChangedFile>, Vec<Signal>) {
     let mut order = Vec::with_capacity(files.len());
-    let (main, low) = build(&files, &signals, "");
+    let (main, groups) = build(&files, &signals, "");
     main.collect_files(&mut order);
-    low.collect_files(&mut order);
+    for (_, tree) in &groups {
+        tree.collect_files(&mut order);
+    }
     let mut slots: Vec<Option<(ChangedFile, Signal)>> =
         files.into_iter().zip(signals).map(Some).collect();
     order
@@ -449,32 +493,33 @@ pub fn sticky_folders(rows: &[TreeRow], top: usize) -> Option<Sticky> {
 
 /// The row that stands for `path`: its own, or while a closed folder hides
 /// it, the innermost folder on screen that holds it, so the tree still
-/// shows where the diff is. `low` says whether the file is low signal, and
-/// so in the low-signal group.
-pub fn shown_row(rows: &[TreeRow], path: &str, low: bool) -> Option<usize> {
+/// shows where the diff is. `group` is the group the file sits in, `None`
+/// for the tree at the top.
+pub fn shown_row(rows: &[TreeRow], path: &str, group: Option<&str>) -> Option<usize> {
     if let Some(ix) = rows.iter().position(|row| row.path == path) {
         return Some(ix);
     }
     rows.iter()
         .enumerate()
-        .filter(|(_, row)| row.dir().is_some() && holds(&row.path, path, low))
+        .filter(|(_, row)| row.dir().is_some() && holds(&row.path, path, group))
         .max_by_key(|(_, row)| row.depth)
         .map(|(ix, _)| ix)
 }
 
-/// Whether the folder keyed `folder` holds the file at `path`. The
-/// low-signal group holds every low-signal file, and a folder inside it
-/// (`Low signal/data`) the low-signal files of the folder it names.
-pub fn holds(folder: &str, path: &str, low: bool) -> bool {
-    if folder == LOW_SIGNAL {
-        return low;
+/// Whether the folder keyed `folder` holds the file at `path`, which sits
+/// in `group`. A group holds its files, and a folder inside it
+/// (`Low signal/data`) the files of the group in the folder it names.
+pub fn holds(folder: &str, path: &str, group: Option<&str>) -> bool {
+    if group == Some(folder) {
+        return true;
     }
-    let real = match folder
-        .strip_prefix(LOW_SIGNAL)
-        .and_then(|rest| rest.strip_prefix('/'))
-    {
-        Some(inner) if low => inner,
-        None if !low => folder,
+    let inside = GROUPS.iter().find_map(|name| {
+        let inner = folder.strip_prefix(name)?.strip_prefix('/')?;
+        Some((*name, inner))
+    });
+    let real = match inside {
+        Some((name, inner)) if group == Some(name) => inner,
+        None if group.is_none() => folder,
         _ => return false,
     };
     path.strip_prefix(real)
@@ -630,9 +675,10 @@ mod tests {
 
     use super::super::signal::{Attributes, Signal, classify_all};
     use super::{
-        GitTint, LARGE_TREE, LOW_SIGNAL, Move, RowKind, Sticky, TreeRow, ViewedMark, active_folder,
-        distinct_starts, folder_tint, holds, initial_collapsed, into_tree_order, move_down,
-        move_left, move_right, move_up, shown_row, sticky_folders, tree_rows, viewed_mark,
+        DOCS, GitTint, LARGE_TREE, LOW_SIGNAL, Move, RowKind, Sticky, TESTS, TreeRow, ViewedMark,
+        active_folder, distinct_starts, folder_tint, holds, initial_collapsed, into_tree_order,
+        move_down, move_left, move_right, move_up, shown_row, sticky_folders, tree_rows,
+        viewed_mark,
     };
 
     /// Every file as code, so a tree sorts by name alone.
@@ -956,7 +1002,7 @@ mod tests {
         let files = sample();
         let client = "src/lib/http/client.rs";
         let rows = tree_rows(&files, &code(&files), "", &HashSet::new());
-        assert_eq!(shown_row(&rows, client, false), Some(find(&rows, client)));
+        assert_eq!(shown_row(&rows, client, None), Some(find(&rows, client)));
         let rows = tree_rows(
             &files,
             &code(&files),
@@ -964,14 +1010,14 @@ mod tests {
             &HashSet::from(["src/lib/http".to_owned()]),
         );
         assert_eq!(
-            shown_row(&rows, client, false),
+            shown_row(&rows, client, None),
             Some(find(&rows, "src/lib/http"))
         );
         let collapsed = HashSet::from(["src".to_owned(), "src/lib/http".to_owned()]);
         let rows = tree_rows(&files, &code(&files), "", &collapsed);
-        assert_eq!(shown_row(&rows, client, false), Some(find(&rows, "src")));
+        assert_eq!(shown_row(&rows, client, None), Some(find(&rows, "src")));
         // `src` is not a folder of `srcs/a.rs`.
-        assert_eq!(shown_row(&rows, "srcs/a.rs", false), None);
+        assert_eq!(shown_row(&rows, "srcs/a.rs", None), None);
     }
 
     #[test]
@@ -1085,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn code_reads_first_then_tests_then_docs_and_low_signal_last() {
+    fn all_the_code_reads_first_then_the_tests_the_docs_and_low_signal() {
         let (files, signals) = fixture();
         let rows = tree_rows(&files, &signals, "", &HashSet::new());
         assert_eq!(
@@ -1093,13 +1139,16 @@ mod tests {
             [
                 "src/ [1] +5 -5",
                 "  src/units.rs",
-                "web/src/components/ [2] +30 -0",
+                "web/src/components/ [1] +20 -0",
                 "  web/src/components/IngredientList.tsx",
-                "  web/src/components/IngredientList.test.tsx",
                 "Cargo.toml",
-                "docs/guide/ [1] +5 -4",
-                "  docs/guide/quickstart.md",
-                "README.md",
+                "Tests/ [1] +10 -0",
+                "  web/src/components/ [1] +10 -0",
+                "    web/src/components/IngredientList.test.tsx",
+                "Docs/ [2] +7 -5",
+                "  docs/guide/ [1] +5 -4",
+                "    docs/guide/quickstart.md",
+                "  README.md",
                 "Low signal/ [5] +47 -19",
                 "  assets/ [2] +0 -0",
                 "    assets/badge.png",
@@ -1124,6 +1173,22 @@ mod tests {
         assert_eq!(tree_files, diff_files);
         assert!(signals[..6].iter().all(|signal| !signal.is_low()));
         assert!(signals[6..].iter().all(|signal| signal.is_low()));
+        // Without code the tests fill the tree at the top, and the docs
+        // still follow them in a group.
+        let files = vec![file("docs/testing.md", 3, 0), file("tests/scale.rs", 4, 0)];
+        let signals = classify_all(&files, &Attributes::default());
+        let (files, signals) = into_tree_order(files, signals);
+        let rows = tree_rows(&files, &signals, "", &HashSet::new());
+        assert_eq!(
+            outline(&files, &rows),
+            [
+                "tests/ [1] +4 -0",
+                "  tests/scale.rs",
+                "Docs/ [1] +3 -0",
+                "  docs/ [1] +3 -0",
+                "    docs/testing.md",
+            ]
+        );
     }
 
     #[test]
@@ -1139,8 +1204,9 @@ mod tests {
         let group = find(&rows, LOW_SIGNAL);
         // A low-signal file hidden in the group shows as the group, and a
         // code file never does.
-        assert_eq!(shown_row(&rows, "assets/badge.png", true), Some(group));
-        assert_eq!(shown_row(&rows, "web/pnpm-lock.yaml", true), Some(group));
+        let low = Some(LOW_SIGNAL);
+        assert_eq!(shown_row(&rows, "assets/badge.png", low), Some(group));
+        assert_eq!(shown_row(&rows, "web/pnpm-lock.yaml", low), Some(group));
         // Closing `Low signal/web` closes the lockfile's folder only.
         let closed = HashSet::from(["Low signal/web".to_owned()]);
         let rows = tree_rows(&files, &signals, "", &closed);
@@ -1150,7 +1216,7 @@ mod tests {
         );
         assert!(!rows.iter().any(|row| row.path == "web/pnpm-lock.yaml"));
         assert_eq!(
-            shown_row(&rows, "web/pnpm-lock.yaml", true),
+            shown_row(&rows, "web/pnpm-lock.yaml", low),
             Some(find(&rows, "Low signal/web"))
         );
         // A pull request of low-signal files alone opens the group.
@@ -1161,15 +1227,22 @@ mod tests {
 
     #[test]
     fn a_folder_holds_the_files_of_its_own_section() {
-        assert!(holds(LOW_SIGNAL, "assets/badge.png", true));
-        assert!(!holds(LOW_SIGNAL, "src/units.rs", false));
-        assert!(holds("Low signal/assets", "assets/badge.png", true));
-        assert!(!holds("Low signal/assets", "assets/badge.png", false));
-        assert!(holds("web", "web/src/a.ts", false));
-        assert!(!holds("web", "web/pnpm-lock.yaml", true));
-        assert!(!holds("Low signal/web", "website/a.csv", true));
-        // A real folder whose name starts like the group is an ordinary one.
-        assert!(holds("Low signals", "Low signals/a.rs", false));
+        let low = Some(LOW_SIGNAL);
+        assert!(holds(LOW_SIGNAL, "assets/badge.png", low));
+        assert!(!holds(LOW_SIGNAL, "src/units.rs", None));
+        assert!(holds("Low signal/assets", "assets/badge.png", low));
+        assert!(!holds("Low signal/assets", "assets/badge.png", None));
+        assert!(holds("web", "web/src/a.ts", None));
+        assert!(!holds("web", "web/pnpm-lock.yaml", low));
+        assert!(!holds("Low signal/web", "website/a.csv", low));
+        assert!(holds(TESTS, "web/a.test.ts", Some(TESTS)));
+        assert!(holds("Tests/web", "web/a.test.ts", Some(TESTS)));
+        assert!(!holds("Tests/web", "web/a.ts", None));
+        assert!(!holds("web", "web/a.test.ts", Some(TESTS)));
+        assert!(!holds(DOCS, "web/a.test.ts", Some(TESTS)));
+        // A real folder whose name starts like a group is an ordinary one.
+        assert!(holds("Low signals", "Low signals/a.rs", None));
+        assert!(holds("Tests", "Tests/Scale.swift", None));
     }
 
     #[test]

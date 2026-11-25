@@ -5,8 +5,8 @@
 //! code, a minified bundle, a data file, or a new file of more than a
 //! thousand lines). The files tab orders them code, tests, docs, and then the
 //! low-signal group, and opens the low-signal files folded under a label that
-//! says what they are and how large. A file with no text to read (a mode
-//! change, an empty file, a binary of an unknown type) joins them.
+//! says what they are and how large. A file with no lines to read joins
+//! them, named for what changed: a mode change or an empty file.
 
 use loupe_github::{ChangedFile, FileStatus};
 
@@ -30,9 +30,11 @@ pub enum Signal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LowSignal {
     Binary,
-    /// No lines to read: a mode change, an empty file, or a binary GitHub
-    /// gives no patch for.
-    NoText,
+    /// A file GitHub lists as modified with no lines and no patch: only its
+    /// mode changed, as a script made executable.
+    ModeChange,
+    /// A file added or deleted with no lines, as a `.gitkeep`.
+    Empty,
     Lockfile,
     Generated,
     Vendored,
@@ -61,7 +63,8 @@ impl LowSignal {
     pub fn name(self) -> &'static str {
         match self {
             LowSignal::Binary => "Binary",
-            LowSignal::NoText => "No text diff",
+            LowSignal::ModeChange => "Mode change",
+            LowSignal::Empty => "Empty file",
             LowSignal::Lockfile => "Lockfile",
             LowSignal::Generated => "Generated",
             LowSignal::Vendored => "Vendored",
@@ -77,7 +80,7 @@ impl LowSignal {
         let lines = file.additions + file.deletions;
         match self {
             LowSignal::Binary => "Binary file".to_owned(),
-            LowSignal::NoText => self.name().to_owned(),
+            LowSignal::ModeChange | LowSignal::Empty => self.name().to_owned(),
             _ if lines == 1 => format!("{} · 1 line", self.name()),
             _ => format!("{} · {} lines", self.name(), thousands(lines)),
         }
@@ -107,7 +110,10 @@ pub fn classify_all(files: &[ChangedFile], attributes: &Attributes) -> Vec<Signa
 
 /// What kind of change `file` is. `attributes` are the repository's
 /// `.gitattributes`, whose `linguist-generated` and `linguist-vendored`
-/// win over every guess from the path or the contents, either way.
+/// decide whether a file is generated or vendored, either way, over the
+/// guess from its path or first lines. Binaries, files with no lines, and
+/// lockfiles are told before them, and a file they leave out can still be
+/// minified, data, or a large new file.
 pub fn classify(file: &ChangedFile, attributes: &Attributes) -> Signal {
     let path = file.path.as_str();
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -118,7 +124,10 @@ pub fn classify(file: &ChangedFile, attributes: &Attributes) -> Signal {
     }
     let moved = matches!(file.status, FileStatus::Renamed | FileStatus::Copied);
     if file.patch.is_none() && file.additions + file.deletions == 0 && !moved {
-        return Signal::Low(LowSignal::NoText);
+        return Signal::Low(match file.status {
+            FileStatus::Added | FileStatus::Removed => LowSignal::Empty,
+            _ => LowSignal::ModeChange,
+        });
     }
     if LOCKFILES.contains(&name) || extension == "lock" {
         return Signal::Low(LowSignal::Lockfile);
@@ -517,15 +526,15 @@ mod tests {
             |path: &str, status: FileStatus| classify(&file(path, status, 0, None), &attributes);
         assert_eq!(
             bare("scripts/seed.sh", FileStatus::Modified),
-            low(LowSignal::NoText)
+            low(LowSignal::ModeChange)
         );
         assert_eq!(
             bare("web/.gitkeep", FileStatus::Added),
-            low(LowSignal::NoText)
+            low(LowSignal::Empty)
         );
         assert_eq!(
             bare("tools/blob", FileStatus::Removed),
-            low(LowSignal::NoText)
+            low(LowSignal::Empty)
         );
         // A rename with no edits keeps its place beside the code.
         assert_eq!(
@@ -533,8 +542,12 @@ mod tests {
             Signal::Code
         );
         assert_eq!(
-            LowSignal::NoText.label(&file("a.sh", FileStatus::Modified, 0, None)),
-            "No text diff"
+            LowSignal::ModeChange.label(&file("a.sh", FileStatus::Modified, 0, None)),
+            "Mode change"
+        );
+        assert_eq!(
+            LowSignal::Empty.label(&file("web/.gitkeep", FileStatus::Added, 0, None)),
+            "Empty file"
         );
         // A package manifest beside its lockfile is code.
         assert_eq!(kind("web/package.json"), Signal::Code);

@@ -42,10 +42,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::diff::{Hunk, anchor_for_range, find_line, git_patch, parse_patch};
+use loupe_github::diff::{DiffLine, Hunk, anchor_for_range, find_line, git_patch, parse_patch};
 use loupe_github::{
-    ChangedFile, CommitFiles, GitHub, NodeId, PullRequestDetail, RepoRef, ViewedFailure,
-    ViewedState,
+    ChangedFile, CommitFiles, FileStatus, GitHub, NodeId, PullRequestDetail, RepoRef,
+    ViewedFailure, ViewedState,
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
@@ -61,8 +61,8 @@ use self::search::{Match, Needle};
 use self::signal::{Attributes, LowSignal, Signal, classify_all, thousands};
 use self::sticky::HeaderWatch;
 use self::tree::{
-    GitTint, LOW_SIGNAL, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors,
-    distinct_starts, file_tint, filter_keeps, folder_tint, holds, initial_collapsed,
+    GROUPS, GitTint, LOW_SIGNAL, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors,
+    distinct_starts, file_groups, file_tint, filter_keeps, folder_tint, holds, initial_collapsed,
     into_tree_order, move_down, move_left, move_right, move_up, shown_row, tree_rows, viewed_mark,
 };
 use self::tree_view::{RowView, StickyFolders};
@@ -131,7 +131,8 @@ const LOW_SIGNAL_ICON: &str = "icons/eye-off.svg";
 /// What a file's header in the diff shows.
 type HeaderFor = Rc<dyn Fn(&DiffFile) -> header::HeaderContent>;
 
-/// What a low-signal file's line under its header shows.
+/// What a low-signal file's header says about it.
+#[derive(Clone)]
 struct LowNote {
     path: String,
     /// "Generated · 2,001 lines".
@@ -139,7 +140,17 @@ struct LowNote {
     /// Why the diff is not here, and whether it is loading, for a file
     /// GitHub left out.
     omitted: Option<(SharedString, bool)>,
+    /// Whether the file has lines to show, and so a Show diff button.
+    openable: bool,
 }
+
+/// The ids of the divider over the low-signal files: under the header of
+/// the file before them, and under that file's last line.
+const DIVIDER_FOLDED: &str = "low-signal-divider:folded";
+const DIVIDER_OPEN: &str = "low-signal-divider:open";
+
+/// What the diff of a file whose only change is its mode says.
+const MODE_CHANGE_NOTE: &str = "Only the file mode changed";
 
 /// What a low-signal file's line says when GitHub left its diff out.
 const LOW_OMITTED_NOTE: &str = "diff left out by GitHub";
@@ -159,8 +170,38 @@ struct LowGroup {
 fn review_files(files: Vec<ChangedFile>, attributes: &Attributes) -> (LoadedFiles, Vec<Signal>) {
     let signals = classify_all(&files, attributes);
     let (files, signals) = into_tree_order(files, signals);
-    let loaded = build_files(files, git_patch, |patch| parse_patch(patch).ok());
+    let no_lines: HashMap<String, LowSignal> = files
+        .iter()
+        .zip(&signals)
+        .filter_map(|(file, signal)| match signal {
+            Signal::Low(kind @ (LowSignal::ModeChange | LowSignal::Empty)) => {
+                Some((file.path.clone(), *kind))
+            }
+            _ => None,
+        })
+        .collect();
+    let patch_for = |file: &ChangedFile| match no_lines.get(&file.path) {
+        Some(kind) => Some(no_lines_patch(file, *kind)),
+        None => git_patch(file),
+    };
+    let loaded = build_files(files, patch_for, |patch| parse_patch(patch).ok());
     (loaded, signals)
+}
+
+/// The patch of a file with no lines, so its diff says what changed instead
+/// of passing for a binary: an empty file added or deleted, or a file whose
+/// mode alone changed.
+fn no_lines_patch(file: &ChangedFile, kind: LowSignal) -> String {
+    let path = &file.path;
+    match (kind, file.status) {
+        (LowSignal::Empty, FileStatus::Removed) => {
+            format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ /dev/null\n")
+        }
+        (LowSignal::Empty, _) => {
+            format!("diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n")
+        }
+        _ => format!("diff --git a/{path} b/{path}\n{MODE_CHANGE_NOTE}\n"),
+    }
 }
 
 /// Where the repository's `.gitattributes` at `sha` is kept.
@@ -184,16 +225,6 @@ fn read_attributes(gh: &GitHub, repo: &RepoRef, sha: &str, key: Option<&str>) ->
         crate::cache::put(key, &text);
     }
     Attributes::parse(&text)
-}
-
-/// The divider over the low-signal files: a document with no lines, named
-/// for the group, which the diff draws as a header of its own.
-fn low_signal_divider() -> Option<DiffFile> {
-    DiffFile::parse(&format!(
-        "diff --git a/{LOW_SIGNAL} b/{LOW_SIGNAL}\n{LOW_SIGNAL}\n"
-    ))
-    .ok()
-    .and_then(|docs| docs.into_iter().next())
 }
 
 struct ThreadSlot {
@@ -286,6 +317,8 @@ pub struct FilesTab {
     low: HashMap<String, LowSignal>,
     /// The low-signal files the viewer opened, kept open through reloads.
     low_open: HashSet<String>,
+    /// The tree group each file in one sits in (`tree::file_groups`), by path.
+    groups: HashMap<String, &'static str>,
     /// Folders the viewer closed, by full path.
     collapsed: HashSet<String>,
     /// The tree's width in points while its edge is dragged.
@@ -403,6 +436,7 @@ impl FilesTab {
             signals: Vec::new(),
             low: HashMap::new(),
             low_open: HashSet::new(),
+            groups: HashMap::new(),
             collapsed: HashSet::new(),
             tree_drag: None,
             selected: None,
@@ -729,6 +763,11 @@ impl FilesTab {
                 _ => None,
             })
             .collect();
+        self.groups = files
+            .iter()
+            .zip(file_groups(&signals))
+            .filter_map(|(file, group)| Some((file.path.clone(), group?)))
+            .collect();
         self.files = files;
         self.signals = signals;
     }
@@ -754,39 +793,23 @@ impl FilesTab {
                     || self.folds_low(&file.path)
             })
             .map(|file| file.path.clone())
-            .chain([LOW_SIGNAL.to_owned()])
             .collect();
         let Some(state) = &self.diff else { return };
         state.update(cx, |state, cx| {
-            for path in self
-                .files
-                .iter()
-                .map(|file| file.path.as_str())
-                .chain([LOW_SIGNAL])
-            {
+            for path in self.files.iter().map(|file| file.path.as_str()) {
                 state.set_file_collapsed(path, self.folded.contains(path), cx);
             }
         });
     }
 
-    /// The diffs of the files the filter keeps, in the tree's order, with the
-    /// low-signal divider over the first low-signal file.
+    /// The diffs of the files the filter keeps, in the tree's order.
     fn filtered_docs(&self, cx: &App) -> Vec<DiffFile> {
         let filter = self.filter.read(cx).value();
-        let mut docs: Vec<DiffFile> = self
-            .docs
+        self.docs
             .iter()
             .filter(|doc| filter_keeps(doc.path(), &filter))
             .cloned()
-            .collect();
-        if let Some(first) = docs
-            .iter()
-            .position(|doc| self.low.contains_key(doc.path().as_ref()))
-            && let Some(divider) = low_signal_divider()
-        {
-            docs.insert(first, divider);
-        }
-        docs
+            .collect()
     }
 
     /// The low-signal files the filter keeps, for the divider over them.
@@ -2352,7 +2375,7 @@ impl FilesTab {
 
     /// The row that stands for `path` in `rows` (`tree::shown_row`).
     fn shown(&self, rows: &[TreeRow], path: &str) -> Option<usize> {
-        shown_row(rows, path, self.low.contains_key(path))
+        shown_row(rows, path, self.groups.get(path).copied())
     }
 
     /// A click selects the row and focuses the tree. A file also scrolls the
@@ -2425,8 +2448,8 @@ impl FilesTab {
         if file == rows[ix].path || self.shown(rows, &file) != Some(ix) {
             return;
         }
-        let low = self.low.contains_key(&file);
-        self.collapsed.retain(|folder| !holds(folder, &file, low));
+        let group = self.groups.get(&file).copied();
+        self.collapsed.retain(|folder| !holds(folder, &file, group));
         if let Some(at) = self.shown(&self.current_rows(cx), &file) {
             self.tree_scroll.scroll_to_item(at, ScrollStrategy::Nearest);
         }
@@ -2531,18 +2554,29 @@ impl FilesTab {
                         };
                         let count = dir.files.len();
                         let noun = if count == 1 { "file" } else { "files" };
-                        let group = row.path == LOW_SIGNAL;
-                        // A folder in the group is named for the folder of
-                        // the code it mirrors.
-                        let (shown_path, section) = match row
-                            .path
-                            .strip_prefix(LOW_SIGNAL)
-                            .and_then(|rest| rest.strip_prefix('/'))
-                        {
-                            Some(inner) => (inner, " (low signal)"),
-                            None => (row.path.as_str(), ""),
+                        let low_group = row.path == LOW_SIGNAL;
+                        let group = GROUPS.contains(&row.path.as_str());
+                        // A folder in a group is named for the folder it
+                        // mirrors.
+                        let (shown_path, section) = match GROUPS.iter().find_map(|name| {
+                            let inner = row.path.strip_prefix(name)?.strip_prefix('/')?;
+                            Some((inner, format!(" ({})", name.to_lowercase())))
+                        }) {
+                            Some(inside) => inside,
+                            None => (row.path.as_str(), String::new()),
                         };
-                        let (tooltip, accessible_name) = if group {
+                        let (tooltip, accessible_name) = if group && !low_group {
+                            (
+                                format!(
+                                    "{} · {count} {noun} · +{} −{}",
+                                    row.path, dir.additions, dir.deletions
+                                ),
+                                format!(
+                                    "{} group, {count} {noun}, +{} −{}",
+                                    row.path, dir.additions, dir.deletions
+                                ),
+                            )
+                        } else if low_group {
                             (
                                 format!(
                                     "{LOW_SIGNAL} · {count} {noun} · +{} −{} · {LOW_SIGNAL_HINT}",
@@ -2577,7 +2611,7 @@ impl FilesTab {
                             } else {
                                 foreground
                             },
-                            icon: if group {
+                            icon: if low_group {
                                 LOW_SIGNAL_ICON
                             } else if dir.expanded {
                                 assets::FOLDER_OPEN
@@ -2720,15 +2754,13 @@ impl FilesTab {
         let mut annotations = Vec::new();
         let mut views: Vec<(ElementId, AnyView)> = Vec::new();
         let mut notes: Vec<NoDiffNote> = Vec::new();
-        // Each low-signal file says what it is and how large right under its
-        // header, with the control that opens it.
-        let mut lows: HashMap<ElementId, LowNote> = HashMap::new();
+        // Each low-signal file says what it is and how large in its header,
+        // with the control that opens it.
+        let mut lows: HashMap<String, LowNote> = HashMap::new();
         for file in &self.files {
             let Some(kind) = self.low.get(&file.path) else {
                 continue;
             };
-            let id = ElementId::Name(SharedString::from(format!("low:{}", file.path)));
-            annotations.push(DiffAnnotation::file(id.clone(), file.path.clone()));
             let omitted = (self.missing.get(&file.path) == Some(&Missing::Omitted)).then(|| {
                 let note = match self.patch_errors.get(&file.path) {
                     Some(error) => SharedString::from(error.clone()),
@@ -2737,16 +2769,17 @@ impl FilesTab {
                 (note, self.loading_patch(&file.path))
             });
             lows.insert(
-                id,
+                file.path.clone(),
                 LowNote {
                     path: file.path.clone(),
                     label: kind.label(file).into(),
                     omitted,
+                    openable: !matches!(kind, LowSignal::ModeChange | LowSignal::Empty),
                 },
             );
         }
+        let lows = Rc::new(lows);
         let low_state = state.clone();
-        let low_weak = weak.clone();
         let low_group = self.low_group(cx).map(Rc::new);
         for placed in &self.placed {
             let Some(slot) = self.threads.get(&placed.thread_id) else {
@@ -2838,6 +2871,41 @@ impl FilesTab {
             }
         }
 
+        // The divider over the low-signal files goes under the last file
+        // before them: under its last line while it is open, and under its
+        // header while it is folded or has no lines. Without a file before
+        // them it heads the diff.
+        let filter = self.filter.read(cx).value();
+        let before_low = low_group.as_ref().and_then(|_| {
+            self.files.iter().rev().find(|file| {
+                !self.low.contains_key(&file.path) && filter_keeps(&file.path, &filter)
+            })
+        });
+        let mut divider_at: Option<(SharedString, bool)> = None;
+        if let Some(file) = before_low {
+            annotations.push(DiffAnnotation::file(
+                ElementId::Name(DIVIDER_FOLDED.into()),
+                file.path.clone(),
+            ));
+            let last = self
+                .shown_hunks(&file.path)
+                .and_then(|hunks| hunks.last())
+                .and_then(|hunk| hunk.lines.last())
+                .map(DiffLine::anchor);
+            if let Some((line, side)) = last {
+                annotations.push(DiffAnnotation::line(
+                    ElementId::Name(DIVIDER_OPEN.into()),
+                    DiffLinePosition::new(file.path.clone(), to_diff_side(side), line as usize),
+                ));
+            }
+            divider_at = Some((file.path.clone().into(), last.is_some()));
+        }
+        let lone_divider = match (&low_group, before_low) {
+            (Some(group), None) => Some(low_divider(group, &weak, cx)),
+            _ => None,
+        };
+        let (divider_group, divider_weak) = (low_group.clone(), weak.clone());
+
         // Each file's size, for its header, as GitHub counts it.
         let sizes: Rc<HashMap<String, (u32, u32)>> = Rc::new(
             self.files
@@ -2876,6 +2944,7 @@ impl FilesTab {
         let card_width = self.card_width.clone();
         let content: HeaderFor = {
             let (viewed, sizes, weak) = (viewed.clone(), sizes.clone(), weak.clone());
+            let (low_notes, note_state) = (lows.clone(), state.clone());
             Rc::new(move |file: &DiffFile| {
                 let path = file.path().clone();
                 let title = match (file.original_path(), file.modified_path()) {
@@ -2890,6 +2959,13 @@ impl FilesTab {
                     DiffFileStatus::Copied => Some("Copied"),
                     _ => None,
                 };
+                let note = low_notes.get(path.as_ref()).map(|note| {
+                    let (note, state, weak) = (note.clone(), note_state.clone(), weak.clone());
+                    Rc::new(move |cx: &App| {
+                        let collapsed = state.read(cx).is_file_collapsed(&note.path);
+                        low_note(&note, collapsed, &weak, cx.theme().muted_foreground)
+                    }) as header::Note
+                });
                 let weak = weak.clone();
                 let toggle_path = path.to_string();
                 header::HeaderContent {
@@ -2905,6 +2981,7 @@ impl FilesTab {
                             .ok();
                     }),
                     on_drawn: None,
+                    note,
                 }
             })
         };
@@ -2919,31 +2996,24 @@ impl FilesTab {
         );
         let header = {
             let (content, watch) = (content.clone(), self.headers.clone());
-            let divider_weak = weak.clone();
-            move |file: &DiffFile, _: &mut Window, cx: &mut App| {
-                let on_drawn = file_ixs.get(file.path()).map(|&ix| {
+            move |file: &DiffFile, _: &mut Window, _: &mut App| {
+                let mut header = content(file);
+                header.on_drawn = file_ixs.get(file.path()).map(|&ix| {
                     let watch = watch.clone();
                     Rc::new(move |bounds, viewport| watch.borrow_mut().record(ix, bounds, viewport))
                         as header::OnDrawn
                 });
-                if file.path().as_ref() == LOW_SIGNAL
-                    && let Some(group) = &low_group
-                {
-                    return divider_header(group, on_drawn, &divider_weak, cx);
-                }
-                let mut header = content(file);
-                header.on_drawn = on_drawn;
                 header::file_header(header).into_any_element()
             }
         };
         let pinned = self.pinned_header(state, content, cx);
         let decorations = self.find_decorations(cx);
-        div()
+        let panel = div()
             .debug_selector(|| "files-diff".into())
             .relative()
             .flex_1()
-            .min_w_0()
-            .h_full()
+            .min_h_0()
+            .w_full()
             .child(
                 // Long lines scroll sideways by default, so a line keeps its
                 // indentation (the component has no hanging indent for a
@@ -2958,9 +3028,21 @@ impl FilesTab {
                     .decorations(decorations)
                     .annotations(annotations)
                     .render_annotation(move |annotation, _, cx| {
-                        if let Some(note) = lows.get(annotation.id()) {
-                            let collapsed = low_state.read(cx).is_file_collapsed(&note.path);
-                            return low_note(note, collapsed, &low_weak, muted);
+                        if let ElementId::Name(name) = annotation.id()
+                            && (name.as_ref() == DIVIDER_FOLDED || name.as_ref() == DIVIDER_OPEN)
+                        {
+                            let shown = divider_at.as_ref().is_some_and(|(path, has_line)| {
+                                let folded = low_state.read(cx).is_file_collapsed(path);
+                                if name.as_ref() == DIVIDER_OPEN {
+                                    !folded
+                                } else {
+                                    folded || !has_line
+                                }
+                            });
+                            return match &divider_group {
+                                Some(group) if shown => low_divider(group, &divider_weak, cx),
+                                _ => div().into_any_element(),
+                            };
                         }
                         if let Some(bar) = bars.get(annotation.id()) {
                             return gap_bar(bar, &gap_weak, muted, fold);
@@ -3048,7 +3130,13 @@ impl FilesTab {
                         )),
                 )
             })
-            .child(pinned)
+            .child(pinned);
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .children(lone_divider)
+            .child(panel)
             .into_any_element()
     }
 
@@ -3080,10 +3168,6 @@ impl FilesTab {
                     cx.defer(move |cx| {
                         weak.update(cx, |tab, cx| tab.follow_diff(&path, cx)).ok();
                     });
-                }
-                // The divider is a heading, not a file to pin.
-                if path.as_ref() == LOW_SIGNAL {
-                    return None;
                 }
                 let (headers, viewport) = {
                     let watch = watch.borrow();
@@ -3356,6 +3440,9 @@ impl Render for ResizeFileTree {
 
 /// The line under a low-signal file's header: what it is and how large,
 /// and the control that opens it (Load diff while GitHub left it out).
+/// A low-signal file's note in its header: what the file is and how large,
+/// and the button that opens or folds it, or loads the diff GitHub left
+/// out. A file with no lines to show has no button.
 fn low_note(
     note: &LowNote,
     collapsed: bool,
@@ -3365,62 +3452,62 @@ fn low_note(
     let path = note.path.clone();
     let weak = weak.clone();
     let button = match &note.omitted {
-        Some((_, busy)) => Button::new(SharedString::from(format!("low-load:{path}")))
-            .outline()
-            .xsmall()
-            .label("Load diff")
-            .accessibility_label(format!("Load diff of {path}"))
-            .loading(*busy)
-            .disabled(*busy)
-            .on_click(move |_, _, cx| {
-                weak.update(cx, |this, cx| {
-                    this.low_open.insert(path.clone());
-                    this.load_omitted_patch(&path, cx)
-                })
-                .ok();
-            }),
-        None => {
-            let verb = if collapsed { "Show" } else { "Hide" };
-            Button::new(SharedString::from(format!("low-toggle:{path}")))
+        Some((_, busy)) => Some(
+            Button::new(SharedString::from(format!("low-load:{path}")))
                 .outline()
                 .xsmall()
-                .label(format!("{verb} diff"))
-                .accessibility_label(format!("{verb} diff of {path}"))
+                .label("Load diff")
+                .accessibility_label(format!("Load diff of {path}"))
+                .loading(*busy)
+                .disabled(*busy)
                 .on_click(move |_, _, cx| {
-                    weak.update(cx, |this, cx| this.open_low(&path, collapsed, cx))
-                        .ok();
-                })
+                    weak.update(cx, |this, cx| {
+                        this.low_open.insert(path.clone());
+                        this.load_omitted_patch(&path, cx)
+                    })
+                    .ok();
+                }),
+        ),
+        None if note.openable => {
+            let verb = if collapsed { "Show" } else { "Hide" };
+            Some(
+                Button::new(SharedString::from(format!("low-toggle:{path}")))
+                    .outline()
+                    .xsmall()
+                    .label(format!("{verb} diff"))
+                    .accessibility_label(format!("{verb} diff of {path}"))
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| this.open_low(&path, collapsed, cx))
+                            .ok();
+                    }),
+            )
         }
+        None => None,
     };
     h_flex()
         .id(SharedString::from(format!("low-note:{}", note.path)))
         .debug_selector(|| "low-signal-note".into())
         .role(Role::Note)
         .aria_label(format!("{}, {}", note.path, note.label))
-        .mx_3()
-        .my_2()
         .gap_2()
         .items_center()
         .text_size(scale::meta())
         .text_color(muted)
+        .whitespace_nowrap()
         .child(Icon::new(IconName::EyeOff).xsmall())
         .child(note.label.clone())
         .when_some(note.omitted.as_ref(), |row, (why, _)| {
             row.child("·").child(why.clone())
         })
-        .child(button)
+        .children(button)
         .into_any_element()
 }
 
 /// The divider over the low-signal files in the diff: what the group holds,
 /// and Mark all low-signal viewed.
-fn divider_header(
-    group: &LowGroup,
-    on_drawn: Option<header::OnDrawn>,
-    weak: &WeakEntity<FilesTab>,
-    cx: &App,
-) -> AnyElement {
-    let muted = cx.theme().muted_foreground;
+fn low_divider(group: &LowGroup, weak: &WeakEntity<FilesTab>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
     let noun = if group.files == 1 { "file" } else { "files" };
     let lines = group.additions + group.deletions;
     let size = match lines {
@@ -3439,23 +3526,19 @@ fn divider_header(
         .id("low-signal-divider")
         .debug_selector(|| "low-signal-divider".into())
         .role(Role::Group)
-        .aria_label(format!("{LOW_SIGNAL}, {}, folded", size.replace(" ·", ",")))
-        .relative()
-        .flex_1()
-        .min_w_0()
-        .h(rems(1.375))
+        .aria_label(format!(
+            "{LOW_SIGNAL}, {}, folded so the code reads first",
+            size.replace(" ·", ",")
+        ))
+        .w_full()
+        .min_h(rems(1.375))
+        .px_3()
+        .py_1()
         .gap_2()
         .items_center()
-        .when_some(on_drawn, |row, on_drawn| {
-            row.child(
-                canvas(
-                    move |bounds, window, _| on_drawn(bounds, window.content_mask().bounds),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0(),
-            )
-        })
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(theme.muted.opacity(0.35))
         .child(Icon::new(IconName::EyeOff).xsmall().text_color(muted))
         .child(
             div()
@@ -3634,7 +3717,7 @@ pub(super) mod tests {
 
     use chrono::{DateTime, Utc};
     use gpui_kit::component::ActiveTheme as _;
-    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use gpui_kit::component::diff::{DiffFileStatus, DiffLineRange, DiffSide};
     use gpui_kit::{
         AppContext as _, Bounds, Context, Entity, InputEvent as _, Modifiers, MouseButton,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent,
@@ -3650,10 +3733,10 @@ pub(super) mod tests {
     use super::expand::{Direction, Source};
     use super::model::build_files;
     use super::signal::{Attributes, classify_all};
-    use super::tree::LOW_SIGNAL;
+    use super::tree::{LOW_SIGNAL, TESTS};
     use super::{
-        FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab, PrTabContext,
-        low_signal_divider, review_files,
+        FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab, MODE_CHANGE_NOTE,
+        PrTabContext, review_files,
     };
     use crate::services::{Accounts, Services};
     use crate::store::{FileTreePosition, Settings, update_settings};
@@ -4743,10 +4826,41 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_low_signal_divider_is_a_document_named_for_the_group() {
-        let divider = low_signal_divider().expect("the divider parses");
-        assert_eq!(divider.path().as_ref(), LOW_SIGNAL);
-        assert_eq!((divider.additions(), divider.deletions()), (0, 0));
+    fn a_file_with_no_lines_says_what_changed_and_never_passes_for_binary() {
+        let bare = |path: &str, status: FileStatus| ChangedFile {
+            status,
+            ..binary(path)
+        };
+        let files = vec![
+            bare("scripts/seed.sh", FileStatus::Modified),
+            bare("web/.gitkeep", FileStatus::Added),
+            bare("tools/old.keep", FileStatus::Removed),
+            binary("assets/badge.png"),
+        ];
+        let (loaded, _) = review_files(files, &Attributes::default());
+        let doc = |path: &str| {
+            loaded
+                .docs
+                .iter()
+                .find(|doc| doc.path().as_ref() == path)
+                .expect("a diff for every file")
+        };
+        let mode = doc("scripts/seed.sh");
+        assert!(!mode.is_binary());
+        let headers: Vec<&str> = mode
+            .extended_headers()
+            .iter()
+            .map(|line| line.as_ref())
+            .collect();
+        assert_eq!(headers, [MODE_CHANGE_NOTE]);
+        let added = doc("web/.gitkeep");
+        assert!(!added.is_binary());
+        assert_eq!(added.status(), DiffFileStatus::Added);
+        assert!(added.extended_headers().is_empty());
+        let removed = doc("tools/old.keep");
+        assert!(!removed.is_binary());
+        assert_eq!(removed.status(), DiffFileStatus::Deleted);
+        assert!(doc("assets/badge.png").is_binary());
     }
 
     #[gpui_kit::test]
@@ -4768,7 +4882,6 @@ pub(super) mod tests {
                 "src/units.rs",
                 "src/units.test.rs",
                 "README.md",
-                LOW_SIGNAL,
                 "assets/badge.png",
                 "data/part-01.csv",
             ]
@@ -4785,9 +4898,10 @@ pub(super) mod tests {
         assert!(!collapsed(cx, "src/units.rs"));
         assert!(collapsed(cx, "data/part-01.csv"), "data opens folded");
         assert!(collapsed(cx, "assets/badge.png"), "a binary opens folded");
-        assert!(collapsed(cx, LOW_SIGNAL));
-        // The tree ends with the group, closed beside the code.
+        // The tests follow all the code in a group of their own, and the
+        // tree ends with the low-signal group, closed beside the code.
         let rows = tab.read_with(cx, |tab, cx| tab.current_rows(cx));
+        assert!(rows.iter().any(|row| row.path == TESTS));
         let last = rows.last().expect("rows");
         assert_eq!(last.path, LOW_SIGNAL);
         assert!(
