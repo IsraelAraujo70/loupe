@@ -164,7 +164,7 @@ impl GitHub {
     }
 
     /// The bytes of the file at `path` at commit `sha`.
-    pub(crate) fn raw_contents(&self, repo: &RepoRef, path: &str, sha: &str) -> Result<Vec<u8>> {
+    pub fn raw_contents(&self, repo: &RepoRef, path: &str, sha: &str) -> Result<Vec<u8>> {
         let path = format!(
             "/repos/{}/{}/contents/{}?ref={}",
             repo.owner,
