@@ -24,3 +24,4 @@
 - Entry 024: a one-line change, so the pull request has more than 250 commits.
 - Entry 025: a one-line change, so the pull request has more than 250 commits.
 - Entry 026: a one-line change, so the pull request has more than 250 commits.
+- Entry 027: a one-line change, so the pull request has more than 250 commits.
