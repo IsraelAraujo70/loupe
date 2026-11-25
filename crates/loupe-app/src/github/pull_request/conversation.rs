@@ -85,10 +85,7 @@ impl ConversationTab {
         let new_comment = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(3, 14)
-                .placeholder(format!(
-                    "Leave a comment ({} to send)",
-                    ui::shortcut("cmd-enter")
-                ))
+                .placeholder("Leave a comment")
         });
         let changes = cx.subscribe_in(&new_comment, window, |_, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
@@ -848,14 +845,10 @@ impl ConversationTab {
                         .error()
                         .map(|message| error_text(message, cx)),
                 )
+                .child(ui::send_hint(cx))
                 .child(
-                    Button::new("comment")
-                        .primary()
+                    ui::send_button("comment", "Comment", empty, busy, cx)
                         .small()
-                        .label("Comment")
-                        .tooltip(format!("Comment ({})", ui::shortcut("cmd-enter")))
-                        .loading(busy)
-                        .disabled(busy || empty)
                         .on_click(cx.listener(|this, _, _, cx| this.submit_comment(cx))),
                 ),
         );

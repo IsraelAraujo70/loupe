@@ -14,7 +14,9 @@ use gpui_kit::component::empty::{
 use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme as _, Selectable, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Selectable, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -202,6 +204,44 @@ pub fn bound_shortcut(action: &dyn Action, cx: &App) -> String {
     bound_keystroke(action, cx)
         .map(|keystroke| gpui_kit::component::kbd::Kbd::format(&keystroke))
         .unwrap_or_default()
+}
+
+/// The button that sends a comment box. With nothing to send it is outlined
+/// and neutral, its label in the muted color, which stays readable (the
+/// kit's disabled primary is a faint label on a faint fill); with text it
+/// is the box's one filled action.
+pub fn send_button(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    empty: bool,
+    busy: bool,
+    cx: &App,
+) -> Button {
+    let button = Button::new(id).loading(busy).disabled(busy || empty);
+    if empty {
+        button
+            .outline()
+            .accessibility_label(label)
+            .child(div().text_color(cx.theme().muted_foreground).child(label))
+    } else {
+        button.primary().label(label)
+    }
+}
+
+/// The send key of a comment box (Cmd+Enter, Ctrl+Enter off macOS) as a
+/// key cap, then "to send", in the meta style.
+pub fn send_hint(cx: &App) -> Div {
+    h_flex()
+        .flex_none()
+        .gap_1()
+        .items_center()
+        .text_size(scale::meta())
+        .text_color(cx.theme().muted_foreground)
+        .children(
+            platform_keystroke("cmd-enter")
+                .map(|keystroke| gpui_kit::component::kbd::Kbd::new(keystroke).outline()),
+        )
+        .child("to send")
 }
 
 /// The one header row of a screen: icon, title, count, then
