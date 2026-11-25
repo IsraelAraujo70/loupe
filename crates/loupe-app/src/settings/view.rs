@@ -60,6 +60,8 @@ pub struct SettingsView {
     pub(super) t3_token: Entity<InputState>,
     pub(super) t3_notice: Notice,
     pub(super) guide_executable: Entity<InputState>,
+    /// The Model row's free-form name, for a model outside the presets.
+    pub(super) guide_model_name: Entity<InputState>,
     pub(super) github_error: Option<SharedString>,
     pub(super) appearance: AppearanceState,
     pub(super) review: ReviewFields,
@@ -98,6 +100,14 @@ impl SettingsView {
                 .placeholder("claude (auto-detected)")
                 .default_value(saved_guide_exe)
         });
+        let saved_model_name = custom_model_name(&Settings::get(cx).guide.model);
+        let guide_model_name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Other model name")
+                .default_value(saved_model_name)
+        });
+        // The Connection row shows the last check; make sure there is one.
+        crate::github::guide_service::probe_availability_if_needed(cx);
         let (review, review_subscriptions) = ReviewFields::new(window, cx);
         let mut subscriptions = vec![
             cx.observe_global::<crate::services::Accounts>(|_, cx| cx.notify()),
@@ -109,6 +119,24 @@ impl SettingsView {
                     let next = (!raw.is_empty()).then_some(raw);
                     store::update_settings(cx, |settings| settings.guide.executable = next);
                     crate::github::guide_service::recheck_availability(cx);
+                }
+            }),
+            cx.subscribe(&guide_model_name, |_, input, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let typed = loupe_guide::GuideModel::from_name(&input.read(cx).value());
+                let current = Settings::get(cx).guide.model.clone();
+                let next = match typed {
+                    Some(model) => model,
+                    // Emptied: back to the default, unless a preset was just picked.
+                    None if matches!(current, loupe_guide::GuideModel::Custom(_)) => {
+                        loupe_guide::GuideModel::default()
+                    }
+                    None => current.clone(),
+                };
+                if next != current {
+                    store::update_settings(cx, |settings| settings.guide.model = next);
                 }
             }),
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
@@ -152,6 +180,7 @@ impl SettingsView {
             t3_token,
             t3_notice: Notice::None,
             guide_executable,
+            guide_model_name,
             github_error: None,
             appearance,
             review,
@@ -202,20 +231,29 @@ impl SettingsView {
             theme::apply(cx);
             self.appearance.sync(window, cx);
         }
-        if section == Section::GitHub {
-            let exe = Settings::get(cx)
-                .guide
-                .executable
-                .clone()
-                .unwrap_or_default();
-            self.guide_executable
-                .update(cx, |input, cx| input.set_value(exe, window, cx));
+        if section == Section::GuidedReview {
+            let guide = Settings::get(cx).guide.clone();
+            self.guide_executable.update(cx, |input, cx| {
+                input.set_value(guide.executable.clone().unwrap_or_default(), window, cx)
+            });
+            self.guide_model_name.update(cx, |input, cx| {
+                input.set_value(custom_model_name(&guide.model), window, cx)
+            });
             crate::github::guide_service::recheck_availability(cx);
         }
         if section == Section::T3 {
             self.review.sync(window, cx);
         }
         cx.notify();
+    }
+}
+
+/// The name the Model row's text field shows: the model's own name when it
+/// is not one of the presets.
+fn custom_model_name(model: &loupe_guide::GuideModel) -> String {
+    match model {
+        loupe_guide::GuideModel::Custom(_) => model.as_cli_arg().to_owned(),
+        _ => String::new(),
     }
 }
 
@@ -489,40 +527,103 @@ impl SettingsView {
                 |settings, place| settings.comment_box = Some(place),
             )
             .into_any_element()),
+            Item::GuideConnection => {
+                let (availability, probing) = crate::github::guide_service::availability(cx);
+                let status = match (&availability, probing) {
+                    (_, true) | (None, _) => ui::tinted_chip(tokens::pending()).child("Checking…"),
+                    (Some(loupe_guide::ClaudeAvailability::Ready { version, .. }), _) => {
+                        ui::tinted_chip(tokens::open()).child(format!("Ready · {version}"))
+                    }
+                    (Some(loupe_guide::ClaudeAvailability::NotInstalled { .. }), _) => {
+                        ui::tinted_chip(tokens::closed()).child("Not installed")
+                    }
+                    (Some(loupe_guide::ClaudeAvailability::NotLoggedIn { .. }), _) => {
+                        ui::tinted_chip(tokens::closed()).child("Not signed in")
+                    }
+                };
+                let problem = match &availability {
+                    Some(loupe_guide::ClaudeAvailability::NotLoggedIn { detail, .. }) => {
+                        Some(detail.clone())
+                    }
+                    Some(loupe_guide::ClaudeAvailability::NotInstalled { tried }) => Some(format!(
+                        "Could not find the Claude Code executable ({tried})."
+                    )),
+                    _ => None,
+                };
+                v_flex()
+                    .w_full()
+                    .child(setting_row(
+                        entry.title,
+                        entry.description,
+                        h_flex().gap_2().items_center().child(status).child(
+                            Button::new("guide-connection-check")
+                                .outline()
+                                .control()
+                                .label("Check again")
+                                .disabled(probing)
+                                .on_click(|_, _, cx| {
+                                    crate::github::guide_service::recheck_availability(cx);
+                                }),
+                        ),
+                        colors,
+                    ))
+                    .children(
+                        problem.map(|text| div().pb_3().child(message(text.into(), colors.danger))),
+                    )
+                    .into_any_element()
+            }
             Item::GuideModel => {
                 let current = settings.guide.model.clone();
                 let current_label = current.label();
-                row(Button::new("guide-model")
-                    .outline()
-                    .control()
-                    .label(current_label.clone())
-                    .dropdown_caret(true)
-                    .accessibility_label(format!("Guide model: {current_label}"))
-                    .menu_trigger()
-                    .dropdown_menu(move |menu, _, _| {
-                        let choices = [
-                            (
-                                loupe_guide::GuideModel::Sonnet,
-                                "Claude Sonnet (recommended)",
-                            ),
-                            (loupe_guide::GuideModel::Opus, "Claude Opus"),
-                            (loupe_guide::GuideModel::Haiku, "Claude Haiku (fast)"),
-                        ];
-                        choices.into_iter().fold(
-                            menu.min_w(scale::menu_min_width()),
-                            |menu, (model, label)| {
-                                let selected = model == current;
-                                menu.item(PopupMenuItem::new(label).checked(selected).on_click(
-                                    move |_, _, cx| {
-                                        let model = model.clone();
-                                        store::update_settings(cx, move |settings| {
-                                            settings.guide.model = model;
-                                        });
+                let name_input = self.guide_model_name.clone();
+                row(h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("guide-model")
+                            .outline()
+                            .control()
+                            .label(current_label.clone())
+                            .dropdown_caret(true)
+                            .accessibility_label(format!("Model: {current_label}"))
+                            .menu_trigger()
+                            .dropdown_menu(move |menu, _, _| {
+                                loupe_guide::GuideModel::PRESETS.into_iter().fold(
+                                    menu.min_w(scale::menu_min_width()),
+                                    |menu, model| {
+                                        let selected = model == current;
+                                        let label = match model {
+                                            loupe_guide::GuideModel::Sonnet => {
+                                                format!("{} (recommended)", model.label())
+                                            }
+                                            _ => model.label(),
+                                        };
+                                        let name_input = name_input.clone();
+                                        menu.item(
+                                            PopupMenuItem::new(label).checked(selected).on_click(
+                                                move |_, window, cx| {
+                                                    let model = model.clone();
+                                                    store::update_settings(cx, move |settings| {
+                                                        settings.guide.model = model;
+                                                    });
+                                                    name_input.update(cx, |input, cx| {
+                                                        input.set_value("", window, cx)
+                                                    });
+                                                },
+                                            ),
+                                        )
                                     },
-                                ))
-                            },
-                        )
-                    })
+                                )
+                            }),
+                    )
+                    .child(
+                        div().w(dp(200.)).child(
+                            Input::new(&self.guide_model_name)
+                                .small()
+                                .cleanable(true)
+                                .aria_label("Other model name"),
+                        ),
+                    )
                     .into_any_element())
             }
             Item::GuideEffort => {

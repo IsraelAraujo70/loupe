@@ -14,6 +14,7 @@ use crate::store::Settings;
 pub enum Section {
     General,
     Appearance,
+    GuidedReview,
     GitHub,
     Linear,
     T3,
@@ -22,9 +23,10 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::General,
         Section::Appearance,
+        Section::GuidedReview,
         Section::GitHub,
         Section::Linear,
         Section::T3,
@@ -36,6 +38,7 @@ impl Section {
         match self {
             Section::General => "General",
             Section::Appearance => "Appearance",
+            Section::GuidedReview => "Guided review",
             Section::GitHub => "GitHub",
             Section::Linear => "Linear",
             Section::T3 => "T3 Code",
@@ -48,6 +51,7 @@ impl Section {
         match self {
             Section::General => IconName::SlidersHorizontal,
             Section::Appearance => IconName::Palette,
+            Section::GuidedReview => IconName::BookOpen,
             Section::GitHub => IconName::Github,
             Section::Linear => IconName::SquareKanban,
             Section::T3 => IconName::Bot,
@@ -59,7 +63,7 @@ impl Section {
     /// The nav group the section sits in.
     pub fn group(self) -> &'static str {
         match self {
-            Section::General | Section::Appearance => "Preferences",
+            Section::General | Section::Appearance | Section::GuidedReview => "Preferences",
             Section::GitHub | Section::Linear | Section::T3 => "Accounts",
             Section::Shortcuts | Section::About => "Loupe",
         }
@@ -70,6 +74,7 @@ impl Section {
         match self {
             Section::General => "settings-general",
             Section::Appearance => "settings-appearance",
+            Section::GuidedReview => "settings-guided-review",
             Section::GitHub => "settings-github",
             Section::Linear => "settings-linear",
             Section::T3 => "settings-t3",
@@ -86,7 +91,11 @@ impl Section {
     pub fn has_defaults(self) -> bool {
         matches!(
             self,
-            Section::General | Section::Appearance | Section::GitHub | Section::T3
+            Section::General
+                | Section::Appearance
+                | Section::GuidedReview
+                | Section::GitHub
+                | Section::T3
         )
     }
 
@@ -111,8 +120,8 @@ impl Section {
                 settings.file_tree_position = defaults.file_tree_position;
                 settings.comment_order = defaults.comment_order;
                 settings.comment_box = defaults.comment_box;
-                settings.guide = defaults.guide;
             }
+            Section::GuidedReview => settings.guide = defaults.guide,
             Section::T3 => settings.t3_review = defaults.t3_review,
             Section::Linear | Section::Shortcuts | Section::About => {}
         }
@@ -147,6 +156,7 @@ pub enum Item {
     LongLines,
     CommentOrder,
     CommentBox,
+    GuideConnection,
     GuideModel,
     GuideEffort,
     GuideExecutable,
@@ -348,33 +358,42 @@ pub fn entries() -> Vec<Entry> {
             "top bottom end compose",
         ),
         entry(
+            GuideConnection,
+            S::GuidedReview,
+            "Claude Code",
+            "Connection",
+            "Loupe uses your own Claude Code login and settings (~/.claude/settings.json), \
+             including apiKeyHelper and env for a proxy or gateway.",
+            "guide claude login proxy gateway endpoint api key helper env token status",
+        ),
+        entry(
             GuideModel,
-            S::GitHub,
-            "Review guide",
-            "Guide model",
-            "The Claude model used by local Claude Code to build guided PR reviews.",
-            "guide summarize claude sonnet opus haiku ai",
+            S::GuidedReview,
+            "Claude Code",
+            "Model",
+            "Always passed to Claude Code. Pick one or type any name your Claude Code setup serves.",
+            "guide summarize claude sonnet opus haiku fable ai model proxy custom name",
         ),
         entry(
             GuideEffort,
-            S::GitHub,
-            "Review guide",
+            S::GuidedReview,
+            "Claude Code",
             "Guide effort",
             "How deeply Claude Code reasons when building a guided PR review.",
             "guide summarize reasoning effort low medium high",
         ),
         entry(
             GuideExecutable,
-            S::GitHub,
-            "Review guide",
+            S::GuidedReview,
+            "Claude Code",
             "Claude Code executable",
             "Optional path to the claude binary. Leave empty to detect automatically.",
             "guide claude cli binary path executable",
         ),
         entry(
             GuideAutoLimit,
-            S::GitHub,
-            "Review guide",
+            S::GuidedReview,
+            "Claude Code",
             "Auto-summarize limit",
             "Maximum guides generated automatically per hour across saved views.",
             "guide auto summarize hourly limit rate cap views",
@@ -601,6 +620,10 @@ mod tests {
             file_tree_position: FileTreePosition::Right,
             comment_order: CommentOrder::NewestFirst,
             comment_box: Some(CommentBoxPlace::Bottom),
+            guide: crate::store::GuideSettings {
+                model: loupe_guide::GuideModel::Custom("proxy-large".into()),
+                ..crate::store::GuideSettings::default()
+            },
             watched_repos: vec![RepoRef::new("acme", "app")],
             t3_server_url: Some("https://t3.example".into()),
             t3_review: crate::t3::ReviewSettings {
@@ -621,6 +644,11 @@ mod tests {
         assert_eq!(settings.file_tree_position, FileTreePosition::Left);
         assert_eq!(settings.comment_order, CommentOrder::OldestFirst);
         assert_eq!(settings.comment_box, None);
+        assert_eq!(
+            settings.guide.model,
+            loupe_guide::GuideModel::Custom("proxy-large".into()),
+            "the guide has its own section"
+        );
         assert_eq!(
             settings.watched_repos,
             [RepoRef::new("acme", "app")],
@@ -644,6 +672,9 @@ mod tests {
         assert!(settings.notification_filter.is_empty());
         assert_eq!(settings.watched_repos.len(), 1);
         assert!(!settings.t3_review.risk_check, "T3 Code is untouched");
+
+        Section::GuidedReview.restore_defaults(&mut settings);
+        assert_eq!(settings.guide, crate::store::GuideSettings::default());
 
         Section::T3.restore_defaults(&mut settings);
         assert_eq!(settings.t3_review, crate::t3::ReviewSettings::default());

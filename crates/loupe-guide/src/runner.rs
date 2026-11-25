@@ -19,6 +19,7 @@ use crate::claude::{
 };
 use crate::prompt::{GuidePromptInput, SYSTEM_PROMPT, build_user_prompt};
 use crate::schema::{GuideValidationError, ReviewGuide, guide_json_schema, validate};
+use crate::user_settings::ForwardedSettings;
 
 /// Shared cancellation flag passed to a guide generation run.
 #[derive(Clone, Debug, Default)]
@@ -176,7 +177,21 @@ pub fn run_in_checkout_with_timeout(
         .map_err(|err| GuideRunError::Spawn(err.to_string()))?;
     let user_prompt = build_user_prompt(input);
 
-    let mut cmd = build_command(exe, checkout_dir, config, &schema_json, SYSTEM_PROMPT);
+    // Kept alive until the child exits; its file is removed on drop.
+    let user_settings = ForwardedSettings::load();
+    let forwarded = user_settings.forwarded();
+    let redact = |text: &str| match forwarded {
+        Some(settings) => settings.redact(text),
+        None => text.to_owned(),
+    };
+    let mut cmd = build_command(
+        exe,
+        checkout_dir,
+        config,
+        forwarded.map(ForwardedSettings::path),
+        &schema_json,
+        SYSTEM_PROMPT,
+    );
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -303,13 +318,13 @@ pub fn run_in_checkout_with_timeout(
         } else {
             detail.to_owned()
         };
-        return Err(GuideRunError::AgentFailed(msg));
+        return Err(GuideRunError::AgentFailed(redact(&msg)));
     };
 
     if is_error {
-        return Err(GuideRunError::AgentFailed(
-            error_message.unwrap_or_else(|| format!("exit status {status}")),
-        ));
+        return Err(GuideRunError::AgentFailed(redact(
+            &error_message.unwrap_or_else(|| format!("exit status {status}")),
+        )));
     }
 
     let Some(structured) = structured_output else {

@@ -5,6 +5,7 @@ pub mod claude;
 pub mod prompt;
 pub mod runner;
 pub mod schema;
+pub mod user_settings;
 
 pub use checkout::{CheckoutError, TempCheckout, snapshot_tree};
 pub use claude::{

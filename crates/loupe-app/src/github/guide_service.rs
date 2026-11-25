@@ -114,6 +114,11 @@ pub fn recheck_availability(cx: &mut App) {
     service_mut(cx)._probe_task = Some(task);
 }
 
+/// The last Claude Code check, and whether a new one is running.
+pub fn availability(cx: &App) -> (Option<ClaudeAvailability>, bool) {
+    service(cx).map_or((None, false), |s| (s.availability.clone(), s.probing))
+}
+
 /// Whether a guide generation is currently running for `pr`.
 pub fn is_generating(cx: &App, pr: &PrRef) -> bool {
     service(cx).is_some_and(|s| s.runs.contains_key(pr))
