@@ -101,13 +101,17 @@ fn sorted_files(dir: &Dir) -> Vec<(&str, usize)> {
     files
 }
 
-fn build(files: &[ChangedFile], filter: &str) -> Dir {
+/// Whether the files filter keeps `path`: a case-insensitive substring of
+/// the full path, so `http/` or `client.rs` both narrow the files.
+pub fn filter_keeps(path: &str, filter: &str) -> bool {
     let filter = filter.trim().to_lowercase();
+    filter.is_empty() || path.to_lowercase().contains(&filter)
+}
+
+fn build(files: &[ChangedFile], filter: &str) -> Dir {
     let mut root = Dir::default();
     for (index, file) in files.iter().enumerate() {
-        // A case-insensitive substring of the full path, so `http/` or
-        // `client.rs` both narrow the tree.
-        if filter.is_empty() || file.path.to_lowercase().contains(&filter) {
+        if filter_keeps(&file.path, filter) {
             root.insert(&file.path, index);
         }
     }

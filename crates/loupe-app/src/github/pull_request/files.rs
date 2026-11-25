@@ -54,8 +54,8 @@ use self::search::Match;
 use self::sticky::HeaderWatch;
 use self::tree::{
     GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
-    file_tint, folder_tint, into_tree_order, move_down, move_left, move_right, move_up, tree_rows,
-    viewed_mark,
+    file_tint, filter_keeps, folder_tint, into_tree_order, move_down, move_left, move_right,
+    move_up, tree_rows, viewed_mark,
 };
 use self::tree_view::{RowView, StickyFolders};
 use super::tab::{PrTabContext, PrTabEvent};
@@ -178,6 +178,10 @@ pub struct FilesTab {
     patch_errors: HashMap<String, String>,
     /// The lines revealed between hunks, by path.
     expansions: HashMap<String, Expansion>,
+    /// Every file's diff; the diff shows the ones the filter keeps.
+    docs: Vec<DiffFile>,
+    /// The files folded to their header, kept while the filter hides them.
+    folded: HashSet<String>,
     diff: Option<Entity<DiffState>>,
     /// The changed words the diff marks, read by its highlighter.
     emphasis: SharedEmphasis,
@@ -227,8 +231,9 @@ impl FilesTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files"));
-        let filter_changes = cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
+        let filter_changes = cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
+                this.show_filtered(cx);
                 cx.notify();
             }
         });
@@ -263,6 +268,8 @@ impl FilesTab {
             patch_loads: HashMap::new(),
             patch_errors: HashMap::new(),
             expansions: HashMap::new(),
+            docs: Vec::new(),
+            folded: HashSet::new(),
             diff: None,
             emphasis: SharedEmphasis::default(),
             syntax_theme: cx.theme().highlight_theme.clone(),
@@ -487,15 +494,17 @@ impl FilesTab {
         self.missing = loaded.missing;
         self.expansions.clear();
         self.refresh_emphasis();
+        self.docs = loaded.docs;
+        let docs = self.filtered_docs(cx);
         let mode = diff_mode(self.layout);
         match &self.diff {
-            Some(state) => state.update(cx, |state, cx| state.set_files(loaded.docs, cx)),
+            Some(state) => state.update(cx, |state, cx| state.set_files(docs, cx)),
             None => {
                 let highlighter = self.highlighter(cx);
                 // Every line given is shown: the lines revealed between
                 // hunks are context the component would fold away again.
                 self.diff = Some(cx.new(|cx| {
-                    DiffState::new(loaded.docs, cx)
+                    DiffState::new(docs, cx)
                         .with_mode(mode)
                         .with_context_lines(None)
                         .with_inline_unit(None)
@@ -525,16 +534,83 @@ impl FilesTab {
     /// Collapses viewed files, and files whose diff GitHub left out so the
     /// header stands alone with its Load diff note. A commit keeps viewed
     /// files open: one viewed in the pull request may change again in it.
-    fn collapse_viewed(&self, cx: &mut Context<Self>) {
-        let Some(state) = &self.diff else { return };
+    fn collapse_viewed(&mut self, cx: &mut Context<Self>) {
         let collapse_viewed = self.commit.is_none();
+        self.folded = self
+            .files
+            .iter()
+            .filter(|file| {
+                self.missing.get(&file.path) == Some(&Missing::Omitted)
+                    || (collapse_viewed && is_viewed(file.viewed))
+            })
+            .map(|file| file.path.clone())
+            .collect();
+        let Some(state) = &self.diff else { return };
         state.update(cx, |state, cx| {
             for file in &self.files {
-                let omitted = self.missing.get(&file.path) == Some(&Missing::Omitted);
-                let viewed = collapse_viewed && is_viewed(file.viewed);
-                state.set_file_collapsed(&file.path, viewed || omitted, cx);
+                state.set_file_collapsed(&file.path, self.folded.contains(&file.path), cx);
             }
         });
+    }
+
+    /// The diffs of the files the filter keeps, in the tree's order.
+    fn filtered_docs(&self, cx: &App) -> Vec<DiffFile> {
+        let filter = self.filter.read(cx).value();
+        self.docs
+            .iter()
+            .filter(|doc| filter_keeps(doc.path(), &filter))
+            .cloned()
+            .collect()
+    }
+
+    /// Shows in the diff only the files the filter keeps, as GitHub does,
+    /// each folded or open as it was, from the top; the find follows them.
+    fn show_filtered(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.diff.clone() else {
+            return;
+        };
+        let docs = self.filtered_docs(cx);
+        let unchanged = {
+            let shown = state.read(cx).files();
+            shown.len() == docs.len()
+                && shown
+                    .iter()
+                    .zip(&docs)
+                    .all(|(shown, doc)| shown.path() == doc.path())
+        };
+        if unchanged {
+            return;
+        }
+        let folded = &mut self.folded;
+        state.update(cx, |state, cx| {
+            for file in state.files() {
+                let path = file.path().to_string();
+                if state.is_file_collapsed(&path) {
+                    folded.insert(path);
+                } else {
+                    folded.remove(&path);
+                }
+            }
+            let paths: Vec<SharedString> = docs.iter().map(|doc| doc.path().clone()).collect();
+            state.set_files(docs, cx);
+            for path in paths.iter().filter(|path| folded.contains(path.as_ref())) {
+                state.set_file_collapsed(path, true, cx);
+            }
+        });
+        self.headers.borrow_mut().jumped_to(0);
+        self.run_find(false, cx);
+    }
+
+    /// Puts `doc` in place of its file's diff, so it stays while the filter
+    /// hides the file.
+    fn replace_doc(&mut self, doc: &DiffFile) {
+        if let Some(existing) = self
+            .docs
+            .iter_mut()
+            .find(|existing| existing.path() == doc.path())
+        {
+            *existing = doc.clone();
+        }
     }
 
     /// Whether a Viewed mark was set here, so another view of the same pull
@@ -665,6 +741,10 @@ impl FilesTab {
             self.hunks.insert(file.path.clone(), Arc::new(hunks));
         }
         self.refresh_emphasis();
+        if let Some(doc) = &doc {
+            self.replace_doc(doc);
+            self.set_collapsed(path, viewed, cx);
+        }
         if let (Some(state), Some(doc)) = (&self.diff, doc) {
             state.update(cx, |state, cx| {
                 let docs = state
@@ -679,7 +759,6 @@ impl FilesTab {
                     })
                     .collect::<Vec<_>>();
                 state.set_files(docs, cx);
-                state.set_file_collapsed(path, viewed, cx);
                 state.scroll_to_file(path, cx);
             });
         }
@@ -828,6 +907,7 @@ impl FilesTab {
         let (Some(doc), None) = file_doc(&file, git_patch(&file)) else {
             return;
         };
+        self.replace_doc(&doc);
         self.refresh_emphasis();
         let lead = expand::lead(&shown, lines.start, search::LEAD);
         if let Some(state) = &self.diff {
@@ -958,6 +1038,7 @@ impl FilesTab {
         if !self.filter.read(cx).value().is_empty() {
             self.filter
                 .update(cx, |filter, cx| filter.set_value("", window, cx));
+            self.show_filtered(cx);
         }
         if self.diff.is_none() {
             self.pending_reveal = Some((path.to_owned(), line, side));
@@ -1057,13 +1138,18 @@ impl FilesTab {
             .current
             .and_then(|ix| self.find.matches.get(ix))
             .cloned();
-        let files = self.files.iter().map(|file| {
-            let hunks = self.shown_hunks(&file.path);
-            (
-                file.path.as_str(),
-                hunks.map_or(&[][..], |hunks| hunks.as_slice()),
-            )
-        });
+        let filter = self.filter.read(cx).value();
+        let files = self
+            .files
+            .iter()
+            .filter(|file| filter_keeps(&file.path, &filter))
+            .map(|file| {
+                let hunks = self.shown_hunks(&file.path);
+                (
+                    file.path.as_str(),
+                    hunks.map_or(&[][..], |hunks| hunks.as_slice()),
+                )
+            });
         self.find.matches = search::find(files, &query);
         self.find.query = query.clone();
         if !query.is_empty() {
@@ -1193,10 +1279,11 @@ impl FilesTab {
             )),
             None => Some(("No results".to_owned(), "No line has the text".to_owned())),
         };
+        let filter = self.filter.read(cx).value();
         let not_searched = self
             .missing
-            .values()
-            .filter(|reason| **reason == Missing::Omitted)
+            .iter()
+            .filter(|(path, reason)| **reason == Missing::Omitted && filter_keeps(path, &filter))
             .count();
         let hint = if self.commit.is_some() {
             COMMIT_NOT_SEARCHED_HINT
@@ -1416,7 +1503,12 @@ impl FilesTab {
         cx.notify();
     }
 
-    fn set_collapsed(&self, path: &str, collapsed: bool, cx: &mut Context<Self>) {
+    fn set_collapsed(&mut self, path: &str, collapsed: bool, cx: &mut Context<Self>) {
+        if collapsed {
+            self.folded.insert(path.to_owned());
+        } else {
+            self.folded.remove(path);
+        }
         if let Some(state) = &self.diff {
             state.update(cx, |state, cx| {
                 state.set_file_collapsed(path, collapsed, cx)
@@ -1523,6 +1615,15 @@ impl FilesTab {
         } else {
             OMITTED_HINT
         };
+        let filter = self.filter.read(cx).value();
+        let shown = (!filter.trim().is_empty()).then(|| {
+            let kept = self
+                .files
+                .iter()
+                .filter(|file| filter_keeps(&file.path, &filter))
+                .count();
+            format!("Showing {kept} of {} files", self.files.len())
+        });
         let tree_right = Settings::get(cx).file_tree_position == FileTreePosition::Right;
         let mut parts = vec![
             h_flex()
@@ -1551,6 +1652,20 @@ impl FilesTab {
             parts.push(Spinner::new().xsmall().color(muted).into_any_element());
         }
         parts.push(div().flex_1().into_any_element());
+        if let Some(shown) = shown {
+            parts.push(
+                div()
+                    .id("files-filter-shown")
+                    .debug_selector(|| "files-filter-shown".into())
+                    .role(Role::Status)
+                    .aria_label(shown.clone())
+                    .flex_none()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(shown)
+                    .into_any_element(),
+            );
+        }
         // In words, beside the control that answers it: lines go on
         // past the edge. The edge's fade alone is dark on dark and says
         // nothing on a line with no tint, and the component shows its
@@ -2366,6 +2481,32 @@ impl FilesTab {
         let Some(state) = self.diff.clone() else {
             return div().into_any_element();
         };
+        let diff_body = if state.read(cx).files().is_empty() {
+            ui::empty_state(
+                IconName::ListFilter,
+                "No files match the filter",
+                format!(
+                    "None of the {} changed files has it in its path.",
+                    self.files.len()
+                ),
+            )
+            .action(
+                Button::new("files-filter-clear")
+                    .debug_selector(|| "files-filter-clear".into())
+                    .outline()
+                    .small()
+                    .label("Clear filter")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.filter
+                            .update(cx, |filter, cx| filter.set_value("", window, cx));
+                        this.show_filtered(cx);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+        } else {
+            self.diff_view(&state, cx)
+        };
         v_flex()
             .size_full()
             .child(self.toolbar(cx))
@@ -2397,13 +2538,10 @@ impl FilesTab {
                         .child(self.file_list(window, cx));
                     let find_bar = self.find.open.then(|| self.find_bar(cx));
                     let diff = resizable_panel().child(
-                        v_flex().size_full().children(find_bar).child(
-                            h_flex()
-                                .flex_1()
-                                .min_h_0()
-                                .w_full()
-                                .child(self.diff_view(&state, cx)),
-                        ),
+                        v_flex()
+                            .size_full()
+                            .children(find_bar)
+                            .child(h_flex().flex_1().min_h_0().w_full().child(diff_body)),
                     );
                     // One id per side: the group keeps its panels' widths by
                     // index, and the tree's width must not land on the diff.
@@ -3211,5 +3349,122 @@ pub(super) mod tests {
         };
         assert!(target(11, cx), "a line of the patch takes a comment");
         assert!(!target(30, cx), "GitHub anchors comments only to the patch");
+    }
+
+    /// The paths the diff shows, in order.
+    fn diff_paths(cx: &mut VisualTestContext, tab: &Entity<FilesTab>) -> Vec<String> {
+        tab.read_with(cx, |tab, cx| {
+            let state = tab.diff.as_ref().expect("diff").read(cx);
+            state
+                .files()
+                .iter()
+                .map(|file| file.path().to_string())
+                .collect()
+        })
+    }
+
+    #[gpui_kit::test]
+    fn the_filter_narrows_the_diff_and_the_find_to_its_files(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_files_tab_with_files(
+            cx,
+            vec![
+                added("docs/guide.md", 300),
+                added("src/lib.rs", 300),
+                added("src/main.rs", 300),
+            ],
+        );
+        let cx = &mut cx;
+        draw(cx);
+        let every = ["docs/guide.md", "src/lib.rs", "src/main.rs"];
+        assert_eq!(diff_paths(cx, &tab), every);
+        assert!(cx.debug_bounds("files-filter-shown").is_none());
+        tab.update(cx, |tab, cx| {
+            let state = tab.diff.clone().expect("diff");
+            state.update(cx, |state, cx| {
+                state.set_file_collapsed("src/main.rs", true, cx)
+            });
+        });
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.open_find(window, cx)));
+        cx.simulate_input("line 300");
+        draw(cx);
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 3);
+
+        let focus_filter = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let filter = tab.read(cx).filter.clone();
+                filter.update(cx, |filter, cx| filter.focus(window, cx));
+            })
+        };
+        focus_filter(cx);
+        cx.simulate_input("SRC/");
+        draw(cx);
+        assert_eq!(
+            diff_paths(cx, &tab),
+            ["src/lib.rs", "src/main.rs"],
+            "the diff shows only the files the tree keeps"
+        );
+        assert!(
+            cx.debug_bounds("files-filter-shown").is_some(),
+            "the toolbar says how many files show"
+        );
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.find.matches.len()),
+            2,
+            "the find goes through the files shown"
+        );
+
+        cx.simulate_input("x");
+        draw(cx);
+        assert!(diff_paths(cx, &tab).is_empty());
+        assert!(
+            cx.debug_bounds("files-filter-clear").is_some(),
+            "an empty diff says nothing matches and offers to clear"
+        );
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 0);
+
+        for _ in 0.."SRC/x".len() {
+            cx.simulate_keystrokes("backspace");
+        }
+        draw(cx);
+        assert_eq!(diff_paths(cx, &tab), every);
+        assert!(cx.debug_bounds("files-filter-shown").is_none());
+        assert!(
+            tab.read_with(cx, |tab, cx| tab
+                .diff
+                .as_ref()
+                .expect("diff")
+                .read(cx)
+                .is_file_collapsed("src/main.rs")),
+            "a file folded before the filter stays folded"
+        );
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 3);
+
+        // Going to a line clears the filter, so its file is in the diff.
+        focus_filter(cx);
+        cx.simulate_input("docs");
+        draw(cx);
+        cx.run_until_parked();
+        assert_eq!(diff_paths(cx, &tab), ["docs/guide.md"]);
+        cx.update(|window, cx| {
+            tab.update(cx, |tab, cx| {
+                tab.reveal_line(
+                    "src/lib.rs",
+                    Some(250),
+                    loupe_github::Side::Right,
+                    window,
+                    cx,
+                )
+            })
+        });
+        for _ in 0..3 {
+            draw(cx);
+            cx.run_until_parked();
+        }
+        assert_eq!(diff_paths(cx, &tab), every);
+        assert_eq!(
+            tab.read_with(cx, |tab, cx| (tab.selected.clone(), tab.top_file(cx))),
+            (Some("src/lib.rs".to_owned()), Some(1)),
+            "the diff goes to the line and the tree follows"
+        );
     }
 }
