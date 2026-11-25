@@ -16,9 +16,10 @@ use crate::github::widgets;
 use crate::theme::{scale, tokens};
 use crate::ui;
 
-/// Bodies taller than this show cut, with "Show more".
+/// Bodies taller than this show cut, with "Show more": low enough that
+/// a long description leaves the comments and the comment box in view.
 fn max_body_height() -> Pixels {
-    scale::dp(600.)
+    scale::dp(360.)
 }
 /// The fade over the bottom of a cut body.
 fn fade_height() -> Pixels {
