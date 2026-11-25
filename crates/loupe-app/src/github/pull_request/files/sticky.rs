@@ -63,6 +63,11 @@ impl HeaderWatch {
         self.last.clear();
     }
 
+    /// The file at the top of the diff, by its place in the diff.
+    pub fn top(&self) -> Option<usize> {
+        self.top
+    }
+
     /// The headers of the last frame that ended, top first.
     pub fn headers(&self) -> &[HeaderAt] {
         &self.last
