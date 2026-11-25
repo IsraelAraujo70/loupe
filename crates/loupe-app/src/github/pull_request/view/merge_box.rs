@@ -193,7 +193,9 @@ fn progress_count(progress: Progress, verb: &str, empty: &str) -> String {
 }
 
 /// A count in the reviewer's line: an icon that turns into a green check
-/// once every item is done, and the count, or `action` in its place.
+/// once every item is done, and the count, or `action` in its place. The
+/// line wraps a fact whole before it cuts one; a fact wider than the line
+/// alone ends in an ellipsis, with the whole text in its tooltip.
 fn progress_fact(
     id: &'static str,
     icon: IconName,
@@ -209,18 +211,26 @@ fn progress_fact(
     } else {
         (icon, muted)
     };
+    let name = format!("{title}: {count}");
     h_flex()
         .id(id)
+        .debug_selector(move || id.to_owned())
         .role(Role::ProgressIndicator)
-        .aria_label(format!("{title}: {count}"))
+        .aria_label(name.clone())
         .aria_min_numeric_value(0.)
         .aria_max_numeric_value(100.)
         .aria_numeric_value(f64::from(share(progress.done, progress.total) * 100.).round())
-        .flex_none()
+        .min_w_0()
+        .max_w_full()
         .gap_1p5()
         .items_center()
         .child(Icon::new(icon).with_size(dp(14.)).text_color(color))
-        .child(action.unwrap_or_else(|| div().child(count).into_any_element()))
+        .map(|fact| match action {
+            Some(action) => fact.child(action),
+            None => fact
+                .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+                .child(div().min_w_0().truncate().child(count)),
+        })
 }
 
 impl PullRequestView {
@@ -511,7 +521,8 @@ impl PullRequestView {
             .id("merge-box-line-checks")
             .debug_selector(|| "merge-box-line-checks".to_owned())
             .aria_label(format!("Checks: {checks_label}"))
-            .flex_none()
+            .min_w_0()
+            .max_w_full()
             .h_6()
             .px_1p5()
             .gap_1p5()
@@ -522,21 +533,29 @@ impl PullRequestView {
                     .with_size(dp(14.))
                     .text_color(checks_color),
             )
-            .child(div().text_color(foreground).child(checks_label))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(foreground)
+                    .child(checks_label.clone()),
+            )
             .map(|fact| {
                 if !has_runs {
-                    return fact.role(Role::Status);
+                    return fact.role(Role::Status).tooltip(move |window, cx| {
+                        Tooltip::new(checks_label.clone()).build(window, cx)
+                    });
                 }
                 fact.role(Role::Button)
                     .aria_expanded(checks_open)
                     .hover(move |fact| fact.bg(hover))
                     .tooltip(move |window, cx| {
-                        let tip = if checks_open {
+                        let action = if checks_open {
                             "Hide the checks"
                         } else {
                             "Show the checks"
                         };
-                        Tooltip::new(tip).build(window, cx)
+                        Tooltip::new(format!("{checks_label}. {action}")).build(window, cx)
                     })
                     .child(
                         Icon::new(if checks_open {
@@ -573,11 +592,13 @@ impl PullRequestView {
             .child(divider)
             .child(
                 h_flex()
+                    .debug_selector(|| "merge-box-line-facts".to_owned())
                     .flex_1()
                     .min_w_0()
-                    .gap_3()
+                    .flex_wrap()
+                    .gap_x_3()
+                    .gap_y_1()
                     .items_center()
-                    .overflow_hidden()
                     .text_size(scale::meta())
                     .text_color(muted)
                     .child(checks)
@@ -804,6 +825,16 @@ mod tests {
         ready: Submit,
         cx: &mut TestAppContext,
     ) -> VisualTestContext {
+        open_at(detail, ready, px(1280.), cx)
+    }
+
+    /// [`open`] in a window `width` wide.
+    fn open_at(
+        detail: PullRequestDetail,
+        ready: Submit,
+        width: gpui_kit::Pixels,
+        cx: &mut TestAppContext,
+    ) -> VisualTestContext {
         let detail = Arc::new(detail);
         let (handle, view) = cx.update(|cx| {
             gpui_kit::init(cx);
@@ -815,7 +846,7 @@ mod tests {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                         Default::default(),
-                        size(px(1280.), px(820.)),
+                        size(width, px(820.)),
                     ))),
                     ..Default::default()
                 },
@@ -1029,6 +1060,45 @@ mod tests {
         let mut cx = open(model::tests::detail(), Submit::Idle, cx);
         assert!(cx.debug_bounds("merge-box-line").is_some());
         assert!(cx.debug_bounds("merge-box-merge").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn a_narrow_line_wraps_its_facts_instead_of_cutting_them(cx: &mut TestAppContext) {
+        let mut detail = failing_checks("bruno");
+        detail.merge_state = loupe_github::MergeStateStatus::Unstable;
+        detail.checks.runs.extend([
+            run("e2e", CheckStatus::Running),
+            run("docs", CheckStatus::Cancelled),
+        ]);
+        detail.reviewers = vec![loupe_github::Reviewer {
+            kind: loupe_github::ReviewerKind::User(Actor {
+                login: "carla".into(),
+                avatar_url: String::new(),
+            }),
+            state: loupe_github::ReviewerState::Requested,
+        }];
+        let mut cx = open_at(detail, Submit::Idle, px(760.), cx);
+        let facts = cx.debug_bounds("merge-box-line-facts").expect("the facts");
+        let merge = cx.debug_bounds("merge-box-merge").expect("Merge stays");
+        for fact in [
+            "merge-box-line-checks",
+            "merge-box-line-threads",
+            "merge-box-line-approvals",
+        ] {
+            let bounds = cx.debug_bounds(fact).expect(fact);
+            assert!(
+                bounds.right() <= facts.right() && bounds.right() <= merge.left(),
+                "{fact} ends inside the line, before Merge: {bounds:?} in {facts:?}"
+            );
+        }
+        let checks = cx.debug_bounds("merge-box-line-checks").expect("checks");
+        let approvals = cx
+            .debug_bounds("merge-box-line-approvals")
+            .expect("approvals");
+        assert!(
+            approvals.top() > checks.top(),
+            "the approvals wrap under the checks"
+        );
     }
 
     fn stack_node(number: u64, base: &str, head: &str) -> loupe_github::StackNode {
