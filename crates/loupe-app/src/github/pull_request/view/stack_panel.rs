@@ -3,7 +3,6 @@
 //! number, title, position, approval, and checks, highlighting the PR on screen.
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -15,16 +14,6 @@ use crate::shell::OpenOnClick as _;
 use crate::theme::scale::{self, dp};
 use crate::theme::tokens;
 use crate::ui;
-
-fn approval_chip(decision: ReviewDecision) -> Tag {
-    match decision {
-        ReviewDecision::Approved => ui::tinted_chip(tokens::open()).child("Approved"),
-        ReviewDecision::ChangesRequested => {
-            ui::tinted_chip(tokens::closed()).child("Changes requested")
-        }
-        ReviewDecision::ReviewRequired => ui::chip().child("Review required"),
-    }
-}
 
 /// Renders the vertical Graphite-style stack rail dot and connecting segments
 /// for row `ix` out of `total` (above the base branch footer).
@@ -180,7 +169,7 @@ fn render_entry_row(
                         .child(position),
                 ),
         )
-        .children(node.review_decision.map(approval_chip))
+        .children(node.review_decision.map(widgets::approval_chip))
         .child(
             h_flex()
                 .flex_none()

@@ -10,7 +10,7 @@ mod thread;
 mod view;
 
 use gpui_kit::{AnyView, App, AppContext as _, Global, Window};
-use loupe_github::{PrRef, PullRequestDetail};
+use loupe_github::{PrRef, PullRequestDetail, Side};
 
 use view::PullRequestView;
 
@@ -37,6 +37,35 @@ pub(super) fn take_stack_merge_confirm(pr: &PrRef, cx: &mut App) -> bool {
     }
     cx.default_global::<PendingStackMergeConfirm>().pr = None;
     true
+}
+
+/// One-shot intent set when a stack guide's snippet from another pull request
+/// is clicked: that pull request's view consumes it once loaded and opens its
+/// Files tab at the file and line.
+#[derive(Default)]
+struct PendingOpenFile {
+    request: Option<(PrRef, String, Option<u32>, Side)>,
+}
+
+impl Global for PendingOpenFile {}
+
+pub(super) fn request_open_file(
+    pr: PrRef,
+    path: String,
+    line: Option<u32>,
+    side: Side,
+    cx: &mut App,
+) {
+    cx.default_global::<PendingOpenFile>().request = Some((pr, path, line, side));
+}
+
+pub(super) fn take_open_file(pr: &PrRef, cx: &mut App) -> Option<(String, Option<u32>, Side)> {
+    let pending = cx.try_global::<PendingOpenFile>()?;
+    if pending.request.as_ref().map(|(target, ..)| target) != Some(pr) {
+        return None;
+    }
+    let (_, path, line, side) = cx.default_global::<PendingOpenFile>().request.take()?;
+    Some((path, line, side))
 }
 
 pub fn view(pr: PrRef, window: &mut Window, cx: &mut App) -> AnyView {

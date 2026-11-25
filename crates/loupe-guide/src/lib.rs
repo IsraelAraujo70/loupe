@@ -7,6 +7,7 @@ mod private_dir;
 pub mod prompt;
 pub mod runner;
 pub mod schema;
+pub mod stack;
 pub mod user_settings;
 
 pub use checkout::{CheckoutError, TempCheckout, snapshot_tree};
@@ -17,7 +18,8 @@ pub use claude::{
 };
 pub use language::{GuideLanguage, LanguagePreference, detect_language};
 pub use prompt::{
-    GuidePromptInput, PromptComment, PromptCommit, PromptFile, SYSTEM_PROMPT, build_user_prompt,
+    EarlierChapter, GuidePromptInput, PromptComment, PromptCommit, PromptFile, SYSTEM_PROMPT,
+    StackPosition, build_user_prompt,
 };
 pub use runner::{
     CancelToken, DEFAULT_AGENT_TIMEOUT, GeneratedGuide, GuideRunError, ProgressEvent,
@@ -28,4 +30,8 @@ pub use schema::{
     GuideSummary, GuideValidationError, RemovedTest, ReviewGuide, SCHEMA_VERSION, SnippetSide,
     StepChange, StepKind, StoredGuide, changed_steps_since, guide_json_schema, is_valid_slug,
     parse_and_validate, uncovered_files, validate,
+};
+pub use stack::{
+    ChapterChange, ChapterRequest, GeneratedStack, STACK_SCHEMA_VERSION, StackChapter,
+    StackGuideError, StackMember, StackOverview, StackProgress, StoredStackGuide, generate_stack,
 };

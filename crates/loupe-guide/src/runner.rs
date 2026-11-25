@@ -1,7 +1,7 @@
 //! End-to-end local guided review runner with live progress and cancellation.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,22 +106,31 @@ pub fn generate_for_pr(
     cancel: &CancelToken,
     mut on_progress: impl FnMut(ProgressEvent),
 ) -> Result<GeneratedGuide, GuideRunError> {
-    let exe = match check_availability(config.executable_path()) {
-        ClaudeAvailability::Ready { path, .. } => path,
-        ClaudeAvailability::NotInstalled { tried } => {
-            return Err(GuideRunError::NotInstalled { tried });
-        }
-        ClaudeAvailability::NotLoggedIn { detail, .. } => {
-            return Err(GuideRunError::NotLoggedIn(detail));
-        }
-    };
-
+    let exe = ready_executable(config)?;
     if cancel.is_cancelled() {
         return Err(GuideRunError::Cancelled);
     }
-
     on_progress(ProgressEvent::PreparingCheckout);
-    let checkout = TempCheckout::from_github_pr(
+    let checkout = checkout_pr(input, github_token, cancel)?;
+    run_in_checkout(&exe, checkout.path(), input, config, cancel, on_progress)
+}
+
+/// The Claude Code executable `config` names, once it is installed and signed in.
+pub(crate) fn ready_executable(config: &ClaudeConfig) -> Result<PathBuf, GuideRunError> {
+    match check_availability(config.executable_path()) {
+        ClaudeAvailability::Ready { path, .. } => Ok(path),
+        ClaudeAvailability::NotInstalled { tried } => Err(GuideRunError::NotInstalled { tried }),
+        ClaudeAvailability::NotLoggedIn { detail, .. } => Err(GuideRunError::NotLoggedIn(detail)),
+    }
+}
+
+/// A temporary checkout of `input`'s pull request at its head commit.
+pub(crate) fn checkout_pr(
+    input: &GuidePromptInput,
+    github_token: Option<&str>,
+    cancel: &CancelToken,
+) -> Result<TempCheckout, GuideRunError> {
+    TempCheckout::from_github_pr(
         &input.repo,
         input.pr_number,
         &input.head_oid,
@@ -132,9 +141,7 @@ pub fn generate_for_pr(
         CheckoutError::Cancelled => GuideRunError::Cancelled,
         CheckoutError::TimedOut => GuideRunError::TimedOut,
         other => GuideRunError::Checkout(other),
-    })?;
-
-    run_in_checkout(&exe, checkout.path(), input, config, cancel, on_progress)
+    })
 }
 
 /// Runs the hardened Claude Code CLI inside an already-prepared read-only checkout
@@ -172,11 +179,58 @@ pub fn run_in_checkout_with_timeout(
     if cancel.is_cancelled() {
         return Err(GuideRunError::Cancelled);
     }
-
     on_progress(ProgressEvent::StartingAgent);
-    let schema_json = serde_json::to_string(&guide_json_schema())
+    let request = AgentRequest {
+        checkout_dir,
+        user_prompt: build_user_prompt(input, checkout_dir),
+        system_prompt: SYSTEM_PROMPT,
+        schema: guide_json_schema(),
+    };
+    let output = run_agent(exe, &request, config, cancel, timeout, &mut on_progress)?;
+    on_progress(ProgressEvent::ValidatingOutput);
+    let guide: ReviewGuide = serde_json::from_value(output.structured)
+        .map_err(|err| GuideValidationError::MalformedJson(err.to_string()))?;
+    validate(&guide)?;
+    Ok(GeneratedGuide {
+        guide,
+        model: output.model,
+        duration_ms: output.duration_ms,
+    })
+}
+
+/// One hardened Claude Code run: what it reads, what it is told, and the
+/// JSON Schema its structured output must match.
+pub(crate) struct AgentRequest<'a> {
+    /// The only directory the agent may read, added with `--add-dir`.
+    pub checkout_dir: &'a Path,
+    pub user_prompt: String,
+    pub system_prompt: &'a str,
+    pub schema: serde_json::Value,
+}
+
+/// The unvalidated structured output of a finished run.
+pub(crate) struct AgentOutput {
+    pub structured: serde_json::Value,
+    pub model: String,
+    pub duration_ms: Option<u64>,
+}
+
+/// Launches Claude Code in read-only, structured-output mode from an empty
+/// private working directory and returns its structured output.
+pub(crate) fn run_agent(
+    exe: &Path,
+    request: &AgentRequest<'_>,
+    config: &ClaudeConfig,
+    cancel: &CancelToken,
+    timeout: Duration,
+    on_progress: &mut dyn FnMut(ProgressEvent),
+) -> Result<AgentOutput, GuideRunError> {
+    if cancel.is_cancelled() {
+        return Err(GuideRunError::Cancelled);
+    }
+    let schema_json = serde_json::to_string(&request.schema)
         .map_err(|err| GuideRunError::Spawn(err.to_string()))?;
-    let user_prompt = build_user_prompt(input, checkout_dir);
+    let user_prompt = request.user_prompt.clone();
     let workdir = PrivateDir::create("loupe-claude-work")
         .map_err(|err| GuideRunError::Spawn(err.to_string()))?;
 
@@ -190,11 +244,11 @@ pub fn run_in_checkout_with_timeout(
     let mut cmd = build_command(
         exe,
         workdir.path(),
-        checkout_dir,
+        request.checkout_dir,
         config,
         forwarded.map(ForwardedSettings::path),
         &schema_json,
-        SYSTEM_PROMPT,
+        request.system_prompt,
     );
     #[cfg(unix)]
     {
@@ -335,13 +389,8 @@ pub fn run_in_checkout_with_timeout(
         return Err(GuideRunError::MissingStructuredOutput);
     };
 
-    on_progress(ProgressEvent::ValidatingOutput);
-    let guide: ReviewGuide = serde_json::from_value(structured)
-        .map_err(|err| GuideValidationError::MalformedJson(err.to_string()))?;
-    validate(&guide)?;
-
-    Ok(GeneratedGuide {
-        guide,
+    Ok(AgentOutput {
+        structured,
         model: resolved_model,
         duration_ms,
     })
@@ -487,6 +536,7 @@ mod tests {
                 }],
                 previous_step_ids: Vec::new(),
                 language: crate::GuideLanguage::english(),
+                stack: None,
             };
             let err = run_in_checkout(
                 &stub,
@@ -551,6 +601,7 @@ mod tests {
             files: Vec::new(),
             previous_step_ids: Vec::new(),
             language: crate::language::GuideLanguage::english(),
+            stack: None,
         };
         let _ = run_in_checkout(
             &stub,
@@ -609,6 +660,7 @@ mod tests {
                 files: Vec::new(),
                 previous_step_ids: Vec::new(),
                 language: crate::GuideLanguage::english(),
+                stack: None,
             };
             let err = run_in_checkout_with_timeout(
                 &stub,
@@ -675,6 +727,7 @@ mod tests {
                 }],
                 previous_step_ids: Vec::new(),
                 language: crate::GuideLanguage::english(),
+                stack: None,
             };
 
             let config = ClaudeConfig {

@@ -5,7 +5,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{Icon, Sizable as _, h_flex};
 use gpui_kit::*;
-use loupe_github::{ChecksState, Label, PrState};
+use loupe_github::{ChecksState, Label, PrState, ReviewDecision};
 
 use crate::theme::{scale, tokens};
 use crate::ui::ChipExt as _;
@@ -43,6 +43,18 @@ pub fn state_label(state: PrState, is_draft: bool) -> &'static str {
         (PrState::Open, false) => "Open",
         (PrState::Merged, _) => "Merged",
         (PrState::Closed, _) => "Closed",
+    }
+}
+
+/// A pull request's review decision as a chip: green when approved, red when
+/// changes were requested.
+pub fn approval_chip(decision: ReviewDecision) -> Tag {
+    match decision {
+        ReviewDecision::Approved => crate::ui::tinted_chip(tokens::open()).child("Approved"),
+        ReviewDecision::ChangesRequested => {
+            crate::ui::tinted_chip(tokens::closed()).child("Changes requested")
+        }
+        ReviewDecision::ReviewRequired => crate::ui::chip().child("Review required"),
     }
 }
 

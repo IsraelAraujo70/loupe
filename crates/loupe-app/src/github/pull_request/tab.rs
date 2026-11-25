@@ -26,4 +26,12 @@ pub enum PrTabEvent {
         line: Option<u32>,
         side: Side,
     },
+    /// Open another pull request (one of this one's stack) on its Files tab
+    /// at `path` (and `line` on `side` when given).
+    OpenFileIn {
+        pr: PrRef,
+        path: String,
+        line: Option<u32>,
+        side: Side,
+    },
 }

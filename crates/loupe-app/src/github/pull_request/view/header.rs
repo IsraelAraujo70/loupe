@@ -167,19 +167,31 @@ impl PullRequestView {
     }
 
     /// Summarize: opens the Guide tab and generates a guided review with local
-    /// Claude Code (or shows the cached guide when already up to date).
+    /// Claude Code (or shows the cached guide when already up to date). In a
+    /// stack it summarizes the whole stack unless "this PR only" was picked;
+    /// its menu picks the scope and the language.
     fn render_summarize_button(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> Div {
-        let busy = crate::github::guide_service::is_generating(cx, &detail.pr);
-        let fresh = crate::github::guide_service::has_fresh_guide(cx, detail);
-        let tooltip = if busy {
-            "Generating guided review with Claude Code"
-        } else if fresh {
-            "Open the guided review for this commit"
-        } else {
-            "Generate a guided review using local Claude Code"
+        use crate::github::guide_service::{self, GuideScope};
+        let stack = self.stack_graph.as_ref();
+        let busy = guide_service::is_generating(cx, &detail.pr);
+        let fresh = guide_service::has_fresh_scoped_guide(cx, detail, stack);
+        let scope = guide_service::wanted_scope(cx, &detail.pr, stack);
+        let stack_size = stack
+            .filter(|graph| graph.len() >= 2 && graph.contains(detail.pr.number))
+            .map(|graph| graph.len());
+        let tooltip = match (busy, fresh, scope) {
+            (true, _, _) => "Generating guided review with Claude Code",
+            (false, true, GuideScope::Stack) => "Open the guided review of this stack",
+            (false, true, GuideScope::PullRequest) => "Open the guided review for this commit",
+            (false, false, GuideScope::Stack) => {
+                "Generate a guided review of the whole stack using local Claude Code"
+            }
+            (false, false, GuideScope::PullRequest) => {
+                "Generate a guided review using local Claude Code"
+            }
         };
-        let current = crate::github::guide_service::wanted_language(cx, detail);
-        let choices = crate::github::guide_service::language_choices(cx, detail);
+        let current = guide_service::wanted_language(cx, detail);
+        let choices = guide_service::language_choices(cx, detail);
         let view = cx.entity().downgrade();
         div()
             .flex_none()
@@ -199,9 +211,29 @@ impl PullRequestView {
                                 cx.listener(|this, _, _, cx| this.summarize_pull_request(cx)),
                             ),
                     )
-                    .menu_accessibility_label("Summarize in another language")
+                    .menu_accessibility_label("Summarize options")
                     .dropdown_menu(move |menu, _, _| {
-                        let menu = menu.min_w(scale::menu_min_width()).label("Summarize in");
+                        let mut menu = menu.min_w(scale::menu_min_width());
+                        if let Some(size) = stack_size {
+                            for (label, item_scope) in [
+                                (format!("Summarize stack ({size} PRs)"), GuideScope::Stack),
+                                ("Summarize this PR only".to_owned(), GuideScope::PullRequest),
+                            ] {
+                                let view = view.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(label)
+                                        .checked(item_scope == scope)
+                                        .on_click(move |_, _, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.summarize_scope(item_scope, cx)
+                                            })
+                                            .ok();
+                                        }),
+                                );
+                            }
+                            menu = menu.separator();
+                        }
+                        let menu = menu.label("Summarize in");
                         choices
                             .iter()
                             .enumerate()

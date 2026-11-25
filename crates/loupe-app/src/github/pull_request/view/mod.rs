@@ -221,8 +221,9 @@ pub struct PullRequestView {
     /// Runs while the header's Copy link button says "Copied", and puts its
     /// label back when it ends.
     link_copied: Option<Task<()>>,
-    /// Last `(head_oid, guide_service::revision, language)` synchronized into `GuideTab`.
-    guide_sync: Option<(String, u64, loupe_guide::GuideLanguage)>,
+    /// Last `(head_oid, guide_service::revision, language, stack)` synchronized
+    /// into `GuideTab`.
+    guide_sync: Option<(String, u64, loupe_guide::GuideLanguage, Option<StackGraph>)>,
     _ticker: Task<()>,
 }
 
@@ -523,15 +524,36 @@ impl PullRequestView {
                 self.reload(cx);
             }
             PrTabEvent::OpenFile { path, line, side } => {
-                self.tab = PrTab::Files;
-                if let Some(loaded) = &self.loaded {
-                    loaded.files.update(cx, |files, cx| {
-                        files.reveal_line(path, *line, *side, window, cx)
-                    });
-                }
-                cx.notify();
+                self.reveal_file(path, *line, *side, window, cx);
+            }
+            PrTabEvent::OpenFileIn {
+                pr,
+                path,
+                line,
+                side,
+            } => {
+                super::request_open_file(pr.clone(), path.clone(), *line, *side, cx);
+                crate::shell::navigate(crate::route::Route::PullRequest(pr.clone()), window, cx);
             }
         }
+    }
+
+    /// Shows the Files tab at `path` (and `line` on `side` when given).
+    fn reveal_file(
+        &mut self,
+        path: &str,
+        line: Option<u32>,
+        side: loupe_github::Side,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab = PrTab::Files;
+        if let Some(loaded) = &self.loaded {
+            loaded.files.update(cx, |files, cx| {
+                files.reveal_line(path, line, side, window, cx)
+            });
+        }
+        cx.notify();
     }
 
     /// After a load: keeps the ETags of the poll that asked for it, tells
@@ -1050,13 +1072,24 @@ impl PullRequestView {
 
     pub(super) fn summarize_pull_request(&mut self, cx: &mut Context<Self>) {
         self.tab = PrTab::Guide;
+        let stack = self.stack_graph.as_ref();
         if let Some(detail) = self.detail.value().cloned()
             && !crate::github::guide_service::is_generating(cx, &detail.pr)
-            && !crate::github::guide_service::has_fresh_guide(cx, &detail)
+            && !crate::github::guide_service::has_fresh_scoped_guide(cx, &detail, stack)
         {
-            crate::github::guide_service::start_generation(detail, cx);
+            crate::github::guide_service::start_scoped_generation(detail, stack, cx);
         }
         cx.notify();
+    }
+
+    /// Summarize the whole stack or this pull request alone, for this session.
+    pub(super) fn summarize_scope(
+        &mut self,
+        scope: crate::github::guide_service::GuideScope,
+        cx: &mut Context<Self>,
+    ) {
+        crate::github::guide_service::set_scope_for(&self.pr, scope, cx);
+        self.summarize_pull_request(cx);
     }
 
     /// Summarize in `language` for this pull request, without changing Settings.
@@ -1073,7 +1106,11 @@ impl PullRequestView {
 
     pub(super) fn trigger_guide_generation(&mut self, cx: &mut Context<Self>) {
         if let Some(detail) = self.detail.value().cloned() {
-            crate::github::guide_service::start_generation(detail, cx);
+            crate::github::guide_service::start_scoped_generation(
+                detail,
+                self.stack_graph.as_ref(),
+                cx,
+            );
         }
     }
 
@@ -1250,6 +1287,11 @@ impl Render for PullRequestView {
         if let Some(detail) = self.incoming.take() {
             self.install(detail, window, cx);
         }
+        if self.loaded.is_some()
+            && let Some((path, line, side)) = super::take_open_file(&self.pr, cx)
+        {
+            self.reveal_file(&path, line, side, window, cx);
+        }
         self.maybe_open_requested_stack_confirm(window, cx);
         if let Some(loaded) = &self.loaded {
             let freshness = self.freshness();
@@ -1261,9 +1303,14 @@ impl Render for PullRequestView {
                     detail.head_oid.clone(),
                     crate::github::guide_service::revision(cx),
                     crate::github::guide_service::wanted_language(cx, detail),
+                    self.stack_graph.clone(),
                 );
                 if self.guide_sync.as_ref() != Some(&sync_key) {
-                    let guide_state = crate::github::guide_service::view_state(cx, detail);
+                    let guide_state = crate::github::guide_service::view_state(
+                        cx,
+                        detail,
+                        self.stack_graph.as_ref(),
+                    );
                     loaded
                         .guide
                         .update(cx, |tab, cx| tab.set_state(guide_state, cx));

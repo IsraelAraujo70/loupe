@@ -83,6 +83,18 @@ When a pull request advances to a new `head_oid`, the cached guide for the previ
 
 A guide is shown only in the language asked for: Settings > Guide language (`Same as the pull request` detects it from the title and description, falling back to English), or the language picked from the menu beside Summarize for that pull request. Switching languages never shows a guide written in another one; the Guide tab offers Summarize instead.
 
+## Stack guides (`StoredStackGuide`)
+
+When a pull request belongs to a stack (the chain or tree of open pull requests Loupe already reads for the stack panel and the stack merge), Summarize writes one guide across the whole stack by default; its menu offers **Summarize stack (N PRs)** and **Summarize this PR only**. The stack guide (`crates/loupe-guide/src/stack.rs`) holds:
+
+- `overview` (`headline`, `why`): what the whole stack delivers, written last, from the chapters.
+- `chapters`: one per pull request, in the order the stack merges (`StackGraph::merge_order`: a chain from the base up, a tree's deepest children first and its root last). Each chapter records `pr_number`, `title`, `base_ref`, `head_oid`, `base_oid`, `changed_files`, and a regular v1 `guide` (`ReviewGuide`).
+- `repo`, `base_ref`, `model`, `effort`, `generated_at`, `language`, and `schema_version` (`1`).
+
+Each chapter is generated in its own run, in a checkout of that pull request's head, and the prompt lists what the earlier chapters covered (their titles, headlines, and step titles, capped at 16 KiB, keeping the closest chapters) so the chapter covers only what its pull request adds. Only one pull request's diff is ever in a run, so a tall stack never overflows the model's context, and progress is reported per chapter. The overview run reads only the chapters, in an empty directory.
+
+The guide is cached under the stack's root pull request, per language, with a pointer from each chapter's pull request, so the Guide tab of every pull request in the stack shows it, opening on that pull request's chapter. A chapter is outdated when its pull request's head commit moved; the banner names those chapters, and Update guide writes again only them, then the overview. A pull request that joined or left the stack shows in the map as such. Viewed marks are kept per chapter and commit. The stack's decision points (every chapter's, each naming its pull request) and the map (merge order, base of each pull request, approval, and checks as GitHub reports them now) sit above the chapter. A snippet of another pull request opens that pull request on its Files tab at the file and line.
+
 ## Content and security rules
 
 Loupe builds the generation prompt itself (no third-party templates):
