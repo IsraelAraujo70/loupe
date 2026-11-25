@@ -9,6 +9,7 @@ mod header;
 mod model;
 mod on_screen;
 mod search;
+mod signal;
 mod sticky;
 mod tree;
 mod tree_view;
@@ -41,9 +42,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::diff::{Hunk, anchor_for_range, find_line, git_patch, parse_patch};
+use loupe_github::diff::{DiffLine, Hunk, anchor_for_range, find_line, git_patch, parse_patch};
 use loupe_github::{
-    ChangedFile, CommitFiles, NodeId, PullRequestDetail, ViewedFailure, ViewedState,
+    ChangedFile, CommitFiles, FileStatus, GitHub, NodeId, PullRequestDetail, RepoRef,
+    ViewedFailure, ViewedState,
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
@@ -56,11 +58,12 @@ use self::model::{
 };
 use self::on_screen::{CardWidth, on_screen};
 use self::search::{Match, Needle};
+use self::signal::{Attributes, LowSignal, Signal, classify_all, thousands};
 use self::sticky::HeaderWatch;
 use self::tree::{
-    GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
-    file_tint, filter_keeps, folder_tint, initial_collapsed, into_tree_order, move_down, move_left,
-    move_right, move_up, shown_row, tree_rows, viewed_mark,
+    GROUPS, GitTint, LOW_SIGNAL, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors,
+    distinct_starts, file_groups, file_tint, filter_keeps, folder_tint, holds, initial_collapsed,
+    into_tree_order, move_down, move_left, move_right, move_up, shown_row, tree_rows, viewed_mark,
 };
 use self::tree_view::{RowView, StickyFolders};
 use super::tab::{PrTabContext, PrTabEvent};
@@ -120,8 +123,109 @@ fn stopped_by(error: &LoadError) -> (SharedString, SharedString) {
     (error.title().into(), error.message().into())
 }
 
+/// What the low-signal group holds, in its tooltip and on its divider.
+const LOW_SIGNAL_HINT: &str = "binaries, lockfiles, generated, vendored, minified and data files, and new files over 1,000 lines, folded so the code reads first";
+/// The group's icon in the tree.
+const LOW_SIGNAL_ICON: &str = "icons/eye-off.svg";
+
 /// What a file's header in the diff shows.
 type HeaderFor = Rc<dyn Fn(&DiffFile) -> header::HeaderContent>;
+
+/// What a low-signal file's header says about it.
+#[derive(Clone)]
+struct LowNote {
+    path: String,
+    /// "Generated · 2,001 lines".
+    label: SharedString,
+    /// Why the diff is not here, and whether it is loading, for a file
+    /// GitHub left out.
+    omitted: Option<(SharedString, bool)>,
+    /// Whether the file has lines to show, and so a Show diff button.
+    openable: bool,
+}
+
+/// The ids of the divider over the low-signal files: under the header of
+/// the file before them, and under that file's last line.
+const DIVIDER_FOLDED: &str = "low-signal-divider:folded";
+const DIVIDER_OPEN: &str = "low-signal-divider:open";
+
+/// What the diff of a file whose only change is its mode says.
+const MODE_CHANGE_NOTE: &str = "Only the file mode changed";
+
+/// What a low-signal file's line says when GitHub left its diff out.
+const LOW_OMITTED_NOTE: &str = "diff left out by GitHub";
+
+/// What the low-signal group holds, for its divider in the diff.
+struct LowGroup {
+    files: usize,
+    additions: u32,
+    deletions: u32,
+    /// Every low-signal file the filter keeps, to mark them viewed at once.
+    paths: Vec<String>,
+    all_viewed: bool,
+}
+
+/// The changed files in review order (code, tests, docs, then low signal)
+/// with their kinds, and their diffs in the same order.
+fn review_files(files: Vec<ChangedFile>, attributes: &Attributes) -> (LoadedFiles, Vec<Signal>) {
+    let signals = classify_all(&files, attributes);
+    let (files, signals) = into_tree_order(files, signals);
+    let no_lines: HashMap<String, LowSignal> = files
+        .iter()
+        .zip(&signals)
+        .filter_map(|(file, signal)| match signal {
+            Signal::Low(kind @ (LowSignal::ModeChange | LowSignal::Empty)) => {
+                Some((file.path.clone(), *kind))
+            }
+            _ => None,
+        })
+        .collect();
+    let patch_for = |file: &ChangedFile| match no_lines.get(&file.path) {
+        Some(kind) => Some(no_lines_patch(file, *kind)),
+        None => git_patch(file),
+    };
+    let loaded = build_files(files, patch_for, |patch| parse_patch(patch).ok());
+    (loaded, signals)
+}
+
+/// The patch of a file with no lines, so its diff says what changed instead
+/// of passing for a binary: an empty file added or deleted, or a file whose
+/// mode alone changed.
+fn no_lines_patch(file: &ChangedFile, kind: LowSignal) -> String {
+    let path = &file.path;
+    match (kind, file.status) {
+        (LowSignal::Empty, FileStatus::Removed) => {
+            format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ /dev/null\n")
+        }
+        (LowSignal::Empty, _) => {
+            format!("diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n")
+        }
+        _ => format!("diff --git a/{path} b/{path}\n{MODE_CHANGE_NOTE}\n"),
+    }
+}
+
+/// Where the repository's `.gitattributes` at `sha` is kept.
+fn attributes_key(cx: &App, repo: &RepoRef, sha: &str) -> Option<String> {
+    crate::cache::github_key(cx, &format!("gitattributes/{}/{sha}", repo.url()))
+}
+
+/// The repository's root `.gitattributes` at `sha`, read from GitHub once
+/// and kept under `key`. A repository without one has no attributes; one
+/// GitHub cannot read now is read again on the next load.
+fn read_attributes(gh: &GitHub, repo: &RepoRef, sha: &str, key: Option<&str>) -> Attributes {
+    if let Some(text) = key.and_then(crate::cache::get::<String>) {
+        return Attributes::parse(&text);
+    }
+    let text = match gh.raw_contents(repo, ".gitattributes", sha) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(loupe_github::Error::Http { status: 404, .. }) => String::new(),
+        Err(_) => return Attributes::default(),
+    };
+    if let Some(key) = key {
+        crate::cache::put(key, &text);
+    }
+    Attributes::parse(&text)
+}
 
 struct ThreadSlot {
     view: Entity<ThreadView>,
@@ -207,6 +311,14 @@ pub struct FilesTab {
     load: Loadable<()>,
     _load: Option<Task<()>>,
     files: Vec<ChangedFile>,
+    /// Each file's kind, in file order.
+    signals: Vec<Signal>,
+    /// Why each low-signal file is low signal, by path.
+    low: HashMap<String, LowSignal>,
+    /// The low-signal files the viewer opened, kept open through reloads.
+    low_open: HashSet<String>,
+    /// The tree group each file in one sits in (`tree::file_groups`), by path.
+    groups: HashMap<String, &'static str>,
     /// Folders the viewer closed, by full path.
     collapsed: HashSet<String>,
     /// The tree's width in points while its edge is dragged.
@@ -321,6 +433,10 @@ impl FilesTab {
             load: Loadable::Loading,
             _load: None,
             files: Vec::new(),
+            signals: Vec::new(),
+            low: HashMap::new(),
+            low_open: HashSet::new(),
+            groups: HashMap::new(),
             collapsed: HashSet::new(),
             tree_drag: None,
             selected: None,
@@ -397,6 +513,8 @@ impl FilesTab {
         if head_changed {
             self.load = Loadable::Loading;
             self.files.clear();
+            self.signals.clear();
+            self.low.clear();
             self.hunks.clear();
             self.patch_loads.clear();
             self.patch_errors.clear();
@@ -427,16 +545,19 @@ impl FilesTab {
                 self.context.detail.base_oid
             ),
         );
+        let repo = self.context.pr.repo.clone();
+        let head = self.context.detail.head_oid.clone();
+        let attributes_key = attributes_key(cx, &repo, &head);
         if let Some(files) = key
             .as_deref()
             .and_then(crate::cache::get::<Vec<ChangedFile>>)
         {
-            self.finish_load(
-                Ok(build_files(into_tree_order(files), git_patch, |patch| {
-                    parse_patch(patch).ok()
-                })),
-                cx,
-            );
+            let attributes = attributes_key
+                .as_deref()
+                .and_then(crate::cache::get::<String>)
+                .map(|text| Attributes::parse(&text))
+                .unwrap_or_default();
+            self.finish_load(Ok(review_files(files, &attributes)), cx);
         }
         let reused = self.load.value().is_some();
         self.load.start_refresh();
@@ -473,9 +594,8 @@ impl FilesTab {
                         files
                     }
                 };
-                Ok(build_files(into_tree_order(files), git_patch, |patch| {
-                    parse_patch(patch).ok()
-                }))
+                let attributes = read_attributes(gh, &repo, &head, attributes_key.as_deref());
+                Ok(review_files(files, &attributes))
             },
             move |this, result, cx| {
                 if write_key
@@ -485,13 +605,17 @@ impl FilesTab {
                     this.load_files(cx);
                     return;
                 }
-                if let (Some(key), Ok(loaded)) = (&write_key, &result) {
+                if let (Some(key), Ok((loaded, _))) = (&write_key, &result) {
                     crate::cache::put(key, &loaded.files);
                 }
-                if reused {
+                // Kinds read from GitHub for the first time can reorder the
+                // files: the diff is laid out again so it keeps the tree's
+                // order.
+                let reordered = matches!(&result, Ok((_, signals)) if *signals != this.signals);
+                if reused && !reordered {
                     match result {
-                        Ok(loaded) => {
-                            this.files = loaded.files;
+                        Ok((loaded, signals)) => {
+                            this.set_files(loaded.files, signals);
                             this.load.finish(Ok(()));
                             this.collapse_viewed(cx);
                         }
@@ -512,6 +636,7 @@ impl FilesTab {
         };
         let pr = self.context.pr.clone();
         let key = crate::cache::github_key(cx, &format!("commit-files/{}/{oid}", pr.repo.url()));
+        let attributes_key = attributes_key(cx, &pr.repo, &oid);
         self.load.start_refresh();
         let read_key = key.clone();
         self._load = Some(common::run(
@@ -525,10 +650,8 @@ impl FilesTab {
                     None => gh.commit_files(&pr.repo, &oid)?,
                 };
                 gh.merge_viewed_states(&pr, &mut commit.files)?;
-                let loaded =
-                    build_files(into_tree_order(commit.files.clone()), git_patch, |patch| {
-                        parse_patch(patch).ok()
-                    });
+                let attributes = read_attributes(gh, &pr.repo, &oid, attributes_key.as_deref());
+                let loaded = review_files(commit.files.clone(), &attributes);
                 Ok((commit, loaded))
             },
             move |this, result, cx| {
@@ -546,8 +669,12 @@ impl FilesTab {
         ));
     }
 
-    fn finish_load(&mut self, result: Result<LoadedFiles, LoadError>, cx: &mut Context<Self>) {
-        let loaded = match result {
+    fn finish_load(
+        &mut self,
+        result: Result<(LoadedFiles, Vec<Signal>), LoadError>,
+        cx: &mut Context<Self>,
+    ) {
+        let (loaded, signals) = match result {
             Ok(loaded) => loaded,
             Err(error) => {
                 self.load.finish(Err(error));
@@ -556,9 +683,9 @@ impl FilesTab {
         };
         self.load.finish(Ok(()));
         let first_load = self.diff.is_none();
-        self.files = loaded.files;
+        self.set_files(loaded.files, signals);
         if first_load {
-            self.collapsed = initial_collapsed(&self.files);
+            self.collapsed = initial_collapsed(&self.files, &self.signals);
         }
         eprintln!(
             "review-files-ready pr={} files={} timestamp={}",
@@ -626,9 +753,35 @@ impl FilesTab {
         self.run_find(jump, cx);
     }
 
-    /// Collapses viewed files, and files whose diff GitHub left out so the
-    /// header stands alone with its Load diff note. A commit keeps viewed
-    /// files open: one viewed in the pull request may change again in it.
+    /// Takes the files in review order with their kinds.
+    fn set_files(&mut self, files: Vec<ChangedFile>, signals: Vec<Signal>) {
+        self.low = files
+            .iter()
+            .zip(&signals)
+            .filter_map(|(file, signal)| match signal {
+                Signal::Low(kind) => Some((file.path.clone(), *kind)),
+                _ => None,
+            })
+            .collect();
+        self.groups = files
+            .iter()
+            .zip(file_groups(&signals))
+            .filter_map(|(file, group)| Some((file.path.clone(), group?)))
+            .collect();
+        self.files = files;
+        self.signals = signals;
+    }
+
+    /// Whether `path` opens folded for being low signal: until the viewer
+    /// opens it.
+    fn folds_low(&self, path: &str) -> bool {
+        self.low.contains_key(path) && !self.low_open.contains(path)
+    }
+
+    /// Collapses viewed files, low-signal files the viewer has not opened, and
+    /// files whose diff GitHub left out so the header stands alone with its
+    /// Load diff note. A commit keeps viewed files open: one viewed in the
+    /// pull request may change again in it.
     fn collapse_viewed(&mut self, cx: &mut Context<Self>) {
         let collapse_viewed = self.commit.is_none();
         self.folded = self
@@ -637,13 +790,14 @@ impl FilesTab {
             .filter(|file| {
                 self.missing.get(&file.path) == Some(&Missing::Omitted)
                     || (collapse_viewed && is_viewed(file.viewed))
+                    || self.folds_low(&file.path)
             })
             .map(|file| file.path.clone())
             .collect();
         let Some(state) = &self.diff else { return };
         state.update(cx, |state, cx| {
-            for file in &self.files {
-                state.set_file_collapsed(&file.path, self.folded.contains(&file.path), cx);
+            for path in self.files.iter().map(|file| file.path.as_str()) {
+                state.set_file_collapsed(path, self.folded.contains(path), cx);
             }
         });
     }
@@ -656,6 +810,41 @@ impl FilesTab {
             .filter(|doc| filter_keeps(doc.path(), &filter))
             .cloned()
             .collect()
+    }
+
+    /// The low-signal files the filter keeps, for the divider over them.
+    fn low_group(&self, cx: &App) -> Option<LowGroup> {
+        let filter = self.filter.read(cx).value();
+        let files: Vec<&ChangedFile> = self
+            .files
+            .iter()
+            .filter(|file| self.low.contains_key(&file.path) && filter_keeps(&file.path, &filter))
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        Some(LowGroup {
+            files: files.len(),
+            additions: files.iter().map(|file| file.additions).sum(),
+            deletions: files.iter().map(|file| file.deletions).sum(),
+            all_viewed: files.iter().all(|file| is_viewed(file.viewed)),
+            paths: files.iter().map(|file| file.path.clone()).collect(),
+        })
+    }
+
+    /// Opens or folds a low-signal file from its label, and keeps it so
+    /// through reloads.
+    fn open_low(&mut self, path: &str, open: bool, cx: &mut Context<Self>) {
+        if open {
+            self.low_open.insert(path.to_owned());
+        } else {
+            self.low_open.remove(path);
+        }
+        self.set_collapsed(path, !open, cx);
+        if !open && let Some(state) = &self.diff {
+            state.update(cx, |state, cx| state.scroll_to_file(path, cx));
+        }
+        cx.notify();
     }
 
     /// Shows in the diff only the files the filter keeps, as GitHub does,
@@ -748,7 +937,8 @@ impl FilesTab {
                     });
                     if let Some(file) = changed {
                         file.viewed = fresh.viewed;
-                        this.set_collapsed(&fresh.path, viewed, cx);
+                        let fold = viewed || this.folds_low(&fresh.path);
+                        this.set_collapsed(&fresh.path, fold, cx);
                     }
                 }
             },
@@ -985,8 +1175,8 @@ impl FilesTab {
     }
 
     /// Puts loaded diffs (`None` for a binary file) in the viewer with one
-    /// change of its files, opens those not viewed, and shows the header of
-    /// `scroll_to`.
+    /// change of its files, opens those not viewed (a low-signal file only
+    /// once the viewer opened it), and shows the header of `scroll_to`.
     fn apply_omitted_patches(
         &mut self,
         patches: Vec<(String, Option<String>)>,
@@ -995,8 +1185,9 @@ impl FilesTab {
     ) {
         let mut docs = HashMap::new();
         for (path, patch) in patches {
-            if let Some(doc) = self.take_omitted_patch(&path, patch) {
-                docs.insert(path, doc);
+            if let Some((doc, viewed)) = self.take_omitted_patch(&path, patch) {
+                let fold = viewed || self.folds_low(&path);
+                docs.insert(path, (doc, fold));
             }
         }
         for (path, (doc, viewed)) in &docs {
@@ -1774,7 +1965,8 @@ impl FilesTab {
         }
         self.viewed_error = None;
         for path in &batch {
-            self.set_collapsed(path, viewed, cx);
+            let fold = viewed || self.folds_low(path);
+            self.set_collapsed(path, fold, cx);
         }
         self.viewed_pending.extend(batch.iter().cloned());
         let write = self.viewed_writes;
@@ -1809,7 +2001,8 @@ impl FilesTab {
                 for failure in &failures {
                     if let Some(state) = previous.get(&failure.path) {
                         restore_viewed(&mut this.files, &failure.path, *state);
-                        this.set_collapsed(&failure.path, is_viewed(*state), cx);
+                        let fold = is_viewed(*state) || this.folds_low(&failure.path);
+                        this.set_collapsed(&failure.path, fold, cx);
                     }
                 }
                 if let Some(first) = failures.first() {
@@ -2172,7 +2365,17 @@ impl FilesTab {
     }
 
     fn current_rows(&self, cx: &App) -> Vec<TreeRow> {
-        tree_rows(&self.files, &self.filter.read(cx).value(), &self.collapsed)
+        tree_rows(
+            &self.files,
+            &self.signals,
+            &self.filter.read(cx).value(),
+            &self.collapsed,
+        )
+    }
+
+    /// The row that stands for `path` in `rows` (`tree::shown_row`).
+    fn shown(&self, rows: &[TreeRow], path: &str) -> Option<usize> {
+        shown_row(rows, path, self.groups.get(path).copied())
     }
 
     /// A click selects the row and focuses the tree. A file also scrolls the
@@ -2191,7 +2394,7 @@ impl FilesTab {
         // A closed folder standing for the selected file keeps the file
         // selected, so opening it lands on the file.
         let stands_for_selection = self.selected.as_deref().is_some_and(|selected| {
-            selected != path && ix.is_some() && shown_row(&rows, selected) == ix
+            selected != path && ix.is_some() && self.shown(&rows, selected) == ix
         });
         if !stands_for_selection {
             self.selected = Some(path.to_owned());
@@ -2217,7 +2420,7 @@ impl FilesTab {
     /// instead, without opening, and opening it shows the file selected.
     fn follow_diff(&mut self, path: &str, cx: &mut Context<Self>) {
         let rows = self.current_rows(cx);
-        let Some(ix) = shown_row(&rows, path) else {
+        let Some(ix) = self.shown(&rows, path) else {
             return;
         };
         self.selected = Some(path.to_owned());
@@ -2242,15 +2445,12 @@ impl FilesTab {
         let Some(file) = self.selected.clone() else {
             return;
         };
-        if file == rows[ix].path || shown_row(rows, &file) != Some(ix) {
+        if file == rows[ix].path || self.shown(rows, &file) != Some(ix) {
             return;
         }
-        self.collapsed.retain(|folder| {
-            !file
-                .strip_prefix(folder.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
-        });
-        if let Some(at) = shown_row(&self.current_rows(cx), &file) {
+        let group = self.groups.get(&file).copied();
+        self.collapsed.retain(|folder| !holds(folder, &file, group));
+        if let Some(at) = self.shown(&self.current_rows(cx), &file) {
             self.tree_scroll.scroll_to_item(at, ScrollStrategy::Nearest);
         }
     }
@@ -2290,7 +2490,7 @@ impl FilesTab {
         let selected = self
             .selected
             .as_deref()
-            .and_then(|path| shown_row(&rows, path));
+            .and_then(|path| self.shown(&rows, path));
         let step = match event.keystroke.key.as_str() {
             "down" => move_down(&rows, selected),
             "up" => move_up(&rows, selected),
@@ -2327,7 +2527,7 @@ impl FilesTab {
         let selected = self
             .selected
             .as_deref()
-            .and_then(|path| shown_row(rows, path));
+            .and_then(|path| self.shown(rows, path));
         let active = selected.and_then(|ix| active_folder(rows, ix));
         let starts = distinct_starts(rows);
         let muted = cx.theme().muted_foreground;
@@ -2354,6 +2554,51 @@ impl FilesTab {
                         };
                         let count = dir.files.len();
                         let noun = if count == 1 { "file" } else { "files" };
+                        let low_group = row.path == LOW_SIGNAL;
+                        let group = GROUPS.contains(&row.path.as_str());
+                        // A folder in a group is named for the folder it
+                        // mirrors.
+                        let (shown_path, section) = match GROUPS.iter().find_map(|name| {
+                            let inner = row.path.strip_prefix(name)?.strip_prefix('/')?;
+                            Some((inner, format!(" ({})", name.to_lowercase())))
+                        }) {
+                            Some(inside) => inside,
+                            None => (row.path.as_str(), String::new()),
+                        };
+                        let (tooltip, accessible_name) = if group && !low_group {
+                            (
+                                format!(
+                                    "{} · {count} {noun} · +{} −{}",
+                                    row.path, dir.additions, dir.deletions
+                                ),
+                                format!(
+                                    "{} group, {count} {noun}, +{} −{}",
+                                    row.path, dir.additions, dir.deletions
+                                ),
+                            )
+                        } else if low_group {
+                            (
+                                format!(
+                                    "{LOW_SIGNAL} · {count} {noun} · +{} −{} · {LOW_SIGNAL_HINT}",
+                                    dir.additions, dir.deletions
+                                ),
+                                format!(
+                                    "{LOW_SIGNAL} group, {count} {noun}, +{} −{}",
+                                    dir.additions, dir.deletions
+                                ),
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "{shown_path}{section} · {count} {noun} · +{} −{}",
+                                    dir.additions, dir.deletions
+                                ),
+                                format!(
+                                    "Folder {shown_path}{section}, {count} {noun}, +{} −{}",
+                                    dir.additions, dir.deletions
+                                ),
+                            )
+                        };
                         RowView {
                             depth: row.depth,
                             folder: Some(dir.expanded),
@@ -2366,12 +2611,14 @@ impl FilesTab {
                             } else {
                                 foreground
                             },
-                            icon: if dir.expanded {
+                            icon: if low_group {
+                                LOW_SIGNAL_ICON
+                            } else if dir.expanded {
                                 assets::FOLDER_OPEN
                             } else {
                                 assets::FOLDER
                             },
-                            icon_color,
+                            icon_color: if group { muted } else { icon_color },
                             additions: dir.additions,
                             deletions: dir.deletions,
                             files: count,
@@ -2380,16 +2627,8 @@ impl FilesTab {
                             selected: is_selected,
                             focused,
                             guides,
-                            tooltip: format!(
-                                "{} · {count} {noun} · +{} −{}",
-                                row.path, dir.additions, dir.deletions
-                            )
-                            .into(),
-                            accessible_name: format!(
-                                "Folder {}, {count} {noun}, +{} −{}",
-                                row.path, dir.additions, dir.deletions
-                            )
-                            .into(),
+                            tooltip: tooltip.into(),
+                            accessible_name: accessible_name.into(),
                             path,
                         }
                     }
@@ -2402,6 +2641,11 @@ impl FilesTab {
                             Some(Missing::Unreadable) => " · diff not shown",
                             None => "",
                         };
+                        let kind = self
+                            .low
+                            .get(&file.path)
+                            .map(|kind| format!(", {}", kind.label(file)))
+                            .unwrap_or_default();
                         RowView {
                             depth: row.depth,
                             folder: None,
@@ -2423,12 +2667,16 @@ impl FilesTab {
                             focused,
                             guides,
                             tooltip: format!(
-                                "{} · +{} −{}{}",
-                                file.path, file.additions, file.deletions, missing
+                                "{} · +{} −{}{}{}",
+                                file.path,
+                                file.additions,
+                                file.deletions,
+                                kind.replacen(',', " ·", 1),
+                                missing
                             )
                             .into(),
                             accessible_name: format!(
-                                "File {}, +{} −{}",
+                                "File {}{kind}, +{} −{}",
                                 file.path, file.additions, file.deletions
                             )
                             .into(),
@@ -2506,6 +2754,33 @@ impl FilesTab {
         let mut annotations = Vec::new();
         let mut views: Vec<(ElementId, AnyView)> = Vec::new();
         let mut notes: Vec<NoDiffNote> = Vec::new();
+        // Each low-signal file says what it is and how large in its header,
+        // with the control that opens it.
+        let mut lows: HashMap<String, LowNote> = HashMap::new();
+        for file in &self.files {
+            let Some(kind) = self.low.get(&file.path) else {
+                continue;
+            };
+            let omitted = (self.missing.get(&file.path) == Some(&Missing::Omitted)).then(|| {
+                let note = match self.patch_errors.get(&file.path) {
+                    Some(error) => SharedString::from(error.clone()),
+                    None => LOW_OMITTED_NOTE.into(),
+                };
+                (note, self.loading_patch(&file.path))
+            });
+            lows.insert(
+                file.path.clone(),
+                LowNote {
+                    path: file.path.clone(),
+                    label: kind.label(file).into(),
+                    omitted,
+                    openable: !matches!(kind, LowSignal::ModeChange | LowSignal::Empty),
+                },
+            );
+        }
+        let lows = Rc::new(lows);
+        let low_state = state.clone();
+        let low_group = self.low_group(cx).map(Rc::new);
         for placed in &self.placed {
             let Some(slot) = self.threads.get(&placed.thread_id) else {
                 continue;
@@ -2534,6 +2809,10 @@ impl FilesTab {
             views.push((id, slot.view.clone().into()));
         }
         for (path, reason) in &self.missing {
+            // A low-signal file's own line says its diff was left out.
+            if *reason == Missing::Omitted && self.low.contains_key(path) {
+                continue;
+            }
             let id = ElementId::Name(SharedString::from(format!("no-diff:{path}")));
             annotations.push(DiffAnnotation::file(id.clone(), path.clone()));
             let note = match self.patch_errors.get(path) {
@@ -2592,6 +2871,41 @@ impl FilesTab {
             }
         }
 
+        // The divider over the low-signal files goes under the last file
+        // before them: under its last line while it is open, and under its
+        // header while it is folded or has no lines. Without a file before
+        // them it heads the diff.
+        let filter = self.filter.read(cx).value();
+        let before_low = low_group.as_ref().and_then(|_| {
+            self.files.iter().rev().find(|file| {
+                !self.low.contains_key(&file.path) && filter_keeps(&file.path, &filter)
+            })
+        });
+        let mut divider_at: Option<(SharedString, bool)> = None;
+        if let Some(file) = before_low {
+            annotations.push(DiffAnnotation::file(
+                ElementId::Name(DIVIDER_FOLDED.into()),
+                file.path.clone(),
+            ));
+            let last = self
+                .shown_hunks(&file.path)
+                .and_then(|hunks| hunks.last())
+                .and_then(|hunk| hunk.lines.last())
+                .map(DiffLine::anchor);
+            if let Some((line, side)) = last {
+                annotations.push(DiffAnnotation::line(
+                    ElementId::Name(DIVIDER_OPEN.into()),
+                    DiffLinePosition::new(file.path.clone(), to_diff_side(side), line as usize),
+                ));
+            }
+            divider_at = Some((file.path.clone().into(), last.is_some()));
+        }
+        let lone_divider = match (&low_group, before_low) {
+            (Some(group), None) => Some(low_divider(group, &weak, cx)),
+            _ => None,
+        };
+        let (divider_group, divider_weak) = (low_group.clone(), weak.clone());
+
         // Each file's size, for its header, as GitHub counts it.
         let sizes: Rc<HashMap<String, (u32, u32)>> = Rc::new(
             self.files
@@ -2630,6 +2944,7 @@ impl FilesTab {
         let card_width = self.card_width.clone();
         let content: HeaderFor = {
             let (viewed, sizes, weak) = (viewed.clone(), sizes.clone(), weak.clone());
+            let (low_notes, note_state) = (lows.clone(), state.clone());
             Rc::new(move |file: &DiffFile| {
                 let path = file.path().clone();
                 let title = match (file.original_path(), file.modified_path()) {
@@ -2644,6 +2959,13 @@ impl FilesTab {
                     DiffFileStatus::Copied => Some("Copied"),
                     _ => None,
                 };
+                let note = low_notes.get(path.as_ref()).map(|note| {
+                    let (note, state, weak) = (note.clone(), note_state.clone(), weak.clone());
+                    Rc::new(move |cx: &App| {
+                        let collapsed = state.read(cx).is_file_collapsed(&note.path);
+                        low_note(&note, collapsed, &weak, cx.theme().muted_foreground)
+                    }) as header::Note
+                });
                 let weak = weak.clone();
                 let toggle_path = path.to_string();
                 header::HeaderContent {
@@ -2659,6 +2981,7 @@ impl FilesTab {
                             .ok();
                     }),
                     on_drawn: None,
+                    note,
                 }
             })
         };
@@ -2675,23 +2998,22 @@ impl FilesTab {
             let (content, watch) = (content.clone(), self.headers.clone());
             move |file: &DiffFile, _: &mut Window, _: &mut App| {
                 let mut header = content(file);
-                if let Some(&ix) = file_ixs.get(file.path()) {
+                header.on_drawn = file_ixs.get(file.path()).map(|&ix| {
                     let watch = watch.clone();
-                    header.on_drawn = Some(Rc::new(move |bounds, viewport| {
-                        watch.borrow_mut().record(ix, bounds, viewport)
-                    }));
-                }
-                header::file_header(header)
+                    Rc::new(move |bounds, viewport| watch.borrow_mut().record(ix, bounds, viewport))
+                        as header::OnDrawn
+                });
+                header::file_header(header).into_any_element()
             }
         };
         let pinned = self.pinned_header(state, content, cx);
         let decorations = self.find_decorations(cx);
-        div()
+        let panel = div()
             .debug_selector(|| "files-diff".into())
             .relative()
             .flex_1()
-            .min_w_0()
-            .h_full()
+            .min_h_0()
+            .w_full()
             .child(
                 // Long lines scroll sideways by default, so a line keeps its
                 // indentation (the component has no hanging indent for a
@@ -2705,7 +3027,23 @@ impl FilesTab {
                     .hover_highlight(DiffHoverHighlight::Both)
                     .decorations(decorations)
                     .annotations(annotations)
-                    .render_annotation(move |annotation, _, _| {
+                    .render_annotation(move |annotation, _, cx| {
+                        if let ElementId::Name(name) = annotation.id()
+                            && (name.as_ref() == DIVIDER_FOLDED || name.as_ref() == DIVIDER_OPEN)
+                        {
+                            let shown = divider_at.as_ref().is_some_and(|(path, has_line)| {
+                                let folded = low_state.read(cx).is_file_collapsed(path);
+                                if name.as_ref() == DIVIDER_OPEN {
+                                    !folded
+                                } else {
+                                    folded || !has_line
+                                }
+                            });
+                            return match &divider_group {
+                                Some(group) if shown => low_divider(group, &divider_weak, cx),
+                                _ => div().into_any_element(),
+                            };
+                        }
                         if let Some(bar) = bars.get(annotation.id()) {
                             return gap_bar(bar, &gap_weak, muted, fold);
                         }
@@ -2792,7 +3130,13 @@ impl FilesTab {
                         )),
                 )
             })
-            .child(pinned)
+            .child(pinned);
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .children(lone_divider)
+            .child(panel)
             .into_any_element()
     }
 
@@ -3094,6 +3438,136 @@ impl Render for ResizeFileTree {
     }
 }
 
+/// The line under a low-signal file's header: what it is and how large,
+/// and the control that opens it (Load diff while GitHub left it out).
+/// A low-signal file's note in its header: what the file is and how large,
+/// and the button that opens or folds it, or loads the diff GitHub left
+/// out. A file with no lines to show has no button.
+fn low_note(
+    note: &LowNote,
+    collapsed: bool,
+    weak: &WeakEntity<FilesTab>,
+    muted: Hsla,
+) -> AnyElement {
+    let path = note.path.clone();
+    let weak = weak.clone();
+    let button = match &note.omitted {
+        Some((_, busy)) => Some(
+            Button::new(SharedString::from(format!("low-load:{path}")))
+                .outline()
+                .xsmall()
+                .label("Load diff")
+                .accessibility_label(format!("Load diff of {path}"))
+                .loading(*busy)
+                .disabled(*busy)
+                .on_click(move |_, _, cx| {
+                    weak.update(cx, |this, cx| {
+                        this.low_open.insert(path.clone());
+                        this.load_omitted_patch(&path, cx)
+                    })
+                    .ok();
+                }),
+        ),
+        None if note.openable => {
+            let verb = if collapsed { "Show" } else { "Hide" };
+            Some(
+                Button::new(SharedString::from(format!("low-toggle:{path}")))
+                    .outline()
+                    .xsmall()
+                    .label(format!("{verb} diff"))
+                    .accessibility_label(format!("{verb} diff of {path}"))
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| this.open_low(&path, collapsed, cx))
+                            .ok();
+                    }),
+            )
+        }
+        None => None,
+    };
+    h_flex()
+        .id(SharedString::from(format!("low-note:{}", note.path)))
+        .debug_selector(|| "low-signal-note".into())
+        .role(Role::Note)
+        .aria_label(format!("{}, {}", note.path, note.label))
+        .gap_2()
+        .items_center()
+        .text_size(scale::meta())
+        .text_color(muted)
+        .whitespace_nowrap()
+        .child(Icon::new(IconName::EyeOff).xsmall())
+        .child(note.label.clone())
+        .when_some(note.omitted.as_ref(), |row, (why, _)| {
+            row.child("·").child(why.clone())
+        })
+        .children(button)
+        .into_any_element()
+}
+
+/// The divider over the low-signal files in the diff: what the group holds,
+/// and Mark all low-signal viewed.
+fn low_divider(group: &LowGroup, weak: &WeakEntity<FilesTab>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let noun = if group.files == 1 { "file" } else { "files" };
+    let lines = group.additions + group.deletions;
+    let size = match lines {
+        0 => format!("{} {noun}", group.files),
+        1 => format!("{} {noun} · 1 line", group.files),
+        _ => format!("{} {noun} · {} lines", group.files, thousands(lines)),
+    };
+    let (paths, mark) = (group.paths.clone(), !group.all_viewed);
+    let weak = weak.clone();
+    let action = if mark {
+        "Mark all low-signal viewed"
+    } else {
+        "Unmark all low-signal viewed"
+    };
+    h_flex()
+        .id("low-signal-divider")
+        .debug_selector(|| "low-signal-divider".into())
+        .role(Role::Group)
+        .aria_label(format!(
+            "{LOW_SIGNAL}, {}, folded so the code reads first",
+            size.replace(" ·", ",")
+        ))
+        .w_full()
+        .min_h(rems(1.375))
+        .px_3()
+        .py_1()
+        .gap_2()
+        .items_center()
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(theme.muted.opacity(0.35))
+        .child(Icon::new(IconName::EyeOff).xsmall().text_color(muted))
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
+                .child(LOW_SIGNAL),
+        )
+        .child(
+            div()
+                .text_size(scale::meta())
+                .text_color(muted)
+                .whitespace_nowrap()
+                .child(format!("{size} · folded so the code reads first")),
+        )
+        .child(
+            Button::new("low-signal-viewed")
+                .outline()
+                .xsmall()
+                .label(action)
+                .accessibility_label(action)
+                .tooltip(LOW_SIGNAL_HINT)
+                .on_click(move |_, _, cx| {
+                    weak.update(cx, |this, cx| this.set_files_viewed(&paths, mark, cx))
+                        .ok();
+                }),
+        )
+        .into_any_element()
+}
+
 fn tint_color(tint: GitTint) -> Hsla {
     match tint {
         GitTint::Created => tokens::open(),
@@ -3243,7 +3717,7 @@ pub(super) mod tests {
 
     use chrono::{DateTime, Utc};
     use gpui_kit::component::ActiveTheme as _;
-    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use gpui_kit::component::diff::{DiffFileStatus, DiffLineRange, DiffSide};
     use gpui_kit::{
         AppContext as _, Bounds, Context, Entity, InputEvent as _, Modifiers, MouseButton,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent,
@@ -3258,8 +3732,11 @@ pub(super) mod tests {
     use super::emphasis::PLAIN;
     use super::expand::{Direction, Source};
     use super::model::build_files;
+    use super::signal::{Attributes, classify_all};
+    use super::tree::{LOW_SIGNAL, TESTS};
     use super::{
-        FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab, PrTabContext,
+        FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab, MODE_CHANGE_NOTE,
+        PrTabContext, review_files,
     };
     use crate::services::{Accounts, Services};
     use crate::store::{FileTreePosition, Settings, update_settings};
@@ -3378,11 +3855,15 @@ pub(super) mod tests {
         let mut cx = VisualTestContext::from_window(handle, cx);
         // With no GitHub client the first load fails; then the files arrive.
         cx.run_until_parked();
+        // The files keep the order given; `review_files` is what puts them in
+        // review order on a real load.
+        let signals = classify_all(&files, &Attributes::default());
         tab.update(&mut cx, |tab, cx| {
             tab.finish_load(
-                Ok(build_files(files, git_patch, |patch| {
-                    parse_patch(patch).ok()
-                })),
+                Ok((
+                    build_files(files, git_patch, |patch| parse_patch(patch).ok()),
+                    signals,
+                )),
                 cx,
             );
             cx.notify();
@@ -4021,6 +4502,7 @@ pub(super) mod tests {
     fn left_out(path: &str) -> ChangedFile {
         ChangedFile {
             patch: None,
+            status: FileStatus::Modified,
             additions: 5000,
             ..added(path, 1)
         }
@@ -4329,5 +4811,115 @@ pub(super) mod tests {
             (Some("src/lib.rs".to_owned()), Some(1)),
             "the diff goes to the line and the tree follows"
         );
+    }
+
+    fn binary(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            previous_path: None,
+            status: FileStatus::Added,
+            additions: 0,
+            deletions: 0,
+            patch: None,
+            viewed: ViewedState::Unviewed,
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_lines_says_what_changed_and_never_passes_for_binary() {
+        let bare = |path: &str, status: FileStatus| ChangedFile {
+            status,
+            ..binary(path)
+        };
+        let files = vec![
+            bare("scripts/seed.sh", FileStatus::Modified),
+            bare("web/.gitkeep", FileStatus::Added),
+            bare("tools/old.keep", FileStatus::Removed),
+            binary("assets/badge.png"),
+        ];
+        let (loaded, _) = review_files(files, &Attributes::default());
+        let doc = |path: &str| {
+            loaded
+                .docs
+                .iter()
+                .find(|doc| doc.path().as_ref() == path)
+                .expect("a diff for every file")
+        };
+        let mode = doc("scripts/seed.sh");
+        assert!(!mode.is_binary());
+        let headers: Vec<&str> = mode
+            .extended_headers()
+            .iter()
+            .map(|line| line.as_ref())
+            .collect();
+        assert_eq!(headers, [MODE_CHANGE_NOTE]);
+        let added = doc("web/.gitkeep");
+        assert!(!added.is_binary());
+        assert_eq!(added.status(), DiffFileStatus::Added);
+        assert!(added.extended_headers().is_empty());
+        let removed = doc("tools/old.keep");
+        assert!(!removed.is_binary());
+        assert_eq!(removed.status(), DiffFileStatus::Deleted);
+        assert!(doc("assets/badge.png").is_binary());
+    }
+
+    #[gpui_kit::test]
+    fn code_comes_first_and_low_signal_files_open_folded_under_a_divider(cx: &mut TestAppContext) {
+        let files = vec![
+            binary("assets/badge.png"),
+            added("data/part-01.csv", 2_001),
+            added("README.md", 4),
+            added("src/units.rs", 30),
+            added("src/units.test.rs", 10),
+        ];
+        let (loaded, _) = review_files(files, &Attributes::default());
+        let (mut cx, tab) = open_files_tab_with_files(cx, loaded.files);
+        let cx = &mut cx;
+        draw(cx);
+        assert_eq!(
+            diff_paths(cx, &tab),
+            [
+                "src/units.rs",
+                "src/units.test.rs",
+                "README.md",
+                "assets/badge.png",
+                "data/part-01.csv",
+            ]
+        );
+        let collapsed = |cx: &mut VisualTestContext, path: &str| {
+            tab.read_with(cx, |tab, cx| {
+                tab.diff
+                    .as_ref()
+                    .expect("diff")
+                    .read(cx)
+                    .is_file_collapsed(path)
+            })
+        };
+        assert!(!collapsed(cx, "src/units.rs"));
+        assert!(collapsed(cx, "data/part-01.csv"), "data opens folded");
+        assert!(collapsed(cx, "assets/badge.png"), "a binary opens folded");
+        // The tests follow all the code in a group of their own, and the
+        // tree ends with the low-signal group, closed beside the code.
+        let rows = tab.read_with(cx, |tab, cx| tab.current_rows(cx));
+        assert!(rows.iter().any(|row| row.path == TESTS));
+        let last = rows.last().expect("rows");
+        assert_eq!(last.path, LOW_SIGNAL);
+        assert!(
+            last.dir()
+                .is_some_and(|dir| !dir.expanded && dir.files.len() == 2)
+        );
+        // Show diff opens one, and it stays open through a reload.
+        tab.update(cx, |tab, cx| tab.open_low("data/part-01.csv", true, cx));
+        assert!(!collapsed(cx, "data/part-01.csv"));
+        tab.update(cx, |tab, cx| tab.collapse_viewed(cx));
+        assert!(!collapsed(cx, "data/part-01.csv"));
+        assert!(collapsed(cx, "assets/badge.png"));
+        let group = tab
+            .read_with(cx, |tab, cx| tab.low_group(cx))
+            .expect("group");
+        assert_eq!(group.files, 2);
+        assert_eq!(group.additions, 2_001);
+        assert_eq!(group.paths, ["assets/badge.png", "data/part-01.csv"]);
+        assert!(!group.all_viewed);
     }
 }
