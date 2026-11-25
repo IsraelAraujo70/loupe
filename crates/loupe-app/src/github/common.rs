@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::GitHub;
 
@@ -214,20 +215,26 @@ pub fn load_failed_page(
         LoadError::NotFound => format!("{what} not found"),
         _ => error.title().to_owned(),
     };
+    // Retrying cannot bring back a page GitHub says does not exist, so a
+    // missing page offers the browser alone.
+    let missing = matches!(error, LoadError::NotFound);
     ui::empty_state(icon, title, error.detail()).action(
         h_flex()
             .gap_2()
-            .child(
-                Button::new("load-failed-retry")
-                    .outline()
-                    .control()
-                    .icon(IconName::RefreshCw)
-                    .label("Retry")
-                    .on_click(on_retry),
-            )
+            .when(!missing, |row| {
+                row.child(
+                    Button::new("load-failed-retry")
+                        .outline()
+                        .control()
+                        .icon(IconName::RefreshCw)
+                        .label("Retry")
+                        .on_click(on_retry),
+                )
+            })
             .child(
                 Button::new("load-failed-open")
-                    .ghost()
+                    .when(missing, |button| button.outline())
+                    .when(!missing, |button| button.ghost())
                     .control()
                     .icon(IconName::ExternalLink)
                     .label("Open on GitHub")
