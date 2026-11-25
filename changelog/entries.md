@@ -223,3 +223,4 @@
 - Entry 223: a one-line change, so the pull request has more than 250 commits.
 - Entry 224: a one-line change, so the pull request has more than 250 commits.
 - Entry 225: a one-line change, so the pull request has more than 250 commits.
+- Entry 226: a one-line change, so the pull request has more than 250 commits.
