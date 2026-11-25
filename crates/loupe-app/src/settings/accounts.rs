@@ -166,10 +166,7 @@ impl SettingsView {
                             LinearForm::Failed(format!("Could not save the key: {error:#}"))
                         }
                     },
-                    Err(loupe_linear::Error::Unauthorized) => {
-                        LinearForm::Failed("Linear rejected this key.".into())
-                    }
-                    Err(error) => LinearForm::Failed(error.to_string()),
+                    Err(error) => LinearForm::Failed(error.message()),
                 };
                 cx.notify();
             })
@@ -319,7 +316,7 @@ impl SettingsView {
                 colors,
             ));
         }
-        for (index, error) in accounts.linear_failed.iter().enumerate() {
+        for (index, kind) in accounts.linear_failed.iter().enumerate() {
             column = column.child(
                 card(colors).child(
                     h_flex()
@@ -331,10 +328,7 @@ impl SettingsView {
                                 .min_w_0()
                                 .gap_2()
                                 .child(card_title("Not connected", None))
-                                .child(message(
-                                    format!("A saved key stopped working: {error}").into(),
-                                    colors.danger,
-                                )),
+                                .child(message(kind.message().into(), colors.danger)),
                         )
                         .child(
                             Button::new(("linear-forget-key", index))

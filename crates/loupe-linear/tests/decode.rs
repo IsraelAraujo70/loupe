@@ -790,9 +790,7 @@ fn errors_are_classified() {
 
     let invalid = json!({ "errors": [{ "message": "Entity not found: Issue" }] });
     let stub = Stub::start(vec![("Issue", vec![invalid.to_string()])]);
-    assert!(
-        matches!(stub.client().issue("ENG-1"), Err(Error::GraphQl(messages)) if messages == ["Entity not found: Issue"])
-    );
+    assert!(matches!(stub.client().issue("ENG-1"), Err(Error::NotFound)));
 
     let wrong_shape = json!({ "data": { "viewer": { "id": 1 } } });
     let stub = Stub::start(vec![("Viewer", vec![wrong_shape.to_string()])]);
