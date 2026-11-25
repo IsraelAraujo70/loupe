@@ -117,3 +117,4 @@
 - Entry 117: a one-line change, so the pull request has more than 250 commits.
 - Entry 118: a one-line change, so the pull request has more than 250 commits.
 - Entry 119: a one-line change, so the pull request has more than 250 commits.
+- Entry 120: a one-line change, so the pull request has more than 250 commits.
