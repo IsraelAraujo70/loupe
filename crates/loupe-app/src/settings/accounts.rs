@@ -19,6 +19,14 @@ use crate::ui::{self, ControlSize as _};
 /// Linear's page for creating personal API keys.
 const LINEAR_API_KEYS_URL: &str = "https://linear.app/settings/account/security";
 
+/// Where the Linear keys are kept: the Keychain on macOS, files in the data
+/// folder elsewhere (see `store::SecretStore`).
+const SECRET_HOME: &str = if cfg!(target_os = "macos") {
+    "the macOS Keychain"
+} else {
+    "files in your Loupe data folder"
+};
+
 /// Width of an account's action (Sign out, Disconnect), so the cards end in
 /// buttons of one size.
 const ACCOUNT_ACTION_WIDTH: f32 = 104.;
@@ -375,11 +383,13 @@ impl SettingsView {
                 colors,
             ))
             .child(message(
-                "Paste a Linear personal API key (it starts with lin_api_). A key reads one \
-                 workspace: connect one per workspace, from any of your Linear accounts. \
-                 Loupe keeps them in the macOS Keychain and also picks up LINEAR_API_KEY when \
-                 no key is saved."
-                    .into(),
+                format!(
+                    "Paste a Linear personal API key (it starts with lin_api_). A key reads one \
+                     workspace: connect one per workspace, from any of your Linear accounts. \
+                     Loupe keeps them in {SECRET_HOME} and also picks up LINEAR_API_KEY when \
+                     no key is saved."
+                )
+                .into(),
                 colors.muted,
             ))
             .child(

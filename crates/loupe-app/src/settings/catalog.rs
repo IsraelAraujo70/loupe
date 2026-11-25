@@ -219,7 +219,7 @@ pub fn entries() -> Vec<Entry> {
             S::General,
             "",
             "Sidebar as icons",
-            "Shrink the sidebar to a rail of icons. Cmd+B switches it.",
+            "Shrink the sidebar to a rail of icons.",
             "collapse rail compact",
         ),
         entry(
@@ -283,7 +283,7 @@ pub fn entries() -> Vec<Entry> {
             S::Appearance,
             "Interface",
             "Zoom",
-            "The size of everything in the window. Cmd+= and Cmd+- step it.",
+            "The size of everything in the window.",
             "font size scale text bigger smaller",
         ),
         entry(
@@ -762,6 +762,17 @@ mod tests {
             search("ree").is_empty(),
             "a word matches from its start, not inside \"tree\""
         );
+    }
+
+    #[test]
+    fn no_description_hand_writes_a_key() {
+        for entry in entries() {
+            assert!(
+                !entry.description.contains("Cmd+") && !entry.description.contains('⌘'),
+                "{:?} writes a key by hand; the keymap says it",
+                entry.item
+            );
+        }
     }
 
     #[test]
