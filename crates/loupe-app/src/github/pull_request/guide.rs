@@ -27,9 +27,11 @@ use loupe_guide::{
     StoredStackGuide,
 };
 
+use super::files::{FADE_WIDTH, LONG_LINE};
 use super::tab::{PrTabContext, PrTabEvent};
 use crate::github::highlight::{highlight_lines, language_for_path};
 use crate::github::widgets;
+use crate::store::Settings;
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui::{self, ControlSize as _};
@@ -587,7 +589,6 @@ impl GuideTab {
 
         v_flex()
             .w_full()
-            .max_w(dp(ui::READING_WIDTH + 32.))
             .px(scale::content_inset())
             .py_4()
             .gap_5()
@@ -844,6 +845,7 @@ impl GuideTab {
             )
             .child(
                 div()
+                    .max_w(dp(ui::READING_WIDTH))
                     .text_size(scale::body())
                     .text_color(muted)
                     .child(decision.impact.clone()),
@@ -915,7 +917,7 @@ impl GuideTab {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(summary.headline.clone()),
             )
-            .child(ui::markdown("guide-summary-why", summary.why.clone()))
+            .child(prose("guide-summary-why", summary.why.clone()))
             .when_some(summary.flow.as_ref(), |card, flow| {
                 card.child(self.render_flow(flow, cx))
             })
@@ -1053,6 +1055,7 @@ impl GuideTab {
                             )
                             .child(
                                 div()
+                                    .max_w(dp(ui::READING_WIDTH))
                                     .text_size(scale::body())
                                     .text_color(muted)
                                     .child(test.reason.clone()),
@@ -1248,7 +1251,7 @@ impl GuideTab {
                         .gap_3()
                         .border_t_1()
                         .border_color(tokens::border_subtle())
-                        .child(ui::markdown(
+                        .child(prose(
                             SharedString::from(format!("guide-step-body-{ix}")),
                             step.explanation.clone(),
                         ))
@@ -1289,6 +1292,18 @@ impl GuideTab {
             .collect();
         let language = language_for_path(&snippet.path);
         let highlighted = highlight_lines(language, &code_lines, &theme.highlight_theme);
+        let wrap = Settings::get(cx).diff_wrap;
+        let runs_on = !wrap && raw_lines.iter().any(|raw| raw.chars().count() > LONG_LINE);
+        let lines = v_flex()
+            .py_1()
+            .font_family(mono.clone())
+            .text_size(scale::code())
+            .children(
+                raw_lines
+                    .into_iter()
+                    .zip(highlighted)
+                    .map(|(raw, runs)| render_diff_line(raw, runs, muted, wrap)),
+            );
 
         v_flex()
             .w_full()
@@ -1351,19 +1366,46 @@ impl GuideTab {
                             .child(Icon::new(IconName::ArrowRight).xsmall()),
                     ),
             )
-            .child(
-                v_flex()
-                    .w_full()
-                    .py_1()
-                    .font_family(mono)
-                    .text_size(scale::code())
-                    .children(
-                        raw_lines
-                            .into_iter()
-                            .zip(highlighted)
-                            .map(|(raw, runs)| render_diff_line(raw, runs, muted)),
-                    ),
-            )
+            .map(|block| {
+                if wrap {
+                    return block.child(lines.w_full());
+                }
+                // Long lines scroll sideways as in the Files tab, and the
+                // trailing edge fades while some line runs past it.
+                let panel = tokens::panel();
+                block.child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "guide-snippet-lines-{step_ix}-{snip_ix}"
+                                )))
+                                .flex()
+                                .flex_row()
+                                .w_full()
+                                .overflow_x_scroll()
+                                .restrict_scroll_to_axis()
+                                .child(lines.flex_none().min_w_full()),
+                        )
+                        .when(runs_on, |area| {
+                            area.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right_0()
+                                    .w(dp(FADE_WIDTH))
+                                    .bg(linear_gradient(
+                                        90.,
+                                        linear_color_stop(panel.opacity(0.), 0.),
+                                        linear_color_stop(panel, 1.),
+                                    )),
+                            )
+                        }),
+                )
+            })
             .into_any_element()
     }
 }
@@ -1393,7 +1435,6 @@ impl GuideTab {
 
         v_flex()
             .w_full()
-            .max_w(dp(ui::READING_WIDTH + 32.))
             .px(scale::content_inset())
             .py_4()
             .gap_5()
@@ -1508,7 +1549,7 @@ impl GuideTab {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(stored.overview.headline.clone()),
             )
-            .child(ui::markdown("guide-stack-why", stored.overview.why.clone()))
+            .child(prose("guide-stack-why", stored.overview.why.clone()))
             .into_any_element()
     }
 
@@ -1853,6 +1894,14 @@ impl Render for GuideTab {
     }
 }
 
+/// Markdown at most `ui::READING_WIDTH` wide, so prose keeps a readable
+/// line length while the cards and diff snippets around it fill the tab.
+fn prose(id: impl Into<ElementId>, text: impl Into<SharedString>) -> AnyElement {
+    ui::markdown(id, text)
+        .max_w(dp(ui::READING_WIDTH))
+        .into_any_element()
+}
+
 fn render_bullet_group(title: &'static str, items: &[String], muted: Hsla) -> AnyElement {
     v_flex()
         .w_full()
@@ -1870,7 +1919,13 @@ fn render_bullet_group(title: &'static str, items: &[String], muted: Hsla) -> An
                 .items_start()
                 .text_size(scale::body())
                 .child(div().text_color(muted).child("•"))
-                .child(div().flex_1().min_w_0().child(item.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .max_w(dp(ui::READING_WIDTH))
+                        .child(item.clone()),
+                )
         }))
         .into_any_element()
 }
@@ -1908,6 +1963,7 @@ fn render_diff_line(
     raw: &str,
     runs: Vec<(std::ops::Range<usize>, HighlightStyle)>,
     muted: Hsla,
+    wrap: bool,
 ) -> AnyElement {
     let (sign, code) = strip_diff_prefix(raw);
     let (bg, sign_color) = match sign {
@@ -1925,7 +1981,6 @@ fn render_diff_line(
             .into_any_element()
     };
     h_flex()
-        .w_full()
         .px_2()
         .gap_2()
         .items_start()
@@ -1937,7 +1992,11 @@ fn render_diff_line(
                 .text_color(sign_color)
                 .child(sign.to_string()),
         )
-        .child(div().flex_1().min_w_0().child(text))
+        .child(if wrap {
+            div().flex_1().min_w_0().child(text)
+        } else {
+            div().flex_none().whitespace_nowrap().child(text)
+        })
         .into_any_element()
 }
 
