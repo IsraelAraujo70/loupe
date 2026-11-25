@@ -11,7 +11,7 @@
 #   --data DIR      start from a copy of this data directory (keeps generated guides)
 #   --wait SECONDS  time to let the page load (default 20)
 #   --pages N       scroll and take up to N consecutive shots, stopping at the end (default 1)
-#   --display N     X display number (default: the first free one from 160)
+#   --display N     X display number (default: the first free one in 240-399)
 #
 # Writes <out-prefix>-p01.png, -p02.png, ... The GitHub token comes from
 # GITHUB_TOKEN or `gh auth token`. Needs Xvfb, dbus-daemon, xdotool and
@@ -39,8 +39,9 @@ bin=$(realpath "$bin")
 mkdir -p "$(dirname "$out")"
 
 if [ -z "$display" ]; then
-  display=160
-  while [ -e /tmp/.X11-unix/X$display ]; do display=$((display + 1)); done
+  display=240
+  while [ -e /tmp/.X11-unix/X$display ] || [ -e /tmp/.X$display-lock ]; do display=$((display + 1)); done
+  [ "$display" -le 399 ] || { echo "no free display in 240-399" >&2; exit 1; }
 fi
 
 run=$(mktemp -d)
