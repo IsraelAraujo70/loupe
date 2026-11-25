@@ -231,6 +231,13 @@ impl TeamView {
             _ if board => return widgets::skeleton_board(cx),
             _ => return div().py_2().child(ui::skeleton_rows(8)).into_any_element(),
         };
+        let nothing_yet = if self.is_project() {
+            "Issues added to this project show up here."
+        } else if self.custom_view(cx).is_some() {
+            "Issues that match this view show up here."
+        } else {
+            "Issues of this team show up here."
+        };
         self.with_groups(team, listed, |visible, groups| {
             if visible == 0 && self.next_cursor.is_none() {
                 let filtered = !self.filters().is_empty();
@@ -244,7 +251,7 @@ impl TeamView {
                     if filtered {
                         "Change or clear the filters to see more."
                     } else {
-                        "Issues of this team show up here."
+                        nothing_yet
                     },
                 );
                 return state

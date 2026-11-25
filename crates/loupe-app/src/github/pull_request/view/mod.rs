@@ -41,6 +41,9 @@ use crate::shell::item_menu::{self, Item, PrItem};
 use crate::theme::scale;
 use crate::ui;
 use model::{Panel, PrTab, review_blocker};
+pub(in crate::github::pull_request) use model::{
+    ReviewButton, can_approve, pending_comments_label, review_button,
+};
 
 /// What exists only after the first successful load.
 #[derive(Clone)]
@@ -94,6 +97,28 @@ enum Write {
     EditTitle(String),
     AddLabel(String),
     RemoveLabel(String),
+}
+
+/// The review `event` with `body` on `detail`, as GitHub takes it: an
+/// author only comments, a comment or a change request needs words, and the
+/// viewer's pending review goes with it, inline comments included.
+fn review_write(
+    detail: &PullRequestDetail,
+    event: ReviewEvent,
+    body: String,
+) -> Result<Write, &'static str> {
+    if event != ReviewEvent::Comment && !can_approve(detail) {
+        return Err("You cannot approve or request changes on your own pull request.");
+    }
+    let pending = detail.pending_review.as_ref();
+    if let Some(reason) = review_blocker(event, &body, pending.map_or(0, |p| p.comment_count)) {
+        return Err(reason);
+    }
+    Ok(Write::Review {
+        event,
+        body,
+        review_id: pending.map(|review| review.id.clone()),
+    })
 }
 
 /// Shown after a merge that GitHub had not finished when Loupe stopped
@@ -207,6 +232,8 @@ pub struct PullRequestView {
     /// Why the commits after the first page did not load.
     commits_error: Option<LoadError>,
     write_task: Option<Task<()>>,
+    /// A review sent from the Guide, to this pull request or another of its stack.
+    guide_review_task: Option<Task<()>>,
     subscriptions: Vec<Subscription>,
     /// When GitHub was last asked about this pull request, by a load or a
     /// poll of its checks.
@@ -314,6 +341,7 @@ impl PullRequestView {
             commits_load: None,
             commits_error: None,
             write_task: None,
+            guide_review_task: None,
             subscriptions: vec![submit_on_secondary_enter],
             last_fetch: Instant::now(),
             checked_at: None,
@@ -547,7 +575,11 @@ impl PullRequestView {
                             .ok();
                     }
                     GuideAction::OpenSettings => {
-                        crate::shell::navigate(crate::route::Route::Settings, window, cx);
+                        crate::settings::view::open_section(
+                            crate::settings::catalog::Section::GuidedReview,
+                            window,
+                            cx,
+                        );
                     }
                     GuideAction::RecheckClaude => {
                         crate::github::guide_service::recheck_availability(cx);
@@ -617,6 +649,9 @@ impl PullRequestView {
                 super::request_open_file(pr.clone(), path.clone(), *line, *side, cx);
                 crate::shell::navigate(crate::route::Route::PullRequest(pr.clone()), window, cx);
             }
+            PrTabEvent::SubmitReview { pr, event, body } => {
+                self.submit_guide_review(pr.clone(), *event, body.clone(), cx);
+            }
         }
     }
 
@@ -628,7 +663,8 @@ impl PullRequestView {
             cx.notify();
             return;
         }
-        if let Some(closed) = self.commit.take()
+        let closed = self.commit.take();
+        if let Some(closed) = &closed
             && closed.files.read(cx).wrote_viewed()
             && let Some(loaded) = &self.loaded
         {
@@ -636,13 +672,15 @@ impl PullRequestView {
                 .files
                 .update(cx, |files, cx| files.refresh_viewed(cx));
         }
+        // Going commit to commit keeps looking for the same text.
+        let find = closed.and_then(|closed| closed.files.read(cx).open_find_text(cx));
         if let (Some(oid), Some(detail)) = (oid, self.detail.value()) {
             let context = PrTabContext {
                 pr: self.pr.clone(),
                 detail: detail.clone(),
             };
             let oid = oid.to_owned();
-            let files = cx.new(|cx| FilesTab::for_commit(context, oid.clone(), window, cx));
+            let files = cx.new(|cx| FilesTab::for_commit(context, oid.clone(), find, window, cx));
             let events = cx.subscribe_in(&files, window, Self::reload_on_tab_event::<FilesTab>);
             self.commit = Some(CommitDiff {
                 oid,
@@ -881,21 +919,59 @@ impl PullRequestView {
             return;
         };
         let body = self.review_body.read(cx).value().trim_end().to_owned();
-        let pending = detail.pending_review.as_ref();
-        if let Some(reason) = review_blocker(event, &body, pending.map_or(0, |p| p.comment_count)) {
-            self.write = Submit::Failed(reason.into());
-            cx.notify();
-            return;
+        match review_write(&detail, event, body) {
+            Ok(write) => self.start_write(write, cx),
+            Err(reason) => {
+                self.write = Submit::Failed(reason.into());
+                cx.notify();
+            }
         }
-        let review_id = pending.map(|review| review.id.clone());
-        self.start_write(
-            Write::Review {
-                event,
-                body,
-                review_id,
-            },
+    }
+
+    /// Sends a review written at the end of the Guide to `pr`: this pull
+    /// request, or another of its stack, loaded first so the same rules and
+    /// its pending review apply. The Guide shows how it ended.
+    fn submit_guide_review(
+        &mut self,
+        pr: PrRef,
+        event: ReviewEvent,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = self
+            .detail
+            .value()
+            .filter(|detail| detail.pr == pr)
+            .cloned();
+        let number = pr.number;
+        self.guide_review_task = Some(common::run(
             cx,
-        );
+            move |gh| {
+                let detail = match shown {
+                    Some(detail) => detail,
+                    None => Arc::new(gh.pull_request(&pr)?),
+                };
+                match review_write(&detail, event, body) {
+                    Ok(write) => write.perform(gh, &detail).map(|_| Ok(())),
+                    Err(reason) => Ok(Err(reason)),
+                }
+            },
+            move |view, result, cx| {
+                let outcome = match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(reason)) => Err(reason.to_owned()),
+                    Err(error) => Err(error.detail()),
+                };
+                if outcome.is_ok() {
+                    view.reload(cx);
+                }
+                if let Some(loaded) = &view.loaded {
+                    loaded
+                        .guide
+                        .update(cx, |tab, cx| tab.finish_review(number, event, outcome, cx));
+                }
+            },
+        ));
     }
 
     fn start_title_edit(&mut self, title: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1593,5 +1669,62 @@ impl Render for PullRequestView {
                     }),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use loupe_github::{Actor, PendingReview, ReviewEvent};
+
+    use super::model::tests::detail;
+    use super::{Write, review_write};
+
+    /// The Guide's review and the header's go through one rule set.
+    #[test]
+    fn review_write_follows_the_rules_github_enforces() {
+        let mut own = detail();
+        own.author = Some(Actor {
+            login: own.viewer_login.to_uppercase(),
+            avatar_url: String::new(),
+        });
+        assert!(review_write(&own, ReviewEvent::Approve, "ok".into()).is_err());
+        assert!(review_write(&own, ReviewEvent::RequestChanges, "fix".into()).is_err());
+        assert!(matches!(
+            review_write(&own, ReviewEvent::Comment, "note".into()),
+            Ok(Write::Review {
+                event: ReviewEvent::Comment,
+                ..
+            })
+        ));
+
+        let theirs = detail();
+        assert!(review_write(&theirs, ReviewEvent::RequestChanges, " ".into()).is_err());
+        assert!(review_write(&theirs, ReviewEvent::Comment, String::new()).is_err());
+        assert!(matches!(
+            review_write(&theirs, ReviewEvent::Approve, String::new()),
+            Ok(Write::Review {
+                review_id: None,
+                ..
+            })
+        ));
+
+        let mut pending = detail();
+        pending.pending_review = Some(PendingReview {
+            id: "PRR_9".into(),
+            comment_count: 2,
+        });
+        match review_write(&pending, ReviewEvent::Comment, String::new()) {
+            Ok(Write::Review {
+                event, review_id, ..
+            }) => {
+                assert_eq!(event, ReviewEvent::Comment);
+                assert_eq!(
+                    review_id.as_deref(),
+                    Some("PRR_9"),
+                    "inline comments go with it"
+                );
+            }
+            other => panic!("expected a review, got {other:?}"),
+        }
     }
 }

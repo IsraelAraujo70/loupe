@@ -867,7 +867,11 @@ pub fn not_connected(
                     .icon(IconName::Settings)
                     .label("Open Settings…")
                     .on_click(|_, window, cx| {
-                        crate::shell::navigate(crate::route::Route::Settings, window, cx);
+                        crate::settings::view::open_section(
+                            crate::settings::catalog::Section::Linear,
+                            window,
+                            cx,
+                        );
                     }),
             ),
         )

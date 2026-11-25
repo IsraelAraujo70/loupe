@@ -4,6 +4,7 @@
 
 mod actions;
 mod common;
+mod diff_labels;
 pub(crate) mod guide_service;
 pub(crate) mod highlight;
 mod inbox;
@@ -23,6 +24,7 @@ use loupe_github::{PrRef, RepoRef, Verdict};
 
 use crate::shell::{PaletteItem, refresh_as};
 
+pub use self::diff_labels::install_diff_labels;
 pub use self::inbox::{
     ClearReviewsSelection, CloseStack, OpenReviewsFilter, OpenStack, SelectTabRows,
     enqueue_auto_guide_if_watched, start_auto_guide, start_bells, start_group_sync,
@@ -115,6 +117,11 @@ pub fn pull_request_tab(view: &AnyView, cx: &App) -> Option<PullRequestTab> {
 /// Pull requests for a GitHub search query the command palette built.
 pub fn palette_search(query: &str, first: u32, cx: &mut App) -> Task<Vec<PaletteItem>> {
     palette::search(query, first, cx)
+}
+
+/// The palette row of the pull request a query names exactly, with its title.
+pub fn palette_pull_request(pr: PrRef, cx: &mut App) -> Task<Vec<PaletteItem>> {
+    palette::find(pr, cx)
 }
 
 /// The repositories the viewer reaches, for the command palette's `repo:`
