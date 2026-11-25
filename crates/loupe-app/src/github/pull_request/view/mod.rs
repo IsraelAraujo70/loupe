@@ -562,7 +562,8 @@ impl PullRequestView {
             detail: detail.clone(),
         };
         let conversation = cx.new(|cx| ConversationTab::new(context.clone(), window, cx));
-        let guide = cx.new(|cx| GuideTab::new(context.clone(), window, cx));
+        let guide =
+            cx.new(|cx| GuideTab::new(context.clone(), self.guide_scroll.clone(), window, cx));
         {
             let pr_view = cx.entity().downgrade();
             guide.update(cx, |tab, _| {

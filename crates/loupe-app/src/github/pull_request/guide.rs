@@ -9,9 +9,9 @@
 //! of its pull requests above one chapter at a time, opening on the chapter of
 //! the pull request on screen.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use loupe_github::diff::{DiffLine, Hunk, LineKind, parse_patch};
 use loupe_github::{ChangedFile, PrRef, PrState, PullRequestDetail, ReviewEvent, Side, StackNode};
 use loupe_guide::{
     ChapterChange, DecisionCategory, DecisionPoint, DiffSnippet, FlowComparison, GuideLanguage,
@@ -119,6 +120,30 @@ type LineCounts = HashMap<String, (u32, u32)>;
 /// Most files one folder of the uncovered list shows before "Show N more".
 const UNCOVERED_FILE_LIMIT: usize = 50;
 
+/// The narrowest content area that puts a step's code beside its prose;
+/// below it the code goes under the prose.
+const TWO_COLUMNS_MIN_WIDTH: f32 = 900.;
+/// The prose column beside the code, as the Capy guide reads.
+const PROSE_COLUMN: f32 = 400.;
+/// Decision points the index lists before "Show N more".
+const FOLDED_DECISIONS: usize = 5;
+/// Lines of prose a summary shows before "Expand".
+const SUMMARY_LINES: f32 = 5.;
+/// The line height of `ui::markdown`'s prose, in rem.
+const PROSE_LINE_HEIGHT: f32 = 1.3125;
+
+/// What the last frame measured of the tab: the width of its content area,
+/// and which folded summaries run past their lines.
+#[derive(Default)]
+struct GuideMeasure {
+    width: Cell<Option<Pixels>>,
+    overflows: RefCell<HashMap<SharedString, bool>>,
+}
+
+/// The pull request's patches, parsed for the files the walkthrough cites,
+/// under the cache key they were read from.
+type CitedHunks = Option<(String, Rc<HashMap<String, Vec<Hunk>>>)>;
+
 /// How the reader left the list of files the walkthrough cites nothing of.
 #[derive(Default)]
 struct UncoveredView {
@@ -200,13 +225,30 @@ pub struct GuideTab {
     /// Reviews sent from this tab, by pull request number.
     reviews: HashMap<u64, GuideReview>,
     uncovered: UncoveredView,
+    /// Every decision point is listed, not only the first few.
+    decisions_expanded: bool,
+    /// Decision points whose impact is open, by `decision_key`.
+    open_decisions: HashSet<String>,
+    /// Summaries opened past their first lines, by their id.
+    open_summaries: HashSet<SharedString>,
+    measure: Rc<GuideMeasure>,
+    /// The tab's scroll, which a jump to a step moves.
+    scroll: ScrollHandle,
+    /// Tracks the walkthrough's steps, one child each, to find where one is.
+    steps_list: ScrollHandle,
+    hunks: RefCell<CitedHunks>,
     _submit_on_secondary_enter: Subscription,
 }
 
 impl EventEmitter<PrTabEvent> for GuideTab {}
 
 impl GuideTab {
-    pub fn new(context: PrTabContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        context: PrTabContext,
+        scroll: ScrollHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let review_body = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(3, 10)
@@ -240,6 +282,13 @@ impl GuideTab {
             clear_review_body: false,
             reviews: HashMap::new(),
             uncovered: UncoveredView::default(),
+            decisions_expanded: false,
+            open_decisions: HashSet::new(),
+            open_summaries: HashSet::new(),
+            measure: Rc::default(),
+            scroll,
+            steps_list: ScrollHandle::new(),
+            hunks: RefCell::new(None),
             _submit_on_secondary_enter: submit_on_secondary_enter,
         }
     }
@@ -511,10 +560,70 @@ impl GuideTab {
         cx.notify();
     }
 
-    fn focus_step(&mut self, step_id: &str, cx: &mut Context<Self>) {
+    /// Opens step `step_ix` (`step_id`), marks it, and scrolls its top to
+    /// the top of the tab. Opening it only grows it downward, so where the
+    /// last frame drew it is still right; after a switch of chapter the last
+    /// frame drew another chapter, so the scroll is done again once the new
+    /// one is laid out.
+    fn focus_step(
+        &mut self,
+        step_ix: usize,
+        step_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.expanded_override.insert(step_id.to_owned(), true);
         self.focused_step = Some(step_id.to_owned());
+        self.scroll_to_step(step_ix);
+        cx.on_next_frame(window, move |_, window, cx| {
+            cx.on_next_frame(window, move |this: &mut Self, _, cx| {
+                this.scroll_to_step(step_ix);
+                cx.notify();
+            });
+        });
         cx.notify();
+    }
+
+    fn scroll_to_step(&self, step_ix: usize) {
+        let Some(bounds) = self.steps_list.bounds_for_item(step_ix) else {
+            return;
+        };
+        let viewport = self.scroll.bounds();
+        let mut offset = self.scroll.offset();
+        offset.y += viewport.top() - bounds.top();
+        self.scroll.set_offset(offset);
+    }
+
+    /// Whether the content area is wide enough for prose beside code; true
+    /// until the first frame measured it.
+    fn wide(&self) -> bool {
+        self.measure
+            .width
+            .get()
+            .is_none_or(|width| width >= dp(TWO_COLUMNS_MIN_WIDTH))
+    }
+
+    /// An invisible layer over its parent that keeps the parent's width as
+    /// the content area's, and renders the tab again when it changes.
+    fn measure_width(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let measure = self.measure.clone();
+        let view = cx.entity().downgrade();
+        canvas(
+            move |bounds, _, cx| {
+                let width = bounds.size.width;
+                let changed = measure
+                    .width
+                    .get()
+                    .is_none_or(|old| (f32::from(old) - f32::from(width)).abs() >= 1.);
+                if changed {
+                    measure.width.set(Some(width));
+                    view.update(cx, |_, cx| cx.notify()).ok();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
     }
 
     /// Opens `path` in the Files tab of the pull request on screen.
@@ -803,34 +912,39 @@ impl GuideTab {
         let total = guide.steps.len();
         let uncovered = loupe_guide::uncovered_files(&stored.changed_files, guide);
 
+        let meta_bar = self.render_meta_bar(
+            &stored.model,
+            &stored.language,
+            ui::chip()
+                .child(
+                    div()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(scale::code())
+                        .child(stored.short_sha().to_owned()),
+                )
+                .into_any_element(),
+            stored.generated_at,
+            (viewed, total),
+            now,
+            cx,
+        );
         v_flex()
             .w_full()
             .px(scale::content_inset())
             .py_4()
             .gap_5()
             .child(
-                self.render_meta_bar(
-                    &stored.model,
-                    &stored.language,
-                    ui::chip()
-                        .child(
-                            div()
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(scale::code())
-                                .child(stored.short_sha().to_owned()),
-                        )
-                        .into_any_element(),
-                    stored.generated_at,
-                    (viewed, total),
-                    now,
-                    cx,
-                ),
+                div()
+                    .relative()
+                    .w_full()
+                    .child(meta_bar)
+                    .child(self.measure_width(cx)),
             )
             .when(stale, |col| col.child(self.render_stale_banner(stored, cx)))
+            .child(self.render_summary(guide, "guide-summary-body".into(), cx))
             .when(!guide.decisions.is_empty(), |col| {
                 col.child(self.render_decisions(guide, cx))
             })
-            .child(self.render_summary(guide, cx))
             .when(!guide.removed_tests.is_empty(), |col| {
                 col.child(self.render_removed_tests(&guide.removed_tests, cx))
             })
@@ -1188,8 +1302,24 @@ impl GuideTab {
         self.render_decision_list(rows, cx)
     }
 
+    /// The decision points as an index, one line each; a long list shows
+    /// its first few until "Show N more".
     fn render_decision_list(&self, rows: Vec<AnyElement>, cx: &mut Context<Self>) -> AnyElement {
         let count = rows.len();
+        let foldable = count > FOLDED_DECISIONS;
+        let expanded = self.decisions_expanded;
+        let shown = if foldable && !expanded {
+            FOLDED_DECISIONS
+        } else {
+            count
+        };
+        let theme = cx.theme();
+        let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+        let more = if expanded {
+            "Show fewer".to_owned()
+        } else {
+            format!("Show {} more", count - shown)
+        };
         v_flex()
             .debug_selector(|| "guide-decisions".into())
             .w_full()
@@ -1203,30 +1333,67 @@ impl GuideTab {
                             .with_size(scale::icon_sm())
                             .text_color(tokens::pending()),
                     )
-                    .child(
-                        div()
-                            .text_size(scale::title())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Decision points"),
-                    )
+                    .child(ui::section_title("Decision points"))
                     .child(ui::count_badge(count, cx)),
             )
             .child(
                 ui::card(cx)
+                    .id("guide-decisions-list")
+                    .role(Role::List)
+                    .aria_label("Decision points")
                     .p_0()
+                    .gap_0()
                     .overflow_hidden()
-                    .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                    .children(rows.into_iter().take(shown).enumerate().map(|(ix, row)| {
                         div()
                             .w_full()
                             .when(ix > 0, |row| {
                                 row.border_t_1().border_color(tokens::border_subtle())
                             })
                             .child(row)
-                    })),
+                    }))
+                    .when(foldable, |card| {
+                        card.child(
+                            h_flex()
+                                .id("guide-decisions-more")
+                                .debug_selector(|| "guide-decisions-more".into())
+                                .role(Role::Button)
+                                .aria_label(format!("{more} decision points"))
+                                .aria_expanded(expanded)
+                                .w_full()
+                                .h(scale::row_height())
+                                .px(scale::card_padding())
+                                .gap_2()
+                                .items_center()
+                                .border_t_1()
+                                .border_color(tokens::border_subtle())
+                                .text_size(scale::meta())
+                                .text_color(muted)
+                                .hover(move |row| row.bg(hover))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.decisions_expanded = !this.decisions_expanded;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    h_flex().flex_none().w_4().justify_center().child(
+                                        Icon::new(if expanded {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
+                                        })
+                                        .small(),
+                                    ),
+                                )
+                                .child(more),
+                        )
+                    }),
             )
             .into_any_element()
     }
 
+    /// One line of the decision index: the pull request in a stack, the
+    /// category, the title, the line it is about, and the step that explains
+    /// it. A click on the line opens its impact under it.
     fn render_decision_row(
         &self,
         ix: usize,
@@ -1236,104 +1403,172 @@ impl GuideTab {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let target_pr = chapter.unwrap_or_else(|| self.shown_pr_number());
-        let muted = cx.theme().muted_foreground;
-        let mono = cx.theme().mono_font_family.clone();
+        let key = format!("{target_pr}/{}", decision.id);
+        let open = self.open_decisions.contains(&key);
+        let theme = cx.theme();
+        let (muted, foreground, hover) =
+            (theme.muted_foreground, theme.foreground, theme.list_hover);
+        let mono = theme.mono_font_family.clone();
         let chip_color = decision_color(decision.category);
         let snippet_target = step_info.and_then(|(_, step)| {
             decision
                 .snippet_index
                 .and_then(|snip_ix| step.snippets.get(snip_ix))
         });
-        let step_id = decision.step_id.clone();
+        let title = inline_code(&decision.title, foreground, FontWeight::NORMAL, cx);
 
-        v_flex()
-            .w_full()
-            .px_4()
-            .py_3()
-            .gap_1p5()
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_wrap()
-                    .gap_2()
-                    .items_center()
-                    .when_some(chapter, |row, number| {
-                        row.child(ui::chip().child(format!("#{number}")))
-                    })
-                    .child(widgets::tinted_tag(chip_color).child(decision.category.label()))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(scale::body())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(decision.title.clone()),
-                    ),
-            )
+        let toggle = h_flex()
+            .id(SharedString::from(format!("guide-decision-{ix}")))
+            .debug_selector(move || format!("guide-decision-{ix}"))
+            .role(Role::Button)
+            .aria_label(format!(
+                "{}: {}",
+                decision.category.label(),
+                decision.title.replace('`', "")
+            ))
+            .aria_expanded(open)
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .gap_2()
+            .items_center()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.open_decisions.remove(&key) {
+                    this.open_decisions.insert(key.clone());
+                }
+                cx.notify();
+            }))
+            .child(chevron(!open, muted))
+            .when_some(chapter, |row, number| {
+                row.child(ui::chip().child(format!("#{number}")))
+            })
+            .child(widgets::tinted_tag(chip_color).child(decision.category.label()))
             .child(
                 div()
-                    .max_w(dp(ui::READING_WIDTH))
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
                     .text_size(scale::body())
-                    .text_color(muted)
-                    .child(decision.impact.clone()),
-            )
-            .child(
-                h_flex()
-                    .pt_0p5()
-                    .flex_wrap()
-                    .gap_2()
-                    .items_center()
-                    .when_some(step_info, |row, (step_ix, step)| {
-                        let step_id = step_id.clone();
-                        row.child(
-                            Button::new(SharedString::from(format!("guide-decision-step-{ix}")))
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::ArrowDown)
-                                .label(format!("Step {}: {}", step_ix + 1, step.title))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(number) = chapter {
-                                        this.select_chapter(number, cx);
-                                    }
-                                    this.focus_step(&step_id, cx);
-                                })),
+                    .child(title),
+            );
+
+        let line = h_flex()
+            .id(SharedString::from(format!("guide-decision-line-{ix}")))
+            .w_full()
+            .h(scale::row_height())
+            .px(scale::card_padding())
+            .gap_2()
+            .items_center()
+            .hover(move |row| row.bg(hover))
+            .child(toggle)
+            .when_some(snippet_target, |row, snippet| {
+                let path = snippet.path.clone();
+                let line = snippet.start_line;
+                let side = to_github_side(snippet.side);
+                row.child(
+                    Button::new(SharedString::from(format!("guide-decision-snippet-{ix}")))
+                        .debug_selector(move || format!("guide-decision-snippet-{ix}"))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(format!("Open {path}:{line} in Files"))
+                        .child(
+                            div()
+                                .font_family(mono)
+                                .text_size(scale::code())
+                                .text_color(tokens::link())
+                                .child(format!("{}:{line}", file_name(&path))),
                         )
-                    })
-                    .when_some(snippet_target, |row, snippet| {
-                        let path = snippet.path.clone();
-                        let line = snippet.start_line;
-                        let side = to_github_side(snippet.side);
-                        let label = format!("{path}:{line}");
-                        row.child(
-                            Button::new(SharedString::from(format!("guide-decision-snippet-{ix}")))
-                                .debug_selector(move || format!("guide-decision-snippet-{ix}"))
-                                .outline()
-                                .xsmall()
-                                .icon(IconName::FileDiff)
-                                .child(
-                                    div()
-                                        .font_family(mono.clone())
-                                        .text_size(scale::code())
-                                        .child(label),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_file_in(
-                                        target_pr,
-                                        path.clone(),
-                                        Some(line),
-                                        side,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    }),
-            )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_file_in(target_pr, path.clone(), Some(line), side, cx);
+                        })),
+                )
+            })
+            .when_some(step_info, |row, (step_ix, step)| {
+                let step_id = step.id.clone();
+                row.child(
+                    Button::new(SharedString::from(format!("guide-decision-step-{ix}")))
+                        .debug_selector(move || format!("guide-decision-step-{ix}"))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ArrowDown)
+                        .label(format!("Step {}", step_ix + 1))
+                        .tooltip(format!("Go to step {}: {}", step_ix + 1, step.title))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(number) = chapter {
+                                this.select_chapter(number, cx);
+                            }
+                            this.focus_step(step_ix, &step_id, window, cx);
+                        })),
+                )
+            });
+
+        v_flex()
+            .id(SharedString::from(format!("guide-decision-item-{ix}")))
+            .role(Role::ListItem)
+            .w_full()
+            .child(line)
+            .when(open, |row| {
+                row.child(
+                    div()
+                        .debug_selector(move || format!("guide-decision-impact-{ix}"))
+                        .w_full()
+                        .pl_9()
+                        .pr(scale::card_padding())
+                        .pb_3()
+                        .text_color(muted)
+                        .child(prose(
+                            SharedString::from(format!("guide-decision-impact-{ix}")),
+                            decision.impact.clone(),
+                        )),
+                )
+            })
             .into_any_element()
     }
 
-    fn render_summary(&self, guide: &ReviewGuide, cx: &mut Context<Self>) -> AnyElement {
+    /// The summary: its headline, then its prose with the flow before and
+    /// after, the callers, and the contracts beside it (under it in a narrow
+    /// tab), folded to its first lines until "Expand".
+    fn render_summary(
+        &self,
+        guide: &ReviewGuide,
+        id: SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let summary = &guide.summary;
-        let muted = cx.theme().muted_foreground;
+        let theme = cx.theme();
+        let (muted, foreground) = (theme.muted_foreground, theme.foreground);
+        let has_side =
+            summary.flow.is_some() || !summary.callers.is_empty() || !summary.contracts.is_empty();
+        let side = has_side.then(|| {
+            v_flex()
+                .w_full()
+                .gap_4()
+                .when_some(summary.flow.as_ref(), |col, flow| {
+                    col.child(self.render_flow(flow, cx))
+                })
+                .when(!summary.callers.is_empty(), |col| {
+                    col.child(render_bullet_group(
+                        "guide-summary-callers",
+                        "Callers",
+                        &summary.callers,
+                        muted,
+                    ))
+                })
+                .when(!summary.contracts.is_empty(), |col| {
+                    col.child(render_bullet_group(
+                        "guide-summary-contracts",
+                        "Contracts",
+                        &summary.contracts,
+                        muted,
+                    ))
+                })
+                .into_any_element()
+        });
+        let body = two_columns(
+            prose("guide-summary-why", summary.why.clone()),
+            side,
+            self.wide(),
+        );
         ui::card(cx)
             .debug_selector(|| "guide-summary".into())
             .p_4()
@@ -1342,17 +1577,106 @@ impl GuideTab {
                 div()
                     .text_size(scale::title())
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(summary.headline.clone()),
+                    .child(inline_code(
+                        &summary.headline,
+                        foreground,
+                        FontWeight::SEMIBOLD,
+                        cx,
+                    )),
             )
-            .child(prose("guide-summary-why", summary.why.clone()))
-            .when_some(summary.flow.as_ref(), |card, flow| {
-                card.child(self.render_flow(flow, cx))
-            })
-            .when(!summary.callers.is_empty(), |card| {
-                card.child(render_bullet_group("Callers", &summary.callers, muted))
-            })
-            .when(!summary.contracts.is_empty(), |card| {
-                card.child(render_bullet_group("Contracts", &summary.contracts, muted))
+            .child(self.render_folded(id, body, cx))
+            .into_any_element()
+    }
+
+    /// `body` folded to its first lines of prose, with a fade over the cut
+    /// and "Expand" under it, while it runs past them.
+    fn render_folded(
+        &self,
+        id: SharedString,
+        body: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.open_summaries.contains(&id);
+        let overflows = self
+            .measure
+            .overflows
+            .borrow()
+            .get(&id)
+            .copied()
+            .unwrap_or(false);
+        let folded = overflows && !open;
+        let limit = rems(SUMMARY_LINES * PROSE_LINE_HEIGHT);
+        let surface = cx.theme().group_box;
+        let probe = {
+            let (measure, key) = (self.measure.clone(), id.clone());
+            let view = cx.entity().downgrade();
+            canvas(
+                move |bounds, window, cx| {
+                    let overflows =
+                        bounds.size.height > limit.to_pixels(window.rem_size()) + px(1.);
+                    let before = measure
+                        .overflows
+                        .borrow_mut()
+                        .insert(key.clone(), overflows);
+                    if before != Some(overflows) {
+                        view.update(cx, |_, cx| cx.notify()).ok();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        };
+        let toggle_id = id.clone();
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .when(folded, |area| area.max_h(limit).overflow_hidden())
+                    .child(div().relative().w_full().child(body).child(probe))
+                    .when(folded, |area| {
+                        area.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(rems(PROSE_LINE_HEIGHT * 2.))
+                                .bg(linear_gradient(
+                                    180.,
+                                    linear_color_stop(surface.opacity(0.), 0.),
+                                    linear_color_stop(surface, 1.),
+                                )),
+                        )
+                    }),
+            )
+            .when(overflows, |col| {
+                col.child(
+                    h_flex().child(
+                        Button::new(SharedString::from(format!("{id}-expand")))
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("{id}-expand")
+                            })
+                            .ghost()
+                            .xsmall()
+                            .icon(if open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .label(if open { "Collapse" } else { "Expand" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.open_summaries.remove(&toggle_id) {
+                                    this.open_summaries.insert(toggle_id.clone());
+                                }
+                                cx.notify();
+                            })),
+                    ),
+                )
             })
             .into_any_element()
     }
@@ -1822,6 +2146,22 @@ impl GuideTab {
         }
     }
 
+    /// Where the Files tab keeps this pull request's changed files for its
+    /// head.
+    fn files_cache_key(&self, cx: &App) -> Option<String> {
+        let detail = &self.context.detail;
+        crate::cache::github_key(
+            cx,
+            &format!(
+                "files/{}/{}/{}/{}",
+                self.context.pr.url(),
+                detail.head_oid,
+                detail.base_ref,
+                detail.base_oid
+            ),
+        )
+    }
+
     /// Lines added and removed per file of the pull request on screen, as
     /// the Files tab read them for its head; empty until it has, and for a
     /// chapter of another pull request of the stack.
@@ -1831,17 +2171,7 @@ impl GuideTab {
         {
             return Rc::default();
         }
-        let detail = &self.context.detail;
-        let Some(key) = crate::cache::github_key(
-            cx,
-            &format!(
-                "files/{}/{}/{}/{}",
-                self.context.pr.url(),
-                detail.head_oid,
-                detail.base_ref,
-                detail.base_oid
-            ),
-        ) else {
+        let Some(key) = self.files_cache_key(cx) else {
             return Rc::default();
         };
         let mut memo = self.uncovered.stats.borrow_mut();
@@ -1872,19 +2202,22 @@ impl GuideTab {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
+        let mut decisions: HashMap<&str, Vec<&DecisionPoint>> = HashMap::new();
+        for decision in &guide.decisions {
+            decisions
+                .entry(decision.step_id.as_str())
+                .or_default()
+                .push(decision);
+        }
+        let hunks = self.cited_hunks(&guide.steps, cx);
         v_flex()
             .w_full()
-            .gap_3()
+            .gap_2()
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .text_size(scale::title())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Walkthrough"),
-                    )
+                    .child(ui::section_title("Walkthrough"))
                     .child(ui::count_badge(total, cx))
                     .child(div().flex_1())
                     .child(
@@ -1894,116 +2227,202 @@ impl GuideTab {
                             .child(format!("{viewed} / {total} viewed")),
                     ),
             )
-            .children(guide.steps.iter().enumerate().map(|(ix, step)| {
-                self.render_step(ix, step, changed_steps.get(&step.id).copied(), cx)
-            }))
+            .child(
+                ui::card(cx)
+                    .id("guide-steps")
+                    .role(Role::List)
+                    .aria_label("Walkthrough")
+                    .track_scroll(&self.steps_list)
+                    .p_0()
+                    .gap_0()
+                    .children(guide.steps.iter().enumerate().map(|(ix, step)| {
+                        let notes = decisions
+                            .get(step.id.as_str())
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        div()
+                            .w_full()
+                            .when(ix > 0, |row| {
+                                row.border_t_1().border_color(tokens::border_subtle())
+                            })
+                            .child(self.render_step(
+                                ix,
+                                total,
+                                step,
+                                changed_steps.get(&step.id).copied(),
+                                notes,
+                                &hunks,
+                                cx,
+                            ))
+                    })),
+            )
             .into_any_element()
     }
 
+    /// One step: its title, its place, and Viewed over its explanation and
+    /// the decision points it explains, with its snippets beside them (under
+    /// them in a narrow tab). A viewed step folds to one line.
+    #[allow(clippy::too_many_arguments)]
     fn render_step(
         &self,
         ix: usize,
+        total: usize,
         step: &GuideStep,
         change: Option<StepChange>,
+        decisions: &[&DecisionPoint],
+        hunks: &HashMap<String, Vec<Hunk>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let viewed = self.read_state.is_viewed(&step.id);
         let expanded = self.is_step_expanded(&step.id);
         let focused = self.focused_step.as_deref() == Some(step.id.as_str());
         let theme = cx.theme();
-        let muted = theme.muted_foreground;
+        let (muted, foreground, radius) = (theme.muted_foreground, theme.foreground, theme.radius);
+        let title_color = if viewed { muted } else { foreground };
         let step_id_expand = step.id.clone();
         let step_id_viewed = step.id.clone();
 
-        ui::card(cx)
+        let toggle = h_flex()
+            .id(SharedString::from(format!("guide-step-toggle-{ix}")))
+            .debug_selector(move || format!("guide-step-toggle-{ix}"))
+            .role(Role::Button)
+            .aria_label(format!(
+                "Step {} of {total}: {}",
+                ix + 1,
+                step.title.replace('`', "")
+            ))
+            .aria_expanded(expanded)
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .items_start()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_step_expanded(&step_id_expand, cx);
+            }))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(rems(1.5))
+                    .items_center()
+                    .child(chevron(!expanded, muted)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_base()
+                    .line_height(rems(1.5))
+                    .when(!expanded, |title| title.truncate())
+                    .child(inline_code(
+                        &step.title,
+                        title_color,
+                        FontWeight::SEMIBOLD,
+                        cx,
+                    )),
+            );
+        let place = h_flex()
+            .flex_none()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(format!("{:02} / {:02}", ix + 1, total)),
+            )
+            .child(ui::chip().child(step.kind.label()))
+            .when_some(change, |row, change| {
+                let tint = match change {
+                    StepChange::New => tokens::open(),
+                    StepChange::Updated => tokens::pending(),
+                };
+                row.child(widgets::tinted_tag(tint).child(change.label()))
+            });
+        let viewed_button = Button::new(SharedString::from(format!("guide-step-viewed-{ix}")))
+            .debug_selector(move || format!("guide-step-viewed-{ix}"))
+            .small()
+            .map(|btn| if viewed { btn.ghost() } else { btn.outline() })
+            .icon(if viewed {
+                IconName::CircleCheck
+            } else {
+                IconName::Check
+            })
+            .label(if viewed { "Viewed" } else { "Mark viewed" })
+            .selected(viewed)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_step_viewed(&step_id_viewed, cx);
+            }));
+        let frame = v_flex()
+            .id(SharedString::from(format!("guide-step-{ix}")))
             .debug_selector(move || format!("guide-step-{ix}"))
-            .p_0()
-            .overflow_hidden()
-            .when(focused, |card| card.border_color(tokens::accent()))
+            .role(Role::ListItem)
+            .w_full()
+            .px_4()
+            .rounded(radius)
+            .border_1()
+            .border_color(if focused {
+                tokens::accent()
+            } else {
+                transparent_black()
+            });
+
+        if !expanded {
+            return frame
+                .py_2()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_3()
+                        .items_center()
+                        .child(toggle)
+                        .child(place)
+                        .child(viewed_button),
+                )
+                .into_any_element();
+        }
+
+        let shown_pr = self.shown_pr_number() == self.context.pr.number;
+        let left = v_flex()
+            .w_full()
+            .gap_3()
+            .child(toggle)
             .child(
                 h_flex()
                     .w_full()
-                    .px_4()
-                    .py_3()
+                    .pl_6()
                     .gap_2()
                     .items_center()
-                    .child(
-                        h_flex()
-                            .id(SharedString::from(format!("guide-step-toggle-{ix}")))
-                            .role(Role::Button)
-                            .aria_label(format!("Step {}: {}", ix + 1, step.title))
-                            .flex_1()
-                            .min_w_0()
-                            .gap_2()
-                            .items_center()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_step_expanded(&step_id_expand, cx);
-                            }))
-                            .child(
-                                Icon::new(if expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .xsmall()
-                                .text_color(muted),
-                            )
-                            .child(ui::count_badge(ix + 1, cx))
-                            .child(ui::chip().child(step.kind.label()))
-                            .when_some(change, |row, change| {
-                                let tint = match change {
-                                    StepChange::New => tokens::open(),
-                                    StepChange::Updated => tokens::pending(),
-                                };
-                                row.child(widgets::tinted_tag(tint).child(change.label()))
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(scale::body())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .when(viewed, |text| text.text_color(muted))
-                                    .child(step.title.clone()),
-                            ),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("guide-step-viewed-{ix}")))
-                            .debug_selector(move || format!("guide-step-viewed-{ix}"))
-                            .small()
-                            .map(|btn| if viewed { btn.ghost() } else { btn.outline() })
-                            .icon(if viewed {
-                                IconName::CircleCheck
-                            } else {
-                                IconName::Check
-                            })
-                            .label(if viewed { "Viewed" } else { "Mark viewed" })
-                            .selected(viewed)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_step_viewed(&step_id_viewed, cx);
-                            })),
-                    ),
+                    .child(place)
+                    .child(div().flex_1())
+                    .child(viewed_button),
             )
-            .when(expanded, |card| {
-                card.child(
-                    v_flex()
-                        .w_full()
-                        .px_4()
-                        .pb_4()
-                        .pt_3()
-                        .gap_3()
-                        .border_t_1()
-                        .border_color(tokens::border_subtle())
-                        .child(prose(
-                            SharedString::from(format!("guide-step-body-{ix}")),
-                            step.explanation.clone(),
-                        ))
-                        .children(step.snippets.iter().enumerate().map(|(snip_ix, snippet)| {
-                            self.render_snippet(ix, snip_ix, snippet, cx)
-                        })),
-                )
-            })
+            .child(prose(
+                SharedString::from(format!("guide-step-body-{ix}")),
+                step.explanation.clone(),
+            ))
+            .children(
+                decisions
+                    .iter()
+                    .enumerate()
+                    .map(|(note_ix, decision)| render_decision_note(ix, note_ix, decision, cx)),
+            )
+            .into_any_element();
+        let right = (!step.snippets.is_empty()).then(|| {
+            v_flex()
+                .w_full()
+                .gap_3()
+                .children(step.snippets.iter().enumerate().map(|(snip_ix, snippet)| {
+                    let file_hunks = shown_pr
+                        .then(|| hunks.get(&snippet.path))
+                        .flatten()
+                        .map(Vec::as_slice);
+                    self.render_snippet(ix, snip_ix, snippet, file_hunks, cx)
+                }))
+                .into_any_element()
+        });
+        frame
+            .py_4()
+            .child(two_columns(left, right, self.wide()))
             .into_any_element()
     }
 
@@ -2012,10 +2431,11 @@ impl GuideTab {
         step_ix: usize,
         snip_ix: usize,
         snippet: &DiffSnippet,
+        hunks: Option<&[Hunk]>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let muted = theme.muted_foreground;
+        let (muted, foreground) = (theme.muted_foreground, theme.foreground);
         let mono = theme.mono_font_family.clone();
         let path = snippet.path.clone();
         let line = snippet.start_line;
@@ -2028,12 +2448,25 @@ impl GuideTab {
                 snippet.path, snippet.start_line, snippet.end_line
             )
         };
+        let lines_label = if snippet.start_line == snippet.end_line {
+            format!("L{}", snippet.start_line)
+        } else {
+            format!("L{}–{}", snippet.start_line, snippet.end_line)
+        };
+        let folder = snippet.path.rsplit_once('/').map(|(folder, _)| folder);
 
         let raw_lines: Vec<&str> = snippet.diff.lines().collect();
+        let added = raw_lines.iter().filter(|raw| raw.starts_with('+')).count() as u32;
+        let removed = raw_lines.iter().filter(|raw| raw.starts_with('-')).count() as u32;
         let code_lines: Vec<&str> = raw_lines
             .iter()
             .map(|raw| strip_diff_prefix(raw).1)
             .collect();
+        let numbers = snippet_line_numbers(snippet, hunks);
+        let gutter = numbers.iter().flatten().max().map(|widest| {
+            // JetBrains Mono's digits are 0.6 em wide.
+            rems(scale::code().0 * 0.6 * widest.to_string().len() as f32)
+        });
         let language = language_for_path(&snippet.path);
         let highlighted = highlight_lines(language, &code_lines, &theme.highlight_theme);
         let wrap = Settings::get(cx).diff_wrap;
@@ -2042,12 +2475,9 @@ impl GuideTab {
             .py_1()
             .font_family(mono.clone())
             .text_size(scale::code())
-            .children(
-                raw_lines
-                    .into_iter()
-                    .zip(highlighted)
-                    .map(|(raw, runs)| render_diff_line(raw, runs, muted, wrap)),
-            );
+            .children(raw_lines.into_iter().zip(highlighted).zip(numbers).map(
+                |((raw, runs), number)| render_diff_line(raw, runs, number, gutter, muted, wrap),
+            ));
 
         v_flex()
             .w_full()
@@ -2073,6 +2503,10 @@ impl GuideTab {
                     .border_color(theme.border)
                     .bg(theme.group_box)
                     .hover(|s| s.bg(tokens::glass_hover()))
+                    .tooltip({
+                        let path = snippet.path.clone();
+                        move |window, cx| Tooltip::new(path.clone()).build(window, cx)
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_file(path.clone(), Some(line), side, cx);
                     }))
@@ -2085,20 +2519,40 @@ impl GuideTab {
                     )
                     .child(
                         div()
+                            .min_w_0()
+                            .truncate()
                             .font_family(mono.clone())
                             .text_size(scale::code())
                             .font_weight(FontWeight::MEDIUM)
-                            .child(range_label),
+                            .text_color(foreground)
+                            .child(file_name(&snippet.path).to_owned()),
                     )
+                    .when_some(folder, |row, folder| {
+                        row.child(
+                            // Shrinks a thousand times faster than the name,
+                            // so the folder is gone before the name is cut.
+                            div()
+                                .min_w_0()
+                                .flex_shrink(1000.)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis_start()
+                                .text_size(scale::meta())
+                                .text_color(muted)
+                                .child(format!("{folder}/")),
+                        )
+                    })
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
+                            .flex_none()
                             .text_size(scale::meta())
                             .text_color(muted)
-                            .child(snippet.caption.clone()),
+                            .child(lines_label),
                     )
+                    .child(div().flex_1())
+                    .when(added + removed > 0, |row| {
+                        row.child(widgets::diff_stat(added, removed))
+                    })
                     .child(
                         h_flex()
                             .flex_none()
@@ -2110,6 +2564,15 @@ impl GuideTab {
                             .child(Icon::new(IconName::ArrowRight).xsmall()),
                     ),
             )
+            .when(!snippet.caption.is_empty(), |block| {
+                block.child(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .text_size(scale::meta())
+                        .child(inline_code(&snippet.caption, muted, FontWeight::NORMAL, cx)),
+                )
+            })
             .map(|block| {
                 if wrap {
                     return block.child(lines.w_full());
@@ -2152,6 +2615,44 @@ impl GuideTab {
             })
             .into_any_element()
     }
+
+    /// The patch of each file the steps cite, parsed from the files the
+    /// Files tab keeps for this pull request's head: empty until it read
+    /// them, and for a stack chapter of another pull request.
+    fn cited_hunks(&self, steps: &[GuideStep], cx: &App) -> Rc<HashMap<String, Vec<Hunk>>> {
+        if self.shown_pr_number() != self.context.pr.number {
+            return Rc::default();
+        }
+        let Some(key) = self.files_cache_key(cx) else {
+            return Rc::default();
+        };
+        let cited: BTreeSet<&str> = steps
+            .iter()
+            .flat_map(|step| step.snippets.iter().map(|snippet| snippet.path.as_str()))
+            .collect();
+        let memo_key = format!(
+            "{key}\n{}",
+            cited.iter().copied().collect::<Vec<_>>().join("\n")
+        );
+        let mut memo = self.hunks.borrow_mut();
+        if let Some((read, hunks)) = memo.as_ref()
+            && *read == memo_key
+        {
+            return hunks.clone();
+        }
+        let Some(files) = crate::cache::get::<Vec<ChangedFile>>(&key) else {
+            return Rc::default();
+        };
+        let hunks: Rc<HashMap<String, Vec<Hunk>>> = Rc::new(
+            files
+                .into_iter()
+                .filter(|file| cited.contains(file.path.as_str()))
+                .filter_map(|file| Some((file.path, parse_patch(&file.patch?).ok()?)))
+                .collect(),
+        );
+        *memo = Some((memo_key, hunks.clone()));
+        hunks
+    }
 }
 
 /// The stack guide.
@@ -2182,24 +2683,31 @@ impl GuideTab {
         let next_in_review = target.as_ref().is_some_and(|target| {
             matches!(self.reviews.get(&target.number), Some(GuideReview::Sent(_)))
         }) && next.is_some();
+        let meta_bar = self.render_meta_bar(
+            &stored.model,
+            &stored.language,
+            stack_tag,
+            stored.generated_at,
+            (viewed, total),
+            Utc::now(),
+            cx,
+        );
         v_flex()
             .w_full()
             .px(scale::content_inset())
             .py_4()
             .gap_5()
-            .child(self.render_meta_bar(
-                &stored.model,
-                &stored.language,
-                stack_tag,
-                stored.generated_at,
-                (viewed, total),
-                Utc::now(),
-                cx,
-            ))
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .child(meta_bar)
+                    .child(self.measure_width(cx)),
+            )
             .when(!changes.is_empty(), |col| {
                 col.child(self.render_stack_stale_banner(changes, cx))
             })
-            .child(self.render_stack_overview(stored, cx))
+            .child(self.render_stack_overview(stored, changes, nodes, cx))
             .when(
                 stored
                     .chapters
@@ -2207,9 +2715,12 @@ impl GuideTab {
                     .any(|c| !c.guide.decisions.is_empty()),
                 |col| col.child(self.render_stack_decisions(stored, cx)),
             )
-            .child(self.render_stack_map(stored, changes, nodes, cx))
             .child(self.render_chapter_header(stored, chapter_ix, changes, cx))
-            .child(self.render_summary(guide, cx))
+            .child(self.render_summary(
+                guide,
+                format!("guide-summary-body-{}", chapter.pr_number).into(),
+                cx,
+            ))
             .when(!guide.removed_tests.is_empty(), |col| {
                 col.child(self.render_removed_tests(&guide.removed_tests, cx))
             })
@@ -2277,12 +2788,18 @@ impl GuideTab {
             .into_any_element()
     }
 
+    /// The stack's overview, folded to its first lines, over its pull
+    /// requests in merge order: the stack's table of contents, where a row
+    /// opens its chapter.
     fn render_stack_overview(
         &self,
         stored: &StoredStackGuide,
+        changes: &BTreeMap<u64, ChapterChange>,
+        nodes: &[StackNode],
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
+        let theme = cx.theme();
+        let (muted, foreground) = (theme.muted_foreground, theme.foreground);
         ui::card(cx)
             .debug_selector(|| "guide-stack-overview".into())
             .p_4()
@@ -2304,9 +2821,19 @@ impl GuideTab {
                 div()
                     .text_size(scale::title())
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(stored.overview.headline.clone()),
+                    .child(inline_code(
+                        &stored.overview.headline,
+                        foreground,
+                        FontWeight::SEMIBOLD,
+                        cx,
+                    )),
             )
-            .child(prose("guide-stack-why", stored.overview.why.clone()))
+            .child(self.render_folded(
+                "guide-stack-why-body".into(),
+                prose("guide-stack-why", stored.overview.why.clone()),
+                cx,
+            ))
+            .child(self.render_stack_map(stored, changes, nodes, cx))
             .into_any_element()
     }
 
@@ -2388,27 +2915,23 @@ impl GuideTab {
         v_flex()
             .debug_selector(|| "guide-stack-map".into())
             .w_full()
-            .gap_2()
+            .gap_1()
+            .pt_3()
+            .border_t_1()
+            .border_color(tokens::border_subtle())
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .text_size(scale::title())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Pull requests in merge order"),
-                    )
+                    .child(ui::section_label("Pull requests in merge order", cx))
                     .child(ui::count_badge(count, cx)),
             )
             .child(
-                ui::card(cx)
-                    .p_0()
-                    .py_1()
-                    .overflow_hidden()
+                v_flex()
                     .id("guide-stack-map-list")
                     .role(Role::List)
                     .aria_label("Chapters of this stack guide")
+                    .w_full()
                     .children(rows),
             )
             .into_any_element()
@@ -2565,12 +3088,15 @@ impl GuideTab {
                         el.child(widgets::tinted_tag(tokens::pending()).child(change.label()))
                     }),
             )
-            .child(
-                div()
-                    .text_size(scale::heading())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("#{} {}", chapter.pr_number, chapter.title)),
-            )
+            // The page's header already names this pull request.
+            .when(chapter.pr_number != self.context.pr.number, |header| {
+                header.child(
+                    div()
+                        .text_size(scale::title())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("#{} {}", chapter.pr_number, chapter.title)),
+                )
+            })
             .into_any_element()
     }
 
@@ -2817,7 +3343,230 @@ fn prose(id: impl Into<ElementId>, text: impl Into<SharedString>) -> AnyElement 
         .into_any_element()
 }
 
-fn render_bullet_group(title: &'static str, items: &[String], muted: Hsla) -> AnyElement {
+/// Prose on the left at a reading width and code on the right, as the Capy
+/// guide reads; in a content area narrower than `TWO_COLUMNS_MIN_WIDTH` the
+/// code goes under the prose. Without code the prose keeps its reading width.
+fn two_columns(left: AnyElement, right: Option<AnyElement>, wide: bool) -> AnyElement {
+    let Some(right) = right else {
+        return div()
+            .w_full()
+            .max_w(dp(ui::READING_WIDTH))
+            .child(left)
+            .into_any_element();
+    };
+    if !wide {
+        return v_flex()
+            .w_full()
+            .gap_4()
+            .child(div().w_full().max_w(dp(ui::READING_WIDTH)).child(left))
+            .child(right)
+            .into_any_element();
+    }
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap_8()
+        .child(div().flex_none().w(dp(PROSE_COLUMN)).child(left))
+        .child(div().flex_1().min_w_0().child(right))
+        .into_any_element()
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// One line of plain text with each `` `code` `` span set in the code font on
+/// the inline-code fill, as `ui::markdown` sets it, for titles and labels
+/// that stay one line and truncate. A lone backtick stays as it is.
+fn inline_code(text: &str, color: Hsla, weight: FontWeight, cx: &App) -> StyledText {
+    let theme = cx.theme();
+    let mut plain = font(theme.font_family.clone());
+    plain.weight = weight;
+    let code = font(theme.mono_font_family.clone());
+    let pieces = inline_code_pieces(text);
+    let runs = pieces
+        .iter()
+        .map(|piece| TextRun {
+            len: piece.text.len(),
+            font: if piece.mono {
+                code.clone()
+            } else {
+                plain.clone()
+            },
+            color,
+            background_color: piece.fill.then(tokens::code_inline),
+            underline: None,
+            strikethrough: None,
+        })
+        .collect();
+    let shown: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+    StyledText::new(shown).with_runs(runs)
+}
+
+/// A stretch of a line set by `inline_code`.
+#[derive(Debug, PartialEq, Eq)]
+struct InlinePiece {
+    text: String,
+    /// In the code font.
+    mono: bool,
+    /// On the inline-code fill.
+    fill: bool,
+}
+
+/// `text` cut where its backticks open and close code, without them.
+fn inline_code_pieces(text: &str) -> Vec<InlinePiece> {
+    let piece = |text: String, mono: bool, fill: bool| InlinePiece { text, mono, fill };
+    let parts: Vec<&str> = text.split('`').collect();
+    // An odd part is code only when a backtick closes it.
+    let closed = if parts.len().is_multiple_of(2) {
+        parts.len() - 1
+    } else {
+        parts.len()
+    };
+    let mut pieces = Vec::new();
+    for (ix, part) in parts.iter().enumerate() {
+        if ix % 2 == 1 && ix < closed && !part.is_empty() {
+            // Thin spaces on the fill pad the code as Markdown's 4 px do.
+            pieces.push(piece("\u{2009}".into(), false, true));
+            pieces.push(piece((*part).into(), true, true));
+            pieces.push(piece("\u{2009}".into(), false, true));
+            continue;
+        }
+        let text = if ix % 2 == 1 {
+            format!("`{part}")
+        } else {
+            (*part).to_owned()
+        };
+        if !text.is_empty() {
+            pieces.push(piece(text, false, false));
+        }
+    }
+    pieces
+}
+
+/// The number on its side of the diff of each line of `snippet`, or none for
+/// a line only the other side has. A snippet skips lines of its range, so
+/// the numbers come from the pull request's patch of the file, `hunks`: each
+/// line is found there in order, from the start of the range. Without the
+/// patch, a snippet whose lines fill its range is numbered from its start,
+/// and any other has none rather than wrong ones.
+fn snippet_line_numbers(snippet: &DiffSnippet, hunks: Option<&[Hunk]>) -> Vec<Option<u32>> {
+    let lines: Vec<(char, &str)> = snippet.diff.lines().map(strip_diff_prefix).collect();
+    let (other, number): (char, fn(&DiffLine) -> Option<u32>) = match snippet.side {
+        SnippetSide::New => ('-', |line| line.new_line),
+        SnippetSide::Old => ('+', |line| line.old_line),
+    };
+    if let Some(hunks) = hunks {
+        let patch: Vec<&DiffLine> = hunks.iter().flat_map(|hunk| &hunk.lines).collect();
+        if let Some(mut cursor) = patch
+            .iter()
+            .position(|line| number(line).is_some_and(|n| n >= snippet.start_line))
+        {
+            while cursor > 0 && number(patch[cursor - 1]).is_none() {
+                cursor -= 1;
+            }
+            // A model's range can stop short of its last lines.
+            let last = snippet.end_line + lines.len() as u32;
+            let found: Vec<Option<u32>> = lines
+                .iter()
+                .map(|(sign, text)| {
+                    let kind = match sign {
+                        '+' => LineKind::Added,
+                        '-' => LineKind::Removed,
+                        _ => LineKind::Context,
+                    };
+                    let window: Vec<&DiffLine> = patch[cursor..]
+                        .iter()
+                        .copied()
+                        .take_while(|line| number(line).is_none_or(|n| n <= last))
+                        .collect();
+                    let same_text = |line: &&DiffLine| line.text.trim() == text.trim();
+                    // A model may mark a line it kept as added: the text
+                    // alone finds it when no line of its kind does.
+                    let offset = window
+                        .iter()
+                        .position(|line| line.kind == kind && same_text(line))
+                        .or_else(|| window.iter().position(same_text))?;
+                    cursor += offset + 1;
+                    number(patch[cursor - 1])
+                })
+                .collect();
+            if found.iter().any(Option::is_some) {
+                return found;
+            }
+        }
+    }
+    let on_side = lines.iter().filter(|(sign, _)| *sign != other).count() as u32;
+    if on_side != snippet.end_line - snippet.start_line + 1 {
+        return vec![None; lines.len()];
+    }
+    let mut next = snippet.start_line;
+    lines
+        .iter()
+        .map(|(sign, _)| {
+            (*sign != other).then(|| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
+
+/// A decision point written out in the step that explains it.
+fn render_decision_note(
+    step_ix: usize,
+    note_ix: usize,
+    decision: &DecisionPoint,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let color = decision_color(decision.category);
+    v_flex()
+        .w_full()
+        .p_3()
+        .gap_1p5()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(color.opacity(0.35))
+        .bg(color.opacity(0.06))
+        .child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_start()
+                .child(widgets::tinted_tag(color).child(decision.category.label()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(scale::body())
+                        .child(inline_code(
+                            &decision.title,
+                            theme.foreground,
+                            FontWeight::SEMIBOLD,
+                            cx,
+                        )),
+                ),
+        )
+        .child(div().text_color(theme.muted_foreground).child(prose(
+            SharedString::from(format!("guide-step-decision-{step_ix}-{note_ix}")),
+            decision.impact.clone(),
+        )))
+        .into_any_element()
+}
+
+/// A labeled list, as Markdown so its `code` reads as code.
+fn render_bullet_group(
+    id: &'static str,
+    title: &'static str,
+    items: &[String],
+    muted: Hsla,
+) -> AnyElement {
+    let list = items
+        .iter()
+        .map(|item| format!("- {}", item.replace('\n', " ")))
+        .collect::<Vec<_>>()
+        .join("\n");
     v_flex()
         .w_full()
         .gap_1()
@@ -2828,20 +3577,7 @@ fn render_bullet_group(title: &'static str, items: &[String], muted: Hsla) -> An
                 .text_color(muted)
                 .child(title),
         )
-        .children(items.iter().map(|item| {
-            h_flex()
-                .gap_2()
-                .items_start()
-                .text_size(scale::body())
-                .child(div().text_color(muted).child("•"))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .max_w(dp(ui::READING_WIDTH))
-                        .child(item.clone()),
-                )
-        }))
+        .child(prose(id, list))
         .into_any_element()
 }
 
@@ -2877,6 +3613,8 @@ fn strip_diff_prefix(raw: &str) -> (char, &str) {
 fn render_diff_line(
     raw: &str,
     runs: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    number: Option<u32>,
+    gutter: Option<Rems>,
     muted: Hsla,
     wrap: bool,
 ) -> AnyElement {
@@ -2900,6 +3638,16 @@ fn render_diff_line(
         .gap_2()
         .items_start()
         .when_some(bg, |row, bg| row.bg(bg))
+        .when_some(gutter, |row, gutter| {
+            row.child(
+                h_flex()
+                    .flex_none()
+                    .w(gutter)
+                    .justify_end()
+                    .text_color(tokens::text_faint())
+                    .children(number.map(|number| number.to_string())),
+            )
+        })
         .child(
             div()
                 .flex_none()
@@ -2944,8 +3692,8 @@ mod tests {
 
     use chrono::Utc;
     use gpui_kit::{
-        AppContext as _, Bounds, Focusable as _, Modifiers, TestAppContext, VisualTestContext,
-        WindowBounds, WindowOptions, px, size,
+        AppContext as _, Bounds, Focusable as _, Modifiers, ScrollHandle, TestAppContext,
+        VisualTestContext, WindowBounds, WindowOptions, px, size,
     };
     use loupe_github::{
         Actor, Checks, MergeMethod, MergeStateStatus, Mergeable, PrRef, PrState, PullRequestDetail,
@@ -2956,7 +3704,9 @@ mod tests {
         RemovedTest, ReviewGuide, SCHEMA_VERSION, SnippetSide, StepKind, StoredGuide,
     };
 
-    use super::{GuideTab, GuideViewState, group_by_folder};
+    use super::{
+        GuideTab, GuideViewState, group_by_folder, inline_code_pieces, snippet_line_numbers,
+    };
     use crate::github::pull_request::tab::{PrTabContext, PrTabEvent};
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
@@ -3069,6 +3819,15 @@ mod tests {
         height: f32,
         detail: PullRequestDetail,
     ) -> (VisualTestContext, gpui_kit::Entity<GuideTab>) {
+        open_guide_sized(cx, 1000., height, detail)
+    }
+
+    fn open_guide_sized(
+        cx: &mut TestAppContext,
+        width: f32,
+        height: f32,
+        detail: PullRequestDetail,
+    ) -> (VisualTestContext, gpui_kit::Entity<GuideTab>) {
         let d = Arc::new(detail);
         let (handle, tab) = cx.update(|cx| {
             gpui_kit::init(cx);
@@ -3080,7 +3839,7 @@ mod tests {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                         Default::default(),
-                        size(px(1000.), px(height)),
+                        size(px(width), px(height)),
                     ))),
                     ..Default::default()
                 },
@@ -3090,7 +3849,7 @@ mod tests {
                         pr: d.pr.clone(),
                         detail: d.clone(),
                     };
-                    cx.new(|cx| GuideTab::new(context, window, cx))
+                    cx.new(|cx| GuideTab::new(context, ScrollHandle::new(), window, cx))
                 },
             )
             .expect("open window")
@@ -3380,6 +4139,165 @@ mod tests {
             })
         );
         assert_eq!(tab.read_with(&cx, |tab, _| tab.step_count()), Some(3));
+    }
+
+    /// Where a step's code lands in a window `width` px wide: beside its
+    /// prose (true) or under it.
+    fn code_is_beside_prose(cx: &mut TestAppContext, width: f32) -> bool {
+        let (mut cx, tab) = open_guide_sized(cx, width, 1400., detail());
+        load_fixture_guide(&mut cx, &tab);
+        // The first frame measures the content area, the next lays it out.
+        paint(&mut cx);
+        let title = cx.debug_bounds("guide-step-toggle-0").expect("step title");
+        let code = cx.debug_bounds("guide-snippet-0-0").expect("snippet");
+        if code.left() > title.right() && code.top() < title.bottom() {
+            return true;
+        }
+        assert!(code.top() > title.bottom(), "the code goes under the prose");
+        false
+    }
+
+    /// A step's code sits beside its prose in a content area 900 px wide or
+    /// more, and under it in a narrower one.
+    #[gpui_kit::test]
+    fn a_wide_tab_puts_a_steps_code_beside_its_prose(cx: &mut TestAppContext) {
+        assert!(code_is_beside_prose(cx, 1000.));
+    }
+
+    #[gpui_kit::test]
+    fn a_narrow_tab_puts_a_steps_code_under_its_prose(cx: &mut TestAppContext) {
+        assert!(!code_is_beside_prose(cx, 800.));
+    }
+
+    /// The decision points list five lines, then "Show N more"; a line's
+    /// impact opens under it on a click.
+    #[gpui_kit::test]
+    fn decision_points_fold_to_five_lines_and_open_their_impact(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_guide_with_height(cx, 2400.);
+        let mut guide = fixture_guide();
+        let decision = guide.decisions[0].clone();
+        guide.decisions = (0..7)
+            .map(|ix| DecisionPoint {
+                id: format!("decision-{ix}"),
+                title: format!("Decision {ix} on `parse`"),
+                ..decision.clone()
+            })
+            .collect();
+        let raw = serde_json::to_string(&guide).unwrap();
+        tab.update(&mut cx, |tab, cx| {
+            tab.load_raw_json(
+                &raw,
+                "abc1234567890".into(),
+                "m".into(),
+                "medium".into(),
+                cx,
+            );
+        });
+        paint(&mut cx);
+        assert!(cx.debug_bounds("guide-decision-4").is_some());
+        assert!(cx.debug_bounds("guide-decision-5").is_none());
+        assert!(cx.debug_bounds("guide-decision-impact-0").is_none());
+
+        click(&mut cx, "guide-decision-0");
+        assert!(cx.debug_bounds("guide-decision-impact-0").is_some());
+        click(&mut cx, "guide-decisions-more");
+        assert!(cx.debug_bounds("guide-decision-6").is_some());
+        click(&mut cx, "guide-decision-0");
+        assert!(cx.debug_bounds("guide-decision-impact-0").is_none());
+    }
+
+    /// A long summary shows its first lines and Expand, which shows it all.
+    #[gpui_kit::test]
+    fn a_long_summary_folds_until_expand(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_guide_with_height(cx, 2400.);
+        let mut guide = fixture_guide();
+        guide.summary.why = (0..12)
+            .map(|ix| format!("Paragraph {ix} of the motivation."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let raw = serde_json::to_string(&guide).unwrap();
+        tab.update(&mut cx, |tab, cx| {
+            tab.load_raw_json(
+                &raw,
+                "abc1234567890".into(),
+                "m".into(),
+                "medium".into(),
+                cx,
+            );
+        });
+        paint(&mut cx);
+        paint(&mut cx);
+        let folded = cx
+            .debug_bounds("guide-summary")
+            .expect("summary")
+            .size
+            .height;
+        click(&mut cx, "guide-summary-body-expand");
+        let open = cx
+            .debug_bounds("guide-summary")
+            .expect("summary")
+            .size
+            .height;
+        assert!(
+            open > folded * 2.,
+            "Expand shows the whole summary ({folded} -> {open})"
+        );
+    }
+
+    #[test]
+    fn snippet_lines_take_their_numbers_from_the_patch() {
+        let hunks = loupe_github::diff::parse_patch(
+            "@@ -1,4 +1,6 @@\n fn a() {\n-    old();\n+    let x = 1;\n+    new(x);\n     done();\n+    extra();\n }",
+        )
+        .unwrap();
+        let snippet = |start, end, diff: &str| DiffSnippet {
+            path: "src/a.rs".into(),
+            start_line: start,
+            end_line: end,
+            side: SnippetSide::New,
+            caption: String::new(),
+            diff: diff.into(),
+        };
+        // The snippet skips lines, marks a kept brace as added, and its range
+        // stops short of it.
+        let skipping = snippet(2, 5, "-    old();\n+    let x = 1;\n+    extra();\n+}");
+        assert_eq!(
+            snippet_line_numbers(&skipping, Some(&hunks)),
+            [None, Some(2), Some(5), Some(6)]
+        );
+        // Without the patch, only a snippet that fills its range is numbered.
+        assert_eq!(
+            snippet_line_numbers(&snippet(2, 3, "+a\n+b"), None),
+            [Some(2), Some(3)]
+        );
+        assert_eq!(
+            snippet_line_numbers(&snippet(2, 5, "+a\n+b"), None),
+            [None, None]
+        );
+    }
+
+    #[test]
+    fn inline_code_drops_the_backticks_and_keeps_a_lone_one() {
+        let text = |raw: &str| {
+            inline_code_pieces(raw)
+                .into_iter()
+                .map(|piece| (piece.text, piece.mono))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            text("Use `parse` now"),
+            [
+                ("Use ".to_owned(), false),
+                ("\u{2009}".to_owned(), false),
+                ("parse".to_owned(), true),
+                ("\u{2009}".to_owned(), false),
+                (" now".to_owned(), false),
+            ]
+        );
+        assert_eq!(
+            text("a `b"),
+            [("a ".to_owned(), false), ("`b".to_owned(), false)]
+        );
     }
 
     #[test]
