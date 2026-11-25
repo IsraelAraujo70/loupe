@@ -3867,6 +3867,7 @@ dependencies = [
  "loupe-linear",
  "loupe-t3",
  "loupe-update",
+ "rust-i18n",
  "security-framework",
  "serde",
  "serde_json",

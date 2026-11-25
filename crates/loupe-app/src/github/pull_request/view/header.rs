@@ -101,7 +101,6 @@ impl PullRequestView {
                     .icon(IconName::ExternalLink)
                     .label("Open on GitHub")
                     .tooltip("Open this pull request in the browser")
-                    .accessibility_label("Open in browser")
                     .on_click(move |_, _, cx| cx.open_url(&url)),
             )
             .child(self.render_summarize_button(detail, cx))
