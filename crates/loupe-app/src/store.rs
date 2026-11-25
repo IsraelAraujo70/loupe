@@ -206,6 +206,10 @@ pub struct Settings {
     /// The expanded sidebar's width in points, set by dragging its edge.
     /// `None` is the default width, which a double-click on the edge restores.
     pub sidebar_width: Option<f32>,
+    /// The files tree's width in points, set by dragging its edge, the same
+    /// in every pull request. `None` is the default width, which a
+    /// double-click on the edge restores.
+    pub file_tree_width: Option<f32>,
     /// The tabs of files written before panes: moved into `panes` when the
     /// file loads, never written.
     #[serde(skip_serializing)]

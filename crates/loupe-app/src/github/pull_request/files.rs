@@ -32,7 +32,7 @@ use gpui_kit::component::diff::{
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Search};
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::resize_handle;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -59,8 +59,8 @@ use self::search::{Match, Needle};
 use self::sticky::HeaderWatch;
 use self::tree::{
     GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
-    file_tint, filter_keeps, folder_tint, into_tree_order, move_down, move_left, move_right,
-    move_up, tree_rows, viewed_mark,
+    file_tint, filter_keeps, folder_tint, initial_collapsed, into_tree_order, move_down, move_left,
+    move_right, move_up, tree_rows, viewed_mark,
 };
 use self::tree_view::{RowView, StickyFolders};
 use super::tab::{PrTabContext, PrTabEvent};
@@ -205,6 +205,8 @@ pub struct FilesTab {
     files: Vec<ChangedFile>,
     /// Folders the viewer closed, by full path.
     collapsed: HashSet<String>,
+    /// The tree's width in points while its edge is dragged.
+    tree_drag: Option<f32>,
     /// The selected tree row, by path, so it survives filtering and reloads.
     selected: Option<String>,
     tree_focus: FocusHandle,
@@ -316,6 +318,7 @@ impl FilesTab {
             _load: None,
             files: Vec::new(),
             collapsed: HashSet::new(),
+            tree_drag: None,
             selected: None,
             tree_focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
@@ -550,6 +553,9 @@ impl FilesTab {
         self.load.finish(Ok(()));
         let first_load = self.diff.is_none();
         self.files = loaded.files;
+        if first_load {
+            self.collapsed = initial_collapsed(&self.files);
+        }
         eprintln!(
             "review-files-ready pr={} files={} timestamp={}",
             self.context.pr.url(),
@@ -2333,6 +2339,7 @@ impl FilesTab {
                             icon_color,
                             additions: dir.additions,
                             deletions: dir.deletions,
+                            files: count,
                             status: None,
                             viewed,
                             selected: is_selected,
@@ -2370,6 +2377,7 @@ impl FilesTab {
                             icon_color: muted,
                             additions: file.additions,
                             deletions: file.deletions,
+                            files: 0,
                             status: Some((status_letter(file.status), tint)),
                             viewed: if viewed {
                                 ViewedMark::All
@@ -2931,32 +2939,120 @@ impl FilesTab {
             }))
             .child(
                 // The tree's edge drags, so a deep path can be given the
-                // room to show whole.
+                // room to show whole; the width holds in every pull request
+                // and across restarts. A drag ends at the mouse up, wherever
+                // in the window it lands.
                 div().flex_1().min_h_0().w_full().child({
-                    let tree = resizable_panel()
-                        .size(dp(FILE_LIST_WIDTH))
-                        .size_range(dp(FILE_LIST_MIN)..dp(FILE_LIST_MAX))
+                    let tree_right =
+                        Settings::get(cx).file_tree_position == FileTreePosition::Right;
+                    let width = dp(self.tree_width(cx));
+                    let tree = div()
+                        .flex_none()
+                        .h_full()
+                        .w(width)
                         .child(self.file_list(window, cx));
                     let find_bar = self.find.open.then(|| self.find_bar(cx));
-                    let diff = resizable_panel().child(
-                        v_flex()
-                            .size_full()
-                            .children(find_bar)
-                            .child(h_flex().flex_1().min_h_0().w_full().child(diff_body)),
-                    );
-                    // One id per side: the group keeps its panels' widths by
-                    // index, and the tree's width must not land on the diff.
-                    match Settings::get(cx).file_tree_position {
-                        FileTreePosition::Left => {
-                            h_resizable("files-split").child(tree).child(diff)
-                        }
-                        FileTreePosition::Right => {
-                            h_resizable("files-split-right").child(diff).child(tree)
-                        }
+                    let diff = v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .children(find_bar)
+                        .child(h_flex().flex_1().min_h_0().w_full().child(diff_body));
+                    // Last, so the band straddling the seam is on top of both.
+                    let edge = div()
+                        .absolute()
+                        .top_0()
+                        .h_full()
+                        .w(px(0.))
+                        .map(|edge| {
+                            if tree_right {
+                                edge.right(width)
+                            } else {
+                                edge.left(width)
+                            }
+                        })
+                        .child(self.tree_edge(cx));
+                    let split = h_flex()
+                        .relative()
+                        .size_full()
+                        .on_drag_move(cx.listener(Self::drag_tree_edge))
+                        .capture_any_mouse_up(
+                            cx.listener(|this, _, _, cx| this.finish_tree_drag(cx)),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.finish_tree_drag(cx)),
+                        );
+                    if tree_right {
+                        split.child(diff).child(tree).child(edge)
+                    } else {
+                        split.child(tree).child(diff).child(edge)
                     }
                 }),
             )
             .into_any_element()
+    }
+
+    /// The tree's width in points: the one being dragged, else the saved one.
+    fn tree_width(&self, cx: &App) -> f32 {
+        self.tree_drag
+            .or(Settings::get(cx).file_tree_width)
+            .map_or(FILE_LIST_WIDTH, |width| {
+                width.clamp(FILE_LIST_MIN, FILE_LIST_MAX)
+            })
+    }
+
+    fn drag_tree_edge(
+        &mut self,
+        event: &DragMoveEvent<ResizeFileTree>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = Settings::get(cx);
+        // From the split's edge on the tree's side to the pointer.
+        let dragged = match settings.file_tree_position {
+            FileTreePosition::Left => event.event.position.x - event.bounds.left(),
+            FileTreePosition::Right => event.bounds.right() - event.event.position.x,
+        };
+        let points = f32::from(dragged) / settings.zoom.factor();
+        let width = points.round().clamp(FILE_LIST_MIN, FILE_LIST_MAX);
+        if self.tree_drag != Some(width) {
+            self.tree_drag = Some(width);
+            cx.notify();
+        }
+    }
+
+    fn finish_tree_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(width) = self.tree_drag.take() {
+            update_settings(cx, move |settings| settings.file_tree_width = Some(width));
+        }
+    }
+
+    /// The band on the seam between the tree and the diff: drag to resize,
+    /// double click to restore the default width.
+    fn tree_edge(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        resize_handle::<ResizeFileTree, ResizeFileTree>("files-tree-edge", Axis::Horizontal)
+            .role(Role::Splitter)
+            .aria_label("Resize file tree")
+            .aria_description("Drag to resize. Double-click to restore the default width.")
+            .debug_selector(|| "files-tree-edge".into())
+            .on_drag(ResizeFileTree, |_, _, _, cx| cx.new(|_| ResizeFileTree))
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    this.tree_drag = None;
+                    update_settings(cx, |settings| settings.file_tree_width = None);
+                }
+            }))
+    }
+}
+
+/// A drag on the files tree's edge, and the (empty) view it drags.
+#[derive(Clone)]
+struct ResizeFileTree;
+
+impl Render for ResizeFileTree {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
     }
 }
 
@@ -3351,6 +3447,11 @@ pub(super) mod tests {
         drag_divider(cx, tree.right(), 60.);
         let (tree, _) = panes(cx);
         assert_eq!(width(tree), FILE_LIST_WIDTH + 60., "the edge drags");
+        assert_eq!(
+            cx.update(|_, cx| Settings::get(cx).file_tree_width),
+            Some(FILE_LIST_WIDTH + 60.),
+            "the width is kept"
+        );
 
         cx.update(|_, cx| {
             update_settings(cx, |settings| {
@@ -3361,13 +3462,13 @@ pub(super) mod tests {
         assert_eq!(f32::from(diff.left()), 0., "the diff starts on the left");
         assert!(tree.left() >= diff.right(), "the tree comes after the diff");
         assert_eq!(f32::from(tree.right()).round(), WINDOW_WIDTH);
-        assert_eq!(width(tree), FILE_LIST_WIDTH, "the same starting width");
+        assert_eq!(width(tree), FILE_LIST_WIDTH + 60., "the same width");
 
         // The same drag, mirrored: pulling the edge away from the tree's
         // side widens the tree, within the same limits.
         drag_divider(cx, tree.left(), -60.);
         let (tree, diff) = panes(cx);
-        assert_eq!(width(tree), FILE_LIST_WIDTH + 60.);
+        assert_eq!(width(tree), FILE_LIST_WIDTH + 120.);
         assert_eq!(f32::from(tree.right()).round(), WINDOW_WIDTH);
         assert!(tree.left() >= diff.right());
 
