@@ -1,9 +1,9 @@
 //! Recipes: a name, the servings it feeds, and its amounts.
 
-mod parse;
+mod parser;
 pub mod scale;
 
-pub use parse::parse_line;
+pub use parser::parse_line;
 
 use crate::units::Unit;
 
