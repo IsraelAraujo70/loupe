@@ -315,7 +315,7 @@ impl PullRequestView {
             stack_task: None,
             stack_merge_run: None,
             stack_merge_task: None,
-            tab: PrTab::Conversation,
+            tab: PrTab::initial(),
             loaded: None,
             commit: None,
             incoming: None,
