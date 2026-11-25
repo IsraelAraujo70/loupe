@@ -44,8 +44,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::diff::{DiffLine, Hunk, anchor_for_range, find_line, git_patch, parse_patch};
 use loupe_github::{
-    ChangedFile, CommitFiles, FileStatus, GitHub, NodeId, PullRequestDetail, RepoRef,
-    ViewedFailure, ViewedState,
+    COMPARE_FILES_LIMIT, ChangedFile, CommitFiles, Comparison, FileStatus, GitHub, NodeId,
+    PullRequestDetail, RepoRef, Verdict, ViewedFailure, ViewedState,
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
@@ -89,6 +89,10 @@ const OMITTED_HINT: &str = "GitHub leaves some diffs out of a pull request this 
 /// The same note and hint for one commit.
 const COMMIT_OMITTED_NOTE: &str = "GitHub left this diff out because the commit is too large.";
 const COMMIT_OMITTED_HINT: &str = "GitHub leaves some diffs out of a commit this large. Their line counts are included; choose Load diff on a file, or Load all, to see them.";
+/// The same note and hint for the changes since the viewer's last review.
+const SINCE_OMITTED_NOTE: &str =
+    "GitHub left this diff out because the changes since your last review are too large.";
+const SINCE_OMITTED_HINT: &str = "GitHub leaves some diffs out of changes this large. Their line counts are included; choose Load diff on a file, or Load all, to see them.";
 /// Wide enough for a whole file name five folders deep.
 const FILE_LIST_MIN: f32 = 320.;
 /// The most of the window the tree takes, so a width dragged in a wide
@@ -101,6 +105,7 @@ pub(super) const FADE_WIDTH: f32 = 32.;
 /// What the find bar's note about diffs GitHub left out explains.
 const NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a pull request this large, so their lines are not searched. Choose Load all to search them too.";
 const COMMIT_NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a commit this large, so their lines are not searched. Choose Load all to search them too.";
+const SINCE_NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of changes this large, so their lines are not searched. Choose Load all to search them too.";
 /// How many left-out diffs Load all reads at once, so a large pull request
 /// does not send GitHub a burst of calls.
 const LOAD_ALL_AT_ONCE: usize = 4;
@@ -274,11 +279,105 @@ struct Find {
     current: Option<usize>,
 }
 
-/// The one commit a tab shows instead of the whole pull request.
+/// What a files tab shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    PullRequest,
+    Commit,
+    SinceReview,
+}
+
+/// What a tab shows instead of the whole pull request: one commit against
+/// its first parent, or every change since the viewer's last review.
 struct CommitSource {
+    /// The commit the diff ends at: the commit, or the head.
     oid: String,
-    /// Its first parent, once its files load.
+    /// The commit the diff starts from: the commit's first parent once its
+    /// files load, or the commit the viewer last reviewed.
     parent: Option<String>,
+    /// Set for the changes since the viewer's last review: how many commits
+    /// they span, and whether GitHub cut its list of files, once compared.
+    since_review: Option<Option<Compared>>,
+}
+
+impl CommitSource {
+    fn is_since_review(&self) -> bool {
+        self.since_review.is_some()
+    }
+}
+
+/// What GitHub's comparison of the reviewed commit and the head says
+/// beside the files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Compared {
+    commits: u32,
+    truncated: bool,
+}
+
+/// "Since your last review" in the pull request's own tab: the commits it
+/// compares, how many files changed once GitHub said, and the tab that
+/// shows those changes while the toggle is on.
+struct SinceReview {
+    reviewed: String,
+    head: String,
+    /// The number of files and the comparison, or why it failed.
+    files: Option<Result<(usize, Compared), SharedString>>,
+    _load: Task<()>,
+    shown: Option<SinceTab>,
+}
+
+struct SinceTab {
+    tab: Entity<FilesTab>,
+    _events: [Subscription; 2],
+}
+
+/// The changes-since-review tab asks its pull request's tab to show every
+/// change again.
+pub struct ShowAllChanges;
+
+/// What the bar over the changes since a review says when GitHub cut the list.
+const SINCE_CUT_HINT: &str = "GitHub lists at most 300 files of a comparison. The rest changed too; open the comparison on GitHub to see them.";
+
+/// "1 file", "12 files", or "300+ files" for a list GitHub cut.
+fn files_label(files: usize, truncated: bool) -> String {
+    match (files, truncated) {
+        (files, true) => format!("{files}+ files"),
+        (1, false) => "1 file".to_owned(),
+        (files, false) => format!("{files} files"),
+    }
+}
+
+/// "1 commit" or "3 commits".
+fn commits_label(commits: u32) -> String {
+    match commits {
+        1 => "1 commit".to_owned(),
+        commits => format!("{commits} commits"),
+    }
+}
+
+fn short_sha(oid: &str) -> String {
+    oid.chars().take(7).collect()
+}
+
+/// Where GitHub's comparison of `reviewed` and `head` is kept; it never
+/// changes.
+fn comparison_key(cx: &App, repo: &RepoRef, reviewed: &str, head: &str) -> Option<String> {
+    crate::cache::github_key(cx, &format!("compare/{}/{reviewed}...{head}", repo.url()))
+}
+
+/// GitHub's comparison of `reviewed` and `head`, from the cache under
+/// `key` when it is there.
+fn comparison(
+    gh: &GitHub,
+    repo: &RepoRef,
+    reviewed: &str,
+    head: &str,
+    key: Option<&str>,
+) -> loupe_github::Result<Comparison> {
+    match key.and_then(crate::cache::get::<Comparison>) {
+        Some(comparison) => Ok(comparison),
+        None => gh.compare(repo, reviewed, head),
+    }
 }
 
 /// Load all: every diff GitHub left out, read a few at a time and put in the
@@ -308,6 +407,9 @@ impl LoadAll {
 pub struct FilesTab {
     context: PrTabContext,
     commit: Option<CommitSource>,
+    /// "Since your last review", while commits landed after it: only in
+    /// the pull request's own tab.
+    since: Option<SinceReview>,
     load: Loadable<()>,
     _load: Option<Task<()>>,
     files: Vec<ChangedFile>,
@@ -389,7 +491,30 @@ impl FilesTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let commit = CommitSource { oid, parent: None };
+        let commit = CommitSource {
+            oid,
+            parent: None,
+            since_review: None,
+        };
+        Self::build(context, Some(commit), find, window, cx)
+    }
+
+    /// The tab for every change from `reviewed`, the commit the viewer last
+    /// reviewed, to the head, as GitHub compares them. Like a commit's, its
+    /// Viewed marks are the pull request's, and it takes no threads or new
+    /// comments.
+    fn for_since_review(
+        context: PrTabContext,
+        reviewed: String,
+        find: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let commit = CommitSource {
+            oid: context.detail.head_oid.clone(),
+            parent: Some(reviewed),
+            since_review: Some(None),
+        };
         Self::build(context, Some(commit), find, window, cx)
     }
 
@@ -430,6 +555,7 @@ impl FilesTab {
         let mut tab = Self {
             context,
             commit,
+            since: None,
             load: Loadable::Loading,
             _load: None,
             files: Vec::new(),
@@ -482,6 +608,7 @@ impl FilesTab {
             },
         };
         tab.load_files(cx);
+        tab.sync_since(window, cx);
         tab
     }
 
@@ -527,13 +654,94 @@ impl FilesTab {
             self.load_files(cx);
         }
         self.sync_threads(window, cx);
+        self.sync_since(window, cx);
         cx.notify();
     }
 
-    fn load_files(&mut self, cx: &mut Context<Self>) {
+    /// Keeps "Since your last review" on the commits the pull request has
+    /// now: compares the reviewed commit and the head again when either
+    /// moved, keeping the toggle on, and hands the shown tab the detail.
+    fn sync_since(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.commit.is_some() {
-            self.load_commit_files(cx);
             return;
+        }
+        let detail = self.context.detail.clone();
+        let wanted = detail
+            .reviewed_before_head()
+            .map(|review| (review.commit_oid.clone(), detail.head_oid.clone()));
+        let current = self
+            .since
+            .as_ref()
+            .map(|since| (since.reviewed.clone(), since.head.clone()));
+        if wanted == current {
+            if let Some(shown) = self.since.as_ref().and_then(|since| since.shown.as_ref()) {
+                shown
+                    .tab
+                    .update(cx, |tab, cx| tab.set_detail(detail, window, cx));
+            }
+            return;
+        }
+        let was_on = self
+            .since
+            .as_ref()
+            .is_some_and(|since| since.shown.is_some());
+        self.since = wanted.map(|(reviewed, head)| self.compare_since(reviewed, head, cx));
+        if was_on {
+            self.show_since(true, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Asks GitHub what changed from `reviewed` to `head`, for the toggle's
+    /// count; the tab the toggle opens reads the same comparison.
+    fn compare_since(&self, reviewed: String, head: String, cx: &mut Context<Self>) -> SinceReview {
+        let repo = self.context.pr.repo.clone();
+        let key = comparison_key(cx, &repo, &reviewed, &head);
+        let read_key = key.clone();
+        let (from, to) = (reviewed.clone(), head.clone());
+        let (asked_from, asked_to) = (reviewed.clone(), head.clone());
+        let load = common::run(
+            cx,
+            move |gh| comparison(gh, &repo, &from, &to, read_key.as_deref()),
+            move |this: &mut Self, result, _| {
+                let Some(since) = this
+                    .since
+                    .as_mut()
+                    .filter(|since| since.reviewed == asked_from && since.head == asked_to)
+                else {
+                    return;
+                };
+                since.files = Some(match result {
+                    Ok(comparison) => {
+                        if let Some(key) = &key {
+                            crate::cache::put(key, &comparison);
+                        }
+                        Ok((
+                            comparison.files.len(),
+                            Compared {
+                                commits: comparison.commits,
+                                truncated: comparison.truncated,
+                            },
+                        ))
+                    }
+                    Err(error) => Err(error.message().into()),
+                });
+            },
+        );
+        SinceReview {
+            reviewed,
+            head,
+            files: None,
+            _load: load,
+            shown: None,
+        }
+    }
+
+    fn load_files(&mut self, cx: &mut Context<Self>) {
+        match self.scope() {
+            Scope::PullRequest => {}
+            Scope::Commit => return self.load_commit_files(cx),
+            Scope::SinceReview => return self.load_since_review_files(cx),
         }
         let key = crate::cache::github_key(
             cx,
@@ -667,6 +875,93 @@ impl FilesTab {
                 this.finish_load(loaded, cx);
             },
         ));
+    }
+
+    /// Loads the changes since the viewer's last review, kept by the commits
+    /// compared since they never change, and reads their viewed marks in the
+    /// pull request every time.
+    fn load_since_review_files(&mut self, cx: &mut Context<Self>) {
+        let Some((reviewed, head)) = self
+            .commit
+            .as_ref()
+            .and_then(|source| Some((source.parent.clone()?, source.oid.clone())))
+        else {
+            return;
+        };
+        let pr = self.context.pr.clone();
+        let key = comparison_key(cx, &pr.repo, &reviewed, &head);
+        let attributes_key = attributes_key(cx, &pr.repo, &head);
+        self.load.start_refresh();
+        let read_key = key.clone();
+        self._load = Some(common::run(
+            cx,
+            move |gh| {
+                let comparison = comparison(gh, &pr.repo, &reviewed, &head, read_key.as_deref())?;
+                let mut files = comparison.files.clone();
+                gh.merge_viewed_states(&pr, &mut files)?;
+                let attributes = read_attributes(gh, &pr.repo, &head, attributes_key.as_deref());
+                Ok((comparison, review_files(files, &attributes)))
+            },
+            move |this, result, cx| {
+                let loaded = result.map(|(comparison, loaded)| {
+                    if let Some(key) = &key {
+                        crate::cache::put(key, &comparison);
+                    }
+                    if let Some(source) = &mut this.commit {
+                        source.since_review = Some(Some(Compared {
+                            commits: comparison.commits,
+                            truncated: comparison.truncated,
+                        }));
+                    }
+                    loaded
+                });
+                this.finish_load(loaded, cx);
+            },
+        ));
+    }
+
+    fn scope(&self) -> Scope {
+        match &self.commit {
+            None => Scope::PullRequest,
+            Some(source) if source.is_since_review() => Scope::SinceReview,
+            Some(_) => Scope::Commit,
+        }
+    }
+
+    /// Turns "Since your last review" on or off. Off, the Viewed marks set
+    /// in the changes since the review are read again here.
+    fn show_since(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(since) = &mut self.since else {
+            return;
+        };
+        if !on {
+            let Some(shown) = since.shown.take() else {
+                return;
+            };
+            if shown.tab.read(cx).wrote_viewed() {
+                self.refresh_viewed(cx);
+            }
+            cx.notify();
+            return;
+        }
+        if since.shown.is_some() {
+            return;
+        }
+        let reviewed = since.reviewed.clone();
+        let context = self.context.clone();
+        let find = self.open_find_text(cx);
+        let tab = cx.new(|cx| FilesTab::for_since_review(context, reviewed, find, window, cx));
+        let events = cx.subscribe(&tab, |_, _, event: &PrTabEvent, cx| cx.emit(event.clone()));
+        let back = cx.subscribe_in(&tab, window, |this, _, _: &ShowAllChanges, window, cx| {
+            this.show_since(false, window, cx)
+        });
+        if let Some(since) = &mut self.since {
+            since.shown = Some(SinceTab {
+                tab,
+                _events: [events, back],
+            });
+        }
+        cx.notify();
     }
 
     fn finish_load(
@@ -1553,6 +1848,7 @@ impl FilesTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_since(false, window, cx);
         if !self.filter.read(cx).value().is_empty() {
             self.filter
                 .update(cx, |filter, cx| filter.set_value("", window, cx));
@@ -1820,10 +2116,10 @@ impl FilesTab {
             .iter()
             .filter(|(path, reason)| **reason == Missing::Omitted && filter_keeps(path, &filter))
             .count();
-        let hint = if self.commit.is_some() {
-            COMMIT_NOT_SEARCHED_HINT
-        } else {
-            NOT_SEARCHED_HINT
+        let hint = match self.scope() {
+            Scope::PullRequest => NOT_SEARCHED_HINT,
+            Scope::Commit => COMMIT_NOT_SEARCHED_HINT,
+            Scope::SinceReview => SINCE_NOT_SEARCHED_HINT,
         };
         let focus_input = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
             this.find
@@ -2198,10 +2494,10 @@ impl FilesTab {
             .values()
             .filter(|reason| **reason == Missing::Omitted)
             .count();
-        let omitted_hint = if self.commit.is_some() {
-            COMMIT_OMITTED_HINT
-        } else {
-            OMITTED_HINT
+        let omitted_hint = match self.scope() {
+            Scope::PullRequest => OMITTED_HINT,
+            Scope::Commit => COMMIT_OMITTED_HINT,
+            Scope::SinceReview => SINCE_OMITTED_HINT,
         };
         let filter = self.filter.read(cx).value();
         let shown = (!filter.trim().is_empty()).then(|| {
@@ -2236,6 +2532,7 @@ impl FilesTab {
                 .into_any_element(),
             widgets::diff_stat(additions, deletions).into_any_element(),
         ];
+        parts.extend(self.since_toggle(cx));
         if self.load.is_busy() {
             parts.push(Spinner::new().xsmall().color(muted).into_any_element());
         }
@@ -2362,6 +2659,202 @@ impl FilesTab {
             .border_color(border)
             .children(parts)
             .into_any_element()
+    }
+
+    /// The toggle between every change and the changes since the viewer's
+    /// last review, with how many files changed since: in the pull
+    /// request's tab while commits landed after the review, selected in the
+    /// tab it opens.
+    fn since_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (on, files) = match (&self.commit, &self.since) {
+            (Some(source), _) => {
+                let compared = source.since_review?;
+                (
+                    true,
+                    compared.map(|compared| Ok((self.files.len(), compared))),
+                )
+            }
+            (None, Some(since)) => (false, since.files.clone()),
+            (None, None) => return None,
+        };
+        let muted = cx.theme().muted_foreground;
+        let count = match &files {
+            Some(Ok((files, compared))) => Some(files_label(*files, compared.truncated)),
+            _ => None,
+        };
+        let name = match &count {
+            Some(count) => format!("Since your last review, {count}"),
+            None => "Since your last review".to_owned(),
+        };
+        let tooltip = match (on, &files) {
+            (true, _) => "Show every change of the pull request".to_owned(),
+            (false, Some(Err(error))) => format!("GitHub did not compare the commits: {error}"),
+            (false, files) => {
+                let commits = match files {
+                    Some(Ok((_, compared))) => commits_label(compared.commits),
+                    _ => "the commits".to_owned(),
+                };
+                format!("Show only what changed in the {commits} after your last review")
+            }
+        };
+        let status = match (&files, count) {
+            (Some(Ok(_)), Some(count)) => Some(
+                div()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(count)
+                    .into_any_element(),
+            ),
+            (None, _) => Some(Spinner::new().xsmall().color(muted).into_any_element()),
+            _ => None,
+        };
+        Some(
+            Button::new("files-since-review")
+                .debug_selector(|| "files-since-review".into())
+                .ghost()
+                .control()
+                .icon(IconName::RotateCcwClock)
+                .label("Since your last review")
+                .children(status)
+                .selected(on)
+                .toggled(on)
+                .tooltip(tooltip)
+                .accessibility_label(name)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if on {
+                        cx.emit(ShowAllChanges);
+                    } else {
+                        this.show_since(true, window, cx);
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The bar over the changes since the viewer's last review, as over one
+    /// commit: back to all changes, which review they start at and how many
+    /// commits came after it, and the comparison on GitHub.
+    fn since_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let source = self
+            .commit
+            .as_ref()
+            .filter(|source| source.is_since_review())?;
+        let reviewed = source.parent.clone()?;
+        let compared = source.since_review.flatten();
+        let theme = cx.theme();
+        let (muted, mono) = (theme.muted_foreground, theme.mono_font_family.clone());
+        let review = self
+            .context
+            .detail
+            .viewer_review
+            .as_ref()
+            .filter(|review| review.commit_oid == reviewed);
+        let verb = match review.and_then(|review| review.verdict) {
+            Some(Verdict::Approved) => "You approved",
+            Some(Verdict::ChangesRequested) => "You requested changes on",
+            None => "You reviewed",
+        };
+        let when = review
+            .and_then(|review| review.submitted_at)
+            .map(|at| match ui::relative_time(at, Utc::now()) {
+                age if age == "now" => "just now".to_owned(),
+                age => format!("{age} ago"),
+            });
+        let sha = short_sha(&reviewed);
+        let mut summary = format!("Since your last review. {verb} {sha}");
+        if let Some(when) = &when {
+            summary.push_str(&format!(" {when}"));
+        }
+        if let Some(compared) = compared {
+            summary.push_str(&format!(
+                ", then {} landed",
+                commits_label(compared.commits)
+            ));
+        }
+        let url = format!(
+            "{}/compare/{reviewed}...{}",
+            self.context.pr.repo.url(),
+            source.oid
+        );
+        let truncated = compared.is_some_and(|compared| compared.truncated);
+        Some(
+            ui::toolbar()
+                .id("since-review-bar")
+                .child(
+                    Button::new("since-review-all-changes")
+                        .ghost()
+                        .control()
+                        .icon(IconName::ArrowLeft)
+                        .label("All changes")
+                        .tooltip("Show every change of the pull request")
+                        .accessibility_label("Show all changes")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ShowAllChanges))),
+                )
+                .child(ui::vertical_divider(cx))
+                .child(
+                    h_flex()
+                        .id("since-review-summary")
+                        .role(Role::Group)
+                        .aria_label(summary.clone())
+                        .flex_1()
+                        .min_w_0()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::RotateCcwClock)
+                                .small()
+                                .text_color(muted),
+                        )
+                        .child(div().flex_none().text_size(scale::body()).child(verb))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(mono)
+                                .text_size(scale::code())
+                                .text_color(muted)
+                                .child(sha),
+                        )
+                        .children(when.map(|when| {
+                            div()
+                                .flex_none()
+                                .text_size(scale::meta())
+                                .text_color(muted)
+                                .child(when)
+                        }))
+                        .tooltip(move |window, cx| Tooltip::new(summary.clone()).build(window, cx)),
+                )
+                .children(compared.map(|compared| {
+                    div()
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .child(format!("{} since", commits_label(compared.commits)))
+                }))
+                .when(truncated, |bar| {
+                    bar.child(
+                        div()
+                            .id("since-review-cut")
+                            .role(Role::Note)
+                            .aria_label(SINCE_CUT_HINT)
+                            .flex_none()
+                            .text_size(scale::meta())
+                            .text_color(muted)
+                            .tooltip(|window, cx| Tooltip::new(SINCE_CUT_HINT).build(window, cx))
+                            .child(format!("First {COMPARE_FILES_LIMIT} files")),
+                    )
+                })
+                .child(
+                    Button::new("since-review-on-github")
+                        .ghost()
+                        .control()
+                        .icon(IconName::ExternalLink)
+                        .label("Open on GitHub")
+                        .tooltip("Compare the reviewed commit with the head in the browser")
+                        .accessibility_label("Open the comparison on GitHub")
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+                .into_any_element(),
+        )
     }
 
     fn current_rows(&self, cx: &App) -> Vec<TreeRow> {
@@ -2817,8 +3310,11 @@ impl FilesTab {
             annotations.push(DiffAnnotation::file(id.clone(), path.clone()));
             let note = match self.patch_errors.get(path) {
                 Some(error) => error.clone().into(),
-                None if self.commit.is_some() && *reason == Missing::Omitted => {
+                None if *reason == Missing::Omitted && self.scope() == Scope::Commit => {
                     COMMIT_OMITTED_NOTE.into()
+                }
+                None if *reason == Missing::Omitted && self.scope() == Scope::SinceReview => {
+                    SINCE_OMITTED_NOTE.into()
                 }
                 None => reason.note().into(),
             };
@@ -3672,10 +4168,15 @@ fn skeleton(cx: &App) -> impl IntoElement {
 
 impl EventEmitter<PrTabEvent> for FilesTab {}
 
+impl EventEmitter<ShowAllChanges> for FilesTab {}
+
 impl Render for FilesTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.threads_dirty {
             self.sync_threads(window, cx);
+        }
+        if let Some(shown) = self.since.as_ref().and_then(|since| since.shown.as_ref()) {
+            return div().size_full().child(shown.tab.clone());
         }
         let body = match &self.load {
             Loadable::Loading => skeleton(cx).into_any_element(),
@@ -3687,10 +4188,10 @@ impl Render for FilesTab {
                 ui::empty_state(
                     IconName::FileDiff,
                     "No changed files",
-                    if self.commit.is_some() {
-                        "This commit does not change any files."
-                    } else {
-                        "This pull request does not change any files."
+                    match self.scope() {
+                        Scope::PullRequest => "This pull request does not change any files.",
+                        Scope::Commit => "This commit does not change any files.",
+                        Scope::SinceReview => "Nothing changed since your last review.",
                     },
                 )
                 .into_any_element()
@@ -3707,7 +4208,14 @@ impl Render for FilesTab {
             .on_action(cx.listener(|this, _: &FindInDiff, window, cx| this.open_find(window, cx)))
             // A text field answers Cmd+F with Search and passes it on.
             .on_action(cx.listener(|this, _: &Search, window, cx| this.open_find(window, cx)))
-            .child(body)
+            .child(match self.since_bar(cx) {
+                Some(bar) => v_flex()
+                    .size_full()
+                    .child(bar)
+                    .child(div().flex_1().min_h_0().w_full().child(body))
+                    .into_any_element(),
+                None => body,
+            })
     }
 }
 
@@ -3726,7 +4234,7 @@ pub(super) mod tests {
     use loupe_github::diff::{git_patch, parse_patch};
     use loupe_github::{
         ChangedFile, Checks, FileStatus, MergeMethod, MergeStateStatus, Mergeable, PrRef, PrState,
-        PullRequestDetail, RepoRef, ViewedState,
+        PullRequestDetail, RepoRef, ViewedState, ViewerReview,
     };
 
     use super::emphasis::PLAIN;
@@ -3735,8 +4243,8 @@ pub(super) mod tests {
     use super::signal::{Attributes, classify_all};
     use super::tree::{LOW_SIGNAL, TESTS};
     use super::{
-        FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab, MODE_CHANGE_NOTE,
-        PrTabContext, review_files,
+        Compared, FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab,
+        MODE_CHANGE_NOTE, PrTabContext, Scope, ShowAllChanges, files_label, review_files,
     };
     use crate::services::{Accounts, Services};
     use crate::store::{FileTreePosition, Settings, update_settings};
@@ -4921,5 +5429,129 @@ pub(super) mod tests {
         assert_eq!(group.additions, 2_001);
         assert_eq!(group.paths, ["assets/badge.png", "data/part-01.csv"]);
         assert!(!group.all_viewed);
+    }
+
+    fn modified(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+            patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
+            viewed: ViewedState::Unviewed,
+        }
+    }
+
+    /// The pull request's tab with the viewer's last review given on
+    /// `reviewed` (the head is `abc`).
+    fn open_reviewed_tab(
+        cx: &mut TestAppContext,
+        reviewed: &'static str,
+    ) -> (VisualTestContext, Entity<FilesTab>) {
+        open_tab(
+            cx,
+            vec![modified("src/a.rs"), modified("src/b.rs")],
+            move |mut context, window, cx| {
+                context.detail = Arc::new(PullRequestDetail {
+                    viewer_review: Some(ViewerReview {
+                        verdict: None,
+                        commit_oid: reviewed.into(),
+                        submitted_at: None,
+                    }),
+                    ..detail()
+                });
+                FilesTab::new(context, window, cx)
+            },
+        )
+    }
+
+    #[gpui_kit::test]
+    fn since_your_last_review_shows_the_changes_after_it_and_back(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_reviewed_tab(cx, "0ld");
+        let cx = &mut cx;
+        let compared = Compared {
+            commits: 2,
+            truncated: false,
+        };
+        tab.update(cx, |tab, _| {
+            let since = tab.since.as_mut().expect("commits landed after the review");
+            assert_eq!(
+                (since.reviewed.as_str(), since.head.as_str()),
+                ("0ld", "abc")
+            );
+            since.files = Some(Ok((1, compared)));
+        });
+        draw(cx);
+        assert!(
+            cx.debug_bounds("files-since-review").is_some(),
+            "the toggle is in the bar"
+        );
+
+        let shown = tab.update_in(cx, |tab, window, cx| {
+            tab.show_since(true, window, cx);
+            tab.since
+                .as_ref()
+                .and_then(|since| since.shown.as_ref())
+                .map(|shown| shown.tab.clone())
+                .expect("the toggle is on")
+        });
+        cx.run_until_parked();
+        shown.update(cx, |since, cx| {
+            assert_eq!(since.scope(), Scope::SinceReview);
+            assert_eq!(
+                since.diff_ends(),
+                ("0ld".to_owned(), "abc".to_owned()),
+                "from the reviewed commit to the head"
+            );
+            let files = vec![modified("src/b.rs")];
+            let signals = classify_all(&files, &Attributes::default());
+            since.finish_load(
+                Ok((
+                    build_files(files, git_patch, |patch| parse_patch(patch).ok()),
+                    signals,
+                )),
+                cx,
+            );
+            if let Some(source) = &mut since.commit {
+                source.since_review = Some(Some(compared));
+            }
+        });
+        draw(cx);
+        assert!(
+            cx.debug_bounds("files-since-review").is_some(),
+            "the toggle stays in the bar, on"
+        );
+        assert_eq!(shown.read_with(cx, |since, _| since.files.len()), 1);
+
+        shown.update(cx, |_, cx| cx.emit(ShowAllChanges));
+        cx.run_until_parked();
+        assert!(
+            tab.read_with(cx, |tab, _| tab
+                .since
+                .as_ref()
+                .is_some_and(|since| since.shown.is_none())),
+            "All changes or the toggle shows every change again"
+        );
+        assert_eq!(tab.read_with(cx, |tab, _| tab.files.len()), 2);
+    }
+
+    #[gpui_kit::test]
+    fn no_toggle_without_commits_after_your_review(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_reviewed_tab(cx, "abc");
+        let cx = &mut cx;
+        draw(cx);
+        assert!(tab.read_with(cx, |tab, _| tab.since.is_none()));
+        assert!(
+            cx.debug_bounds("files-since-review").is_none(),
+            "a review of the head leaves nothing to show since"
+        );
+    }
+
+    #[test]
+    fn the_toggle_counts_files_and_says_when_github_cut_the_list() {
+        assert_eq!(files_label(1, false), "1 file");
+        assert_eq!(files_label(12, false), "12 files");
+        assert_eq!(files_label(300, true), "300+ files");
     }
 }

@@ -459,7 +459,7 @@ pub struct PullRequestDetail {
     pub pending_review: Option<PendingReview>,
     pub viewer_login: String,
     pub viewer_can_update: bool,
-    /// The viewer's latest review when it approves or asks for changes.
+    /// The viewer's latest submitted review, whatever it decided.
     /// Defaulted so details cached before this field still load.
     #[serde(default)]
     pub viewer_review: Option<ViewerReview>,
@@ -488,7 +488,15 @@ impl PullRequestDetail {
         self.viewer_review
             .as_ref()
             .filter(|review| review.commit_oid == self.head_oid)
-            .map(|review| review.verdict)
+            .and_then(|review| review.verdict)
+    }
+
+    /// The commit the viewer last reviewed, when commits landed after it:
+    /// the start of "Since your last review".
+    pub fn reviewed_before_head(&self) -> Option<&ViewerReview> {
+        self.viewer_review
+            .as_ref()
+            .filter(|review| !review.commit_oid.is_empty() && review.commit_oid != self.head_oid)
     }
 }
 
@@ -499,12 +507,27 @@ pub enum Verdict {
     ChangesRequested,
 }
 
-/// A review that approved or asked for changes, and the head commit it was
-/// given on.
+/// The viewer's latest submitted review and the head commit it was given on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewerReview {
-    pub verdict: Verdict,
+    /// `None` for a review that only commented, or was dismissed.
+    pub verdict: Option<Verdict>,
     pub commit_oid: String,
+    /// `None` in a detail cached before this field.
+    #[serde(default)]
+    pub submitted_at: Option<Timestamp>,
+}
+
+/// What changed from one commit to another, as GitHub compares them: from
+/// their merge base to the second.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Comparison {
+    /// Every file starts `Unviewed`: see [`crate::GitHub::merge_viewed_states`].
+    pub files: Vec<ChangedFile>,
+    /// The commits the second has that the first does not.
+    pub commits: u32,
+    /// GitHub lists at most [`crate::COMPARE_FILES_LIMIT`] files, so there may be more.
+    pub truncated: bool,
 }
 
 /// One edit of a pull request's description.

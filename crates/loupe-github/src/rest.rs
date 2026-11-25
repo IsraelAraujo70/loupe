@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 use ureq::RequestBuilder;
 
 use crate::{
-    Actor, BranchCi, BranchPullRequest, ChangedFile, Commit, CommitFiles, Error, FailedRun,
-    FileStatus, GitHub, Notification, NotificationSubject, PrRef, PrState, RepoRef, Result,
-    Timestamp, ViewedState,
+    Actor, BranchCi, BranchPullRequest, ChangedFile, Commit, CommitFiles, Comparison, Error,
+    FailedRun, FileStatus, GitHub, Notification, NotificationSubject, PrRef, PrState, RepoRef,
+    Result, Timestamp, ViewedState,
 };
 
 pub(crate) const REST_URL: &str = "https://api.github.com";
@@ -25,6 +25,8 @@ const COMMITS_PER_PAGE: usize = 100;
 /// The most commits [`GitHub::pull_request_commits`] lists of a pull
 /// request; a list this long may have been cut.
 pub const PR_COMMITS_LIMIT: usize = 3000;
+/// The most files GitHub lists of a comparison of two commits.
+pub const COMPARE_FILES_LIMIT: usize = 300;
 /// Compare pages read at the same time.
 const PARALLEL_PAGES: usize = 4;
 /// GitHub lists at most 3000 files of a pull request.
@@ -167,6 +169,27 @@ impl GitHub {
             }
         }
         Ok(commit)
+    }
+
+    /// What changed from `base_oid` to `head_oid` (from their merge base,
+    /// as GitHub compares), with the files' patches: one call, since GitHub
+    /// lists the files of a comparison on its first page only, at most
+    /// [`COMPARE_FILES_LIMIT`] of them. A file GitHub left the patch out of
+    /// keeps its line counts; [`GitHub::omitted_patch`] loads it.
+    pub fn compare(&self, repo: &RepoRef, base_oid: &str, head_oid: &str) -> Result<Comparison> {
+        for oid in [base_oid, head_oid] {
+            if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(Error::Decode(format!("invalid commit sha {oid:?}")));
+            }
+        }
+        let body = self.rest(
+            RestMethod::Get,
+            &format!(
+                "/repos/{}/{}/compare/{base_oid}...{head_oid}?per_page=1",
+                repo.owner, repo.name
+            ),
+        )?;
+        parse_comparison(&body)
     }
 
     /// Sets each file's viewed state in pull request `pr` from GraphQL and
@@ -934,6 +957,24 @@ struct WireCompare {
 }
 
 #[derive(Deserialize)]
+struct WireCompareFiles {
+    ahead_by: u32,
+    #[serde(default)]
+    files: Vec<WireFile>,
+}
+
+/// Parses the first page of `GET /compare/{base}...{head}`.
+fn parse_comparison(body: &str) -> Result<Comparison> {
+    let wire: WireCompareFiles =
+        serde_json::from_str(body).map_err(|error| Error::Decode(error.to_string()))?;
+    Ok(Comparison {
+        truncated: wire.files.len() >= COMPARE_FILES_LIMIT,
+        files: wire.files.into_iter().map(changed_file).collect(),
+        commits: wire.ahead_by,
+    })
+}
+
+#[derive(Deserialize)]
 struct WireCommitSha {
     sha: String,
 }
@@ -1160,6 +1201,45 @@ mod tests {
             parse_commit_page(r#"{"sha":"root","parents":[]}"#).expect("a root commit parses");
         assert_eq!(parent, None);
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn a_comparison_has_its_files_and_how_many_commits_it_spans() {
+        let body = r#"{"status":"ahead","ahead_by":2,"behind_by":0,"total_commits":2,
+            "merge_base_commit":{"sha":"aaa1"},"commits":[{"sha":"c1"}],
+            "files":[
+                {"filename":"src/new.rs","previous_filename":"src/old.rs","status":"renamed",
+                 "additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-a\n+b"},
+                {"filename":"data/huge.csv","status":"modified","additions":9000,"deletions":0}
+            ]}"#;
+        let comparison = parse_comparison(body).expect("fixture parses");
+        assert_eq!(comparison.commits, 2);
+        assert!(!comparison.truncated);
+        assert_eq!(comparison.files.len(), 2);
+        assert_eq!(comparison.files[0].status, FileStatus::Renamed);
+        assert_eq!(
+            comparison.files[0].previous_path.as_deref(),
+            Some("src/old.rs")
+        );
+        assert_eq!(
+            comparison.files[1].patch, None,
+            "a patch GitHub left out stays out"
+        );
+        assert_eq!(comparison.files[1].additions, 9000, "with its line counts");
+
+        let empty = parse_comparison(r#"{"ahead_by":0,"merge_base_commit":{"sha":"a"}}"#)
+            .expect("a comparison with no files parses");
+        assert!(empty.files.is_empty());
+
+        let file = r#"{"filename":"f","status":"modified","additions":1,"deletions":0}"#;
+        let full = format!(
+            r#"{{"ahead_by":1,"files":[{}]}}"#,
+            vec![file; COMPARE_FILES_LIMIT].join(",")
+        );
+        assert!(
+            parse_comparison(&full).expect("parses").truncated,
+            "GitHub stops listing at the limit, so a full list may be cut"
+        );
     }
 
     #[test]
