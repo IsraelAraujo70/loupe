@@ -17,3 +17,4 @@
 - Entry 017: a one-line change, so the pull request has more than 250 commits.
 - Entry 018: a one-line change, so the pull request has more than 250 commits.
 - Entry 019: a one-line change, so the pull request has more than 250 commits.
+- Entry 020: a one-line change, so the pull request has more than 250 commits.
