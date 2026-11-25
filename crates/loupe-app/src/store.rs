@@ -203,6 +203,9 @@ pub struct Settings {
     pub t3_review: crate::t3::ReviewSettings,
     /// Whether the sidebar shows as an icon rail (Cmd+B).
     pub sidebar_collapsed: bool,
+    /// Whether a pull request's details column shows, as the user last left
+    /// it in a narrow window and in a wide one.
+    pub pr_details: PrDetails,
     /// The expanded sidebar's width in points, set by dragging its edge.
     /// `None` is the default width, which a double-click on the edge restores.
     pub sidebar_width: Option<f32>,
@@ -249,6 +252,37 @@ pub struct Settings {
 }
 
 impl Global for Settings {}
+
+/// A pull request's details column as the user last left it, by window
+/// width (`theme::scale::side_column_breakpoint`). `None` until the user
+/// opens or hides it at that width: open in a wide window, hidden in a
+/// narrow one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrDetails {
+    pub narrow: Option<bool>,
+    pub wide: Option<bool>,
+}
+
+impl PrDetails {
+    /// Whether the column shows in a `wide` window or a narrow one.
+    pub fn is_open(self, wide: bool) -> bool {
+        if wide {
+            self.wide.unwrap_or(true)
+        } else {
+            self.narrow.unwrap_or(false)
+        }
+    }
+
+    /// Keeps `open` for windows as wide as `wide` says.
+    pub fn set_open(&mut self, wide: bool, open: bool) {
+        if wide {
+            self.wide = Some(open);
+        } else {
+            self.narrow = Some(open);
+        }
+    }
+}
 
 /// How a pane is split: `Horizontal` puts the two side by side,
 /// `Vertical` one over the other.
@@ -948,8 +982,8 @@ mod tests {
 
     use super::{
         CLOSED_TAB_GROUPS_KEPT, ClosedTabGroup, CommentBoxPlace, CommentOrder, Favorite,
-        FileTreePosition, KEYCHAIN_SERVICE, PaneLayout, SavedTabGroup, Secret, SecretStore,
-        Settings, SplitAxis, TabGroupColor, WorkspaceMapping, parse_github_target,
+        FileTreePosition, KEYCHAIN_SERVICE, PaneLayout, PrDetails, SavedTabGroup, Secret,
+        SecretStore, Settings, SplitAxis, TabGroupColor, WorkspaceMapping, parse_github_target,
     };
     use crate::route::Route;
     use loupe_github::RepoRef;
@@ -960,6 +994,33 @@ mod tests {
             workspace_id: workspace_id.into(),
             workspace_name: workspace_id.into(),
         }
+    }
+
+    #[test]
+    fn pull_request_details_start_by_width_and_keep_the_choice_per_width() {
+        let mut details = PrDetails::default();
+        assert!(
+            details.is_open(true),
+            "a wide window starts with the column"
+        );
+        assert!(!details.is_open(false), "a narrow one starts without it");
+
+        details.set_open(false, true);
+        assert!(details.is_open(false));
+        details.set_open(true, false);
+        assert!(!details.is_open(true));
+        assert!(details.is_open(false), "each width keeps its own choice");
+
+        let saved = serde_json::to_vec(&Settings {
+            pr_details: details,
+            ..Settings::default()
+        })
+        .unwrap();
+        assert_eq!(Settings::parse(&saved).unwrap().pr_details, details);
+        assert_eq!(
+            Settings::parse(b"{}").unwrap().pr_details,
+            PrDetails::default()
+        );
     }
 
     #[test]
