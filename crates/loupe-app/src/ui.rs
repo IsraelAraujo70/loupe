@@ -120,7 +120,7 @@ pub fn relative_time(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 /// A round avatar loaded from a remote URL. While the image loads, when it
 /// fails, or when `url` is empty it shows a neutral person icon.
 pub fn avatar(url: impl Into<SharedString>, size: Pixels) -> impl IntoElement {
-    base_avatar(url.into(), size)
+    round_avatar(url.into(), None, size)
 }
 
 /// Like [`avatar`], with the person's name: the fallback shows their initials
@@ -130,40 +130,41 @@ pub fn avatar_named(
     name: impl Into<SharedString>,
     size: Pixels,
 ) -> AnyElement {
-    let url: SharedString = url.into();
-    let name: SharedString = name.into();
-    // The kit sizes the initials' box for a custom size but not their text,
-    // which then overflows the box; the text size and line height here keep
-    // them centered in the circle.
-    let initials = move || {
-        Avatar::new()
-            .with_size(size)
-            .name(name.clone())
-            .text_size(size * 0.45)
-            .line_height(size * 0.5)
-            .into_any_element()
+    round_avatar(url.into(), Some(name.into()), size)
+}
+
+/// Every avatar of the app. gpui-component 0.9 gets two things wrong at a
+/// custom size, and no later release fixes them: the image slot leaves an
+/// empty circle while the picture loads and when it cannot load, and the
+/// initials keep the inherited text size inside a box half the avatar wide,
+/// so two letters wrap and the second is cut. Here the picture falls back to
+/// the kit's avatar, and the initials get half the avatar's size on one
+/// line, centered on that box.
+fn round_avatar(url: SharedString, name: Option<SharedString>, size: Pixels) -> AnyElement {
+    let fallback = move || {
+        let avatar = Avatar::new().with_size(size);
+        match name.clone() {
+            Some(name) => avatar
+                .name(name)
+                .text_size(size * 0.5)
+                .line_height(size * 0.5)
+                .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
+                .text_center()
+                .into_any_element(),
+            None => avatar.into_any_element(),
+        }
     };
     if url.is_empty() {
-        return initials();
+        return fallback();
     }
-    // The kit's image slot leaves an empty circle while the picture loads and
-    // when it cannot load; the initials stand in for it in both cases.
     img(url)
         .flex_none()
         .size(size)
         .rounded_full()
-        .with_loading(initials.clone())
-        .with_fallback(initials)
+        .with_loading(fallback.clone())
+        .with_fallback(fallback)
         .into_any_element()
-}
-
-fn base_avatar(url: SharedString, size: Pixels) -> Avatar {
-    let avatar = Avatar::new().with_size(size);
-    if url.is_empty() {
-        avatar
-    } else {
-        avatar.src(url)
-    }
 }
 
 /// A shortcut written with `cmd` for the platform key, as the app binds it:
