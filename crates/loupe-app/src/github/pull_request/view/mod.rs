@@ -46,6 +46,7 @@ pub(in crate::github::pull_request) use model::{
     ReviewButton, can_approve, pending_comments_label, review_button,
 };
 pub use progress::{NEXT_UNVIEWED_KEYS, NextUnviewedFile};
+pub(in crate::github::pull_request) use toolbar::{OpenReviewComposer, PendingComments};
 
 /// What exists only after the first successful load.
 #[derive(Clone)]
@@ -274,6 +275,10 @@ pub struct PullRequestView {
     /// Each file's Viewed mark when the Files tab last changed, to tell
     /// when one changes.
     viewed_marks: Vec<bool>,
+    /// Every write sent, in order: the tests' stand-in for GitHub, which
+    /// refuses a verdict on the fixture's own pull request.
+    #[cfg(test)]
+    sent_writes: Vec<Write>,
     _ticker: Task<()>,
 }
 
@@ -281,22 +286,20 @@ impl PullRequestView {
     pub(super) fn new(pr: PrRef, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let review_body = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(3, 10)
+                .auto_grow(6, 18)
                 .placeholder("Leave a comment on this pull request")
         });
-        let submit_on_secondary_enter = cx.subscribe_in(
+        // The composer's verdicts say why they cannot go out yet, which
+        // depends on the summary as it is typed.
+        let review_body_events = cx.subscribe_in(
             &review_body,
             window,
-            |this, _, event: &InputEvent, _window, cx| {
-                if matches!(
-                    event,
-                    InputEvent::PressEnter {
-                        secondary: true,
-                        ..
-                    }
-                ) {
-                    this.submit_review(ReviewEvent::Comment, cx);
-                }
+            |this, _, event: &InputEvent, _window, cx| match event {
+                InputEvent::PressEnter {
+                    secondary: true, ..
+                } => this.submit_review(ReviewEvent::Comment, cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
             },
         );
         let ticker = cx.spawn(async move |this, cx| {
@@ -350,7 +353,7 @@ impl PullRequestView {
             // The details column leaves out Linear and T3 while they are not
             // connected, so connecting one brings its section back.
             subscriptions: vec![
-                submit_on_secondary_enter,
+                review_body_events,
                 cx.observe_global::<crate::services::Services>(|_, cx| cx.notify()),
             ],
             last_fetch: Instant::now(),
@@ -369,6 +372,8 @@ impl PullRequestView {
             pr_poll_task: None,
             guide_sync: None,
             viewed_marks: Vec::new(),
+            #[cfg(test)]
+            sent_writes: Vec::new(),
             _ticker: ticker,
         };
         let page = cx.entity_id();
@@ -534,6 +539,14 @@ impl PullRequestView {
         if !self.panel.still_valid(&detail) {
             self.panel = Panel::Closed;
         }
+        PendingComments::set(
+            &detail.id,
+            detail
+                .pending_review
+                .as_ref()
+                .map_or(0, |r| r.comment_count),
+            cx,
+        );
         let link_context = PrLinkContext {
             pr: self.pr.clone(),
             ..PrLinkContext::from_detail(&detail)
@@ -893,6 +906,8 @@ impl PullRequestView {
         let Some(detail) = self.detail.value().cloned() else {
             return;
         };
+        #[cfg(test)]
+        self.sent_writes.push(write.clone());
         let clears_review_body = matches!(write, Write::Review { .. });
         let is_merge = matches!(write, Write::Merge(_));
         let marks_ready = matches!(write, Write::MarkReady);
@@ -1491,7 +1506,8 @@ impl PullRequestView {
                     cx.notify();
                 }))
         });
-        let details = self.tab.has_side_column().then(|| {
+        // The review composer takes the details column's place while open.
+        let details = (self.tab.has_side_column() && !self.composer_open()).then(|| {
             use gpui_kit::assets::IconName;
             let (name, icon) = if details_open {
                 ("Hide details", IconName::PanelRightClose)
@@ -1687,7 +1703,10 @@ impl Render for PullRequestView {
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &NextUnviewedFile, window, cx| {
                 this.next_unviewed_file(window, cx)
-            }));
+            }))
+            .on_action(
+                cx.listener(|this, _: &OpenReviewComposer, _, cx| this.open_review_composer(cx)),
+            );
         let wide = window.viewport_size().width
             >= scale::side_column_breakpoint().to_pixels(window.rem_size());
         let details_open = crate::store::Settings::get(cx).pr_details.is_open(wide);
@@ -1700,7 +1719,8 @@ impl Render for PullRequestView {
                 })
                 .into_any_element();
         };
-        let side = self.tab.has_side_column() && details_open;
+        let composing = self.composer_open();
+        let side = self.tab.has_side_column() && details_open && !composing;
         page.child(self.render_header(&detail, window, cx))
             .children(self.render_title_edit(cx))
             .child(self.render_panel_band(&detail, cx))
@@ -1719,6 +1739,9 @@ impl Render for PullRequestView {
                     )
                     .when(side, |row| {
                         row.child(self.render_side(&detail, &loaded, cx))
+                    })
+                    .when(composing, |row| {
+                        row.child(self.render_review_composer(&detail, cx))
                     }),
             )
             .into_any_element()

@@ -1,5 +1,9 @@
-//! The review and state actions of the meta line, and the band under it
-//! where the review form, a confirmation, or a write error opens.
+//! The review and state actions of the meta line, the band under it where
+//! a confirmation or a write error opens, and the review composer: a column
+//! at the trailing edge of every tab, so opening it moves nothing above or
+//! below it.
+
+use std::collections::HashMap;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
@@ -12,23 +16,61 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{
-    ChecksState, MergeMethod, PullRequestDetail, ReviewEvent, StackEntry, StackGraph,
+    ChecksState, MergeMethod, NodeId, PullRequestDetail, ReviewEvent, StackEntry, StackGraph,
     StackMergePlan, StackMergeStep, StepStatus,
 };
 
 use super::header::OverflowItems;
 use super::model::{
-    DraftAction, Panel, PrActions, PrTab, StackMerge, StateAction, can_approve,
+    DraftAction, Panel, PrActions, PrTab, ReviewButton, StackMerge, StateAction, can_approve,
     discard_confirm_text, merge_button_label, merge_confirm_text, pending_comments_label,
-    ready_subset_button_label, resolve_method, stack_confirm_headline, stack_entry_problems,
-    stack_merge, stack_merge_button_label, stack_merge_confirm_text,
+    ready_subset_button_label, resolve_method, review_blocker, review_button,
+    stack_confirm_headline, stack_entry_problems, stack_merge, stack_merge_button_label,
+    stack_merge_confirm_text,
 };
 use super::{PullRequestView, StackMergeRun, Write};
+use crate::github::common::Submit;
 use crate::github::widgets;
 use crate::shell::Refreshable as _;
 use crate::theme::{scale, tokens};
 use crate::ui;
 use crate::ui::{ControlSize as _, MenuTriggerExt as _};
+
+gpui_kit::actions!(
+    github,
+    [
+        /// Opens the review composer of the pull request on screen, on any
+        /// tab, with the caret in its summary. Dispatch it from inside the
+        /// page (the Guide's last step, the inline comment box).
+        OpenReviewComposer
+    ]
+);
+
+/// How many comments each pull request's pending review holds, by the pull
+/// request's node id, as its page last loaded it: the inline comment box
+/// says what its comment joins.
+#[derive(Default)]
+pub(in crate::github::pull_request) struct PendingComments(HashMap<NodeId, u32>);
+
+impl Global for PendingComments {}
+
+impl PendingComments {
+    pub(super) fn set(pull_request_id: &NodeId, count: u32, cx: &mut App) {
+        if Self::count(pull_request_id, cx) == count && cx.has_global::<Self>() {
+            return;
+        }
+        cx.default_global::<Self>()
+            .0
+            .insert(pull_request_id.clone(), count);
+    }
+
+    pub(in crate::github::pull_request) fn count(pull_request_id: &NodeId, cx: &App) -> u32 {
+        cx.try_global::<Self>()
+            .and_then(|counts| counts.0.get(pull_request_id))
+            .copied()
+            .unwrap_or(0)
+    }
+}
 
 /// How a confirmation commits: the merge is the pull request's goal, the
 /// others destroy something.
@@ -49,10 +91,12 @@ impl PullRequestView {
         let border = cx.theme().border;
         let surface = cx.theme().group_box;
         // Ready for review reports in the merge box, which only the
-        // Conversation tab shows; elsewhere its error comes here.
+        // Conversation tab shows; elsewhere its error comes here. A write's
+        // error shows in the review composer while it is open.
         let error = self
             .write
             .error()
+            .filter(|_| !self.composer_open())
             .or(self
                 .ready
                 .error()
@@ -64,6 +108,8 @@ impl PullRequestView {
                 !matches!(
                     self.panel,
                     Panel::Closed
+                        | Panel::Review
+                        | Panel::ConfirmDiscard
                         | Panel::ConfirmMerge(_)
                         | Panel::ConfirmStackMerge(_)
                         | Panel::StackMergeProgress
@@ -123,7 +169,8 @@ impl PullRequestView {
 
     /// The review button, filled when `primary`: it is the page's main
     /// action while the pull request cannot be merged, and an outlined
-    /// secondary action once the merge button is on screen.
+    /// secondary action once the merge button is on screen. It opens and
+    /// closes the review composer; discarding a pending review is there.
     pub(super) fn render_review_controls(
         &self,
         detail: &PullRequestDetail,
@@ -157,22 +204,61 @@ impl PullRequestView {
                     } else {
                         "Review changes"
                     })
-                    .selected(self.panel == Panel::Review)
-                    .on_click(cx.listener(|this, _, _, cx| this.set_panel(Panel::Review, cx))),
+                    .tooltip(if self.composer_open() {
+                        "Close the review"
+                    } else {
+                        "Open the review: summary, pending comments, and verdict"
+                    })
+                    .selected(self.composer_open())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_review_composer(cx))),
             )
-            .when(pending.is_some(), |row| {
-                row.child(
-                    ui::icon_button(
-                        "pr-discard-review",
-                        IconName::Trash,
-                        "Discard pending review…",
-                    )
-                    .selected(self.panel == Panel::ConfirmDiscard)
-                    .on_click(
-                        cx.listener(|this, _, _, cx| this.set_panel(Panel::ConfirmDiscard, cx)),
-                    ),
-                )
-            })
+    }
+
+    /// Whether the review composer is on screen: writing the review, or
+    /// confirming that its pending comments go away.
+    pub(super) fn composer_open(&self) -> bool {
+        matches!(self.panel, Panel::Review | Panel::ConfirmDiscard)
+    }
+
+    /// Opens the review composer with the caret in its summary, on a pull
+    /// request that has something to review; an open composer only takes
+    /// the caret back.
+    pub(super) fn open_review_composer(&mut self, cx: &mut Context<Self>) {
+        let reviewable = self
+            .detail
+            .value()
+            .is_some_and(|detail| review_button(detail) != ReviewButton::Hidden);
+        if !reviewable {
+            return;
+        }
+        if !self.composer_open() {
+            self.panel = Panel::Review;
+        }
+        self.focus_review_body = true;
+        if self.write.error().is_some() {
+            self.write = Submit::Idle;
+        }
+        cx.notify();
+    }
+
+    fn toggle_review_composer(&mut self, cx: &mut Context<Self>) {
+        if self.composer_open() {
+            self.close_review_composer(cx);
+        } else {
+            self.open_review_composer(cx);
+        }
+    }
+
+    /// Closes the composer and keeps what was typed in the summary.
+    fn close_review_composer(&mut self, cx: &mut Context<Self>) {
+        if self.write.is_busy() {
+            return;
+        }
+        self.panel = Panel::Closed;
+        if self.write.error().is_some() {
+            self.write = Submit::Idle;
+        }
+        cx.notify();
     }
 
     /// The "More actions" menu: the header's labeled actions that left its
@@ -499,26 +585,8 @@ impl PullRequestView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match self.panel {
-            Panel::Closed => div().into_any_element(),
-            Panel::Review => self.render_review_panel(detail, cx).into_any_element(),
-            Panel::ConfirmDiscard => {
-                let count = detail
-                    .pending_review
-                    .as_ref()
-                    .map_or(0, |r| r.comment_count);
-                let Some(review_id) = detail.pending_review.as_ref().map(|r| r.id.clone()) else {
-                    return div().into_any_element();
-                };
-                self.render_confirm(
-                    discard_confirm_text(count),
-                    "Discard review",
-                    Commit::Destructive,
-                    Write::DiscardReview { review_id },
-                    None,
-                    cx,
-                )
-                .into_any_element()
-            }
+            // The review composer draws these.
+            Panel::Closed | Panel::Review | Panel::ConfirmDiscard => div().into_any_element(),
             Panel::ConfirmMerge(method) => match stack_merge(detail) {
                 Some(stack) => self
                     .render_confirm(
@@ -878,100 +946,312 @@ impl PullRequestView {
             .children(details.map(|details| div().pl_6().child(details)))
     }
 
-    fn render_review_panel(
+    /// The review composer, a column at the trailing edge of the tab's
+    /// content: what goes out with the review (files viewed, pending inline
+    /// comments), the summary, and the verdict. A verdict that cannot go out
+    /// yet is outlined and neutral, with the reason in its tooltip.
+    pub(super) fn render_review_composer(
         &self,
         detail: &PullRequestDetail,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
+        let border = tokens::border_subtle();
         let busy = self.write.is_busy();
         let may_approve = can_approve(detail);
-        let submit = |id: &'static str,
-                      label: &'static str,
-                      event: ReviewEvent,
-                      allowed: bool,
-                      cx: &mut Context<Self>| {
-            Button::new(id)
-                .small()
-                .label(label)
-                .disabled(busy || !allowed)
-                .when(!allowed, |button| {
-                    button.tooltip("You cannot approve or request changes on your own pull request")
-                })
-                .on_click(cx.listener(move |this, _, _, cx| this.submit_review(event, cx)))
+        let pending = detail.pending_review.as_ref();
+        let pending_count = pending.map_or(0, |review| review.comment_count);
+        let body = self.review_body.read(cx).value().to_string();
+        let blocker = |event: ReviewEvent| -> Option<&'static str> {
+            match event {
+                ReviewEvent::Approve if !may_approve => {
+                    Some("You cannot approve your own pull request")
+                }
+                ReviewEvent::RequestChanges if !may_approve => {
+                    Some("You cannot request changes on your own pull request")
+                }
+                _ => review_blocker(event, &body, pending_count),
+            }
         };
-        v_flex()
+        let verdict = |id: &'static str,
+                       label: &'static str,
+                       event: ReviewEvent,
+                       style: fn(Button) -> Button,
+                       tooltip: String,
+                       cx: &mut Context<Self>| {
+            let reason = blocker(event);
+            let button = Button::new(id)
+                .control()
+                .disabled(busy || reason.is_some())
+                .on_click(cx.listener(move |this, _, _, cx| this.submit_review(event, cx)));
+            let button = match reason {
+                // The kit's disabled fill keeps a trace of the variant's
+                // color; a verdict that cannot go out reads as neutral.
+                Some(reason) => button
+                    .outline()
+                    .accessibility_label(label)
+                    .tooltip(reason)
+                    .child(div().text_color(muted).child(label)),
+                None => style(button.label(label)).tooltip(tooltip),
+            };
+            div()
+                .flex_none()
+                .debug_selector(move || id.to_owned())
+                .child(button)
+        };
+
+        let header = h_flex()
+            .flex_none()
+            .h(scale::toolbar_height())
+            .px(scale::content_inset())
             .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(border)
             .child(
                 div()
-                    .text_size(scale::meta())
+                    .id("pr-review-composer-title")
+                    .role(Role::Heading)
+                    .aria_label(format!("Review #{}", detail.pr.number))
+                    .text_size(scale::title())
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Review summary"),
+                    .child("Review"),
             )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(format!("#{}", detail.pr.number)),
+            )
+            .child(
+                ui::icon_button("pr-review-close", IconName::Close, "Close review")
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_review_composer(cx))),
+            );
+
+        let viewed = v_flex()
+            .gap_1()
+            .child(ui::section_label("Viewed", cx))
+            .child(match self.render_review_progress(cx) {
+                Some(meter) => h_flex().child(meter).into_any_element(),
+                None => ui::empty_line(IconName::Loader, "Counting files…", cx).into_any_element(),
+            });
+
+        let pending_body = match (self.panel, pending) {
+            (Panel::ConfirmDiscard, Some(review)) => {
+                let review_id = review.id.clone();
+                v_flex()
+                    .id("pr-discard-confirm")
+                    .role(Role::Group)
+                    .aria_label("Discard pending review")
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                h_flex().flex_none().h_5().items_center().child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .small()
+                                        .text_color(tokens::pending()),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(scale::body())
+                                    .child(discard_confirm_text(review.comment_count)),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("pr-discard-cancel")
+                                    .small()
+                                    .ghost()
+                                    .label("Keep comments")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.panel = Panel::Review;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "pr-discard-confirm-button".to_owned())
+                                    .child(
+                                        Button::new("pr-discard-confirm-button")
+                                            .small()
+                                            .danger()
+                                            .label("Discard review")
+                                            .loading(busy)
+                                            .disabled(busy)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.start_write(
+                                                    Write::DiscardReview {
+                                                        review_id: review_id.clone(),
+                                                    },
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            (_, Some(review)) => h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .id("pr-review-pending")
+                        .debug_selector(|| "pr-review-pending".to_owned())
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            widgets::tinted_tag(tokens::pending())
+                                .child(pending_comments_label(review.comment_count)),
+                        ),
+                )
+                .child(
+                    Button::new("pr-discard-review")
+                        .small()
+                        .ghost()
+                        .icon(IconName::Trash)
+                        .label("Discard…")
+                        .tooltip("Discard the pending review and its inline comments")
+                        .disabled(busy)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.set_panel(Panel::ConfirmDiscard, cx)),
+                        ),
+                )
+                .into_any_element(),
+            (_, None) => div()
+                .id("pr-review-pending")
+                .debug_selector(|| "pr-review-pending".to_owned())
+                .text_size(scale::meta())
+                .text_color(muted)
+                .child(format!(
+                    "{}. Comments you add on lines in Files go out with this review.",
+                    pending_comments_label(0)
+                ))
+                .into_any_element(),
+        };
+        let pending_section = v_flex()
+            .gap_1()
+            .child(ui::section_label("Pending comments", cx))
+            .child(pending_body);
+
+        let summary = v_flex()
+            .gap_1()
+            .child(ui::section_label("Summary", cx))
             .child(Textarea::new(&self.review_body).disabled(busy))
+            .child(ui::send_hint(cx).child("as a comment"));
+
+        let error = self.write.error().map(|message| {
+            div()
+                .debug_selector(|| "pr-review-error".to_owned())
+                .child(Alert::error("pr-review-error", message.to_owned()))
+        });
+
+        let status = if busy {
+            "Submitting…".to_owned()
+        } else if !may_approve {
+            "You are the author, so you can only comment.".to_owned()
+        } else {
+            match pending_count {
+                0 => "The summary goes out with your verdict.".to_owned(),
+                count => format!(
+                    "The summary and {} go out with your verdict.",
+                    pending_comments_label(count).to_lowercase()
+                ),
+            }
+        };
+        let footer = v_flex()
+            .flex_none()
+            .px(scale::content_inset())
+            .py_3()
+            .gap_2()
+            .border_t_1()
+            .border_color(border)
+            .child(
+                div()
+                    .id("pr-review-status")
+                    .role(Role::Status)
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(status),
+            )
             .child(
                 h_flex()
                     .gap_2()
-                    .items_center()
-                    .flex_wrap()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(scale::meta())
-                            .text_color(muted)
-                            .child(if busy {
-                                "Submitting…".to_owned()
-                            } else if may_approve {
-                                format!("{} submits as a comment.", ui::shortcut("cmd-enter"))
-                            } else {
-                                "You are the author, so you can only comment.".to_owned()
-                            }),
-                    )
-                    .child(
-                        Button::new("pr-review-cancel")
-                            .small()
-                            .ghost()
-                            .label("Cancel")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.panel = Panel::Closed;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        submit(
-                            "pr-review-comment",
-                            "Comment",
-                            ReviewEvent::Comment,
-                            true,
-                            cx,
-                        )
-                        .outline(),
-                    )
-                    .child(
-                        submit(
-                            "pr-review-changes",
-                            "Request changes",
-                            ReviewEvent::RequestChanges,
-                            may_approve,
-                            cx,
-                        )
-                        .danger(),
-                    )
-                    .child(
-                        submit(
-                            "pr-review-approve",
-                            "Approve",
-                            ReviewEvent::Approve,
-                            may_approve,
-                            cx,
-                        )
+                    .justify_end()
+                    .child(verdict(
+                        "pr-review-comment",
+                        "Comment",
+                        ReviewEvent::Comment,
+                        |button| button.outline(),
+                        format!("Comment ({})", ui::shortcut("cmd-enter")),
+                        cx,
+                    ))
+                    .child(verdict(
+                        "pr-review-changes",
+                        "Request changes",
+                        ReviewEvent::RequestChanges,
+                        |button| button.danger().outline(),
+                        "Request changes before this can merge".to_owned(),
+                        cx,
+                    ))
+                    .child(verdict(
+                        "pr-review-approve",
+                        "Approve",
+                        ReviewEvent::Approve,
                         // The screen's one primary tone. Green is for the
                         // merge alone.
-                        .primary(),
-                    ),
+                        |button| button.primary(),
+                        "Approve these changes".to_owned(),
+                        cx,
+                    )),
+            );
+
+        v_flex()
+            .id("pr-review-composer")
+            .debug_selector(|| "pr-review-composer".to_owned())
+            .role(Role::Group)
+            .aria_label(format!("Review #{}", detail.pr.number))
+            .flex_none()
+            .w(scale::side_wide_width())
+            .h_full()
+            .bg(tokens::panel())
+            .border_l_1()
+            .border_color(border)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.close_review_composer(cx);
+                }
+            }))
+            .child(header)
+            .child(
+                v_flex()
+                    .id("pr-review-composer-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p(scale::content_inset())
+                    .gap(scale::section_gap())
+                    .child(viewed)
+                    .child(pending_section)
+                    .child(summary)
+                    .children(error),
             )
+            .child(footer)
+            .into_any_element()
     }
 }
 
@@ -1272,4 +1552,242 @@ fn render_progress_step_row(
                 message,
             )))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui_kit::{
+        AppContext as _, Bounds, Entity, Modifiers, TestAppContext, VisualTestContext,
+        WindowBounds, WindowOptions, px, size,
+    };
+    use loupe_github::{Actor, PendingReview, PullRequestDetail, ReviewEvent};
+
+    use super::super::{PullRequestView, Write, model};
+    use super::OpenReviewComposer;
+    use crate::github::common::Loadable;
+    use crate::services::{Accounts, Services};
+    use crate::store::Settings;
+
+    /// The page of `detail` on its Conversation tab, 1600 px wide; GitHub
+    /// is not connected, so every write lands in `sent_writes` only.
+    fn open(
+        detail: PullRequestDetail,
+        cx: &mut TestAppContext,
+    ) -> (Entity<PullRequestView>, VisualTestContext) {
+        let detail = Arc::new(detail);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(Settings::default());
+            cx.set_global(Services::default());
+            cx.set_global(Accounts::default());
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1600.), px(900.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| PullRequestView::new(detail.pr.clone(), window, cx)),
+            )
+            .expect("open a window")
+        });
+        let mut cx = VisualTestContext::from_window(handle, cx);
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| {
+            view.incoming = Some(detail.clone());
+            view.detail = Loadable::Loaded(detail);
+            cx.notify();
+        });
+        draw(&mut cx);
+        (view, cx)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    /// Opens the composer the way the Guide does: the action, dispatched
+    /// from inside the page.
+    fn open_composer(view: &Entity<PullRequestView>, cx: &mut VisualTestContext) {
+        view.update_in(cx, |view, window, cx| view.focus.focus(window, cx));
+        cx.dispatch_action(OpenReviewComposer);
+        draw(cx);
+    }
+
+    fn type_summary(view: &Entity<PullRequestView>, text: &str, cx: &mut VisualTestContext) {
+        view.update_in(cx, |view, window, cx| {
+            view.review_body
+                .update(cx, |body, cx| body.set_value(text.to_owned(), window, cx));
+        });
+        draw(cx);
+    }
+
+    fn click(selector: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is on screen"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        draw(cx);
+    }
+
+    fn sent(view: &Entity<PullRequestView>, cx: &mut VisualTestContext) -> Vec<Write> {
+        view.read_with(cx, |view, _| view.sent_writes.clone())
+    }
+
+    fn with_pending(detail: PullRequestDetail) -> PullRequestDetail {
+        PullRequestDetail {
+            pending_review: Some(PendingReview {
+                id: "PRR_9".into(),
+                comment_count: 2,
+            }),
+            ..detail
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_composer_opens_without_moving_the_tabs_or_the_page(cx: &mut TestAppContext) {
+        let (view, mut cx) = open(model::tests::detail(), cx);
+        let before = cx.debug_bounds("merge-box-line").expect("the merge box");
+        assert!(cx.debug_bounds("pr-review-composer").is_none());
+
+        open_composer(&view, &mut cx);
+        let composer = cx
+            .debug_bounds("pr-review-composer")
+            .expect("the composer opens");
+        let after = cx.debug_bounds("merge-box-line").expect("the merge box");
+        assert_eq!(before.origin.y, after.origin.y, "nothing moves down");
+        assert!(
+            composer.origin.y >= after.origin.y - px(80.),
+            "the composer starts under the tabs, not above them"
+        );
+        assert!(
+            composer.origin.x > after.origin.x,
+            "it is a column at the trailing edge"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn approve_sends_the_summary_and_the_pending_comments(cx: &mut TestAppContext) {
+        let (view, mut cx) = open(with_pending(model::tests::detail()), cx);
+        open_composer(&view, &mut cx);
+        assert!(cx.debug_bounds("pr-review-pending").is_some());
+        type_summary(&view, "Ship it", &mut cx);
+
+        click("pr-review-approve", &mut cx);
+        let writes = sent(&view, &mut cx);
+        assert!(
+            matches!(
+                writes.as_slice(),
+                [Write::Review { event: ReviewEvent::Approve, body, review_id: Some(id) }]
+                    if body == "Ship it" && id == "PRR_9"
+            ),
+            "{writes:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn approve_needs_no_words(cx: &mut TestAppContext) {
+        let (view, mut cx) = open(model::tests::detail(), cx);
+        open_composer(&view, &mut cx);
+
+        click("pr-review-approve", &mut cx);
+        let writes = sent(&view, &mut cx);
+        assert!(
+            matches!(
+                writes.as_slice(),
+                [Write::Review {
+                    event: ReviewEvent::Approve,
+                    review_id: None,
+                    ..
+                }]
+            ),
+            "{writes:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn request_changes_waits_for_the_reason(cx: &mut TestAppContext) {
+        let (view, mut cx) = open(model::tests::detail(), cx);
+        open_composer(&view, &mut cx);
+
+        click("pr-review-changes", &mut cx);
+        assert!(
+            sent(&view, &mut cx).is_empty(),
+            "nothing goes out without words"
+        );
+
+        type_summary(&view, "Handle the empty list", &mut cx);
+        click("pr-review-changes", &mut cx);
+        let writes = sent(&view, &mut cx);
+        assert!(
+            matches!(
+                writes.as_slice(),
+                [Write::Review { event: ReviewEvent::RequestChanges, body, .. }]
+                    if body == "Handle the empty list"
+            ),
+            "{writes:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_author_can_only_comment(cx: &mut TestAppContext) {
+        let mut own = model::tests::detail();
+        own.author = Some(Actor {
+            login: own.viewer_login.clone(),
+            avatar_url: String::new(),
+        });
+        let (view, mut cx) = open(own, cx);
+        open_composer(&view, &mut cx);
+        type_summary(&view, "Note to self", &mut cx);
+
+        click("pr-review-approve", &mut cx);
+        click("pr-review-changes", &mut cx);
+        assert!(
+            sent(&view, &mut cx).is_empty(),
+            "both verdicts are disabled"
+        );
+
+        click("pr-review-comment", &mut cx);
+        let writes = sent(&view, &mut cx);
+        assert!(
+            matches!(
+                writes.as_slice(),
+                [Write::Review {
+                    event: ReviewEvent::Comment,
+                    ..
+                }]
+            ),
+            "{writes:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn discarding_asks_first_inside_the_composer(cx: &mut TestAppContext) {
+        let (view, mut cx) = open(with_pending(model::tests::detail()), cx);
+        open_composer(&view, &mut cx);
+        view.update(&mut cx, |view, cx| {
+            view.set_panel(super::Panel::ConfirmDiscard, cx)
+        });
+        draw(&mut cx);
+        assert!(
+            cx.debug_bounds("pr-review-composer").is_some(),
+            "the composer stays"
+        );
+
+        click("pr-discard-confirm-button", &mut cx);
+        let writes = sent(&view, &mut cx);
+        assert!(
+            matches!(writes.as_slice(), [Write::DiscardReview { review_id }] if review_id == "PRR_9"),
+            "{writes:?}"
+        );
+    }
 }
