@@ -10,11 +10,12 @@
 //! back), and Escape leaves the text. Outside the text, S, P, A, L (Linear's
 //! keys), Shift+P, Shift+C, Shift+E, Shift+D, and T open the menus. In a
 //! menu, typing narrows it, the arrows move, Enter picks, and Escape closes
-//! it. Escape outside the text closes the modal.
+//! it, back on its chip. Escape outside the text closes the modal.
 
 mod fields;
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -253,6 +254,9 @@ pub(super) struct NewIssueForm {
     /// The modal itself: focused while no field or menu is, so the
     /// property keys reach it.
     focus: FocusHandle,
+    /// The chip (or the breadcrumb's team) each menu hangs from, which
+    /// takes the focus back when its menu closes.
+    chips: HashMap<Property, FocusHandle>,
     create_more: bool,
     expanded: bool,
     submit: Submit,
@@ -362,6 +366,10 @@ impl NewIssueForm {
             menu: None,
             menu_scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
+            chips: std::iter::once(Property::Team)
+                .chain(Property::CHIPS)
+                .map(|property| (property, cx.focus_handle()))
+                .collect(),
             create_more: false,
             expanded: false,
             submit: Submit::Idle,
@@ -509,14 +517,17 @@ impl NewIssueForm {
         cx.notify();
     }
 
+    /// Closes the open menu and gives the focus back to its chip, where Tab
+    /// goes on from and the property keys still reach the modal.
     fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.menu = None;
-        self.focus.focus(window, cx);
+        if let Some(open) = self.menu.take() {
+            self.chips[&open.property].focus(window, cx);
+        }
         cx.notify();
     }
 
     /// Applies row `index` of the open menu. Labels keep the menu open; any
-    /// other pick closes it and leaves the focus on the modal, ready for the
+    /// other pick closes it and leaves the focus on its chip, ready for the
     /// next key.
     fn pick(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(open) = self.menu.filter(|_| !self.busy()) else {
@@ -816,6 +827,7 @@ impl NewIssueForm {
     /// controlled by `NewIssueForm::menu`, so a click and the property's key
     /// open it alike.
     fn menu_popover(&self, property: Property, trigger: Button, cx: &mut Context<Self>) -> Popover {
+        let trigger = trigger.track_focus(&self.chips[&property]);
         let open = self.menu.filter(|open| open.property == property);
         let rows = Rc::new(match open {
             Some(_) => self.rows(property, cx),
@@ -823,7 +835,7 @@ impl NewIssueForm {
         });
         let cursor = open.map_or(0, |open| open.cursor);
         let view = cx.weak_entity();
-        let (on_change, on_click) = (view.clone(), view.clone());
+        let on_change = view.clone();
         let search = self.search.clone();
         let scroll = self.menu_scroll.clone();
         Popover::new(slug(property))
@@ -835,20 +847,19 @@ impl NewIssueForm {
             .on_open_change(move |open, window, cx| {
                 on_change
                     .update(cx, |form, cx| {
+                        // A press, Enter, or Space on the chip opens it.
                         // Another menu may have opened since: only the one
                         // that reports closing clears the state.
                         let this = form.menu.is_some_and(|now| now.property == property);
-                        if !*open && this {
+                        if *open && !this {
+                            form.open_menu(property, window, cx);
+                        } else if !*open && this {
                             form.close_menu(window, cx);
                         }
                     })
                     .ok();
             })
-            .trigger(trigger.on_click(move |_, window, cx| {
-                on_click
-                    .update(cx, |form, cx| form.open_menu(property, window, cx))
-                    .ok();
-            }))
+            .trigger(trigger)
             .content(move |_, _, cx| menu(&search, rows.clone(), cursor, &scroll, view.clone(), cx))
     }
 
@@ -1271,6 +1282,62 @@ mod tests {
             focused(cx),
             Some(description),
             "Shift+Tab goes back to the text"
+        );
+    }
+
+    /// Escape in a chip's menu gives the focus back to that chip, whether
+    /// Space on the chip or the property's key opened the menu, so Tab goes
+    /// on from there.
+    #[gpui_kit::test]
+    fn escape_in_a_menu_gives_the_focus_back_to_its_chip(cx: &mut TestAppContext) {
+        let (mut cx, _) = refusing_linear(cx);
+        let cx = &mut cx;
+        let form = open_form(cx);
+        let (description, search, state, priority) = cx.update(|_, cx| {
+            let form = form.read(cx);
+            (
+                form.description.focus_handle(cx),
+                form.search.focus_handle(cx),
+                form.chips[&Property::State].clone(),
+                form.chips[&Property::Priority].clone(),
+            )
+        });
+        cx.simulate_keystrokes("tab");
+        redraw(cx);
+        assert_eq!(focused(cx), Some(description));
+        cx.simulate_keystrokes("tab");
+        redraw(cx);
+        assert_eq!(focused(cx), Some(state.clone()), "Tab reaches the chip");
+
+        // A keyboard click is the press and the release of the key.
+        let space = gpui_kit::Keystroke::parse("space").expect("a key");
+        cx.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: space.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui_kit::KeyUpEvent { keystroke: space });
+        redraw(cx);
+        assert_eq!(
+            form.read_with(cx, |form, _| form.menu.map(|open| open.property)),
+            Some(Property::State),
+            "Space on the chip opens its menu"
+        );
+        assert_eq!(focused(cx), Some(search.clone()), "on its search field");
+        cx.simulate_keystrokes("escape");
+        redraw(cx);
+        assert!(form.read_with(cx, |form, _| form.menu.is_none()));
+        assert_eq!(focused(cx), Some(state), "Escape goes back to the chip");
+
+        cx.simulate_keystrokes("p");
+        redraw(cx);
+        assert_eq!(focused(cx), Some(search), "P opens the Priority menu");
+        cx.simulate_keystrokes("escape");
+        redraw(cx);
+        assert_eq!(
+            focused(cx),
+            Some(priority),
+            "Escape goes back to the Priority chip"
         );
     }
 }

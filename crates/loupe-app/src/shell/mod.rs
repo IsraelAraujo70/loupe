@@ -3019,6 +3019,51 @@ mod tests {
         assert!(focus_on(cx, "InboxView"), "and so does the page Back shows");
     }
 
+    /// A pull request opened from the palette takes the keyboard focus on
+    /// its page, which has no list of its own to hold it, while it loads
+    /// and after.
+    #[gpui_kit::test]
+    fn a_pull_request_opened_from_the_palette_takes_the_keyboard_focus(cx: &mut TestAppContext) {
+        use gpui_kit::base::actions::Confirm;
+        use loupe_github::{PrRef, RepoRef};
+
+        use crate::shell::actions::OpenPalette;
+
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        cx.update(|_, cx| cx.set_reduce_motion(false));
+        assert!(focus_on(cx, "InboxView"));
+
+        cx.dispatch_action(OpenPalette);
+        redraw(cx);
+        for _ in 0..10 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            redraw(cx);
+        }
+        cx.simulate_input("acme/web#7");
+        redraw(cx);
+        cx.dispatch_action(Confirm { secondary: false });
+        redraw(cx);
+        assert_eq!(
+            tabs(&workspace, cx).0,
+            [Route::PullRequest(PrRef::new(
+                RepoRef::new("acme", "web"),
+                7
+            ))]
+        );
+        assert!(
+            focus_on(cx, "PullRequestView"),
+            "the pull request's page has the focus"
+        );
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        assert!(
+            focus_on(cx, "PullRequestView"),
+            "and keeps it once the palette is gone"
+        );
+    }
+
     /// Tab walks the window in the order it reads: the top bar, the
     /// sidebar's rows (Inbox before My issues), the page's header, and back
     /// to the page's list. Shift+Tab walks back, and Enter on a row opens
@@ -3071,6 +3116,44 @@ mod tests {
         cx.simulate_event(gpui_kit::KeyUpEvent { keystroke: enter });
         redraw(cx);
         assert_eq!(tabs(&workspace, cx).0, [Route::LinearMyIssues]);
+    }
+
+    /// A sidebar row that Tab reaches below the rows in view scrolls into
+    /// view, and Shift+Tab brings the ones above back the same way.
+    #[gpui_kit::test]
+    fn tab_scrolls_the_sidebar_to_the_focused_row(cx: &mut TestAppContext) {
+        let (handle, _) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        cx.simulate_resize(size(px(1280.), px(220.)));
+        redraw(cx);
+        let shown = |cx: &mut VisualTestContext, row: &'static str| {
+            let nav = cx.debug_bounds("sidebar-nav").expect("the sidebar's rows");
+            let row = cx.debug_bounds(row).expect("the row");
+            nav.top() <= row.top() && row.bottom() <= nav.bottom()
+        };
+        assert!(shown(cx, "sidebar-inbox"));
+        assert!(
+            !shown(cx, "sidebar-views"),
+            "the window is too short to show Views"
+        );
+
+        let mut presses = 0;
+        while !ring_on(cx, "sidebar-views") {
+            presses += 1;
+            assert!(presses < 60, "Tab never reached Views");
+            cx.simulate_keystrokes("tab");
+            redraw(cx);
+        }
+        assert!(shown(cx, "sidebar-views"), "the focused row scrolled in");
+        assert!(!shown(cx, "sidebar-inbox"));
+
+        while !ring_on(cx, "sidebar-inbox") {
+            presses -= 1;
+            assert!(presses > 0, "Shift+Tab never came back to Inbox");
+            cx.simulate_keystrokes("shift-tab");
+            redraw(cx);
+        }
+        assert!(shown(cx, "sidebar-inbox"), "and scrolled back up");
     }
 
     /// Two Reviews tabs on different views are told apart: the tab whose
