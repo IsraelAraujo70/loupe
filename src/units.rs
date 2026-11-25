@@ -10,6 +10,7 @@ pub enum Unit {
     Cup,
     Tablespoon,
     Teaspoon,
+    Pinch,
     Ounce,
     Piece,
 }
@@ -30,6 +31,7 @@ impl Unit {
             Unit::Cup => "cup",
             Unit::Tablespoon => "tbsp",
             Unit::Teaspoon => "tsp",
+            Unit::Pinch => "pinch",
             Unit::Ounce => "oz",
             Unit::Piece => "pcs",
         }
@@ -47,6 +49,18 @@ pub fn to_grams(amount: f64, from: Unit) -> Option<f64> {
         Unit::Gram => Some(amount),
         Unit::Kilogram => Some(amount * 1_000.0),
         Unit::Ounce => Some(amount * GRAMS_PER_OUNCE),
+        _ => None,
+    }
+}
+
+/// Converts `amount` from `from` to millilitres, when `from` is a volume.
+pub fn to_millilitres(amount: f64, from: Unit) -> Option<f64> {
+    match from {
+        Unit::Millilitre => Some(amount),
+        Unit::Litre => Some(amount * 1_000.0),
+        Unit::Cup => Some(amount * MILLILITRES_PER_CUP),
+        Unit::Tablespoon => Some(amount * 15.0),
+        Unit::Teaspoon => Some(amount * 5.0),
         _ => None,
     }
 }
