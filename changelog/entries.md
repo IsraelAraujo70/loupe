@@ -19,3 +19,4 @@
 - Entry 019: a one-line change, so the pull request has more than 250 commits.
 - Entry 020: a one-line change, so the pull request has more than 250 commits.
 - Entry 021: a one-line change, so the pull request has more than 250 commits.
+- Entry 022: a one-line change, so the pull request has more than 250 commits.
