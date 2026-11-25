@@ -92,3 +92,4 @@
 - Entry 092: a one-line change, so the pull request has more than 250 commits.
 - Entry 093: a one-line change, so the pull request has more than 250 commits.
 - Entry 094: a one-line change, so the pull request has more than 250 commits.
+- Entry 095: a one-line change, so the pull request has more than 250 commits.
