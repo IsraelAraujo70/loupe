@@ -50,6 +50,17 @@ impl PrTab {
         }
     }
 
+    /// Conversation, unless a debug launch names another tab.
+    pub(super) fn initial() -> PrTab {
+        crate::debug::pr_tab()
+            .and_then(|name| {
+                Self::ALL
+                    .into_iter()
+                    .find(|tab| tab.title().eq_ignore_ascii_case(name.trim()))
+            })
+            .unwrap_or(PrTab::Conversation)
+    }
+
     pub(super) fn index(self) -> usize {
         Self::ALL
             .iter()
