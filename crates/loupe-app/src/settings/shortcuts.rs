@@ -2,6 +2,7 @@
 //! words, with its keys read from the keymap `shell::menus::init` binds, so
 //! the page never shows a key the app does not answer to.
 
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::{Action, App, AsKeystroke as _, Keystroke};
 
 use crate::shell::actions::{
@@ -9,8 +10,8 @@ use crate::shell::actions::{
     CopyItemLink, FocusSettingsSearch, GoBack, GoForward, Minimize, NewTab, NextTab,
     OpenItemInNewTab, OpenItemSideBySide, OpenPalette, OpenSelected, OpenSettings,
     PaletteOpenInNewTab, PreviousTab, Quit, RefreshAllTabs, RefreshPage, ResetZoom, ScrollPageDown,
-    ScrollPageUp, SearchTabs, SelectNext, SelectPrevious, SwitchWorkspace, ToggleSidebar, ZoomIn,
-    ZoomOut,
+    ScrollPageUp, SearchTabs, SelectNext, SelectPrevious, SplitDown, SplitRight, SwitchWorkspace,
+    ToggleSidebar, ZoomIn, ZoomOut,
 };
 
 /// One row of the section: its group (the card it is in), what it does,
@@ -52,6 +53,10 @@ pub const SHORTCUTS: &[Shortcut] = &[
     }),
     shortcut("Tabs", "Last tab", || Box::new(ActivateLastTab)),
     shortcut("Tabs", "Search the open tabs", || Box::new(SearchTabs)),
+    shortcut("Tabs", "Split the tab to the right", || {
+        Box::new(SplitRight)
+    }),
+    shortcut("Tabs", "Split the tab down", || Box::new(SplitDown)),
     shortcut("Tabs", "Refresh the open page", || Box::new(RefreshPage)),
     shortcut("Tabs", "Refresh every open tab", || {
         Box::new(RefreshAllTabs)
@@ -123,6 +128,18 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut("Issue", "Write a comment", || {
         Box::new(crate::linear::WriteComment)
     }),
+    shortcut("Issue", "Move a new issue to a team", || {
+        Box::new(crate::linear::MoveToTeam)
+    }),
+    shortcut("Issue", "Set the cycle of a new issue", || {
+        Box::new(crate::linear::SetCycle)
+    }),
+    shortcut("Issue", "Set the estimate of a new issue", || {
+        Box::new(crate::linear::SetEstimate)
+    }),
+    shortcut("Issue", "Set the due date of a new issue", || {
+        Box::new(crate::linear::SetDueDate)
+    }),
     shortcut("Window", "Show the sidebar as icons", || {
         Box::new(ToggleSidebar)
     }),
@@ -155,6 +172,22 @@ impl Shortcut {
         }
         keys
     }
+
+    /// [`Self::keys`] as one sentence for the page's accessibility tree:
+    /// "Ctrl+K", "J or Down", "O then W".
+    pub fn keys_text(&self, cx: &App) -> String {
+        self.keys(cx)
+            .iter()
+            .map(|strokes| {
+                strokes
+                    .iter()
+                    .map(Kbd::format)
+                    .collect::<Vec<_>>()
+                    .join(" then ")
+            })
+            .collect::<Vec<_>>()
+            .join(" or ")
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +195,29 @@ mod tests {
     use gpui_kit::{Keystroke, TestAppContext};
 
     use super::SHORTCUTS;
+
+    #[gpui_kit::test]
+    fn every_bound_action_has_a_row(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::shell::menus::bind_keys(cx);
+            let listed: Vec<&str> = SHORTCUTS
+                .iter()
+                .map(|shortcut| (shortcut.action)().name())
+                .collect();
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            let unlisted: Vec<&str> = keymap
+                .bindings()
+                .map(|binding| binding.action().name())
+                .filter(|name| !listed.contains(name))
+                .filter(|name| !(2..=8).any(|n| name.ends_with(&format!("ActivateTab{n}"))))
+                .collect();
+            assert!(
+                unlisted.is_empty(),
+                "bound but missing from Keyboard shortcuts: {unlisted:?}"
+            );
+        });
+    }
 
     #[gpui_kit::test]
     fn every_shortcut_shows_the_keys_the_app_binds(cx: &mut TestAppContext) {

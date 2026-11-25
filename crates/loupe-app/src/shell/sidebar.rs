@@ -30,7 +30,7 @@ use crate::github::repos::{self, ListedRepo, RepoSource};
 use crate::linear::{self, SavedView};
 use crate::route::Route;
 use crate::services::{Accounts, Connection, Services};
-use crate::shell::actions::{OpenPalette, SwitchWorkspace};
+use crate::shell::actions::{OpenPalette, OpenSettings, SwitchWorkspace};
 use crate::shell::workspace_menu;
 use crate::shell::{OpenOnClick as _, navigate, open, svg_icon};
 use crate::store::{self, Favorite, Settings};
@@ -757,6 +757,7 @@ pub(super) fn render(
             current_team,
             collapsed,
             colors,
+            cx,
         ))
         .child(
             v_flex()
@@ -774,6 +775,7 @@ pub(super) fn render(
             collapsed,
             *current == Route::Settings,
             colors,
+            cx,
         ))
 }
 
@@ -785,6 +787,7 @@ fn workspace_row(
     current_team: Option<String>,
     collapsed: bool,
     colors: Palette,
+    cx: &App,
 ) -> impl IntoElement {
     let connected = organization.is_some();
     let name = organization.unwrap_or_else(|| "Loupe".into());
@@ -848,7 +851,7 @@ fn workspace_row(
         .ghost()
         .small()
         .icon(IconName::Search)
-        .tooltip(format!("Search ({})", ui::shortcut("cmd-k")))
+        .tooltip(format!("Search ({})", ui::bound_shortcut(&OpenPalette, cx)))
         .accessibility_label("Search")
         .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenPalette), cx));
     let new_issue = Button::new("sidebar-new-issue")
@@ -1273,6 +1276,7 @@ fn footer(
     collapsed: bool,
     settings_selected: bool,
     colors: Palette,
+    cx: &App,
 ) -> impl IntoElement {
     let name: SharedString = viewer
         .name
@@ -1286,7 +1290,10 @@ fn footer(
         .small()
         .icon(IconName::Settings)
         .selected(settings_selected)
-        .tooltip(format!("Settings ({})", ui::shortcut("cmd-,")))
+        .tooltip(format!(
+            "Settings ({})",
+            ui::bound_shortcut(&OpenSettings, cx)
+        ))
         .accessibility_label("Settings")
         .on_click(|_, window, cx| navigate(Route::Settings, window, cx));
     let avatar = ui::avatar_named(viewer.avatar_url.clone(), name.clone(), dp(24.));
