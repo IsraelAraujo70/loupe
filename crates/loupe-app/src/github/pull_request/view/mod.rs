@@ -1229,6 +1229,7 @@ impl PullRequestView {
             .child(self.placeholder_header())
             .child(common::load_failed_page(
                 error,
+                "Pull request",
                 self.pr.url(),
                 cx.listener(|this, _, _, cx| this.reload(cx)),
             ))

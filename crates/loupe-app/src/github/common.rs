@@ -190,9 +190,11 @@ pub fn load_error(
 
 /// A page that failed to load as a whole: the reason in plain words in the
 /// middle of the panel, Retry, and Open on GitHub so the user can check the
-/// address in the browser.
+/// address in the browser. `what` names the page's object ("Pull request")
+/// for the not-found title.
 pub fn load_failed_page(
     error: &LoadError,
+    what: &str,
     url: String,
     on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -208,7 +210,11 @@ pub fn load_failed_page(
         LoadError::NotConnected | LoadError::Unauthorized => IconName::Key,
         LoadError::Other(_) => IconName::TriangleAlert,
     };
-    ui::empty_state(icon, error.title(), error.detail()).action(
+    let title = match error {
+        LoadError::NotFound => format!("{what} not found"),
+        _ => error.title().to_owned(),
+    };
+    ui::empty_state(icon, title, error.detail()).action(
         h_flex()
             .gap_2()
             .child(
