@@ -125,6 +125,7 @@ pub fn bind_keys(cx: &mut App) {
         // Text fields keep the letter: GPUI prefers typing when one is focused.
         KeyBinding::new("f", crate::linear::OpenFilter, Some("TeamView")),
         KeyBinding::new("f", crate::github::OpenReviewsFilter, Some("InboxView")),
+        KeyBinding::new(primary!("f"), crate::github::FindInDiff, Some("FilesTab")),
         // An issue's properties, on Linear's own keys, and its comment box.
         KeyBinding::new("s", crate::linear::ChangeState, Some(ISSUE_KEYS)),
         KeyBinding::new("p", crate::linear::ChangePriority, Some(ISSUE_KEYS)),

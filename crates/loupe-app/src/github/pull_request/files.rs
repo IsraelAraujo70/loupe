@@ -5,6 +5,7 @@
 mod composer;
 mod header;
 mod model;
+mod search;
 mod sticky;
 mod tree;
 mod tree_view;
@@ -18,16 +19,18 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{
-    Diff, DiffAnnotation, DiffFile, DiffFileStatus, DiffHoverHighlight, DiffLinePosition,
-    DiffLineRange, DiffState,
+    Diff, DiffAnnotation, DiffDecoration, DiffFile, DiffFileStatus, DiffHoverHighlight,
+    DiffLinePosition, DiffLineRange, DiffState,
 };
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Search};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::diff::{Hunk, anchor_for_range, find_line, git_patch, parse_patch};
@@ -41,6 +44,7 @@ use self::model::{
     file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
     to_diff_side, to_side, viewed_counts,
 };
+use self::search::Match;
 use self::sticky::HeaderWatch;
 use self::tree::{
     GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
@@ -75,6 +79,19 @@ const FILE_LIST_MAX: f32 = 640.;
 /// How wide the diff's trailing edge fades while long lines run past it.
 const FADE_WIDTH: f32 = 32.;
 
+/// What the find bar's note about diffs GitHub left out explains.
+const NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a pull request this large, so their lines are not searched. Choose Load diff on a file to search it too.";
+const COMMIT_NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a commit this large, so their lines are not searched. Choose Load diff on a file to search it too.";
+
+gpui_kit::actions!(
+    github,
+    [
+        /// Cmd+F (Ctrl+F off macOS) in a pull request's or a commit's files:
+        /// find a text in the diff.
+        FindInDiff
+    ]
+);
+
 /// The note under a file with no diff, and for a diff GitHub left out, the
 /// path to load and whether it is loading.
 type NoDiffNote = (ElementId, SharedString, Option<(String, bool)>);
@@ -90,6 +107,17 @@ struct ThreadSlot {
 struct ComposerSlot {
     view: Entity<ComposerView>,
     _events: Subscription,
+}
+
+/// The find bar over the diff and the lines it found.
+struct Find {
+    input: Entity<InputState>,
+    _events: Subscription,
+    open: bool,
+    /// The text the matches are for.
+    query: SharedString,
+    matches: Vec<Match>,
+    current: Option<usize>,
 }
 
 /// The one commit a tab shows instead of the whole pull request.
@@ -132,6 +160,9 @@ pub struct FilesTab {
     threads_dirty: bool,
     composer: Option<ComposerSlot>,
     pending_reveal: Option<(String, Option<u32>, loupe_github::Side)>,
+    /// The tab's own focus, so Find reaches it while nothing in it is focused.
+    focus: FocusHandle,
+    find: Find,
 }
 
 impl FilesTab {
@@ -165,6 +196,20 @@ impl FilesTab {
                 cx.notify();
             }
         });
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in diff"));
+        let find_events =
+            cx.subscribe(&find_input, |this, _, event: &InputEvent, cx| match event {
+                // Enter also reports a change; only a new text starts over.
+                InputEvent::Change => {
+                    if this.find.input.read(cx).value() != this.find.query {
+                        this.run_find(true, cx)
+                    }
+                }
+                InputEvent::PressEnter { shift, .. } => {
+                    this.step_find(if *shift { -1 } else { 1 }, cx)
+                }
+                _ => {}
+            });
         let mut tab = Self {
             context,
             commit,
@@ -193,6 +238,15 @@ impl FilesTab {
             threads_dirty: false,
             composer: None,
             pending_reveal: None,
+            focus: cx.focus_handle(),
+            find: Find {
+                input: find_input,
+                _events: find_events,
+                open: false,
+                query: SharedString::default(),
+                matches: Vec::new(),
+                current: None,
+            },
         };
         tab.load_files(cx);
         tab
@@ -407,6 +461,7 @@ impl FilesTab {
         if let Some((path, line, side)) = self.pending_reveal.take() {
             self.apply_reveal(&path, line, side, cx);
         }
+        self.run_find(false, cx);
     }
 
     /// Collapses viewed files, and files whose diff GitHub left out so the
@@ -569,6 +624,7 @@ impl FilesTab {
             });
         }
         self.threads_dirty = true;
+        self.run_find(false, cx);
     }
 
     /// Places the pull request's threads in the diff and keeps one entity per
@@ -720,6 +776,277 @@ impl FilesTab {
                 state.scroll_to_file(path, cx);
             }
         });
+    }
+
+    /// Opens the find bar, or takes the focus back to it, with its text
+    /// selected to type over.
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff.is_none() {
+            return;
+        }
+        let reopened = !self.find.open;
+        self.find.open = true;
+        self.find.input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        if reopened {
+            self.run_find(true, cx);
+        }
+        cx.notify();
+    }
+
+    /// Closes the find bar and its marks; its text stays for the next time.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.open = false;
+        self.find.matches.clear();
+        self.find.current = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Finds the bar's text in the diffs loaded. A new text goes to its first
+    /// match from the file on screen; a reload or a diff loaded later keeps
+    /// the current match where it was.
+    fn run_find(&mut self, jump: bool, cx: &mut Context<Self>) {
+        if !self.find.open {
+            return;
+        }
+        let query = self.find.input.read(cx).value();
+        let started = std::time::Instant::now();
+        let previous = self
+            .find
+            .current
+            .and_then(|ix| self.find.matches.get(ix))
+            .cloned();
+        let files = self.files.iter().map(|file| {
+            let hunks = self.hunks.get(&file.path);
+            (
+                file.path.as_str(),
+                hunks.map_or(&[][..], |hunks| hunks.as_slice()),
+            )
+        });
+        self.find.matches = search::find(files, &query);
+        self.find.query = query.clone();
+        if !query.is_empty() {
+            let lines: usize = self
+                .hunks
+                .values()
+                .flat_map(|hunks| hunks.iter())
+                .map(|hunk| hunk.lines.len())
+                .sum();
+            eprintln!(
+                "diff-search files={} lines={lines} matches={} ms={:.2}",
+                self.hunks.len(),
+                self.find.matches.len(),
+                started.elapsed().as_secs_f64() * 1000.
+            );
+        }
+        let kept = previous.filter(|_| !jump).and_then(|previous| {
+            self.find.matches.iter().position(|found| {
+                found.path == previous.path
+                    && found.line == previous.line
+                    && found.side == previous.side
+            })
+        });
+        self.find.current =
+            kept.or_else(|| search::first_from(&self.find.matches, self.top_file(cx)));
+        if jump && let Some(ix) = self.find.current {
+            self.show_match(ix, cx);
+        }
+        cx.notify();
+    }
+
+    /// Goes `delta` matches on, round from the last to the first.
+    fn step_find(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(ix) = search::step(self.find.matches.len(), self.find.current, delta) {
+            self.show_match(ix, cx);
+            cx.notify();
+        }
+    }
+
+    /// Selects match `ix`'s file in the tree and scrolls the diff a few
+    /// lines above the match, opening its file if it was collapsed.
+    fn show_match(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(found) = self.find.matches.get(ix).cloned() else {
+            return;
+        };
+        self.find.current = Some(ix);
+        if let Some(state) = &self.diff {
+            // Opens the fold the line may be in before scrolling above it.
+            let position = DiffLinePosition::new(
+                found.path.clone(),
+                to_diff_side(found.side),
+                found.line as usize,
+            );
+            state.update(cx, |state, cx| state.scroll_to_line(position, cx));
+        }
+        match found.lead {
+            Some((line, side)) => self.apply_reveal(&found.path, Some(line), side, cx),
+            None => self.apply_reveal(&found.path, None, found.side, cx),
+        }
+    }
+
+    /// The place in `files` of the file at the top of the diff.
+    fn top_file(&self, cx: &App) -> Option<usize> {
+        let top = self.headers.borrow().top()?;
+        let state = self.diff.as_ref()?.read(cx);
+        let path = state.files().get(top)?.path();
+        self.files
+            .iter()
+            .position(|file| file.path == path.as_ref())
+    }
+
+    /// The marks of the lines found: a quiet one on each, a stronger one on
+    /// the current match. A split diff marks both halves of an unchanged line.
+    fn find_decorations(&self, cx: &App) -> Vec<DiffDecoration> {
+        if !self.find.open {
+            return Vec::new();
+        }
+        let current = cx.theme().warning.opacity(0.5);
+        let marks = |found: &Match| {
+            let mut marks = vec![DiffDecoration::new(DiffLineRange::new(
+                found.path.clone(),
+                to_diff_side(found.side),
+                found.line as usize,
+                found.line as usize,
+            ))];
+            if let Some(old) = found.old_line {
+                marks.push(DiffDecoration::new(DiffLineRange::new(
+                    found.path.clone(),
+                    to_diff_side(loupe_github::Side::Left),
+                    old as usize,
+                    old as usize,
+                )));
+            }
+            marks
+        };
+        let mut decorations: Vec<DiffDecoration> = self
+            .find
+            .matches
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| Some(*ix) != self.find.current)
+            .flat_map(|(_, found)| marks(found))
+            .collect();
+        // The last decoration on a line is the one shown.
+        if let Some(found) = self.find.current.and_then(|ix| self.find.matches.get(ix)) {
+            decorations.extend(
+                marks(found)
+                    .into_iter()
+                    .map(|mark| mark.with_background(current)),
+            );
+        }
+        decorations
+    }
+
+    /// The bar over the diff: the text, "3 of 41", previous and next, how
+    /// many files GitHub left out of the search, and Close.
+    fn find_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let total = self.find.matches.len();
+        let searching = !self.find.input.read(cx).value().is_empty();
+        let count = match self.find.current {
+            _ if !searching => None,
+            Some(ix) => Some((
+                format!("{} of {total}", ix + 1),
+                format!("Line {} of {total} with the text", ix + 1),
+            )),
+            None => Some(("No results".to_owned(), "No line has the text".to_owned())),
+        };
+        let not_searched = self
+            .missing
+            .values()
+            .filter(|reason| **reason == Missing::Omitted)
+            .count();
+        let hint = if self.commit.is_some() {
+            COMMIT_NOT_SEARCHED_HINT
+        } else {
+            NOT_SEARCHED_HINT
+        };
+        let focus_input = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            this.find
+                .input
+                .update(cx, |input, cx| input.focus(window, cx));
+        };
+        ui::toolbar()
+            .id("files-find")
+            .debug_selector(|| "files-find".into())
+            .role(Role::Search)
+            .aria_label("Find in diff")
+            .on_action(cx.listener(|this, _: &Escape, window, cx| this.close_find(window, cx)))
+            .child(
+                Input::new(&self.find.input)
+                    .small()
+                    .h(rems(1.75))
+                    .w(scale::search_width())
+                    .text_size(scale::body())
+                    .prefix(Icon::new(IconName::Search).with_size(dp(14.)))
+                    .aria_label("Find in diff"),
+            )
+            .children(count.map(|(text, label)| {
+                div()
+                    .id("files-find-count")
+                    .role(Role::Status)
+                    .aria_label(label)
+                    .flex_none()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(text)
+            }))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        ui::icon_button(
+                            "files-find-previous",
+                            IconName::ChevronUp,
+                            "Previous match",
+                        )
+                        .tooltip(format!("Previous match ({})", ui::shortcut("shift-enter")))
+                        .disabled(total == 0)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.step_find(-1, cx);
+                                focus_input(this, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        ui::icon_button("files-find-next", IconName::ChevronDown, "Next match")
+                            .tooltip(format!("Next match ({})", ui::shortcut("enter")))
+                            .disabled(total == 0)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.step_find(1, cx);
+                                focus_input(this, window, cx);
+                            })),
+                    ),
+            )
+            .when(not_searched > 0, |bar| {
+                let text = match not_searched {
+                    1 => "1 file not searched".to_owned(),
+                    count => format!("{count} files not searched"),
+                };
+                bar.child(
+                    div()
+                        .id("files-find-not-searched")
+                        .role(Role::Note)
+                        .aria_label(format!("{text}. {hint}"))
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
+                        .child(text),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                ui::icon_button("files-find-close", IconName::Close, "Close find")
+                    .tooltip(format!("Close ({})", ui::shortcut("escape")))
+                    .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+            )
+            .into_any_element()
     }
 
     /// Marks a file viewed or unviewed at once, collapses or expands it, and
@@ -1009,6 +1336,16 @@ impl FilesTab {
                     .into_any_element(),
             );
         }
+        parts.push(
+            ui::icon_button("files-find-open", IconName::Search, "Find in diff")
+                .tooltip(format!(
+                    "Find in diff ({})",
+                    ui::bound_shortcut(&FindInDiff, cx)
+                ))
+                .selected(self.find.open)
+                .on_click(cx.listener(|this, _, window, cx| this.open_find(window, cx)))
+                .into_any_element(),
+        );
         // Both choices about how the diff is laid out use the one
         // segmented control, side by side.
         parts.push(
@@ -1495,6 +1832,7 @@ impl FilesTab {
             }
         };
         let pinned = self.pinned_header(state, content, cx);
+        let decorations = self.find_decorations(cx);
         div()
             .debug_selector(|| "files-diff".into())
             .relative()
@@ -1511,6 +1849,7 @@ impl FilesTab {
                     .size_full()
                     .soft_wrap(wrap)
                     .hover_highlight(DiffHoverHighlight::Both)
+                    .decorations(decorations)
                     .annotations(annotations)
                     .render_annotation(move |annotation, _, _| {
                         // Threads and the composer sit in a card under their
@@ -1756,7 +2095,16 @@ impl FilesTab {
                         .size(dp(FILE_LIST_WIDTH))
                         .size_range(dp(FILE_LIST_MIN)..dp(FILE_LIST_MAX))
                         .child(self.file_list(window, cx));
-                    let diff = resizable_panel().child(self.diff_view(&state, cx));
+                    let find_bar = self.find.open.then(|| self.find_bar(cx));
+                    let diff = resizable_panel().child(
+                        v_flex().size_full().children(find_bar).child(
+                            h_flex()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(self.diff_view(&state, cx)),
+                        ),
+                    );
                     // One id per side: the group keeps its panels' widths by
                     // index, and the tree's width must not land on the diff.
                     match Settings::get(cx).file_tree_position {
@@ -1847,7 +2195,17 @@ impl Render for FilesTab {
             }
             Loadable::Loaded(()) | Loadable::Refreshing(()) => self.loaded_view(window, cx),
         };
-        div().size_full().child(body)
+        if crate::shell::page_may_take_focus(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        div()
+            .size_full()
+            .key_context("FilesTab")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &FindInDiff, window, cx| this.open_find(window, cx)))
+            // A text field answers Cmd+F with Search and passes it on.
+            .on_action(cx.listener(|this, _: &Search, window, cx| this.open_find(window, cx)))
+            .child(body)
     }
 }
 
@@ -2290,6 +2648,120 @@ mod tests {
             tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
             Some("src/next.rs"),
             "the tree selects the file that reached the top"
+        );
+    }
+
+    /// The current match: its place, the file, and the line.
+    fn current_match(
+        cx: &mut VisualTestContext,
+        tab: &Entity<FilesTab>,
+    ) -> Option<(usize, String, u32)> {
+        tab.read_with(cx, |tab, _| {
+            let ix = tab.find.current?;
+            let found = &tab.find.matches[ix];
+            Some((ix, found.path.clone(), found.line))
+        })
+    }
+
+    #[gpui_kit::test]
+    fn find_goes_through_the_lines_of_every_loaded_diff(cx: &mut TestAppContext) {
+        // A diff GitHub left out: lines changed, no patch.
+        let left_out = ChangedFile {
+            patch: None,
+            additions: 5000,
+            ..added("src/huge.rs", 1)
+        };
+        let (mut cx, tab) = open_files_tab_with_files(
+            cx,
+            vec![
+                added("src/long.rs", 300),
+                added("src/next.rs", 100),
+                left_out,
+            ],
+        );
+        let cx = &mut cx;
+        cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
+        draw(cx);
+        assert!(
+            cx.debug_bounds("files-find").is_none(),
+            "the bar starts closed"
+        );
+
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-f");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-f");
+        draw(cx);
+        assert!(
+            cx.debug_bounds("files-find").is_some(),
+            "the shortcut opens the bar"
+        );
+
+        // `line 25` and `line 250` to `line 259` in the first file, `line 25`
+        // in the second; the left-out diff is not searched.
+        cx.simulate_input("LINE 25");
+        draw(cx);
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 12);
+        assert_eq!(
+            current_match(cx, &tab),
+            Some((0, "src/long.rs".into(), 25)),
+            "the first match from the file on screen, ignoring case"
+        );
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
+            Some("src/long.rs")
+        );
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            current_match(cx, &tab),
+            Some((1, "src/long.rs".into(), 250))
+        );
+        cx.simulate_keystrokes("shift-enter");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-enter");
+        cx.run_until_parked();
+        assert_eq!(
+            current_match(cx, &tab),
+            Some((11, "src/next.rs".into(), 25)),
+            "back past the first goes round to the last"
+        );
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
+            Some("src/next.rs"),
+            "the tree selects the match's file"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        draw(cx);
+        assert!(
+            cx.debug_bounds("files-find").is_none(),
+            "Escape closes the bar"
+        );
+        assert!(tab.read_with(cx, |tab, _| tab.find.matches.is_empty()));
+
+        // Load diff on the left-out file brings its lines into the search.
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.open_find(window, cx)));
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 12);
+        let before = current_match(cx, &tab).map(|(_, path, line)| (path, line));
+        tab.update(cx, |tab, cx| {
+            tab.apply_omitted_patch(
+                "src/huge.rs",
+                Some("@@ -0,0 +1 @@\n+line 25 again".into()),
+                cx,
+            )
+        });
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.find.matches.len()),
+            13,
+            "a diff loaded later is searched too"
+        );
+        assert_eq!(
+            current_match(cx, &tab).map(|(_, path, line)| (path, line)),
+            before,
+            "the current match stays where it was"
         );
     }
 }

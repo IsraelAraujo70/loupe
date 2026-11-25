@@ -12,6 +12,7 @@ mod view;
 use gpui_kit::{AnyView, App, AppContext as _, Global, Window};
 use loupe_github::{PrRef, PullRequestDetail, Side};
 
+pub use files::FindInDiff;
 use view::PullRequestView;
 
 /// One-shot intent set when the user picks "Merge stack" from a stack row's
