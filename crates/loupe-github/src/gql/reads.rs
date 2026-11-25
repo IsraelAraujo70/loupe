@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 
 use crate::{
     Actor, ChecksState, Error, GitHub, Inbox, Label, Mergeable, NodeId, Page, PrListFilter, PrRef,
-    PrState, PrSummary, RepoRef, RepoSummary, Result, ReviewDecision, ReviewRequest, StackMember,
-    StackSummary,
+    PrState, PrSummary, RepoRef, RepoSummary, Result, ReviewDecision, ReviewRequest,
+    ReviewStanding, StackMember, StackSummary,
 };
 
 const REPO_PR_PAGE_SIZE: u32 = 30;
@@ -52,6 +52,10 @@ fragment PrRow on PullRequest {
   assignees(first: 10) { nodes { login avatarUrl } }
   reviewRequests(first: 10) { nodes { requestedReviewer { __typename ... on User { login avatarUrl } ... on Team { combinedSlug } } } }
   latestReviews(first: 20) { nodes { state author { __typename login avatarUrl } } }
+  headRefOid
+  viewerDidAuthor
+  viewerLatestReview { state commit { oid } }
+  viewerLatestReviewRequest { id }
   stack {
     number
     entries(first: 50) { nodes { position pullRequest { number title state } } }
@@ -102,6 +106,14 @@ const INBOX_QUERY: &str = concat!(
 const SEARCH_PULL_REQUESTS_QUERY: &str = concat!(
     "query SearchPullRequests($query: String!, $first: Int!, $after: String) {
   search(type: ISSUE, first: $first, after: $after, query: $query) { ...PrPage }
+}",
+    pr_fragments!()
+);
+
+const REPO_REVIEW_QUEUE_QUERY: &str = concat!(
+    "query RepoReviewQueue($requested: String!, $reviewed: String!) {
+  requested: search(type: ISSUE, first: 100, query: $requested) { ...PrPage }
+  reviewed: search(type: ISSUE, first: 100, query: $reviewed) { ...PrPage }
 }",
     pr_fragments!()
 );
@@ -202,6 +214,7 @@ pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("pull_request_repositories", PULL_REQUEST_REPOSITORIES_QUERY),
     ("pull_request_rows", PULL_REQUEST_ROWS_QUERY),
     ("pull_request_row", PULL_REQUEST_ROW_QUERY),
+    ("repo_review_queue", REPO_REVIEW_QUEUE_QUERY),
 ];
 
 impl GitHub {
@@ -359,6 +372,28 @@ impl GitHub {
         )
     }
 
+    /// The open pull requests of `repo` that wait on the viewer, whatever
+    /// page of the list they are on: those asking for the viewer's review
+    /// (themselves or through a team), then those the viewer reviewed and did
+    /// not write, newest first and each once, with `text` narrowing both as
+    /// the list's search does. A pull request GitHub lists as asking for the
+    /// viewer reads as [`ReviewStanding::Requested`] even when the request
+    /// went to a team, which `viewerLatestReviewRequest` may leave out.
+    pub fn repo_review_queue(&self, repo: &RepoRef, text: Option<&str>) -> Result<Vec<PrSummary>> {
+        let base = repo_search_query(repo, PrListFilter::Open, text);
+        let data: RepoReviewQueueData = self.graphql(
+            REPO_REVIEW_QUEUE_QUERY,
+            json!({
+                "requested": format!("{base} review-requested:@me"),
+                "reviewed": format!("{base} reviewed-by:@me -author:@me"),
+            }),
+        )?;
+        Ok(review_queue(
+            data.requested.into_page()?.items,
+            data.reviewed.into_page()?.items,
+        ))
+    }
+
     /// Repositories the viewer owns, collaborates on, or reaches through an
     /// organization, most recently pushed first (up to 100).
     pub fn viewer_repositories(&self) -> Result<Vec<RepoSummary>> {
@@ -479,6 +514,32 @@ struct WireBaseCount {
 #[derive(Deserialize)]
 struct SearchData {
     search: WireConnection,
+}
+
+#[derive(Deserialize)]
+struct RepoReviewQueueData {
+    requested: WireConnection,
+    reviewed: WireConnection,
+}
+
+/// [`GitHub::repo_review_queue`]'s two searches as one list: the requested
+/// ones first, marked so, then the reviewed ones not already in it.
+fn review_queue(requested: Vec<PrSummary>, reviewed: Vec<PrSummary>) -> Vec<PrSummary> {
+    let mut queue: Vec<PrSummary> = requested
+        .into_iter()
+        .map(|mut pr| {
+            if pr.viewer_review != Some(ReviewStanding::Authored) {
+                pr.viewer_review = Some(ReviewStanding::Requested);
+            }
+            pr
+        })
+        .collect();
+    for pr in reviewed {
+        if queue.iter().all(|known| known.pr != pr.pr) {
+            queue.push(pr);
+        }
+    }
+    queue
 }
 
 #[derive(Deserialize)]
@@ -613,6 +674,14 @@ struct WirePullRequest {
     assignees: WireList<WireActor>,
     review_requests: WireList<WireReviewRequest>,
     latest_reviews: WireList<WireReview>,
+    #[serde(default)]
+    head_ref_oid: String,
+    #[serde(default)]
+    viewer_did_author: bool,
+    #[serde(default)]
+    viewer_latest_review: Option<WireViewerReview>,
+    #[serde(default)]
+    viewer_latest_review_request: Option<serde::de::IgnoredAny>,
     /// Null outside a stack.
     #[serde(default)]
     stack: Option<WireRowStack>,
@@ -711,6 +780,42 @@ struct WireReview {
 }
 
 #[derive(Deserialize)]
+struct WireViewerReview {
+    /// `PENDING` while the viewer's review is a draft nobody else sees.
+    state: String,
+    /// Null when the reviewed commit left the branch.
+    commit: Option<WireOid>,
+}
+
+#[derive(Deserialize)]
+struct WireOid {
+    oid: String,
+}
+
+/// Where the viewer stands with the review of a pull request whose head is
+/// `head`: its author, asked to review, or reviewed on the head or before it.
+/// A pending review is a draft and counts as none.
+fn viewer_review(
+    authored: bool,
+    requested: bool,
+    latest: Option<WireViewerReview>,
+    head: &str,
+) -> Option<ReviewStanding> {
+    if authored {
+        return Some(ReviewStanding::Authored);
+    }
+    if requested {
+        return Some(ReviewStanding::Requested);
+    }
+    let latest = latest.filter(|review| review.state != "PENDING")?;
+    Some(match latest.commit {
+        Some(commit) if commit.oid == head => ReviewStanding::Reviewed,
+        _ if head.is_empty() => ReviewStanding::Reviewed,
+        _ => ReviewStanding::ChangesSinceReview,
+    })
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 enum WirePrState {
     Open,
@@ -804,6 +909,12 @@ impl WirePullRequest {
             .as_deref()
             .and_then(review_decision)
             .or_else(|| decision_from_reviews(&latest));
+        let viewer_review = viewer_review(
+            self.viewer_did_author,
+            self.viewer_latest_review_request.is_some(),
+            self.viewer_latest_review,
+            &self.head_ref_oid,
+        );
         let reviewed = latest
             .into_iter()
             .filter_map(|review| review.author.map(|author| author.actor));
@@ -859,6 +970,7 @@ impl WirePullRequest {
             },
             review_requests,
             reviewed_by,
+            viewer_review,
         }
     }
 }
@@ -948,10 +1060,86 @@ mod tests {
 
     use super::{DOCUMENTS, repositories_from_nodes, repositories_of_pull_requests};
     use super::{InboxData, SearchData, ViewerRepositoriesData, repo_search_query, with_pr_type};
+    use super::{WireOid, WireViewerReview, review_queue, viewer_review};
     use crate::{
         Actor, ChecksState, Error, Mergeable, PrListFilter, PrRef, PrState, RepoRef,
-        ReviewDecision, ReviewRequest,
+        ReviewDecision, ReviewRequest, ReviewStanding,
     };
+
+    /// The author first, then a pending request, then the latest review
+    /// against the head; a draft review is none.
+    #[test]
+    fn the_viewer_review_reads_authorship_requests_then_the_latest_review() {
+        let review = |state: &str, oid: Option<&str>| {
+            Some(WireViewerReview {
+                state: state.into(),
+                commit: oid.map(|oid| WireOid { oid: oid.into() }),
+            })
+        };
+        assert_eq!(
+            viewer_review(true, false, None, "h"),
+            Some(ReviewStanding::Authored)
+        );
+        assert_eq!(
+            viewer_review(false, true, review("APPROVED", Some("old")), "h"),
+            Some(ReviewStanding::Requested),
+            "asked again after a review"
+        );
+        assert_eq!(
+            viewer_review(false, false, review("APPROVED", Some("h")), "h"),
+            Some(ReviewStanding::Reviewed)
+        );
+        assert_eq!(
+            viewer_review(false, false, review("DISMISSED", Some("old")), "h"),
+            Some(ReviewStanding::ChangesSinceReview)
+        );
+        assert_eq!(
+            viewer_review(false, false, review("COMMENTED", None), "h"),
+            Some(ReviewStanding::ChangesSinceReview),
+            "the reviewed commit left the branch"
+        );
+        assert_eq!(
+            viewer_review(false, false, review("PENDING", Some("h")), "h"),
+            None
+        );
+        assert_eq!(viewer_review(false, false, None, "h"), None);
+    }
+
+    /// A request through a team still reads as asked of the viewer, and a
+    /// pull request both searches find shows once, as requested.
+    #[test]
+    fn the_review_queue_marks_requests_and_keeps_each_pull_request_once() {
+        let summary = |number: u64, standing: Option<ReviewStanding>| {
+            let mut pr = page_from(connection(vec![pr_node(number)], false))
+                .expect("page")
+                .items
+                .remove(0);
+            pr.viewer_review = standing;
+            pr
+        };
+        let queue = review_queue(
+            vec![
+                summary(1, None),
+                summary(2, Some(ReviewStanding::ChangesSinceReview)),
+            ],
+            vec![
+                summary(2, Some(ReviewStanding::ChangesSinceReview)),
+                summary(3, Some(ReviewStanding::Reviewed)),
+            ],
+        );
+        let read: Vec<(u64, Option<ReviewStanding>)> = queue
+            .iter()
+            .map(|pr| (pr.pr.number, pr.viewer_review))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (1, Some(ReviewStanding::Requested)),
+                (2, Some(ReviewStanding::Requested)),
+                (3, Some(ReviewStanding::Reviewed)),
+            ]
+        );
+    }
 
     fn pr_node(number: u64) -> Value {
         json!({
@@ -1337,7 +1525,8 @@ mod tests {
                 "review_requested_count",
                 "pull_request_repositories",
                 "pull_request_rows",
-                "pull_request_row"
+                "pull_request_row",
+                "repo_review_queue"
             ]
         );
     }

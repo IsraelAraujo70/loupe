@@ -95,6 +95,25 @@ pub struct PrSummary {
     /// author included when they replied in a review. Bots are left out.
     #[serde(default)]
     pub reviewed_by: Vec<String>,
+    /// Where the viewer stands with its review. `None` when they have no
+    /// part in it, and in a copy stored before Loupe read it.
+    #[serde(default)]
+    pub viewer_review: Option<ReviewStanding>,
+}
+
+/// Where the signed-in user stands with a pull request's review, as GitHub
+/// reports it for the viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReviewStanding {
+    /// The viewer wrote it, so it waits on someone else's review.
+    Authored,
+    /// A review is asked of the viewer, themselves or through a team, and
+    /// has not come in.
+    Requested,
+    /// The viewer reviewed it, and the head moved after that review.
+    ChangesSinceReview,
+    /// The viewer's latest review is on the head commit.
+    Reviewed,
 }
 
 /// One page of a connection. `next_cursor` is `Some` while more pages exist.
