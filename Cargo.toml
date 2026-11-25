@@ -40,6 +40,9 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 apollo-compiler = "1"
+# Diffs the two versions of a file whose patch GitHub left out of a large
+# pull request (loupe-github).
+similar = "2"
 futures = "0.3"
 security-framework = "3"
 # The T3 server starts threads only over its WebSocket RPC (loupe-t3).

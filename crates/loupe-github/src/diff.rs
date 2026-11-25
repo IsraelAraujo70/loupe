@@ -345,11 +345,31 @@ pub fn git_patch(file: &ChangedFile) -> Option<String> {
     Some(out)
 }
 
+/// The hunks between two versions of a file in the shape GitHub's patches
+/// have: three lines of context, starting at `@@`, empty when the text is
+/// the same. `None` when either version is binary: a NUL byte in the first
+/// 8000 bytes, as Git decides, or bytes that are not UTF-8.
+pub fn text_patch(old: &[u8], new: &[u8]) -> Option<String> {
+    fn text(bytes: &[u8]) -> Option<&str> {
+        if bytes.iter().take(8000).any(|&byte| byte == 0) {
+            return None;
+        }
+        std::str::from_utf8(bytes).ok()
+    }
+    let (old, new) = (text(old)?, text(new)?);
+    Some(
+        similar::TextDiff::from_lines(old, new)
+            .unified_diff()
+            .context_radius(3)
+            .to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AnchorError, DiffLine, Hunk, LineKind, anchor_for_range, c_quote, find_line, git_patch,
-        parse_patch,
+        parse_patch, text_patch,
     };
     use crate::{ChangedFile, FileStatus, LineAnchor, Side, ViewedState};
 
@@ -847,5 +867,48 @@ mod tests {
         assert_eq!(c_quote("back\\slash"), "\"back\\\\slash\"");
         assert_eq!(c_quote("é.rs"), "\"\\303\\251.rs\"");
         assert_eq!(c_quote("a\u{1}b"), "\"a\\001b\"");
+    }
+
+    #[test]
+    fn text_patch_reads_back_as_github_style_hunks() {
+        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+        let new = "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\nten\neleven";
+        let patch = text_patch(old.as_bytes(), new.as_bytes()).expect("text");
+        let hunks = parse_patch(&patch).expect("parses");
+        let count = |kind| {
+            hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .filter(|line| line.kind == kind)
+                .count()
+        };
+        assert_eq!((count(LineKind::Added), count(LineKind::Removed)), (2, 1));
+        assert_eq!((hunks[0].old_start, hunks[0].new_start), (2, 2));
+        let last = hunks
+            .last()
+            .and_then(|hunk| hunk.lines.last())
+            .expect("line");
+        assert_eq!(
+            (last.text.as_str(), last.no_newline_at_eof),
+            ("eleven", true)
+        );
+    }
+
+    #[test]
+    fn text_patch_of_an_added_file_starts_from_nothing() {
+        let patch = text_patch(b"", b"a\nb\n").expect("text");
+        let hunks = parse_patch(&patch).expect("parses");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            (hunks[0].old_count, hunks[0].new_start, hunks[0].new_count),
+            (0, 1, 2)
+        );
+        assert_eq!(text_patch(b"same\n", b"same\n").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn text_patch_is_none_for_binary_contents() {
+        assert_eq!(text_patch(b"\x89PNG\r\n\x1a\n\0\0", b"text\n"), None);
+        assert_eq!(text_patch(b"text\n", &[0xff, 0xfe, 0x41]), None);
     }
 }
