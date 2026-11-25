@@ -2559,7 +2559,7 @@ impl Render for FilesTab {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
 
     use chrono::{DateTime, Utc};
@@ -2583,7 +2583,7 @@ mod tests {
 
     const WINDOW_WIDTH: f32 = 1280.;
 
-    fn detail() -> PullRequestDetail {
+    pub(in crate::github::pull_request) fn detail() -> PullRequestDetail {
         let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
         PullRequestDetail {
             id: "PR_1".into(),

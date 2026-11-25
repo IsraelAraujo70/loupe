@@ -40,6 +40,7 @@ use super::data::{self, Loadable};
 use super::views_store::Kind;
 use super::{new_issue, remote_views, views_store, widgets};
 use crate::services;
+use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::store::{self, Favorite};
 
 gpui_kit::actions!(
@@ -165,6 +166,13 @@ pub(crate) struct TeamView {
     created: Option<IssueSummary>,
     /// The board's sideways scroll, to know when columns lie past its edge.
     board_scroll: ScrollHandle,
+    /// The list layout's scroll, and its rows (with the group headings), to
+    /// scroll the keyboard cursor's row into view.
+    list_scroll: ScrollHandle,
+    list_rows: ScrollHandle,
+    /// The id of the issue under the list's keyboard cursor (J and K, or
+    /// the arrows).
+    cursor: Option<String>,
     /// The row of view tabs, tracked for its width: the row shows as many
     /// views as it holds.
     tabs_strip: ScrollHandle,
@@ -268,6 +276,9 @@ impl TeamView {
             notice,
             created: None,
             board_scroll: ScrollHandle::new(),
+            list_scroll: ScrollHandle::new(),
+            list_rows: ScrollHandle::new(),
+            cursor: None,
             tabs_strip: ScrollHandle::new(),
             edge_scroll: 0.,
             edge_scrolling: false,
@@ -1142,20 +1153,29 @@ impl Render for TeamView {
                     .into_any_element();
             }
         }
+        let focused = self.focus.is_focused(window);
         v_flex()
+            .id("team-page")
+            .role(Role::Group)
+            .aria_label(self.name.clone())
             .size_full()
             .key_context("TeamView")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &OpenFilter, window, cx| {
                 this.set_filter_open(true, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.move_cursor(false, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
+            )
             .when(!self.is_project(), |page| {
                 page.child(self.render_header(cx))
             })
             .child(self.render_tabs(window, cx))
             .children(self.render_filter_bar(cx))
             .children(self.render_notice(cx))
-            .child(self.render_body(cx))
+            .child(self.render_body(focused, cx))
             .into_any_element()
     }
 }

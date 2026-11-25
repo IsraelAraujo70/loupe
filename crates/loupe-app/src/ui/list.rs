@@ -2,6 +2,8 @@
 //! heading, and compact navigation row. Every list aligns its content to the
 //! 16 px `content_inset` while letting row hover fills reach 8 px past it.
 
+use std::ops::RangeInclusive;
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -64,6 +66,46 @@ impl ListRowFocus for Stateful<Div> {
                     .border_color(tokens::accent()),
             )
     }
+}
+
+/// Where a list's keyboard cursor goes next among `rows`, the lines on
+/// screen in order: one step from `current`, staying at either end. With no
+/// cursor yet, or one whose line left the list, it starts at the first row
+/// going down and at the last going up.
+pub fn step_cursor<T: PartialEq + Clone>(rows: &[T], current: Option<&T>, down: bool) -> Option<T> {
+    let last = rows.len().checked_sub(1)?;
+    let at = current.and_then(|row| rows.iter().position(|known| known == row));
+    let next = match (at, down) {
+        (Some(at), true) => (at + 1).min(last),
+        (Some(at), false) => at.saturating_sub(1),
+        (None, true) => 0,
+        (None, false) => last,
+    };
+    rows.get(next).cloned()
+}
+
+/// Scrolls `scroll` the least that shows the whole of the children
+/// `children` of the list that `rows` tracks, where the last frame drew
+/// them. The list tracks its children with a handle of its own
+/// (`track_scroll` on an element that does not scroll), so a row is found
+/// where it is whatever the heights above it: a card, an open log, a
+/// heading. Passing a group's heading with its first row keeps the heading
+/// in sight when the cursor comes up to that row.
+pub fn scroll_to_rows(scroll: &ScrollHandle, rows: &ScrollHandle, children: RangeInclusive<usize>) {
+    let (Some(first), Some(last)) = (
+        rows.bounds_for_item(*children.start()),
+        rows.bounds_for_item(*children.end()),
+    ) else {
+        return;
+    };
+    let viewport = scroll.bounds();
+    let mut offset = scroll.offset();
+    if first.top() < viewport.top() {
+        offset.y += viewport.top() - first.top();
+    } else if last.bottom() > viewport.bottom() {
+        offset.y -= last.bottom() - viewport.bottom();
+    }
+    scroll.set_offset(offset);
 }
 
 /// Hairline along the bottom of a `relative()` [`list_row`], inset to the row's
@@ -148,4 +190,46 @@ pub fn nav_row(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<D
             row.text_color(muted)
                 .hover(move |style| style.bg(hover).text_color(fg))
         })
+}
+
+/// What a list's view tests share.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use gpui_kit::*;
+
+    /// Opens the view `build` makes alone in a test window, with the list keys
+    /// (J, K, Enter) bound where the app binds them, for a list's view tests.
+    pub(crate) fn open_list<V: Render>(
+        cx: &mut TestAppContext,
+        build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+    ) -> (VisualTestContext, Entity<V>) {
+        use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
+        use crate::shell::menus::LIST_KEYS;
+
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(crate::store::Settings::default());
+            cx.set_global(crate::services::Services::default());
+            cx.set_global(crate::services::Accounts::default());
+            cx.bind_keys([
+                KeyBinding::new("j", SelectNext, Some(LIST_KEYS)),
+                KeyBinding::new("k", SelectPrevious, Some(LIST_KEYS)),
+                KeyBinding::new("enter", OpenSelected, Some(LIST_KEYS)),
+            ]);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1280.), px(820.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                build,
+            )
+            .expect("open the window")
+        });
+        (VisualTestContext::from_window(handle, cx), view)
+    }
 }

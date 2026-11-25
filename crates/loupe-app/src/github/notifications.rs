@@ -444,7 +444,7 @@ impl NotificationsView {
             .filter(|group| !group.collapsed)
             .flat_map(|group| group.spots.iter().cloned())
             .collect();
-        let Some(next) = super::inbox::step_cursor(&spots, self.cursor.as_ref(), down) else {
+        let Some(next) = ui::step_cursor(&spots, self.cursor.as_ref(), down) else {
             return;
         };
         // The line's place in the scrolled content, from the fixed heights

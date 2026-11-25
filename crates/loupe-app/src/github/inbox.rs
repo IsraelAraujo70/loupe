@@ -64,6 +64,7 @@ use crate::store::ViewSync;
 use crate::theme::{scale, tokens};
 use crate::ui;
 use crate::ui::MenuTriggerExt as _;
+use crate::ui::step_cursor;
 
 /// Where the page's results are stored between runs. A copy from before the
 /// rows carried review requests would put every pull request in No reviewer
@@ -583,26 +584,6 @@ fn threads_of(notifications: &[GitHubNotification], prs: &[PrRef]) -> Vec<String
         })
         .map(|notification| notification.id.clone())
         .collect()
-}
-
-/// Where the keyboard cursor goes next among `rows`, the pull requests on
-/// screen in order: one step from `current`, staying at either end. With no
-/// cursor yet, or one whose pull request left the list, it starts at the
-/// first row going down and at the last going up.
-pub(super) fn step_cursor<T: PartialEq + Clone>(
-    rows: &[T],
-    current: Option<&T>,
-    down: bool,
-) -> Option<T> {
-    let last = rows.len().checked_sub(1)?;
-    let at = current.and_then(|pr| rows.iter().position(|row| row == pr));
-    let next = match (at, down) {
-        (Some(at), true) => (at + 1).min(last),
-        (Some(at), false) => at.saturating_sub(1),
-        (None, true) => 0,
-        (None, false) => last,
-    };
-    rows.get(next).cloned()
 }
 
 pub fn view(window: &mut Window, cx: &mut App) -> AnyView {

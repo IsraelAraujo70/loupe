@@ -23,11 +23,12 @@ use crate::github::repo::{RepoTab, repo_header, repo_tabs};
 use crate::github::repos;
 use crate::route::Route;
 use crate::shell::Refreshable as _;
+use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::shell::{OpenOnClick as _, navigate};
 use crate::theme::scale;
 use crate::theme::scale::dp;
-use crate::ui;
 use crate::ui::MenuTriggerExt as _;
+use crate::ui::{self, ListRowFocus as _};
 
 /// The lanes after the title, in px: repository, workflow, branch, actor,
 /// duration, age.
@@ -222,6 +223,14 @@ pub struct RunsView {
     runs: Loadable<Runs>,
     filter: RunFilter,
     scroll: ScrollHandle,
+    /// The list's children (a line about the repositories that could not
+    /// be read, the column heading, then a row per run), to scroll the
+    /// keyboard cursor's row into view.
+    rows: ScrollHandle,
+    focus: FocusHandle,
+    /// The id of the run under the keyboard cursor (J and K, or the
+    /// arrows).
+    cursor: Option<u64>,
     _load: Option<Task<()>>,
     _poll: Option<Task<()>>,
     _list_changes: Vec<Subscription>,
@@ -244,6 +253,9 @@ impl RunsView {
             runs: Loadable::Loading,
             filter: RunFilter::default(),
             scroll: ScrollHandle::new(),
+            rows: ScrollHandle::new(),
+            focus: cx.focus_handle(),
+            cursor: None,
             _load: None,
             _poll: None,
             _list_changes: list_changes,
@@ -375,6 +387,50 @@ impl RunsView {
             .iter()
             .filter(|item| self.filter.matches(item))
             .collect()
+    }
+
+    /// The runs on screen, top to bottom, and where the first of them is
+    /// among the list's children.
+    fn listed(&self) -> (Vec<&RepoRun>, usize) {
+        let Some(runs) = self.runs.value() else {
+            return (Vec::new(), 0);
+        };
+        let first = if runs.failed.is_empty() { 1 } else { 2 };
+        (self.shown(runs), first)
+    }
+
+    /// Moves the keyboard cursor one row and scrolls it into view, with the
+    /// column heading when it is the first row.
+    fn move_cursor(&mut self, down: bool, cx: &mut Context<Self>) {
+        let (listed, first) = self.listed();
+        let ids: Vec<u64> = listed.iter().map(|item| item.run.id).collect();
+        let Some(next) = ui::step_cursor(&ids, self.cursor.as_ref(), down) else {
+            return;
+        };
+        let at = ids.iter().position(|id| *id == next).unwrap_or(0);
+        let row = first + at;
+        ui::scroll_to_rows(
+            &self.scroll,
+            &self.rows,
+            if at == 0 { first - 1 } else { row }..=row,
+        );
+        self.cursor = Some(next);
+        cx.notify();
+    }
+
+    /// Enter or O: opens the run under the cursor in this tab. With no
+    /// cursor the key goes on to whoever handles it next.
+    fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let route = self
+            .listed()
+            .0
+            .into_iter()
+            .find(|item| self.cursor == Some(item.run.id))
+            .map(run_route);
+        match route {
+            Some(route) => navigate(route, window, cx),
+            None => cx.propagate(),
+        }
     }
 
     /// One repository's page: the branch the list is narrowed to, as a chip
@@ -547,17 +603,14 @@ impl RunsView {
         }
     }
 
-    fn row(&self, item: &RepoRun, cx: &App) -> impl IntoElement {
+    /// One run's row. `focused` marks the row under the keyboard cursor
+    /// while the list has the focus.
+    fn row(&self, item: &RepoRun, focused: bool, cx: &App) -> impl IntoElement {
         let RepoRun { repo, run } = item;
         let theme = cx.theme();
         let now = Utc::now();
         let (icon, color) = status_style(run.status);
-        let route = Route::WorkflowRun {
-            repo: repo.clone(),
-            run_id: run.id,
-            job_id: None,
-            title: format!("{} #{}", run.workflow, run.number),
-        };
+        let route = run_route(item);
         let title = if run.title.is_empty() {
             run.workflow.clone()
         } else {
@@ -589,6 +642,7 @@ impl RunsView {
             .role(Role::Link)
             .aria_label(name)
             .relative()
+            .keyboard_focus(focused, cx)
             .child(ui::list_row_divider(cx))
             .opens(route)
             .child(Icon::new(icon).small().flex_none().text_color(color))
@@ -676,7 +730,9 @@ impl RunsView {
             )
     }
 
-    fn body(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// `focused` says whether the list has the focus, and so whether the
+    /// row under the keyboard cursor shows it.
+    fn body(&self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let runs = match &self.runs {
             Loadable::Failed(error) => {
                 return common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
@@ -731,10 +787,25 @@ impl RunsView {
                 .into_any_element();
         }
         ui::list_container()
+            .id("runs-rows")
+            .track_scroll(&self.rows)
             .children(failed)
             .child(self.heading(cx))
-            .children(shown.into_iter().map(|item| self.row(item, cx)))
+            .children(shown.into_iter().map(|item| {
+                let at_cursor = focused && self.cursor == Some(item.run.id);
+                self.row(item, at_cursor, cx)
+            }))
             .into_any_element()
+    }
+}
+
+fn run_route(item: &RepoRun) -> Route {
+    let RepoRun { repo, run } = item;
+    Route::WorkflowRun {
+        repo: repo.clone(),
+        run_id: run.id,
+        job_id: None,
+        title: format!("{} #{}", run.workflow, run.number),
     }
 }
 
@@ -796,9 +867,27 @@ impl crate::shell::Refreshable for RunsView {
 }
 
 impl Render for RunsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if crate::shell::page_may_take_focus(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        let focused = self.focus.is_focused(window);
+        let name = match &self.scope {
+            Scope::Repo { repo, .. } => format!("Actions of {repo}"),
+            Scope::All => "Actions".to_owned(),
+        };
         v_flex()
+            .id("runs-page")
+            .role(Role::Group)
+            .aria_label(name)
             .size_full()
+            .key_context("RunsView")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.move_cursor(false, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
+            )
             .child(self.header(cx))
             .children(self.tabs())
             .children(self.filter_row(cx))
@@ -809,7 +898,7 @@ impl Render for RunsView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
-                    .child(self.body(cx)),
+                    .child(self.body(focused, cx)),
             )
     }
 }
@@ -817,9 +906,11 @@ impl Render for RunsView {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
+    use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext};
     use loupe_github::{CheckStatus, Error, RepoRef, WorkflowRun};
 
-    use super::{RepoRun, RunFilter, merge};
+    use super::{RepoRun, RunFilter, Runs, RunsView, Scope, merge};
+    use crate::github::common::Loadable;
 
     fn run(id: u64, workflow: &str, branch: &str, status: CheckStatus, at: i64) -> WorkflowRun {
         let time: DateTime<Utc> = DateTime::from_timestamp(at, 0).expect("time");
@@ -937,5 +1028,42 @@ mod tests {
                 CheckStatus::Passed
             ]
         );
+    }
+
+    /// J and K walk the runs the filters keep, from the newest, stopping at
+    /// either end.
+    #[gpui_kit::test]
+    fn j_and_k_walk_the_runs_the_filters_keep(cx: &mut TestAppContext) {
+        let scope = Scope::Repo {
+            repo: repo("app"),
+            branch: None,
+        };
+        let (mut cx, view) = crate::ui::open_list(cx, move |window, cx| {
+            cx.new(|cx| RunsView::new(scope, window, cx))
+        });
+        let cx = &mut cx;
+        cx.run_until_parked();
+        let item = |id, workflow, at| RepoRun {
+            repo: repo("app"),
+            run: run(id, workflow, "main", CheckStatus::Passed, at),
+        };
+        view.update(cx, |view, cx| {
+            view.runs = Loadable::Loaded(Runs {
+                runs: vec![item(3, "CI", 30), item(2, "Lint", 20), item(1, "CI", 10)],
+                failed: Vec::new(),
+            });
+            view.filter.workflow = Some("CI".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let cursor = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.cursor);
+        cx.simulate_keystrokes("j");
+        assert_eq!(cursor(cx), Some(3), "the first J lands on the newest run");
+        cx.simulate_keystrokes("j");
+        assert_eq!(cursor(cx), Some(1), "a run the filter hides is passed over");
+        cx.simulate_keystrokes("j");
+        assert_eq!(cursor(cx), Some(1), "and the cursor stops at the end");
+        cx.simulate_keystrokes("k");
+        assert_eq!(cursor(cx), Some(3));
     }
 }

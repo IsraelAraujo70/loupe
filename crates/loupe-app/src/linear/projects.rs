@@ -14,21 +14,29 @@ use crate::linear::widgets;
 use crate::route::Route;
 use crate::services::background;
 use crate::shell::OpenOnClick as _;
+use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::theme::scale;
-use crate::ui;
+use crate::ui::{self, ListRowFocus as _};
 
 pub fn view(team_id: Option<String>, _window: &mut Window, cx: &mut App) -> AnyView {
+    build(team_id, cx).into()
+}
+
+fn build(team_id: Option<String>, cx: &mut App) -> Entity<ProjectsView> {
     cx.new(|cx| {
         let mut view = ProjectsView {
             team_id,
             client: None,
             projects: Loadable::Loading,
             task: None,
+            scroll: ScrollHandle::new(),
+            rows: ScrollHandle::new(),
+            focus: cx.focus_handle(),
+            cursor: None,
         };
         view.sync_client(cx);
         view
     })
-    .into()
 }
 
 struct ProjectsView {
@@ -37,6 +45,14 @@ struct ProjectsView {
     client: Option<Arc<Linear>>,
     projects: Loadable<Vec<ProjectSummary>>,
     task: Option<Task<()>>,
+    scroll: ScrollHandle,
+    /// The list's children (the column heading, then a row per project), to
+    /// scroll the keyboard cursor's row into view.
+    rows: ScrollHandle,
+    focus: FocusHandle,
+    /// The id of the project under the keyboard cursor (J and K, or the
+    /// arrows).
+    cursor: Option<String>,
 }
 
 impl ProjectsView {
@@ -71,6 +87,49 @@ impl ProjectsView {
         cx.notify();
     }
 
+    /// The projects on screen, top to bottom.
+    fn listed(&self) -> &[ProjectSummary] {
+        match &self.projects {
+            Loadable::Ready(projects) => projects,
+            _ => &[],
+        }
+    }
+
+    /// Moves the keyboard cursor one row and scrolls it into view, with the
+    /// column heading when it is the first row.
+    fn move_cursor(&mut self, down: bool, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .listed()
+            .iter()
+            .map(|project| project.id.clone())
+            .collect();
+        let Some(next) = ui::step_cursor(&ids, self.cursor.as_ref(), down) else {
+            return;
+        };
+        let at = ids.iter().position(|id| *id == next).unwrap_or(0);
+        let row = at + 1;
+        ui::scroll_to_rows(
+            &self.scroll,
+            &self.rows,
+            if at == 0 { 0 } else { row }..=row,
+        );
+        self.cursor = Some(next);
+        cx.notify();
+    }
+
+    /// Enter or O: opens the project under the cursor in this tab. With no
+    /// cursor the key goes on to whoever handles it next.
+    fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self
+            .listed()
+            .iter()
+            .find(|project| self.cursor.as_ref() == Some(&project.id));
+        match project {
+            Some(project) => crate::shell::navigate(project_route(project), window, cx),
+            None => cx.propagate(),
+        }
+    }
+
     fn heading(&self, cx: &App) -> impl IntoElement {
         ui::list_column_header(cx)
             .child(div().flex_none().size_2p5())
@@ -81,15 +140,14 @@ impl ProjectsView {
             .child(div().flex_none().w_20().text_right().child("Target"))
     }
 
-    fn row(&self, project: &ProjectSummary, cx: &App) -> impl IntoElement {
+    /// One project's row. `focused` marks the row under the keyboard cursor
+    /// while the list has the focus.
+    fn row(&self, project: &ProjectSummary, focused: bool, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let color = widgets::hex_color(&project.color).unwrap_or(muted);
         let status_color = widgets::hex_color(&project.status.color).unwrap_or(muted);
-        let route = Route::LinearProject {
-            id: project.id.clone(),
-            name: project.name.clone(),
-        };
+        let route = project_route(project);
         let percent = (project.progress * 100.).round() as u32;
         ui::list_row(SharedString::from(format!("project-{}", project.id)), cx)
             .role(Role::Link)
@@ -97,6 +155,7 @@ impl ProjectsView {
                 "{}, {}, {percent}%",
                 project.name, project.status.name
             ))
+            .keyboard_focus(focused, cx)
             .opens(route)
             .child(div().flex_none().size_2p5().rounded_sm().bg(color))
             .child(
@@ -172,12 +231,23 @@ impl ProjectsView {
     }
 }
 
+fn project_route(project: &ProjectSummary) -> Route {
+    Route::LinearProject {
+        id: project.id.clone(),
+        name: project.name.clone(),
+    }
+}
+
 impl Render for ProjectsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_client(cx);
         if self.client.is_none() {
             return widgets::not_connected(IconName::Box, "Projects");
         }
+        if crate::shell::page_may_take_focus(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        let focused = self.focus.is_focused(window);
         let header = match &self.projects {
             Loadable::Ready(projects) => ui::page_header("Projects")
                 .icon(IconName::Box)
@@ -196,12 +266,27 @@ impl Render for ProjectsView {
             )
             .into_any_element(),
             Loadable::Ready(projects) => ui::list_container()
+                .id("projects-rows")
+                .track_scroll(&self.rows)
                 .child(self.heading(cx))
-                .children(projects.iter().map(|project| self.row(project, cx)))
+                .children(projects.iter().map(|project| {
+                    let at_cursor = focused && self.cursor.as_ref() == Some(&project.id);
+                    self.row(project, at_cursor, cx)
+                }))
                 .into_any_element(),
         };
         v_flex()
+            .id("projects-page")
+            .role(Role::Group)
+            .aria_label("Projects")
             .size_full()
+            .key_context("ProjectsView")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.move_cursor(false, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
+            )
             .child(header)
             .child(
                 div()
@@ -209,8 +294,65 @@ impl Render for ProjectsView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
                     .child(body),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::TestAppContext;
+    use loupe_linear::{ProjectStatus, ProjectStatusKind, ProjectSummary};
+
+    use super::build;
+    use crate::linear::data::Loadable;
+
+    fn project(id: &str) -> ProjectSummary {
+        ProjectSummary {
+            id: id.into(),
+            name: format!("Project {id}"),
+            color: "#888888".into(),
+            status: ProjectStatus {
+                id: "started".into(),
+                name: "In progress".into(),
+                kind: ProjectStatusKind::Started,
+                color: "#888888".into(),
+            },
+            progress: 0.5,
+            lead: None,
+            target_date: None,
+            url: String::new(),
+            team_ids: Vec::new(),
+        }
+    }
+
+    /// The keyboard cursor walks the projects from the first, stopping at
+    /// either end.
+    #[gpui_kit::test]
+    fn the_cursor_walks_the_projects(cx: &mut TestAppContext) {
+        let view = cx.update(|cx| {
+            cx.set_global(crate::services::Services::default());
+            build(None, cx)
+        });
+        view.update(cx, |view, cx| {
+            view.projects = Loadable::Ready(vec![project("a"), project("b")]);
+            cx.notify();
+        });
+        let step = |down: bool, cx: &mut TestAppContext| {
+            view.update(cx, |view, cx| {
+                view.move_cursor(down, cx);
+                view.cursor.clone()
+            })
+        };
+        assert_eq!(step(true, cx).as_deref(), Some("a"));
+        assert_eq!(step(true, cx).as_deref(), Some("b"));
+        assert_eq!(
+            step(true, cx).as_deref(),
+            Some("b"),
+            "the cursor stops at the end"
+        );
+        assert_eq!(step(false, cx).as_deref(), Some("a"));
     }
 }

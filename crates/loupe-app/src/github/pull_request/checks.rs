@@ -2,6 +2,7 @@
 //! job's log on demand, and re-running failed jobs.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
@@ -21,9 +22,10 @@ use crate::github::common::{self, Submit};
 use crate::github::widgets;
 use crate::route::Route;
 use crate::shell::OpenOnClick as _;
+use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
-use crate::ui;
+use crate::ui::{self, ListRowFocus as _};
 
 /// How many checks passed, failed, are still going, or were skipped.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -226,6 +228,25 @@ pub struct ChecksTab {
     freshness: Freshness,
     /// The groups the user folded.
     folded: HashSet<CheckSource>,
+    /// The pull request page's scroll, which the tab is drawn in.
+    scroll: ScrollHandle,
+    /// The list's children (per group its heading, then its checks and an
+    /// open log's panel), to scroll the keyboard cursor's row into view.
+    rows: ScrollHandle,
+    focus: FocusHandle,
+    /// The full name of the check under the keyboard cursor (J and K, or
+    /// the arrows).
+    cursor: Option<String>,
+}
+
+/// One check of the list as it is on screen: its full name, the route that
+/// opens it, if any, and the list's children to bring into view when the
+/// keyboard cursor comes to it (its row, with its group's heading above its
+/// group's first row).
+struct Line {
+    name: String,
+    route: Option<Route>,
+    children: RangeInclusive<usize>,
 }
 
 impl EventEmitter<PrTabEvent> for ChecksTab {}
@@ -238,7 +259,9 @@ fn failed_job(run: &CheckRun) -> Option<ActionsJob> {
 }
 
 impl ChecksTab {
-    pub fn new(context: PrTabContext) -> Self {
+    /// `scroll` is the pull request page's scroll, which the tab is drawn
+    /// in.
+    pub fn new(context: PrTabContext, scroll: ScrollHandle, cx: &mut Context<Self>) -> Self {
         Self {
             context,
             logs: HashMap::new(),
@@ -248,6 +271,68 @@ impl ChecksTab {
             rerun_jobs: Vec::new(),
             freshness: Freshness::default(),
             folded: HashSet::new(),
+            scroll,
+            rows: ScrollHandle::new(),
+            focus: cx.focus_handle(),
+            cursor: None,
+        }
+    }
+
+    /// The checks on screen, top to bottom: those of every group that is
+    /// not folded, in the order the list draws its children.
+    fn lines(&self) -> Vec<Line> {
+        let detail = &self.context.detail;
+        let mut lines = Vec::new();
+        let mut child = 0;
+        for (source, members) in detail.checks.by_source() {
+            let heading = child;
+            child += 1;
+            if self.folded.contains(&source) {
+                continue;
+            }
+            for (at, ix) in members.into_iter().enumerate() {
+                let run = &detail.checks.runs[ix];
+                lines.push(Line {
+                    name: run.full_name(),
+                    route: check_route(&self.context.pr.repo, &detail.head_ref, run),
+                    children: if at == 0 { heading } else { child }..=child,
+                });
+                child += 1;
+                if failed_job(run).is_some_and(|job| self.logs.contains_key(&job.job_id)) {
+                    child += 1;
+                }
+            }
+        }
+        lines
+    }
+
+    /// Moves the keyboard cursor one check and scrolls it into view, with
+    /// its group's heading when it is the group's first check.
+    fn move_cursor(&mut self, down: bool, cx: &mut Context<Self>) {
+        let lines = self.lines();
+        let names: Vec<String> = lines.iter().map(|line| line.name.clone()).collect();
+        let Some(next) = ui::step_cursor(&names, self.cursor.as_ref(), down) else {
+            return;
+        };
+        if let Some(line) = lines.iter().find(|line| line.name == next) {
+            ui::scroll_to_rows(&self.scroll, &self.rows, line.children.clone());
+        }
+        self.cursor = Some(next);
+        cx.notify();
+    }
+
+    /// Enter or O: opens the run of the check under the cursor in this tab,
+    /// as a click on its row does. A check with nothing to open, or no
+    /// cursor, passes the key on to whoever handles it next.
+    fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let route = self
+            .lines()
+            .into_iter()
+            .find(|line| self.cursor.as_ref() == Some(&line.name))
+            .and_then(|line| line.route);
+        match route {
+            Some(route) => crate::shell::navigate(route, window, cx),
+            None => cx.propagate(),
         }
     }
 
@@ -507,7 +592,15 @@ impl ChecksTab {
         })
     }
 
-    fn check_row(&self, ix: usize, run: &CheckRun, cx: &mut Context<Self>) -> impl IntoElement {
+    /// One check's row. `focused` marks the row under the keyboard cursor
+    /// while the list has the focus.
+    fn check_row(
+        &self,
+        ix: usize,
+        run: &CheckRun,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let (icon, color) = status_style(run.status);
         let url = run.details_url.clone();
@@ -526,6 +619,7 @@ impl ChecksTab {
                     .aria_label(format!("{full_name}, open its run"))
                     .opens(route)
             })
+            .keyboard_focus(focused, cx)
             .child(Icon::new(icon).small().text_color(color))
             .child(
                 h_flex()
@@ -650,7 +744,7 @@ impl ChecksTab {
 }
 
 impl Render for ChecksTab {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let detail = self.context.detail.clone();
         if detail.checks.runs.is_empty() {
             let (title, text) = if self.rerun_jobs.is_empty() {
@@ -663,6 +757,13 @@ impl Render for ChecksTab {
             };
             return ui::empty_state(IconName::ListChecks, title, text).into_any_element();
         }
+        if crate::shell::page_may_take_focus(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        let cursor = self
+            .cursor
+            .clone()
+            .filter(|_| self.focus.is_focused(window));
         let card = self.summary_card(cx).into_any_element();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (source, members) in detail.checks.by_source() {
@@ -672,7 +773,8 @@ impl Render for ChecksTab {
             }
             for ix in members {
                 let run = &detail.checks.runs[ix];
-                rows.push(self.check_row(ix, run, cx).into_any_element());
+                let at_cursor = cursor.as_ref() == Some(&run.full_name());
+                rows.push(self.check_row(ix, run, at_cursor, cx).into_any_element());
                 if let Some(panel) = failed_job(run).and_then(|job| self.log_panel(job.job_id, cx))
                 {
                     rows.push(panel);
@@ -680,25 +782,45 @@ impl Render for ChecksTab {
             }
         }
         v_flex()
+            .id("pr-checks-list")
+            .role(Role::Group)
+            .aria_label("Checks")
             .w_full()
             .py_4()
             .gap_2()
+            .key_context("ChecksTab")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.move_cursor(false, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
+            )
             .child(div().px(scale::content_inset()).child(card))
-            .child(ui::list_container().children(rows))
+            .child(
+                ui::list_container()
+                    .id("pr-checks-rows")
+                    .track_scroll(&self.rows)
+                    .children(rows),
+            )
             .into_any_element()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{DateTime, Utc};
-    use loupe_github::{CheckRun, CheckStatus};
+    use gpui_kit::{AppContext as _, ScrollHandle, TestAppContext, VisualTestContext};
+    use loupe_github::{CheckRun, CheckSource, CheckStatus};
 
     use chrono::{Local, TimeZone};
 
     use loupe_github::{ActionsJob, RepoRef};
 
-    use super::{ChecksSummary, Freshness, check_route, format_duration, run_duration};
+    use super::{ChecksSummary, ChecksTab, Freshness, check_route, format_duration, run_duration};
+    use crate::github::pull_request::files::tests::detail;
+    use crate::github::pull_request::tab::PrTabContext;
     use crate::route::Route;
 
     fn run(status: CheckStatus) -> CheckRun {
@@ -884,5 +1006,60 @@ mod tests {
             ..run(CheckStatus::Running)
         };
         assert_eq!(check_route(&repo, "issue/121", &other_repo), None);
+    }
+
+    /// J and K walk the checks group by group, as the tab lists them, and
+    /// pass over the checks of a folded group.
+    #[gpui_kit::test]
+    fn j_and_k_walk_the_checks_and_pass_over_a_folded_group(cx: &mut TestAppContext) {
+        let check = |name: &str, workflow: Option<&str>| CheckRun {
+            name: name.into(),
+            workflow: workflow.map(Into::into),
+            event: workflow.map(|_| "push".into()),
+            ..run(CheckStatus::Passed)
+        };
+        let mut detail = detail();
+        detail.checks.runs = vec![
+            check("deploy", None),
+            check("lint", Some("Lint")),
+            check("build", Some("CI")),
+            check("test", Some("CI")),
+        ];
+        let context = PrTabContext {
+            pr: detail.pr.clone(),
+            detail: Arc::new(detail),
+        };
+        let (mut cx, view) = crate::ui::open_list(cx, move |_, cx| {
+            cx.new(|cx| ChecksTab::new(context, ScrollHandle::new(), cx))
+        });
+        let cx = &mut cx;
+        cx.run_until_parked();
+        let cursor = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.cursor.clone());
+        cx.simulate_keystrokes("j");
+        assert_eq!(cursor(cx).as_deref(), Some("CI / build (push)"));
+        cx.simulate_keystrokes("j j");
+        assert_eq!(cursor(cx).as_deref(), Some("Lint / lint (push)"));
+        cx.simulate_keystrokes("k");
+        assert_eq!(cursor(cx).as_deref(), Some("CI / test (push)"));
+
+        view.update(cx, |view, cx| {
+            view.folded.insert(CheckSource::Workflow {
+                name: "Lint".into(),
+                event: Some("push".into()),
+            });
+            cx.notify();
+        });
+        cx.simulate_keystrokes("j");
+        assert_eq!(
+            cursor(cx).as_deref(),
+            Some("deploy"),
+            "the folded group is passed over"
+        );
+        cx.simulate_keystrokes("j");
+        assert_eq!(
+            cursor(cx).as_deref(),
+            Some("deploy"),
+            "and the cursor stops at the end"
+        );
     }
 }

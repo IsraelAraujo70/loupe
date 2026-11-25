@@ -2,12 +2,13 @@
 //! with a team picker that opens any team.
 
 use std::collections::HashSet;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use chrono::Utc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use loupe_linear::views::ViewConfig;
@@ -19,12 +20,13 @@ use crate::route::Route;
 use crate::services::background;
 use crate::shell::OpenOnClick as _;
 use crate::shell::Refreshable as _;
+use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::shell::item_menu::{Item, with_item_menu};
 use crate::shell::navigate;
 use crate::theme::scale;
 use crate::theme::scale::dp;
-use crate::ui;
 use crate::ui::MenuTriggerExt as _;
+use crate::ui::{self, ListRowFocus as _};
 
 type Group = (StateType, Vec<IssueSummary>);
 
@@ -81,6 +83,23 @@ pub(super) struct MyIssues {
     collapsed: HashSet<StateType>,
     issues_task: Option<Task<()>>,
     teams_task: Option<Task<()>>,
+    scroll: ScrollHandle,
+    /// The list's children (per group its heading, then its rows unless it
+    /// is folded), to scroll the keyboard cursor's row into view.
+    rows: ScrollHandle,
+    focus: FocusHandle,
+    /// The id of the issue under the keyboard cursor (J and K, or the
+    /// arrows).
+    cursor: Option<String>,
+}
+
+/// One issue of the list as it is on screen: its id, its identifier, and the
+/// list's children to bring into view when the keyboard cursor comes to it
+/// (its row, with its group's heading above its group's first row).
+struct Line {
+    id: String,
+    identifier: String,
+    children: RangeInclusive<usize>,
 }
 
 pub fn view(_window: &mut Window, cx: &mut App) -> AnyView {
@@ -109,6 +128,10 @@ impl MyIssues {
             collapsed: HashSet::new(),
             issues_task: None,
             teams_task: None,
+            scroll: ScrollHandle::new(),
+            rows: ScrollHandle::new(),
+            focus: cx.focus_handle(),
+            cursor: None,
         };
         view.sync_client(cx);
         view
@@ -169,6 +192,67 @@ impl MyIssues {
         }));
     }
 
+    /// The issues on screen, top to bottom: the rows of every group that is
+    /// not folded, in the order the list draws its children.
+    fn lines(&self) -> Vec<Line> {
+        let Loadable::Ready(groups) = &self.issues else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        let mut child = 0;
+        for (kind, issues) in groups {
+            let heading = child;
+            child += 1;
+            if self.collapsed.contains(kind) {
+                continue;
+            }
+            for (at, issue) in issues.iter().enumerate() {
+                lines.push(Line {
+                    id: issue.id.clone(),
+                    identifier: issue.identifier.clone(),
+                    children: if at == 0 { heading } else { child }..=child,
+                });
+                child += 1;
+            }
+        }
+        lines
+    }
+
+    /// Moves the keyboard cursor one row and scrolls it into view, with its
+    /// group's heading when it is the group's first row.
+    fn move_cursor(&mut self, down: bool, cx: &mut Context<Self>) {
+        let lines = self.lines();
+        let ids: Vec<String> = lines.iter().map(|line| line.id.clone()).collect();
+        let Some(next) = ui::step_cursor(&ids, self.cursor.as_ref(), down) else {
+            return;
+        };
+        if let Some(line) = lines.iter().find(|line| line.id == next) {
+            ui::scroll_to_rows(&self.scroll, &self.rows, line.children.clone());
+        }
+        self.cursor = Some(next);
+        cx.notify();
+    }
+
+    /// Enter or O: opens the issue under the cursor in this tab. With no
+    /// cursor, or one in a folded group, the key goes on to whoever handles
+    /// it next.
+    fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let line = self
+            .lines()
+            .into_iter()
+            .find(|line| self.cursor.as_ref() == Some(&line.id));
+        match line {
+            Some(line) => navigate(
+                Route::LinearIssue {
+                    identifier: line.identifier,
+                },
+                window,
+                cx,
+            ),
+            None => cx.propagate(),
+        }
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> AnyElement {
         let total = match &self.issues {
             Loadable::Ready(groups) => Some(groups.iter().map(|(_, issues)| issues.len()).sum()),
@@ -200,12 +284,16 @@ impl MyIssues {
             .into_any_element()
     }
 
+    /// One group's children of the list: its heading, which folds it, then
+    /// its rows unless it is folded. `focused` says whether the list has
+    /// the focus, and so whether the row under the keyboard cursor shows it.
     fn group_section(
         &self,
         kind: StateType,
         issues: &[IssueSummary],
+        focused: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Vec<AnyElement> {
         let collapsed = self.collapsed.contains(&kind);
         let theme = cx.theme();
         let (border, muted, header_bg) = (theme.border, theme.muted_foreground, theme.muted);
@@ -261,27 +349,24 @@ impl MyIssues {
                     .child(issues.len().to_string()),
             );
 
-        let rows: Vec<AnyElement> = if collapsed {
-            Vec::new()
-        } else {
-            issues
-                .iter()
-                .map(|issue| {
-                    let route = Route::LinearIssue {
-                        identifier: issue.identifier.clone(),
-                    };
-                    with_item_menu(
-                        widgets::issue_row(issue, now, &props, cx).opens(route),
-                        Item::issue(issue),
-                    )
-                    .into_any_element()
-                })
-                .collect()
-        };
-        v_flex().child(header).children(rows).into_any_element()
+        let mut children = vec![header.into_any_element()];
+        if collapsed {
+            return children;
+        }
+        let cursor = self.cursor.as_ref().filter(|_| focused);
+        children.extend(issues.iter().map(|issue| {
+            let route = Route::LinearIssue {
+                identifier: issue.identifier.clone(),
+            };
+            let row = widgets::issue_row(issue, now, &props, cx)
+                .keyboard_focus(cursor == Some(&issue.id), cx)
+                .opens(route);
+            with_item_menu(row, Item::issue(issue)).into_any_element()
+        }));
+        children
     }
 
-    fn body(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn body(&self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         match &self.issues {
             Loadable::Loading => div().py_2().child(ui::skeleton_rows(8)).into_any_element(),
             Loadable::Failed(message) => widgets::load_error(
@@ -295,15 +380,27 @@ impl MyIssues {
             )
             .into_any_element(),
             Loadable::Ready(groups) => {
-                let sections: Vec<AnyElement> = groups
+                let children: Vec<AnyElement> = groups
                     .iter()
-                    .map(|(kind, issues)| self.group_section(*kind, issues, cx))
+                    .flat_map(|(kind, issues)| self.group_section(*kind, issues, focused, cx))
                     .collect();
-                v_flex()
-                    .id("my-issues-body")
+                div()
+                    .relative()
                     .size_full()
-                    .overflow_y_scrollbar()
-                    .children(sections)
+                    .child(
+                        div()
+                            .id("my-issues-body")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .child(
+                                v_flex()
+                                    .id("my-issues-rows")
+                                    .track_scroll(&self.rows)
+                                    .children(children),
+                            ),
+                    )
+                    .child(Scrollbar::vertical(&self.scroll))
                     .into_any_element()
             }
         }
@@ -340,26 +437,44 @@ impl crate::shell::Refreshable for MyIssues {
 }
 
 impl Render for MyIssues {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_client(cx);
         if self.client.is_none() {
             return v_flex()
                 .size_full()
-                .child(widgets::not_connected(IconName::CircleUser, "My issues"));
+                .child(widgets::not_connected(IconName::CircleUser, "My issues"))
+                .into_any_element();
         }
+        if crate::shell::page_may_take_focus(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        let focused = self.focus.is_focused(window);
         v_flex()
+            .id("my-issues-page")
+            .role(Role::Group)
+            .aria_label("My issues")
             .size_full()
+            .key_context("MyIssues")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.move_cursor(false, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
+            )
             .child(self.header(cx))
-            .child(div().flex_1().min_h_0().child(self.body(cx)))
+            .child(div().flex_1().min_h_0().child(self.body(focused, cx)))
+            .into_any_element()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, TimeZone, Utc};
+    use gpui_kit::{AppContext as _, TestAppContext};
     use loupe_linear::{IssueSummary, Priority, StateRef, StateType, TeamRef};
 
-    use super::{group_by_state_type, replace_issue};
+    use super::{MyIssues, group_by_state_type, replace_issue};
+    use crate::linear::data::Loadable;
 
     fn at(hour: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, 1, hour, 0, 0).unwrap()
@@ -484,5 +599,65 @@ mod tests {
             &mut groups,
             issue("ENG-9", StateType::Started, at(4))
         ));
+    }
+
+    /// The keyboard cursor walks the issues group by group, passes over a
+    /// folded group's rows, and stops at either end. Each step names the
+    /// list's children to bring into view: the group's heading comes with
+    /// its first row.
+    #[gpui_kit::test]
+    fn the_cursor_walks_the_groups_and_skips_a_folded_one(cx: &mut TestAppContext) {
+        let view = cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(crate::services::Services::default());
+            cx.new(MyIssues::new)
+        });
+        view.update(cx, |view, cx| {
+            view.issues = Loadable::Ready(group_by_state_type(vec![
+                issue("ENG-1", StateType::Started, at(2)),
+                issue("ENG-2", StateType::Started, at(1)),
+                issue("ENG-3", StateType::Unstarted, at(3)),
+                issue("ENG-4", StateType::Backlog, at(4)),
+            ]));
+            cx.notify();
+        });
+        let step = |down: bool, cx: &mut TestAppContext| {
+            view.update(cx, |view, cx| {
+                view.move_cursor(down, cx);
+                view.cursor.clone()
+            })
+        };
+        let id = |identifier: &str| Some(format!("id-{identifier}"));
+        assert_eq!(
+            step(true, cx),
+            id("ENG-1"),
+            "the first J lands on the first row"
+        );
+        assert_eq!(step(true, cx), id("ENG-2"));
+        assert_eq!(step(true, cx), id("ENG-3"), "on into the next group");
+        let shown: Vec<_> = view.read_with(cx, |view, _| {
+            view.lines().into_iter().map(|line| line.children).collect()
+        });
+        assert_eq!(shown, [0..=1, 2..=2, 3..=4, 5..=6]);
+
+        view.update(cx, |view, _| {
+            view.collapsed.insert(StateType::Unstarted);
+        });
+        assert_eq!(
+            step(true, cx),
+            id("ENG-1"),
+            "a cursor in a folded group starts over from the top"
+        );
+        assert_eq!(step(true, cx), id("ENG-2"));
+        assert_eq!(
+            step(true, cx),
+            id("ENG-4"),
+            "the folded group's rows are passed over"
+        );
+        assert_eq!(
+            step(true, cx),
+            id("ENG-4"),
+            "and the cursor stops at the end"
+        );
     }
 }
