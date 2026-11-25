@@ -12,7 +12,7 @@ use crate::settings::appearance::AppearanceState;
 use crate::settings::catalog::{self, Entry, Item, Section};
 use crate::settings::review::ReviewFields;
 use crate::settings::shortcuts::SHORTCUTS;
-use crate::shell::actions::FocusSettingsSearch;
+use crate::shell::actions::{FocusSettingsSearch, ToggleSidebar, ZoomIn, ZoomOut};
 use crate::store::{self, CommentBoxPlace, CommentOrder, DiffLayout, FileTreePosition, Settings};
 use crate::theme::scale::dp;
 use crate::theme::{self, Zoom, scale, tokens};
@@ -329,6 +329,36 @@ pub(super) fn rows_card(rows: Vec<AnyElement>, colors: Palette) -> Div {
         }))
 }
 
+/// The description of a setting, with the keys it names taken from the
+/// keymap so they read as what this platform answers to.
+fn shortcut_description(entry: &Entry, cx: &App) -> SharedString {
+    let keys = match entry.item {
+        Item::SidebarIcons => format!("{} switches it.", ui::bound_shortcut(&ToggleSidebar, cx)),
+        Item::Zoom => {
+            // Zoom in has two keys (= and +); the page names the first, which is
+            // the one the View menu shows, because the last one reads "Ctrl++".
+            let zoom_in = cx
+                .key_bindings()
+                .borrow()
+                .bindings_for_action(&ZoomIn)
+                .next()
+                .and_then(|binding| {
+                    binding
+                        .keystrokes()
+                        .first()
+                        .map(|key| Kbd::format(key.as_keystroke()))
+                })
+                .unwrap_or_default();
+            format!(
+                "{zoom_in} and {} step it.",
+                ui::bound_shortcut(&ZoomOut, cx)
+            )
+        }
+        _ => return entry.description.into(),
+    };
+    format!("{} {keys}", entry.description).into()
+}
+
 /// One setting: its name over a one-line description at the leading edge,
 /// its control at the trailing edge.
 pub(super) fn setting_row(
@@ -392,8 +422,9 @@ impl SettingsView {
     /// that are more than a row (accounts, repositories, shortcuts).
     fn entry_row(&mut self, entry: &Entry, colors: Palette, cx: &mut Context<Self>) -> AnyElement {
         let settings = Settings::get(cx).clone();
+        let description = shortcut_description(entry, cx);
         let row = |control: AnyElement| {
-            setting_row(entry.title, entry.description, control, colors).into_any_element()
+            setting_row(entry.title, description.clone(), control, colors).into_any_element()
         };
         match entry.item {
             Item::SidebarIcons => row(Switch::new("sidebar-icons")
@@ -1222,7 +1253,7 @@ mod tests {
 
     use super::SettingsView;
     use crate::services::{Accounts, Services};
-    use crate::settings::catalog::Section;
+    use crate::settings::catalog::{Item, Section};
     use crate::store::Settings;
 
     fn open(cx: &mut TestAppContext) -> (Entity<SettingsView>, VisualTestContext) {
@@ -1261,6 +1292,30 @@ mod tests {
             view.update(cx, |_, cx| cx.notify());
             window.refresh();
             window.draw(cx).clear(cx);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn descriptions_name_the_keys_this_platform_binds(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::shell::menus::bind_keys(cx);
+            let describe = |item| {
+                let entry = crate::settings::catalog::entries()
+                    .into_iter()
+                    .find(|entry| entry.item == item)
+                    .expect("the entry");
+                super::shortcut_description(&entry, cx).to_string()
+            };
+            let (sidebar, zoom) = if cfg!(target_os = "macos") {
+                ("⌘B switches it.", "⌘= and ⌘- step it.")
+            } else {
+                ("Ctrl+B switches it.", "Ctrl+= and Ctrl+- step it.")
+            };
+            assert!(describe(Item::SidebarIcons).ends_with(sidebar));
+            assert_eq!(
+                describe(Item::Zoom),
+                format!("The size of everything in the window. {zoom}")
+            );
         });
     }
 
