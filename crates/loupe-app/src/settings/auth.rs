@@ -37,13 +37,23 @@ pub struct DiscoveredToken {
     pub viewer: Viewer,
 }
 
+/// What [`discover_github_token`] found. No `Debug`: `Found` holds a token.
+pub enum Discovery {
+    Found(DiscoveredToken),
+    /// No candidate worked. `saved_rejected` is true when a token Loupe had
+    /// saved was among those GitHub refused.
+    NotFound {
+        saved_rejected: bool,
+    },
+}
+
 /// Tries, in order, the stored secret, `GITHUB_TOKEN`, and `gh auth token`
 /// (`/opt/homebrew/bin/gh`, `/usr/local/bin/gh`, then `gh` on `PATH`), and
 /// returns the first one `GitHub::viewer()` accepts. Only a rejected token
 /// moves on to the next candidate. Any other failure (offline, a 5xx) stops
 /// with its message: the next candidate may belong to another account, and
 /// every write would then go out under that identity.
-pub fn discover_github_token() -> Result<Option<DiscoveredToken>, String> {
+pub fn discover_github_token() -> Result<Discovery, String> {
     let stored = store::load_secret(Secret::GitHubToken).map(|token| (token, TokenSource::Stored));
     let environment = std::env::var("GITHUB_TOKEN")
         .ok()
@@ -54,24 +64,34 @@ pub fn discover_github_token() -> Result<Option<DiscoveredToken>, String> {
         .into_iter()
         .flatten()
         .chain(std::iter::once_with(from_cli).flatten());
+    first_accepted(candidates, |token| GitHub::new(token).viewer())
+}
+
+fn first_accepted(
+    candidates: impl IntoIterator<Item = (String, TokenSource)>,
+    check: impl Fn(String) -> Result<Viewer, loupe_github::Error>,
+) -> Result<Discovery, String> {
+    let mut saved_rejected = false;
     for (token, source) in candidates {
         let token = token.trim().to_owned();
         if token.is_empty() {
             continue;
         }
-        match GitHub::new(token.clone()).viewer() {
+        match check(token.clone()) {
             Ok(viewer) => {
-                return Ok(Some(DiscoveredToken {
+                return Ok(Discovery::Found(DiscoveredToken {
                     token,
                     source,
                     viewer,
                 }));
             }
-            Err(loupe_github::Error::Unauthorized) => continue,
+            Err(loupe_github::Error::Unauthorized) => {
+                saved_rejected |= source == TokenSource::Stored;
+            }
             Err(error) => return Err(error.to_string()),
         }
     }
-    Ok(None)
+    Ok(Discovery::NotFound { saved_rejected })
 }
 
 /// Runs `gh auth token`. A Finder-launched app has a minimal `PATH`, so the
@@ -262,10 +282,87 @@ mod tests {
 
     use serde_json::json;
 
+    use loupe_github::Viewer;
+
     use super::{
-        AuthError, PollOutcome, parse_device_code, parse_poll, poll_device_token,
-        request_device_code,
+        AuthError, Discovery, PollOutcome, TokenSource, first_accepted, parse_device_code,
+        parse_poll, poll_device_token, request_device_code,
     };
+
+    fn viewer() -> Viewer {
+        Viewer {
+            login: "octocat".into(),
+            name: None,
+            avatar_url: String::new(),
+        }
+    }
+
+    fn only_good_accepted(token: String) -> Result<Viewer, loupe_github::Error> {
+        if token == "good" {
+            Ok(viewer())
+        } else {
+            Err(loupe_github::Error::Unauthorized)
+        }
+    }
+
+    #[test]
+    fn a_rejected_saved_token_is_reported_when_nothing_else_works() {
+        let candidates = [
+            ("stale".to_owned(), TokenSource::Stored),
+            ("stale-env".to_owned(), TokenSource::Environment),
+        ];
+        assert!(matches!(
+            first_accepted(candidates, only_good_accepted),
+            Ok(Discovery::NotFound {
+                saved_rejected: true
+            })
+        ));
+    }
+
+    #[test]
+    fn a_rejected_environment_token_alone_is_not_a_rejected_saved_token() {
+        let candidates = [("stale".to_owned(), TokenSource::Environment)];
+        assert!(matches!(
+            first_accepted(candidates, only_good_accepted),
+            Ok(Discovery::NotFound {
+                saved_rejected: false
+            })
+        ));
+        assert!(matches!(
+            first_accepted([], only_good_accepted),
+            Ok(Discovery::NotFound {
+                saved_rejected: false
+            })
+        ));
+    }
+
+    #[test]
+    fn a_working_later_token_is_found_after_a_rejected_saved_one() {
+        let candidates = [
+            ("stale".to_owned(), TokenSource::Stored),
+            (" good ".to_owned(), TokenSource::GhCli),
+        ];
+        assert!(matches!(
+            first_accepted(candidates, only_good_accepted),
+            Ok(Discovery::Found(found)) if found.source == TokenSource::GhCli && found.token == "good"
+        ));
+    }
+
+    #[test]
+    fn an_unreachable_github_stops_the_search() {
+        let candidates = [
+            ("stale".to_owned(), TokenSource::Stored),
+            ("good".to_owned(), TokenSource::GhCli),
+        ];
+        let result = first_accepted(candidates, |token| {
+            if token == "stale" {
+                Err(loupe_github::Error::Unauthorized)
+            } else {
+                Err(loupe_github::Error::Transport("offline".into()))
+            }
+        });
+        assert!(matches!(result, Err(message) if message == "network error: offline"));
+    }
 
     #[test]
     fn device_code_response_is_parsed() {
