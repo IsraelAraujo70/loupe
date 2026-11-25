@@ -5,11 +5,12 @@
 //! over a dimmed window, can fill the window, and keeps a draft when it
 //! closes without creating.
 //!
-//! Keys: Enter or Tab in the title goes to the description; Tab or Escape
-//! there leaves the text, and then S, P, A, L (Linear's keys), Shift+P,
-//! Shift+C, Shift+E, Shift+D, and T open the menus. In a menu, typing
-//! narrows it, the arrows move, Enter picks, and Escape closes it. Escape
-//! outside the text closes the modal.
+//! Keys: Enter or Tab in the title goes to the description; Tab there goes
+//! on to the property chips, Create more, and Create issue (Shift+Tab comes
+//! back), and Escape leaves the text. Outside the text, S, P, A, L (Linear's
+//! keys), Shift+P, Shift+C, Shift+E, Shift+D, and T open the menus. In a
+//! menu, typing narrows it, the arrows move, Enter picks, and Escape closes
+//! it. Escape outside the text closes the modal.
 
 mod fields;
 
@@ -154,11 +155,12 @@ pub(super) fn open(
     on_created: OnCreated,
     window: &mut Window,
     cx: &mut App,
-) {
+) -> Entity<NewIssueForm> {
     let draft = draft_for(&client, cx).filter(|draft| draft.fields.team_id == team.id);
     let form =
         cx.new(|cx| NewIssueForm::new(team, client, state_id, draft, on_created, window, cx));
     let focus_title = Cell::new(true);
+    let opened = form.clone();
     window.open_dialog(cx, move |dialog, window, cx| {
         if focus_title.replace(false) {
             form.read(cx).title.focus_handle(cx).focus(window, cx);
@@ -181,6 +183,7 @@ pub(super) fn open(
             .close_button(false)
             .child(form.clone())
     });
+    opened
 }
 
 /// The text and properties of a modal that closed without creating. Like
@@ -232,7 +235,7 @@ struct OpenMenu {
     cursor: usize,
 }
 
-struct NewIssueForm {
+pub(super) struct NewIssueForm {
     client: Arc<Linear>,
     team: Arc<Team>,
     /// The teams the issue can move to; the current one until the list
@@ -371,8 +374,9 @@ impl NewIssueForm {
 
     /// The keys that act wherever the focus is in the modal, ahead of the
     /// text fields and the dialog: Cmd+Enter creates (a textarea would
-    /// insert a newline), Tab and Escape move between the text and the
-    /// modal, and a menu takes the arrows and Enter from its search field.
+    /// insert a newline), Tab moves out of the text (the description would
+    /// indent), Escape leaves it for the modal, and a menu takes the arrows
+    /// and Enter from its search field.
     fn keys(cx: &mut Context<Self>) -> Subscription {
         let form = cx.weak_entity();
         cx.intercept_keystrokes(move |event, window, cx| {
@@ -418,8 +422,14 @@ impl NewIssueForm {
             _ if modifiers.secondary(cx) || modifiers.alt || modifiers.control => return,
             ("tab", false) if title.is_focused(window) => description,
             ("tab", true) if description.is_focused(window) => title,
-            ("tab", false) | ("escape", _) if description.is_focused(window) => self.focus.clone(),
-            ("escape", _) if title.is_focused(window) => self.focus.clone(),
+            ("tab", false) if description.is_focused(window) => {
+                cx.stop_propagation();
+                window.focus_next(cx);
+                return;
+            }
+            ("escape", _) if title.is_focused(window) || description.is_focused(window) => {
+                self.focus.clone()
+            }
             ("escape", _) if self.menu.is_none() => {
                 cx.stop_propagation();
                 if !self.sending() {
@@ -681,7 +691,11 @@ impl NewIssueForm {
                     .child(mark)
                     .child(text.clone()),
             )
-            .accessibility_label(format!("{}: {text}", property.name()))
+            .accessibility_label(format!(
+                "{}: {}",
+                property.name(),
+                if set { text.as_str() } else { "none" }
+            ))
             .tooltip(format!("{} ({})", property.name(), property.key()));
         self.menu_popover(property, trigger, cx)
     }
@@ -1148,5 +1162,115 @@ impl Render for NewIssueForm {
             )
             .child(footer);
         self.key_actions(root, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui_kit::{Entity, FocusHandle, Focusable as _, TestAppContext, VisualTestContext};
+    use loupe_linear::Linear;
+
+    use super::fields::Property;
+    use super::fields::tests::team;
+    use super::{NewIssueForm, open};
+    use crate::linear::issue_menu::tests::refusing_linear;
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    fn focused(cx: &mut VisualTestContext) -> Option<FocusHandle> {
+        cx.update(|window, cx| window.focused(cx))
+    }
+
+    fn open_form(cx: &mut VisualTestContext) -> Entity<NewIssueForm> {
+        let form = cx.update(|window, cx| {
+            open(
+                Arc::new(team("eng")),
+                Arc::new(Linear::with_endpoint(
+                    "lin_api_test",
+                    "http://127.0.0.1:9/graphql",
+                )),
+                None,
+                Box::new(|_, _, _, _| {}),
+                window,
+                cx,
+            )
+        });
+        redraw(cx);
+        form
+    }
+
+    /// Tab walks the whole modal: from the description on to every chip,
+    /// Create more, and Create issue, then the header and back to the
+    /// title, never stopping on the modal itself; Shift+Tab comes back.
+    #[gpui_kit::test]
+    fn tab_goes_from_the_description_through_the_chips_and_the_footer(cx: &mut TestAppContext) {
+        let (mut cx, _) = refusing_linear(cx);
+        let cx = &mut cx;
+        let form = open_form(cx);
+        let (title, description, modal) = cx.update(|_, cx| {
+            let form = form.read(cx);
+            (
+                form.title.focus_handle(cx),
+                form.description.focus_handle(cx),
+                form.focus.clone(),
+            )
+        });
+        assert_eq!(
+            focused(cx),
+            Some(title.clone()),
+            "the modal opens on the title"
+        );
+        cx.simulate_keystrokes("tab");
+        redraw(cx);
+        assert_eq!(focused(cx), Some(description.clone()));
+
+        let chips = Property::CHIPS
+            .into_iter()
+            .filter(|property| property.applies_to(&team("eng")))
+            .count();
+        let mut stops = Vec::new();
+        for _ in 0..chips + 10 {
+            cx.simulate_keystrokes("tab");
+            redraw(cx);
+            let now = focused(cx).expect("Tab keeps the focus in the modal");
+            if now == title {
+                break;
+            }
+            assert_ne!(now, modal, "no stop on the modal's own focus");
+            assert!(!stops.contains(&now), "each stop once");
+            stops.push(now);
+        }
+        // The chips, Create more, Create issue, then Team, Full screen, and
+        // Close in the header.
+        assert_eq!(
+            stops.len(),
+            chips + 2 + 3,
+            "every control of the modal is a stop"
+        );
+
+        cx.simulate_keystrokes("tab");
+        redraw(cx);
+        cx.simulate_keystrokes("tab");
+        redraw(cx);
+        assert_eq!(
+            focused(cx),
+            Some(stops[0].clone()),
+            "the first chip after the description"
+        );
+        cx.simulate_keystrokes("shift-tab");
+        redraw(cx);
+        assert_eq!(
+            focused(cx),
+            Some(description),
+            "Shift+Tab goes back to the text"
+        );
     }
 }

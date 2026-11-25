@@ -130,7 +130,7 @@ impl MyIssues {
             teams_task: None,
             scroll: ScrollHandle::new(),
             rows: ScrollHandle::new(),
-            focus: cx.focus_handle(),
+            focus: crate::shell::page_focus(cx),
             cursor: None,
         };
         view.sync_client(cx);

@@ -254,7 +254,7 @@ impl RunsView {
             filter: RunFilter::default(),
             scroll: ScrollHandle::new(),
             rows: ScrollHandle::new(),
-            focus: cx.focus_handle(),
+            focus: crate::shell::page_focus(cx),
             cursor: None,
             _load: None,
             _poll: None,

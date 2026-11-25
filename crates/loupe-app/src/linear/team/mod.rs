@@ -282,7 +282,7 @@ impl TeamView {
             tabs_strip: ScrollHandle::new(),
             edge_scroll: 0.,
             edge_scrolling: false,
-            focus: cx.focus_handle(),
+            focus: crate::shell::page_focus(cx),
             filter_menu,
             filter_open: false,
             drops: Vec::new(),

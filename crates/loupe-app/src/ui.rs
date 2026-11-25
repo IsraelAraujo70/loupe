@@ -32,7 +32,7 @@ mod tabs;
 #[cfg(test)]
 pub(crate) use list::test_support::open_list;
 pub use list::{
-    ListRowFocus, list_column_header, list_container, list_group_header, list_row,
+    ListRowFocus, TabStopRow, list_column_header, list_container, list_group_header, list_row,
     list_row_divider, nav_row, scroll_to_rows, step_cursor,
 };
 pub use menu::{MenuRow, menu_row};

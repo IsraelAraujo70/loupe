@@ -607,7 +607,7 @@ impl IssueView {
 
     /// The keys of the screen. They do nothing while a text field has the
     /// focus: the bindings ask for no `Input` in the context.
-    fn key_actions(&self, root: Div, cx: &mut Context<Self>) -> Div {
+    fn key_actions(&self, root: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
         let open = |property: Property| {
             move |view: &mut Self, cx: &mut Context<Self>| {
                 view.open_picker(property, Place::Side, cx)
@@ -670,6 +670,9 @@ impl Render for IssueView {
             Loadable::Ready(loaded) => self.render_ready(loaded, window, cx),
         };
         let root = v_flex()
+            .id("issue-page")
+            .role(Role::Group)
+            .aria_label(self.identifier.clone())
             .size_full()
             .key_context("IssueView")
             .track_focus(&self.focus);

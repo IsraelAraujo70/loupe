@@ -619,7 +619,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<InboxView> {
             scroll: ScrollHandle::new(),
             views_row: ui::ScrollRow::default(),
             page: PageState::default(),
-            focus: cx.focus_handle(),
+            focus: crate::shell::page_focus(cx),
             filter_menu,
             filter_open: false,
             notice: views_store::take_warning(cx),

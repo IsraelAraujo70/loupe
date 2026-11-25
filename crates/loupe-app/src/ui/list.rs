@@ -57,14 +57,60 @@ impl ListRowFocus for Stateful<Div> {
         self.relative()
             .bg(theme.list_hover)
             .aria_active_descendant()
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(tokens::accent()),
-            )
+            .child(focus_ring(theme.radius))
+    }
+}
+
+/// The keyboard focus ring of a row: a 1 px accent line inside its edge,
+/// following its corners.
+fn focus_ring(radius: Pixels) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(radius)
+        .border_1()
+        .border_color(tokens::accent())
+}
+
+/// A row that acts on a click (a sidebar link, a heading that folds its
+/// section), put in the window's Tab order.
+///
+/// Tab and Shift+Tab stop on it, Enter and Space click it (GPUI's keyboard
+/// click), and while it holds the focus it has `fill` and the ring of
+/// [`ListRowFocus`], drawn inside `radius`. A press does not take the
+/// focus, as a button's does not, so a click leaves the keys where they
+/// were. `key` names the row's focus among its siblings for as long as it
+/// is drawn.
+pub trait TabStopRow: Sized {
+    fn tab_stop_row(
+        self,
+        key: impl Into<ElementId>,
+        fill: Hsla,
+        radius: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self;
+}
+
+impl TabStopRow for Stateful<Div> {
+    fn tab_stop_row(
+        self,
+        key: impl Into<ElementId>,
+        fill: Hsla,
+        radius: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        let focus = window
+            .use_keyed_state(key, cx, |_, cx| cx.focus_handle().tab_stop(true))
+            .read(cx)
+            .clone();
+        let focused = focus.is_focused(window);
+        self.track_focus(&focus)
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .when(focused, |row| {
+                row.relative().bg(fill).child(focus_ring(radius))
+            })
     }
 }
 
