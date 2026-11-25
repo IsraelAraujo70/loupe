@@ -180,6 +180,10 @@ pub struct Settings {
     /// Sidebar sections the user folded, by key such as `workspace` or
     /// `team:<id>`.
     pub collapsed_sections: Vec<String>,
+    /// Teams whose Issues, Projects, and Views the user opened in the
+    /// sidebar, by id; a team's row otherwise starts folded unless it holds
+    /// the open page.
+    pub open_teams: Vec<String>,
     pub diff_layout: DiffLayout,
     /// Whether a diff wraps long lines instead of scrolling them
     /// sideways. Off (scrolling) is the default.
@@ -548,6 +552,29 @@ impl Settings {
         self.collapsed_sections.iter().any(|key| key == section)
     }
 
+    /// Whether the sidebar shows a team's Issues, Projects, and Views: as the
+    /// user last left the team's row, else only while `active` (the open
+    /// page is one of the team's).
+    pub fn is_team_open(&self, team_id: &str, active: bool) -> bool {
+        if self.open_teams.iter().any(|id| id == team_id) {
+            return true;
+        }
+        active && !self.is_collapsed(&team_section(team_id))
+    }
+
+    /// Opens or folds a team's row in the sidebar, and keeps it so whichever
+    /// page is open.
+    pub fn set_team_open(&mut self, team_id: &str, open: bool) {
+        let section = team_section(team_id);
+        self.open_teams.retain(|id| id != team_id);
+        self.collapsed_sections.retain(|key| key != &section);
+        if open {
+            self.open_teams.push(team_id.to_owned());
+        } else {
+            self.collapsed_sections.push(section);
+        }
+    }
+
     /// Folds `section` when it is open, else opens it.
     pub fn toggle_collapsed(&mut self, section: &str) {
         let before = self.collapsed_sections.len();
@@ -904,6 +931,11 @@ fn toggle(list: &mut Vec<RepoRef>, repo: &RepoRef) {
     } else {
         list.push(repo.clone());
     }
+}
+
+/// A team's key in `Settings.collapsed_sections`.
+fn team_section(team_id: &str) -> String {
+    format!("team:{team_id}")
 }
 
 #[cfg(test)]
@@ -1307,6 +1339,24 @@ mod tests {
         assert!(settings.is_collapsed("workspace"));
         settings.toggle_collapsed("workspace");
         assert!(!settings.is_collapsed("workspace"));
+    }
+
+    #[test]
+    fn a_team_starts_folded_unless_it_holds_the_open_page_and_then_stays_as_left() {
+        let mut settings = Settings::default();
+        assert!(!settings.is_team_open("be", false));
+        assert!(settings.is_team_open("be", true));
+
+        settings.set_team_open("be", true);
+        assert!(settings.is_team_open("be", false), "opened by hand");
+        settings.set_team_open("be", false);
+        assert!(!settings.is_team_open("be", true), "folded by hand");
+        assert!(!settings.is_team_open("be", false));
+
+        // A team folded before teams started folded on their own keeps its key.
+        let old: Settings = serde_json::from_str(r#"{"collapsed_sections": ["team:fe"]}"#)
+            .expect("an older settings file loads");
+        assert!(!old.is_team_open("fe", true));
     }
 
     #[test]

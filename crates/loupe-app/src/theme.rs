@@ -500,6 +500,11 @@ pub mod scale {
     pub fn side_column_breakpoint() -> Rems {
         rems(1200. / BASE)
     }
+    /// A window narrower than this, 1100 px, shows the sidebar as its icon
+    /// rail until the user opens it there.
+    pub fn sidebar_rail_breakpoint() -> Rems {
+        rems(1100. / BASE)
+    }
     /// Wide side columns (Linear issue and project properties), 360 px.
     pub fn side_wide_width() -> Rems {
         rems(360. / BASE)

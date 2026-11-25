@@ -3,7 +3,8 @@
 //! (Workspace, Favorites, Your teams with each team's issues, projects, and
 //! views, and Repositories with Actions and each repository's pull requests
 //! and runs); and the account footer. Expanded, at the width
-//! its right edge was dragged to, or collapsed to an icon rail (Cmd+B).
+//! its right edge was dragged to, or collapsed to an icon rail (Cmd+B). A
+//! window narrower than 1100 px shows the rail until Cmd+B opens it.
 //!
 //! The rail is the same sidebar with its texts hidden: the same entries in
 //! the same rows, so every icon keeps its y, the step between rows, and the
@@ -56,6 +57,20 @@ const COLLAPSED_WIDTH: Pixels = px(72.);
 const _: () = assert!(RAIL_WIDTH >= MARK_SIZE + 16.);
 /// How often the Inbox and Reviews counts refresh.
 const COUNTS_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Whether `window` is too narrow to give the sidebar its full width:
+/// below 1100 px at 100% zoom it shows as the rail, so the page keeps room
+/// to read.
+pub(super) fn is_narrow(window: &Window) -> bool {
+    window.viewport_size().width < scale::sidebar_rail_breakpoint().to_pixels(window.rem_size())
+}
+
+/// Whether the sidebar shows as the rail: as `saved` in Settings in a wide
+/// window; in a narrow one, until the user opens it there (Cmd+B or the
+/// top bar's toggle), which Settings does not keep.
+pub(super) fn collapsed(saved: bool, narrow: bool, opened_while_narrow: bool) -> bool {
+    if narrow { !opened_while_narrow } else { saved }
+}
 
 /// The expanded sidebar's width in points at 100% zoom, for a stored or
 /// dragged width: the default when there is none, else clamped to the
@@ -212,9 +227,9 @@ enum Leading {
 #[derive(Debug, PartialEq)]
 enum Target {
     Route(Route),
-    /// Folds or opens the section with this key.
-    Fold {
-        section: String,
+    /// Folds or opens a team's Issues, Projects, and Views rows.
+    FoldTeam {
+        team_id: String,
         open: bool,
     },
     /// Folds or opens a repository's Pull requests and Actions rows.
@@ -320,11 +335,13 @@ fn counted(row: Row, count: Option<SharedString>) -> Row {
 }
 
 /// The sidebar's entries, in order: the same expanded and on the rail.
+/// `current` is the open page, whose team starts open.
 fn entries(
     settings: &Settings,
     loaded: &Loaded,
     views: &[SavedView],
     repos: &[ListedRepo],
+    current: &Route,
 ) -> Vec<Entry> {
     let mut entries = vec![
         Entry::from(counted(
@@ -396,7 +413,8 @@ fn entries(
             )));
         }
         for team in loaded.my_teams.iter() {
-            team_rows(&mut entries, team, settings);
+            let open = settings.is_team_open(&team.id, holds_page(team, current));
+            team_rows(&mut entries, team, open);
         }
     }
 
@@ -480,20 +498,39 @@ fn repo_rows(
     }));
 }
 
-/// A team's row, and under it, unless folded, its Issues, Projects, and Views.
-fn team_rows(entries: &mut Vec<Entry>, team: &TeamSummary, settings: &Settings) {
+/// Whether `current` is one of `team`'s pages: its issues, projects, or
+/// views, or one of its issues, by the identifier's key.
+fn holds_page(team: &TeamSummary, current: &Route) -> bool {
+    match current {
+        Route::LinearTeam { team_id, .. }
+        | Route::LinearProjects {
+            team_id: Some(team_id),
+        }
+        | Route::LinearViews {
+            team_id: Some(team_id),
+        } => team_id == &team.id,
+        Route::LinearIssue { identifier } => identifier
+            .split_once('-')
+            .is_some_and(|(key, _)| team.key.eq_ignore_ascii_case(key)),
+        _ => false,
+    }
+}
+
+/// A team's row, and under it, when open, its Issues, Projects, and Views.
+fn team_rows(entries: &mut Vec<Entry>, team: &TeamSummary, open: bool) {
     let issues = Route::LinearTeam {
         team_id: team.id.clone(),
         name: team.name.clone(),
         view_id: None,
     };
-    let section = format!("team:{}", team.id);
-    let open = !settings.is_collapsed(&section);
     entries.push(Entry::from(row(
         format!("team-{}", team.id),
         team.name.clone(),
         IconName::Users,
-        Target::Fold { section, open },
+        Target::FoldTeam {
+            team_id: team.id.clone(),
+            open,
+        },
     )));
     if !open {
         return;
@@ -572,25 +609,33 @@ fn remote_favorite_row(
         FavoriteTarget::Other { kind } if kind == "folder" => Target::Label,
         _ => Target::Url(favorite.url.clone()?),
     };
-    let icon = if favorite.icon.is_some() {
-        linear::view_icon(favorite.icon.as_deref())
-    } else {
-        match &favorite.target {
-            FavoriteTarget::Issue { .. } => IconName::CircleDot,
-            FavoriteTarget::PredefinedView { .. } => IconName::Copy,
-            FavoriteTarget::Other { kind } if kind == "project" => IconName::Box,
-            FavoriteTarget::Other { kind } if kind == "cycle" => IconName::RefreshCw,
+    // A custom view keeps the icon and color picked for it in Linear; every
+    // other star shows what it is, in the same icon as its page's row.
+    let leading = match &favorite.target {
+        FavoriteTarget::CustomView { .. } => Leading::Colored(
+            linear::view_icon(favorite.icon.as_deref()),
+            linear::view_color(favorite.color.as_deref()),
+        ),
+        FavoriteTarget::Issue { .. } => Leading::Icon(IconName::CircleDot),
+        FavoriteTarget::PredefinedView { .. } => Leading::Icon(IconName::Copy),
+        FavoriteTarget::Other { kind } => Leading::Icon(match kind.as_str() {
+            "project" => IconName::Box,
+            "cycle" => IconName::RefreshCw,
+            "folder" => IconName::Folder,
+            "document" => IconName::FileText,
+            "label" => IconName::Tag,
             _ => IconName::Layers,
-        }
+        }),
     };
-    let mut row = row(
-        format!("linear-favorite-{}", favorite.id),
-        title,
-        icon,
-        target,
-    );
-    row.leading = Leading::Colored(icon, linear::view_color(favorite.color.as_deref()));
-    Some(row)
+    Some(Row {
+        leading,
+        ..row(
+            format!("linear-favorite-{}", favorite.id),
+            title,
+            IconName::Layers,
+            target,
+        )
+    })
 }
 
 /// Whether a starred team or issue belongs to the active workspace: one of
@@ -736,7 +781,7 @@ pub(super) fn render(
     };
 
     let listed = repos::listed(cx);
-    let rows = entries(Settings::get(cx), &loaded, &views, &listed)
+    let rows = entries(Settings::get(cx), &loaded, &views, &listed, current)
         .into_iter()
         .map(|entry| match entry {
             Entry::Section { key, label, open } => {
@@ -746,6 +791,9 @@ pub(super) fn render(
         });
 
     v_flex()
+        .id("sidebar")
+        .role(Role::Navigation)
+        .aria_label("Sidebar")
         .w(width(collapsed, expanded))
         .h_full()
         .flex_none()
@@ -979,7 +1027,7 @@ fn nav_row(
 ) -> AnyElement {
     let is_selected = matches!(&row.target, Target::Route(route) if same_page(route, current));
     let fold = match &row.target {
-        Target::Fold { open, .. } | Target::FoldRepo { open, .. } => Some(*open),
+        Target::FoldTeam { open, .. } | Target::FoldRepo { open, .. } => Some(*open),
         _ => None,
     };
     let verb = |open: bool| if open { "Collapse" } else { "Expand" };
@@ -1038,9 +1086,9 @@ fn nav_row(
         })
         .on_click(move |event, window, cx| match &target {
             Target::Route(route) => open(route.clone(), event, window, cx),
-            Target::Fold { section, .. } => {
-                let section = section.clone();
-                store::update_settings(cx, move |settings| settings.toggle_collapsed(&section));
+            Target::FoldTeam { team_id, open } => {
+                let (team_id, open) = (team_id.clone(), !open);
+                store::update_settings(cx, move |settings| settings.set_team_open(&team_id, open));
             }
             Target::FoldRepo { repo, .. } => {
                 let repo = repo.clone();
@@ -1345,9 +1393,12 @@ mod tests {
     use loupe_github::{Notification, NotificationSubject, RepoRef};
     use loupe_linear::TeamSummary;
 
+    use gpui_kit::assets::IconName;
+    use loupe_linear::{FavoriteTarget, LinearFavorite};
+
     use super::{
-        COLLAPSED_WIDTH, DEFAULT_WIDTH, Entry, Loaded, Target, entries, expanded_width, same_page,
-        width,
+        COLLAPSED_WIDTH, DEFAULT_WIDTH, Entry, Leading, Loaded, Target, collapsed, entries,
+        expanded_width, remote_favorite_row, same_page, width,
     };
     use crate::github::repos;
     use crate::linear::SavedView;
@@ -1459,7 +1510,12 @@ mod tests {
             name: "Meus issues".into(),
             team_id: Some("fe".into()),
         }];
-        let built = entries(&settings, &loaded(), &views, &[]);
+        let back_end = Route::LinearTeam {
+            team_id: "be".into(),
+            name: "Back-end".into(),
+            view_id: None,
+        };
+        let built = entries(&settings, &loaded(), &views, &[], &back_end);
         assert_eq!(
             outline(&built),
             [
@@ -1503,7 +1559,13 @@ mod tests {
             ))),
             ..loaded()
         };
-        let lines = outline(&entries(&Settings::default(), &loaded, &[], &[]));
+        let lines = outline(&entries(
+            &Settings::default(),
+            &loaded,
+            &[],
+            &[],
+            &Route::Notifications,
+        ));
         assert_eq!(
             lines[0],
             format!(
@@ -1526,11 +1588,23 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            outline(&entries(&settings, &loaded, &[], &[]))[0],
+            outline(&entries(
+                &settings,
+                &loaded,
+                &[],
+                &[],
+                &Route::Notifications
+            ))[0],
             "Inbox, 3 [3]"
         );
         assert_eq!(
-            outline(&entries(&Settings::default(), &loaded, &[], &[]))[0],
+            outline(&entries(
+                &Settings::default(),
+                &loaded,
+                &[],
+                &[],
+                &Route::Notifications
+            ))[0],
             "Inbox, 129 [129]"
         );
     }
@@ -1540,7 +1614,13 @@ mod tests {
         let mut settings = Settings::default();
         settings.toggle_collapsed("workspace");
         settings.toggle_collapsed("team:be");
-        let lines = outline(&entries(&settings, &loaded(), &[], &[]));
+        let lines = outline(&entries(
+            &settings,
+            &loaded(),
+            &[],
+            &[],
+            &Route::Notifications,
+        ));
         assert_eq!(
             lines,
             [
@@ -1552,6 +1632,115 @@ mod tests {
                 "Back-end",
             ]
         );
+    }
+
+    #[test]
+    fn teams_start_folded_but_the_one_whose_page_is_open() {
+        let loaded = Loaded {
+            my_teams: Arc::new(vec![team("be", "Back-end"), team("fe", "Front-end")]),
+            ..loaded()
+        };
+        let mut settings = Settings::default();
+        settings.toggle_collapsed("workspace");
+        let teams = |settings: &Settings, current: &Route| {
+            outline(&entries(settings, &loaded, &[], &[], current))[4..].to_vec()
+        };
+        assert_eq!(
+            teams(&settings, &Route::Notifications),
+            ["## Your teams", "Back-end", "Front-end"]
+        );
+        let issue = Route::LinearIssue {
+            identifier: "FE-12".into(),
+        };
+        assert_eq!(
+            teams(&settings, &issue),
+            [
+                "## Your teams",
+                "Back-end",
+                "Front-end",
+                "  Front-end Issues",
+                "  Front-end Projects",
+                "  Front-end Views",
+            ]
+        );
+        settings.set_team_open("be", true);
+        assert_eq!(
+            teams(&settings, &Route::Notifications),
+            [
+                "## Your teams",
+                "Back-end",
+                "  Back-end Issues",
+                "  Back-end Projects",
+                "  Back-end Views",
+                "Front-end",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_starred_item_shows_what_it_is_and_a_view_keeps_its_own_icon() {
+        let star = |id: &str, target: FavoriteTarget| LinearFavorite {
+            id: id.into(),
+            title: id.into(),
+            icon: Some("Bolt".into()),
+            color: Some("#4cb782".into()),
+            url: Some("https://linear.app/test".into()),
+            target,
+        };
+        let views = vec![SavedView {
+            id: "linear:view-1".into(),
+            name: "First".into(),
+            team_id: None,
+        }];
+        let leading =
+            |favorite: LinearFavorite| match remote_favorite_row(&favorite, &loaded(), &views)
+                .expect("a row")
+                .leading
+            {
+                Leading::Icon(icon) => (icon, false),
+                Leading::Colored(icon, color) => (icon, color.is_some()),
+                Leading::Avatar { .. } => panic!("a star has no avatar"),
+            };
+        let other = |kind: &str| FavoriteTarget::Other { kind: kind.into() };
+        assert_eq!(
+            leading(star(
+                "issue",
+                FavoriteTarget::Issue {
+                    identifier: "BE-1".into()
+                }
+            )),
+            (IconName::CircleDot, false)
+        );
+        assert_eq!(
+            leading(star("project", other("project"))),
+            (IconName::Box, false)
+        );
+        assert_eq!(
+            leading(star("cycle", other("cycle"))),
+            (IconName::RefreshCw, false)
+        );
+        assert_eq!(
+            leading(star(
+                "view",
+                FavoriteTarget::CustomView {
+                    view_id: "view-1".into(),
+                    team: None,
+                }
+            )),
+            (IconName::Zap, true)
+        );
+    }
+
+    #[test]
+    fn a_narrow_window_shows_the_rail_until_the_sidebar_is_opened_there() {
+        assert!(collapsed(false, true, false));
+        assert!(!collapsed(false, true, true));
+        assert!(!collapsed(true, true, true));
+        assert!(
+            !collapsed(false, false, true),
+            "a wide window follows Settings"
+        );
+        assert!(collapsed(true, false, false));
     }
 
     #[test]
@@ -1572,7 +1761,13 @@ mod tests {
             ],
         );
         settings.toggle_open_repo(&repo("IsraelAraujo70/dotfiles"));
-        let lines = outline(&entries(&settings, &loaded(), &[], &listed));
+        let lines = outline(&entries(
+            &settings,
+            &loaded(),
+            &[],
+            &listed,
+            &Route::Notifications,
+        ));
         assert_eq!(
             lines[5..],
             [
@@ -1584,7 +1779,9 @@ mod tests {
                 "  IsraelAraujo70/dotfiles Actions",
             ]
         );
-        let Entry::Row(watched) = &entries(&settings, &loaded(), &[], &listed)[7] else {
+        let Entry::Row(watched) =
+            &entries(&settings, &loaded(), &[], &listed, &Route::Notifications)[7]
+        else {
             panic!("a row")
         };
         let menu = watched.repo.as_ref().expect("a repository row");
