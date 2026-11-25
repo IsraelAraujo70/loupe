@@ -382,7 +382,7 @@ impl FilesTab {
                     None => {
                         eprintln!("review-files source=network pr={}", pr.url());
                         let files = gh.pull_request_files(&pr)?;
-                        let current = gh.pull_request(&pr)?;
+                        let current = gh.pull_request_head(&pr)?;
                         if current.head_oid != expected_head
                             || current.base_oid != expected_base
                             || current.base_ref != expected_base_ref
@@ -477,6 +477,12 @@ impl FilesTab {
         };
         self.load.finish(Ok(()));
         self.files = loaded.files;
+        eprintln!(
+            "review-files-ready pr={} files={} timestamp={}",
+            self.context.pr.url(),
+            self.files.len(),
+            chrono::Utc::now().to_rfc3339()
+        );
         self.hunks = loaded.hunks;
         self.missing = loaded.missing;
         self.expansions.clear();
@@ -2613,6 +2619,8 @@ pub(super) mod tests {
             labels: Vec::new(),
             assignees: Vec::new(),
             commits: Vec::new(),
+            commits_total: 0,
+            commits_cursor: None,
             checks: Checks {
                 state: None,
                 runs: Vec::new(),

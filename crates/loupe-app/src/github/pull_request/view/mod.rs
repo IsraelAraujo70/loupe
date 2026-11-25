@@ -198,6 +198,11 @@ pub struct PullRequestView {
     checks_scroll: ScrollHandle,
     side_scroll: ScrollHandle,
     load_task: Option<Task<()>>,
+    /// The commits after the first page loading for the Commits tab, by
+    /// the `base...head` they belong to.
+    commits_load: Option<(String, Task<()>)>,
+    /// Why the commits after the first page did not load.
+    commits_error: Option<LoadError>,
     write_task: Option<Task<()>>,
     subscriptions: Vec<Subscription>,
     /// When GitHub was last asked about this pull request, by a load or a
@@ -302,6 +307,8 @@ impl PullRequestView {
             checks_scroll: ScrollHandle::new(),
             side_scroll: ScrollHandle::new(),
             load_task: None,
+            commits_load: None,
+            commits_error: None,
             write_task: None,
             subscriptions: vec![submit_on_secondary_enter],
             last_fetch: Instant::now(),
@@ -342,6 +349,7 @@ impl PullRequestView {
                 .and_then(crate::cache::get::<PullRequestDetail>)
         {
             let detail = Arc::new(detail);
+            self.load_commits(&detail, cx);
             self.incoming = Some(detail.clone());
             self.detail = Loadable::Loaded(detail);
         }
@@ -355,7 +363,10 @@ impl PullRequestView {
             cx,
             move |gh| gh.pull_request(&pr),
             move |view, result, _cx| match result {
-                Ok(detail) => {
+                Ok(mut detail) => {
+                    if let Some(shown) = view.detail.value() {
+                        model::carry_commits(shown, &mut detail);
+                    }
                     if let Some(key) = &key {
                         crate::cache::put(key, &detail);
                     }
@@ -393,6 +404,7 @@ impl PullRequestView {
                         view.stack_task = None;
                     }
                     let detail = Arc::new(detail);
+                    view.load_commits(&detail, _cx);
                     crate::github::enqueue_auto_guide_if_watched(detail.clone(), _cx);
                     view.incoming = Some(detail.clone());
                     view.detail.finish(Ok(detail));
@@ -401,6 +413,55 @@ impl PullRequestView {
             },
         ));
         cx.notify();
+    }
+
+    /// Lists the commits after the first page in the background when
+    /// `detail` lacks some: the page painted without them, and only the
+    /// Commits tab needs them. A load already running for the same head and
+    /// base goes on.
+    fn load_commits(&mut self, detail: &PullRequestDetail, cx: &mut Context<Self>) {
+        let range = format!("{}...{}", detail.base_oid, detail.head_oid);
+        if !model::commits_missing(detail) {
+            self.commits_load = None;
+            self.commits_error = None;
+            return;
+        }
+        if self
+            .commits_load
+            .as_ref()
+            .is_some_and(|(loading, _)| *loading == range)
+        {
+            return;
+        }
+        self.commits_error = None;
+        let key = crate::cache::github_key(cx, &format!("pr/{}", self.pr.url()));
+        let request = detail.clone();
+        let loaded = range.clone();
+        let task = common::run(
+            cx,
+            move |gh| gh.pull_request_commits(&request),
+            move |view, result, _cx| {
+                view.commits_load = None;
+                let Some(shown) = view.detail.value_mut() else {
+                    return;
+                };
+                if format!("{}...{}", shown.base_oid, shown.head_oid) != loaded {
+                    return;
+                }
+                match result {
+                    Ok(commits) => {
+                        let mut whole = PullRequestDetail::clone(shown);
+                        whole.commits = model::with_fresh(commits, &shown.commits);
+                        if let Some(key) = &key {
+                            crate::cache::put(key, &whole);
+                        }
+                        *shown = Arc::new(whole);
+                    }
+                    Err(error) => view.commits_error = Some(error),
+                }
+            },
+        );
+        self.commits_load = Some((range, task));
     }
 
     fn finish_failed_load(&mut self, error: LoadError) {
@@ -1381,11 +1442,26 @@ impl PullRequestView {
                     .child(loaded.files.clone())
                     .into_any_element(),
             },
-            PrTab::Commits => scrolling(
-                "pr-commits",
-                &self.commits_scroll,
-                commits::render(detail, show_commit, cx),
-            ),
+            PrTab::Commits => {
+                let rest = match (&self.commits_load, &self.commits_error) {
+                    (Some(_), _) => commits::Rest::Loading,
+                    (None, Some(error)) => commits::Rest::Failed(error.message().into()),
+                    (None, None) => commits::Rest::Settled,
+                };
+                let retry: commits::OnRetry = Rc::new(cx.listener(
+                    |view: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                        if let Some(detail) = view.detail.value().cloned() {
+                            view.load_commits(&detail, cx);
+                            cx.notify();
+                        }
+                    },
+                ));
+                scrolling(
+                    "pr-commits",
+                    &self.commits_scroll,
+                    commits::render(detail, rest, show_commit, retry, cx),
+                )
+            }
             PrTab::Checks => scrolling(
                 "pr-checks",
                 &self.checks_scroll,

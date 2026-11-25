@@ -11,13 +11,17 @@ use super::stack::{WireStack, stack_fragment};
 use crate::{
     ActionsJob, Actor, BodyEdit, CheckRun, CheckStatus, Checks, ChecksState, Commit, Error, GitHub,
     IssueComment, Label, MergeMethod, MergeStateStatus, Mergeable, PendingReview, PrRef, PrState,
-    PullRequestDetail, RepoRef, Result, Review, ReviewComment, ReviewDecision, ReviewState,
-    ReviewThread, Reviewer, ReviewerKind, ReviewerState, Side, TimelineItem, Timestamp, Verdict,
-    ViewerReview,
+    PullRequestDetail, PullRequestHead, RepoRef, Result, Review, ReviewComment, ReviewDecision,
+    ReviewState, ReviewThread, Reviewer, ReviewerKind, ReviewerState, Side, TimelineItem,
+    Timestamp, Verdict, ViewerReview,
 };
 
 /// Timeline and thread pages fetched per pull request, the first one included.
 const MAX_PAGES: usize = 10;
+
+/// The most commits GitHub lists of a pull request, in GraphQL as in REST;
+/// past it the list stops without saying so.
+const LISTED_COMMITS: u32 = 250;
 
 macro_rules! timeline_page_fragment {
     () => {
@@ -59,6 +63,7 @@ macro_rules! commits_page_fragment {
     () => {
         r#"
 fragment CommitsPage on PullRequestCommitConnection {
+  totalCount
   pageInfo { hasNextPage endCursor }
   nodes {
     commit {
@@ -250,6 +255,8 @@ query PullRequestCommitsPage($owner: String!, $name: String!, $number: Int!, $cu
     commits_page_fragment!()
 );
 
+const HEAD_QUERY: &str = "query PullRequestHead($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { headRefOid baseRefOid baseRefName } } }";
+
 const THREADS_PAGE_QUERY: &str = concat!(
     r#"
 query PullRequestThreadsPage($owner: String!, $name: String!, $number: Int!, $cursor: String!) {
@@ -270,15 +277,18 @@ pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("pull_request_timeline_page", TIMELINE_PAGE_QUERY),
     ("pull_request_commits_page", COMMITS_PAGE_QUERY),
     ("pull_request_threads_page", THREADS_PAGE_QUERY),
+    ("pull_request_head", HEAD_QUERY),
 ];
 
 impl GitHub {
-    /// Header, body, reviewers, labels, assignees, commits, checks, timeline,
-    /// review threads, and the viewer's pending review of one pull request.
+    /// Header, body, reviewers, labels, assignees, the first 100 commits,
+    /// checks, timeline, review threads, and the viewer's pending review of
+    /// one pull request. [`GitHub::pull_request_commits`] lists the other
+    /// commits, which only the Commits tab needs.
     ///
-    /// The commits, the timeline and the review threads are paged (up to ten
-    /// pages each) with small first pages, because GitHub times out (HTTP
-    /// 502) on one large query for busy pull requests. A thread keeps its first 30
+    /// The timeline and the review threads are paged (up to ten pages each)
+    /// with small first pages, because GitHub times out (HTTP 502) on one
+    /// large query for busy pull requests. A thread keeps its first 30
     /// comments, and the head commit's checks are capped at 100.
     pub fn pull_request(&self, pr: &PrRef) -> Result<PullRequestDetail> {
         let data: Data = self.graphql(
@@ -293,12 +303,7 @@ impl GitHub {
             mut detail,
             mut timeline_cursor,
             mut threads_cursor,
-            commits_cursor,
         } = parse_detail(pr, data)?;
-
-        drain_commits(&mut detail.commits, commits_cursor, |cursor| {
-            self.connection_page(COMMITS_PAGE_QUERY, pr, cursor, "commits")
-        })?;
 
         for _ in 1..MAX_PAGES {
             let Some(cursor) = timeline_cursor.take() else {
@@ -321,6 +326,45 @@ impl GitHub {
             threads_cursor = next;
         }
         Ok(detail)
+    }
+
+    /// Every commit of the pull request `detail` loaded, oldest first, from
+    /// the first page it holds: none asked again while that page is all of
+    /// them.
+    ///
+    /// GitHub lists at most 250 commits of a pull request. Past that the
+    /// commits come from comparing its base and head (REST, which lists
+    /// them all, in pages read side by side) and carry no checks; the list
+    /// still stops at [`PR_COMMITS_LIMIT`].
+    pub fn pull_request_commits(&self, detail: &PullRequestDetail) -> Result<Vec<Commit>> {
+        if detail.commits_total > LISTED_COMMITS {
+            return self.compared_commits(
+                &detail.pr.repo,
+                &detail.base_oid,
+                &detail.head_oid,
+                detail.commits_total,
+            );
+        }
+        let mut commits = detail.commits.clone();
+        drain_commits(&mut commits, detail.commits_cursor.clone(), |cursor| {
+            self.connection_page(COMMITS_PAGE_QUERY, &detail.pr, cursor, "commits")
+        })?;
+        Ok(commits)
+    }
+
+    /// The pull request's head and base commits and its base branch, without
+    /// the rest of the detail: to check that a list read just before still
+    /// belongs to them.
+    pub fn pull_request_head(&self, pr: &PrRef) -> Result<PullRequestHead> {
+        let data: Value = self.graphql(
+            HEAD_QUERY,
+            json!({
+                "owner": pr.repo.owner,
+                "name": pr.repo.name,
+                "number": pr.number,
+            }),
+        )?;
+        parse_head(data)
     }
 
     fn connection_page<T: DeserializeOwned>(
@@ -348,7 +392,8 @@ impl GitHub {
 }
 
 /// Appends the commit pages after the first one, `fetch` returning the page
-/// that follows a cursor.
+/// that follows a cursor. GitHub lists 250 commits at most, so the cap only
+/// guards against a cursor that never ends.
 fn drain_commits(
     commits: &mut Vec<Commit>,
     mut cursor: Option<String>,
@@ -365,6 +410,26 @@ fn drain_commits(
     Ok(())
 }
 
+fn parse_head(data: Value) -> Result<PullRequestHead> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireHead {
+        head_ref_oid: String,
+        base_ref_oid: String,
+        base_ref_name: String,
+    }
+    let node = data
+        .pointer("/repository/pullRequest")
+        .filter(|node| !node.is_null())
+        .ok_or_else(not_found)?;
+    let head = WireHead::deserialize(node).map_err(|error| Error::Decode(error.to_string()))?;
+    Ok(PullRequestHead {
+        head_oid: head.head_ref_oid,
+        base_oid: head.base_ref_oid,
+        base_ref: head.base_ref_name,
+    })
+}
+
 fn not_found() -> Error {
     Error::GraphQl(vec!["Pull request not found".to_owned()])
 }
@@ -374,6 +439,9 @@ fn not_found() -> Error {
 struct Connection<T> {
     nodes: Option<Vec<Option<T>>>,
     page_info: Option<PageInfo>,
+    /// Asked for only where Loupe shows how many there are.
+    #[serde(default)]
+    total_count: Option<u32>,
 }
 
 impl<T> Connection<T> {
@@ -873,7 +941,6 @@ struct FirstPage {
     detail: PullRequestDetail,
     timeline_cursor: Option<String>,
     threads_cursor: Option<String>,
-    commits_cursor: Option<String>,
 }
 
 fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
@@ -929,7 +996,9 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
 
     let (timeline, timeline_cursor) = parse_timeline(wire.timeline_items);
     let (threads, threads_cursor) = parse_threads(wire.review_threads);
+    let commits_total = wire.commits.total_count.unwrap_or_default();
     let (commits, commits_cursor) = parse_commits(wire.commits);
+    let commits_total = commits_total.max(commits.len() as u32);
 
     let pending_review = wire
         .pending_reviews
@@ -1011,6 +1080,8 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
             .map(Actor::from)
             .collect(),
         commits,
+        commits_total,
+        commits_cursor,
         checks,
         timeline,
         threads,
@@ -1024,7 +1095,6 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
         detail,
         timeline_cursor,
         threads_cursor,
-        commits_cursor,
     })
 }
 
@@ -1727,13 +1797,60 @@ mod tests {
     }
 
     #[test]
-    fn first_page_reports_the_commits_cursor() {
+    fn first_page_reports_the_commits_cursor_and_total() {
         let mut json = pull_request_json();
         json["commits"]["pageInfo"] = json!({ "hasNextPage": true, "endCursor": "cursor-c" });
-        let first = parse_detail(&pr_ref(), data(json)).unwrap();
-        assert_eq!(first.commits_cursor.as_deref(), Some("cursor-c"));
-        assert_eq!(first.detail.commits.len(), 2);
-        assert_eq!(parsed().commits_cursor, None);
+        json["commits"]["totalCount"] = json!(769);
+        let detail = parse_detail(&pr_ref(), data(json)).unwrap().detail;
+        assert_eq!(detail.commits_cursor.as_deref(), Some("cursor-c"));
+        assert_eq!(detail.commits.len(), 2);
+        assert_eq!(detail.commits_total, 769);
+        assert_eq!(detail.commit_count(), 769);
+        assert!(!detail.has_every_commit());
+
+        let whole = parsed().detail;
+        assert_eq!(whole.commits_cursor, None);
+        assert_eq!(
+            whole.commits_total, 2,
+            "a page without totalCount counts its own commits"
+        );
+        assert!(whole.has_every_commit());
+    }
+
+    #[test]
+    fn a_detail_cached_before_the_total_counts_its_list() {
+        let mut detail = parsed().detail;
+        let mut cached = serde_json::to_value(&detail).unwrap();
+        let fields = cached.as_object_mut().unwrap();
+        fields.remove("commits_total");
+        fields.remove("commits_cursor");
+        let cached: PullRequestDetail = serde_json::from_value(cached).unwrap();
+        assert_eq!(cached.commits_total, 0);
+        assert_eq!(cached.commit_count(), 2);
+        assert!(cached.has_every_commit());
+
+        detail.commits_total = 3;
+        assert!(!detail.has_every_commit());
+    }
+
+    #[test]
+    fn the_head_query_reads_head_base_and_branch() {
+        let head = parse_head(json!({ "repository": { "pullRequest": {
+            "headRefOid": "abc123",
+            "baseRefOid": "base123",
+            "baseRefName": "main"
+        } } }))
+        .unwrap();
+        assert_eq!(
+            head,
+            PullRequestHead {
+                head_oid: "abc123".into(),
+                base_oid: "base123".into(),
+                base_ref: "main".into(),
+            }
+        );
+        assert!(parse_head(json!({ "repository": { "pullRequest": null } })).is_err());
+        assert!(parse_head(json!({ "repository": null })).is_err());
     }
 
     #[test]

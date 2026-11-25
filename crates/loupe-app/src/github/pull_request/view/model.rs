@@ -1,9 +1,12 @@
 //! Pure view-model logic of the pull request view: tabs, which actions apply
 //! to a loaded detail, labels, and review form validation.
 
+use std::collections::HashMap;
+
 use loupe_github::{
-    CheckRun, CheckStatus, ChecksState, MergeMethod, MergeStateStatus, Mergeable, PrState,
-    PullRequestDetail, ReviewDecision, ReviewEvent, ReviewerState, StackEntry, StackMergePlan,
+    CheckRun, CheckStatus, ChecksState, Commit, MergeMethod, MergeStateStatus, Mergeable,
+    PR_COMMITS_LIMIT, PrState, PullRequestDetail, ReviewDecision, ReviewEvent, ReviewerState,
+    StackEntry, StackMergePlan,
 };
 
 use crate::github::pull_request::checks::format_duration;
@@ -69,10 +72,47 @@ impl PrTab {
         match self {
             PrTab::Conversation | PrTab::Guide => None,
             PrTab::Files => Some(detail.changed_files as usize),
-            PrTab::Commits => Some(detail.commits.len()),
+            PrTab::Commits => Some(detail.commit_count()),
             PrTab::Checks => Some(detail.checks.runs.len()),
         }
     }
+}
+
+/// Whether `detail` lacks commits Loupe can still list: it holds the first
+/// page, and GitHub has more up to [`PR_COMMITS_LIMIT`].
+pub(super) fn commits_missing(detail: &PullRequestDetail) -> bool {
+    detail.commits.len() < detail.commit_count().min(PR_COMMITS_LIMIT)
+}
+
+/// `commits` with each one `fresh` also lists taken from `fresh`: a list
+/// read earlier, with what the latest first page says of its commits (their
+/// checks, which REST's commits do not carry).
+pub(super) fn with_fresh(commits: Vec<Commit>, fresh: &[Commit]) -> Vec<Commit> {
+    let fresh: HashMap<&str, &Commit> = fresh
+        .iter()
+        .map(|commit| (commit.oid.as_str(), commit))
+        .collect();
+    commits
+        .into_iter()
+        .map(|commit| {
+            fresh
+                .get(commit.oid.as_str())
+                .map_or(commit, |fresh| (*fresh).clone())
+        })
+        .collect()
+}
+
+/// Gives `fresh`, loaded with its first page of commits, the longer list
+/// `shown` already holds for the same head and base, so a reload neither
+/// reads the commits again nor shortens the Commits tab.
+pub(super) fn carry_commits(shown: &PullRequestDetail, fresh: &mut PullRequestDetail) {
+    if shown.head_oid != fresh.head_oid
+        || shown.base_oid != fresh.base_oid
+        || shown.commits.len() <= fresh.commits.len()
+    {
+        return;
+    }
+    fresh.commits = with_fresh(shown.commits.clone(), &fresh.commits);
 }
 
 /// The one inline panel open under the toolbar.
@@ -714,6 +754,8 @@ pub(super) mod tests {
         merge_confirm_text, merge_status, pending_comments_label, resolve_method, review_blocker,
         review_button, stack_entry_problems, stack_merge, stack_merge_confirm_text,
     };
+    use super::{carry_commits, commits_missing, with_fresh};
+    use loupe_github::{Commit, PR_COMMITS_LIMIT};
 
     fn actor(login: &str) -> Actor {
         Actor {
@@ -755,6 +797,8 @@ pub(super) mod tests {
             labels: Vec::new(),
             assignees: Vec::new(),
             commits: Vec::new(),
+            commits_total: 0,
+            commits_cursor: None,
             checks: Checks {
                 state: None,
                 runs: Vec::new(),
@@ -767,6 +811,107 @@ pub(super) mod tests {
             viewer_review: None,
             stack: None,
         }
+    }
+
+    fn commit(oid: &str, checks: Option<ChecksState>) -> Commit {
+        Commit {
+            oid: oid.into(),
+            headline: format!("commit {oid}"),
+            body: String::new(),
+            author_name: "Ana".into(),
+            author: None,
+            committed_at: epoch(),
+            checks,
+        }
+    }
+
+    fn commits(range: std::ops::Range<usize>) -> Vec<Commit> {
+        range.map(|ix| commit(&format!("c{ix}"), None)).collect()
+    }
+
+    #[test]
+    fn the_commits_tab_counts_every_commit_before_the_list_loads() {
+        let first_page = PullRequestDetail {
+            commits: commits(0..100),
+            commits_total: 769,
+            ..detail()
+        };
+        assert_eq!(PrTab::Commits.count(&first_page), Some(769));
+        assert!(commits_missing(&first_page));
+
+        let whole = PullRequestDetail {
+            commits: commits(0..769),
+            ..first_page.clone()
+        };
+        assert!(!commits_missing(&whole));
+
+        let beyond_the_limit = PullRequestDetail {
+            commits: commits(0..PR_COMMITS_LIMIT),
+            commits_total: 5000,
+            ..detail()
+        };
+        assert!(
+            !commits_missing(&beyond_the_limit),
+            "a list cut at the limit is not read again"
+        );
+        assert_eq!(PrTab::Commits.count(&beyond_the_limit), Some(5000));
+    }
+
+    #[test]
+    fn a_reload_keeps_the_whole_list_and_takes_the_fresh_checks() {
+        let mut shown = PullRequestDetail {
+            commits: commits(0..300),
+            commits_total: 300,
+            ..detail()
+        };
+        shown.commits[1].checks = Some(ChecksState::Pending);
+        let mut fresh = PullRequestDetail {
+            commits: vec![commit("c0", None), commit("c1", Some(ChecksState::Passing))],
+            commits_total: 300,
+            commits_cursor: Some("next".into()),
+            ..detail()
+        };
+        carry_commits(&shown, &mut fresh);
+        assert_eq!(fresh.commits.len(), 300);
+        assert_eq!(fresh.commits[1].checks, Some(ChecksState::Passing));
+        assert!(!commits_missing(&fresh));
+
+        let mut moved = PullRequestDetail {
+            head_oid: "def".into(),
+            commits: commits(0..2),
+            commits_total: 301,
+            ..detail()
+        };
+        carry_commits(&shown, &mut moved);
+        assert_eq!(moved.commits.len(), 2, "a new head loads its own commits");
+        assert!(commits_missing(&moved));
+
+        let mut longer = PullRequestDetail {
+            commits: commits(0..300),
+            ..detail()
+        };
+        let short = PullRequestDetail {
+            commits: commits(0..2),
+            ..detail()
+        };
+        carry_commits(&short, &mut longer);
+        assert_eq!(
+            longer.commits.len(),
+            300,
+            "a shorter list never replaces one"
+        );
+    }
+
+    #[test]
+    fn fresh_commits_replace_only_their_own() {
+        let merged = with_fresh(
+            vec![commit("a", None), commit("b", None)],
+            &[commit("b", Some(ChecksState::Failing)), commit("z", None)],
+        );
+        let oids: Vec<_> = merged.iter().map(|commit| commit.oid.as_str()).collect();
+        assert_eq!(oids, ["a", "b"]);
+        assert_eq!(merged[0].checks, None);
+        assert_eq!(merged[1].checks, Some(ChecksState::Failing));
     }
 
     fn run(status: CheckStatus) -> CheckRun {

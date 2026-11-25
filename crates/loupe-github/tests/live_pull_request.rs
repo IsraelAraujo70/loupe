@@ -38,6 +38,48 @@ fn loads_a_reviewed_merged_pull_request() {
     assert!(detail.threads.iter().all(|thread| !thread.path.is_empty()));
 }
 
+/// zed-industries/zed#3174 has 769 commits, more than the 250 GitHub lists
+/// of a pull request.
+#[test]
+#[ignore = "needs GITHUB_TOKEN and network"]
+fn lists_every_commit_of_a_pull_request_past_the_250_github_lists() {
+    let github = client();
+    let pr = PrRef::new(RepoRef::new("zed-industries", "zed"), 3174);
+    let detail = github.pull_request(&pr).expect("detail");
+    assert_eq!(detail.commits.len(), 100, "the detail holds the first page");
+    assert_eq!(detail.commits_total, 769);
+    assert!(!detail.has_every_commit());
+
+    let commits = github.pull_request_commits(&detail).expect("commits");
+    assert_eq!(commits.len(), 769);
+    assert_eq!(
+        commits.last().map(|commit| commit.oid.as_str()),
+        Some(detail.head_oid.as_str()),
+        "oldest first, the head last"
+    );
+    let unique: std::collections::HashSet<_> = commits.iter().map(|c| &c.oid).collect();
+    assert_eq!(unique.len(), 769);
+
+    let head = github.pull_request_head(&pr).expect("head");
+    assert_eq!(head.head_oid, detail.head_oid);
+    assert_eq!(head.base_oid, detail.base_oid);
+    assert_eq!(head.base_ref, detail.base_ref);
+}
+
+/// zed-industries/zed#34374 has 122 commits: the list pages on from the
+/// detail's first page in GraphQL.
+#[test]
+#[ignore = "needs GITHUB_TOKEN and network"]
+fn pages_on_from_the_first_commit_page_under_250() {
+    let github = client();
+    let pr = PrRef::new(RepoRef::new("zed-industries", "zed"), 34374);
+    let detail = github.pull_request(&pr).expect("detail");
+    assert_eq!(detail.commits_total, 122);
+    let commits = github.pull_request_commits(&detail).expect("commits");
+    assert_eq!(commits.len(), detail.commits_total as usize);
+    assert_eq!(commits[..100], detail.commits[..]);
+}
+
 #[test]
 #[ignore = "needs GITHUB_TOKEN and network"]
 fn paginates_review_threads_past_one_hundred() {
