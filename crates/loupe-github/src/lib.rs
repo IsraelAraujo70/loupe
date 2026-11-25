@@ -5,6 +5,7 @@
 #![cfg_attr(test, recursion_limit = "256")]
 
 mod actions;
+mod checks;
 mod client;
 pub mod diff;
 mod error;
@@ -21,6 +22,7 @@ mod types;
 mod workflow;
 mod workflow_file;
 
+pub use checks::CheckSource;
 pub use client::{GitHub, Viewer};
 pub use error::{Error, Result};
 pub use gql::{Changes, ChangesQuery, PrStamp, ViewedFailure};

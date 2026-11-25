@@ -172,6 +172,7 @@ query PullRequestDetail($owner: String!, $name: String!, $number: Int!) {
             statusCheckRollup {
               state
               contexts(first: 100) {
+                pageInfo { hasNextPage endCursor }
                 nodes {
                   __typename
                   ... on CheckRun {
@@ -183,7 +184,7 @@ query PullRequestDetail($owner: String!, $name: String!, $number: Int!) {
                     completedAt
                     detailsUrl
                     isRequired(pullRequestNumber: $number)
-                    checkSuite { workflowRun { databaseId workflow { name } } }
+                    checkSuite { workflowRun { databaseId event workflow { name } } }
                   }
                   ... on StatusContext {
                     context
@@ -766,6 +767,7 @@ struct WireCheckSuite {
 #[serde(rename_all = "camelCase")]
 struct WireWorkflowRun {
     database_id: Option<u64>,
+    event: Option<String>,
     workflow: Option<WireWorkflow>,
 }
 
@@ -912,14 +914,13 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
         .into_iter()
         .next()
         .and_then(|node| node.commit.status_check_rollup)
-        .map(|rollup| Checks {
-            state: Some(checks_state(rollup.state)),
-            runs: rollup
-                .contexts
-                .into_nodes()
-                .into_iter()
-                .filter_map(check_run)
-                .collect(),
+        .map(|rollup| {
+            let (contexts, more) = rollup.contexts.into_page();
+            crate::checks::from_rollup(
+                checks_state(rollup.state),
+                contexts.into_iter().filter_map(check_run).collect(),
+                more.is_none(),
+            )
         })
         .unwrap_or(Checks {
             state: None,
@@ -1162,11 +1163,17 @@ fn check_run(context: WireContext) -> Option<CheckRun> {
                         .and_then(|workflow_run| workflow_run.database_id),
                 )
                 .map(|(job_id, run_id)| ActionsJob { job_id, run_id });
+            let (workflow, event) = match workflow_run {
+                Some(workflow_run) => (
+                    workflow_run.workflow.map(|workflow| workflow.name),
+                    workflow_run.event,
+                ),
+                None => (None, None),
+            };
             Some(CheckRun {
                 name: run.name,
-                workflow: workflow_run
-                    .and_then(|workflow_run| workflow_run.workflow)
-                    .map(|workflow| workflow.name),
+                workflow,
+                event,
                 description: None,
                 status: check_run_status(run.status, run.conclusion),
                 started_at: run.started_at,
@@ -1179,6 +1186,7 @@ fn check_run(context: WireContext) -> Option<CheckRun> {
         WireContext::StatusContext(status) => Some(CheckRun {
             name: status.context,
             workflow: None,
+            event: None,
             description: status.description.filter(|text| !text.is_empty()),
             status: match status.state {
                 WireRollupState::Success => CheckStatus::Passed,
@@ -1390,7 +1398,7 @@ mod tests {
                         "completedAt": "2026-01-02T05:03:00Z",
                         "detailsUrl": "https://github.com/acme/web/actions/runs/1",
                         "isRequired": true,
-                        "checkSuite": { "workflowRun": { "databaseId": 77, "workflow": { "name": "CI" } } }
+                        "checkSuite": { "workflowRun": { "databaseId": 77, "event": "pull_request", "workflow": { "name": "CI" } } }
                     },
                     {
                         "__typename": "CheckRun",
@@ -1780,6 +1788,7 @@ mod tests {
         let build = &checks.runs[0];
         assert_eq!(build.name, "build");
         assert_eq!(build.workflow.as_deref(), Some("CI"));
+        assert_eq!(build.event.as_deref(), Some("pull_request"));
         assert_eq!(build.status, CheckStatus::Passed);
         assert!(build.is_required);
         assert!(build.started_at.is_some() && build.completed_at.is_some());
@@ -1794,6 +1803,7 @@ mod tests {
         let lint = &checks.runs[1];
         assert_eq!(lint.status, CheckStatus::Running);
         assert_eq!(lint.workflow, None);
+        assert_eq!(lint.event, None);
         assert_eq!(lint.details_url, None);
         assert_eq!(lint.actions, None, "not an Actions job");
 

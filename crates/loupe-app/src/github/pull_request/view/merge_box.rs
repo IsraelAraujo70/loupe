@@ -407,7 +407,7 @@ impl PullRequestView {
 
     /// The checks under the merge box, in sections by outcome as on GitHub:
     /// each section's heading folds it, and each row says what the check
-    /// did and opens it in Actions or in the browser.
+    /// did, opens its run in Loupe, and has its details in the browser.
     fn render_check_list(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> Div {
         let runs = &detail.checks.runs;
         let theme = cx.theme();
@@ -496,21 +496,18 @@ impl PullRequestView {
         let (muted, foreground, hover) =
             (theme.muted_foreground, theme.foreground, theme.list_hover);
         let (icon, color) = status_style(run.status);
-        let name = match &run.workflow {
-            Some(workflow) => format!("{workflow} / {}", run.name),
-            None => run.name.clone(),
-        };
+        let name = run.full_name();
         let outcome = check_outcome(run);
         let label = match &run.description {
             Some(description) => format!("{name}: {outcome}. {description}"),
             None => format!("{name}: {outcome}"),
         };
-        let actions = check_route(&self.pr.repo, head_ref, run);
+        let route = check_route(&self.pr.repo, head_ref, run);
         h_flex()
             .id(("merge-box-check", ix))
             .role(Role::ListItem)
             .aria_label(label.clone())
-            .when_some(actions.clone(), |row, route| {
+            .when_some(route, |row, route| {
                 row.role(Role::Button)
                     .aria_label(format!("{label}, open its run"))
                     .opens(route)
@@ -535,7 +532,7 @@ impl PullRequestView {
                             .min_w_0()
                             .truncate()
                             .text_color(foreground)
-                            .child(name),
+                            .child(name.clone()),
                     )
                     .child(
                         div()
@@ -564,24 +561,6 @@ impl PullRequestView {
             .when(run.is_required, |row| {
                 row.child(ui::chip().small().child("Required"))
             })
-            .child(
-                h_flex()
-                    .flex_none()
-                    .w_6()
-                    .justify_center()
-                    .children(actions.map(|route| {
-                        ui::icon_button(
-                            ("merge-box-check-run", ix),
-                            IconName::Workflow,
-                            "Open in Actions",
-                        )
-                        .xsmall()
-                        .accessibility_label(format!("Open {} in Actions", run.name))
-                        .on_click(move |event, window, cx| {
-                            crate::shell::open(route.clone(), event, window, cx)
-                        })
-                    })),
-            )
             .child(h_flex().flex_none().w_6().justify_center().children(
                 run.details_url.clone().map(|url| {
                     ui::icon_button(
@@ -590,7 +569,7 @@ impl PullRequestView {
                         "Open details in browser",
                     )
                     .xsmall()
-                    .accessibility_label(format!("Open the details of {} in the browser", run.name))
+                    .accessibility_label(format!("Open the details of {name} in the browser"))
                     .on_click(move |_, _, cx| cx.open_url(&url))
                 }),
             ))

@@ -234,6 +234,9 @@ pub struct CheckRun {
     pub name: String,
     /// Workflow name for Actions check runs; `None` for commit statuses.
     pub workflow: Option<String>,
+    /// The event that started the workflow run (`push`, `pull_request`);
+    /// `None` for commit statuses and other apps' check runs.
+    pub event: Option<String>,
     /// What a commit status says about itself; `None` for check runs and for
     /// a status without a description.
     pub description: Option<String>,
