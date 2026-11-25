@@ -4,6 +4,7 @@
 //! header, and the loading, empty, error, and not-connected states.
 
 use chrono::{DateTime, Utc};
+use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::skeleton::Skeleton;
@@ -13,14 +14,17 @@ use gpui_kit::*;
 use loupe_github::{PrRef, RepoRef};
 use loupe_linear::views::DisplayProperty;
 use loupe_linear::{
-    IssueSummary, Label, Priority, PullRequestLink, PullRequestState, StateRef, StateType, User,
+    ErrorKind, IssueSummary, Label, Priority, PullRequestLink, PullRequestState, StateRef,
+    StateType, User,
 };
 
 use crate::route::Route;
+use crate::services::Accounts;
 use crate::shell::OpenOnClick as _;
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
+use crate::ui::ControlSize as _;
 
 /// Row height for every Linear list (docs/DESIGN.md, "Rows and cards").
 pub const ROW_HEIGHT: f32 = 32.;
@@ -794,6 +798,29 @@ pub fn skeleton_board(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// An issue Linear does not have, or one this key cannot see: Linear answers
+/// both the same way. Retrying cannot bring it back, so the page offers the
+/// browser alone, when the workspace is known.
+pub fn issue_not_found(url: Option<String>) -> AnyElement {
+    let state = ui::empty_state(
+        AssetIcon::FileX,
+        "Issue not found",
+        ErrorKind::NotFound.detail(),
+    );
+    match url {
+        Some(url) => state.action(
+            Button::new("linear-open-in-linear")
+                .outline()
+                .control()
+                .icon(AssetIcon::ExternalLink)
+                .label("Open in Linear")
+                .on_click(move |_, _, cx| cx.open_url(&url)),
+        ),
+        None => state,
+    }
+    .into_any_element()
+}
+
 /// A failed load as an inline error banner with Retry, inset like content.
 pub fn load_error(
     message: SharedString,
@@ -802,23 +829,38 @@ pub fn load_error(
     ui::load_error(message, on_retry).into_any_element()
 }
 
-/// A Linear screen without a key: its page header and "Connect Linear" with
-/// the one action that fixes it.
+/// A Linear screen without a connection: its page header and what is wrong.
+/// With no key at all it says "Connect Linear"; with a saved key that
+/// Linear refused, or one it could not check, it says that instead, so the
+/// user does not think the key was never added. Either way the one action
+/// that fixes it is Settings.
 pub fn not_connected(
     icon: impl Into<gpui_kit::assets::IconName>,
     title: impl Into<SharedString>,
+    cx: &App,
 ) -> AnyElement {
     let icon: gpui_kit::assets::IconName = icon.into();
+    let failed = cx
+        .try_global::<Accounts>()
+        .and_then(|accounts| accounts.linear_failed.first().copied());
+    let state = match failed {
+        None => ui::empty_state(
+            IconName::CircleUser.into(),
+            "Connect Linear",
+            "Add a Linear personal API key in Settings to see your issues.",
+        ),
+        Some(ErrorKind::KeyRejected) => ui::empty_state(
+            AssetIcon::Key,
+            "Your Linear key stopped working",
+            ErrorKind::KeyRejected.detail(),
+        ),
+        Some(kind) => ui::empty_state(AssetIcon::Unplug, kind.title(), kind.detail()),
+    };
     v_flex()
         .size_full()
         .child(ui::page_header(title).icon(icon))
         .child(
-            ui::empty_state(
-                IconName::CircleUser.into(),
-                "Connect Linear",
-                "Add a Linear personal API key in Settings to see your issues.",
-            )
-            .action(
+            state.action(
                 Button::new("linear-open-settings")
                     .small()
                     .primary()

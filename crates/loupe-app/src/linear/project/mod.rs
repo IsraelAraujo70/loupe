@@ -482,7 +482,7 @@ impl Render for ProjectView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_client(cx);
         if self.client.is_none() {
-            return widgets::not_connected(IconName::Box, self.name.clone());
+            return widgets::not_connected(IconName::Box, self.name.clone(), cx);
         }
         self.sync_dates(window, cx);
         self.ensure_issues(window, cx);

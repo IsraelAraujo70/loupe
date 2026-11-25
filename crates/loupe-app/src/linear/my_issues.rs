@@ -442,7 +442,11 @@ impl Render for MyIssues {
         if self.client.is_none() {
             return v_flex()
                 .size_full()
-                .child(widgets::not_connected(IconName::CircleUser, "My issues"))
+                .child(widgets::not_connected(
+                    IconName::CircleUser,
+                    "My issues",
+                    cx,
+                ))
                 .into_any_element();
         }
         if crate::shell::page_may_take_focus(window, cx) {

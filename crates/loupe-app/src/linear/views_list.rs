@@ -390,7 +390,7 @@ impl Render for ViewsListView {
             self.load_teams(cx);
         }
         if self.client.is_none() {
-            return widgets::not_connected(IconName::Layers, "Views");
+            return widgets::not_connected(IconName::Layers, "Views", cx);
         }
         let on_this_list = |view: &View| match (&self.team_id, &view.team_id) {
             (Some(team), Some(own)) => own == team,
