@@ -848,7 +848,7 @@ fn workspace_row(
         .ghost()
         .small()
         .icon(IconName::Search)
-        .tooltip("Search (⌘K)")
+        .tooltip(format!("Search ({})", ui::shortcut("cmd-k")))
         .accessibility_label("Search")
         .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenPalette), cx));
     let new_issue = Button::new("sidebar-new-issue")
@@ -1286,7 +1286,7 @@ fn footer(
         .small()
         .icon(IconName::Settings)
         .selected(settings_selected)
-        .tooltip("Settings (⌘,)")
+        .tooltip(format!("Settings ({})", ui::shortcut("cmd-,")))
         .accessibility_label("Settings")
         .on_click(|_, window, cx| navigate(Route::Settings, window, cx));
     let avatar = ui::avatar_named(viewer.avatar_url.clone(), name.clone(), dp(24.));

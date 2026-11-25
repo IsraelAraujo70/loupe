@@ -126,8 +126,32 @@ pub fn avatar_named(
     url: impl Into<SharedString>,
     name: impl Into<SharedString>,
     size: Pixels,
-) -> impl IntoElement {
-    base_avatar(url.into(), size).name(name)
+) -> AnyElement {
+    let url: SharedString = url.into();
+    let name: SharedString = name.into();
+    // The kit sizes the initials' box for a custom size but not their text,
+    // which then overflows the box; the text size and line height here keep
+    // them centered in the circle.
+    let initials = move || {
+        Avatar::new()
+            .with_size(size)
+            .name(name.clone())
+            .text_size(size * 0.45)
+            .line_height(size * 0.5)
+            .into_any_element()
+    };
+    if url.is_empty() {
+        return initials();
+    }
+    // The kit's image slot leaves an empty circle while the picture loads and
+    // when it cannot load; the initials stand in for it in both cases.
+    img(url)
+        .flex_none()
+        .size(size)
+        .rounded_full()
+        .with_loading(initials.clone())
+        .with_fallback(initials)
+        .into_any_element()
 }
 
 fn base_avatar(url: SharedString, size: Pixels) -> Avatar {
@@ -137,6 +161,25 @@ fn base_avatar(url: SharedString, size: Pixels) -> Avatar {
     } else {
         avatar.src(url)
     }
+}
+
+/// A shortcut written with `cmd` for the platform key, as the app binds it:
+/// Cmd on macOS, Ctrl elsewhere.
+pub fn platform_keystroke(keys: &'static str) -> Option<Keystroke> {
+    let mut keystroke = Keystroke::parse(keys).ok()?;
+    if !cfg!(target_os = "macos") && keystroke.modifiers.platform {
+        keystroke.modifiers.platform = false;
+        keystroke.modifiers.control = true;
+    }
+    Some(keystroke)
+}
+
+/// [`platform_keystroke`] as text for a tooltip or a placeholder: `⌘K` on
+/// macOS, `Ctrl+K` elsewhere.
+pub fn shortcut(keys: &'static str) -> String {
+    platform_keystroke(keys)
+        .map(|keystroke| gpui_kit::component::kbd::Kbd::format(&keystroke))
+        .unwrap_or_default()
 }
 
 /// The one header row of a screen: icon, title, count, then
@@ -586,6 +629,18 @@ pub fn section_label(text: impl Into<SharedString>, cx: &App) -> Div {
     group_title(text).text_color(cx.theme().muted_foreground)
 }
 
+/// A section title in a page's main column (an issue's Pull requests, Links,
+/// and Comments; a pull request's Comments): 14 px, semibold, in the text
+/// color, so the page's own sections stand over the headings inside the
+/// prose they hold.
+pub fn section_title(text: impl Into<SharedString>) -> Div {
+    let text: SharedString = text.into();
+    div()
+        .text_size(scale::title())
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(text)
+}
+
 /// A group title, the heading of a group of content (a section of a list,
 /// a board column, a card): 13 px, semibold, in the text color. One step
 /// under the page title (14 px) and one over a section label, which has
@@ -700,7 +755,7 @@ impl RenderOnce for EmptyState {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let mut header = EmptyHeader::new()
-            .media(EmptyMedia::new().child(svg().path(self.icon.path()).size_5().text_color(muted)))
+            .media(EmptyMedia::new().child(svg().path(self.icon.path()).size_8().text_color(muted)))
             .title(EmptyTitle::new().child(self.title));
         if !self.detail.is_empty() {
             header = header.description(EmptyDescription::new().child(self.detail));

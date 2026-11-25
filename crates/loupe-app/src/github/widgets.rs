@@ -54,7 +54,9 @@ pub fn approval_chip(decision: ReviewDecision) -> Tag {
         ReviewDecision::ChangesRequested => {
             crate::ui::tinted_chip(tokens::closed()).child("Changes requested")
         }
-        ReviewDecision::ReviewRequired => crate::ui::chip().child("Review required"),
+        ReviewDecision::ReviewRequired => {
+            crate::ui::tinted_chip(tokens::pending()).child("Review required")
+        }
     }
 }
 

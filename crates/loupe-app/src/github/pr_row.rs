@@ -275,7 +275,9 @@ fn review_chip(decision: ReviewDecision) -> Tag {
         ReviewDecision::ChangesRequested => {
             ui::tinted_chip(tokens::closed()).child("Changes requested")
         }
-        ReviewDecision::ReviewRequired => ui::chip().child("Review required"),
+        ReviewDecision::ReviewRequired => {
+            ui::tinted_chip(tokens::pending()).child("Review required")
+        }
     }
 }
 

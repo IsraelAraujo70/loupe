@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::GitHub;
 
@@ -9,11 +10,16 @@ use crate::services::{Services, background};
 use crate::ui;
 
 /// Why a screen could not load. `NotConnected` and `Unauthorized` point the
-/// user to Settings; everything else shows GitHub's message.
+/// user to Settings; `NotFound` and `Offline` say what happened in plain
+/// words; everything else shows GitHub's message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadError {
     NotConnected,
     Unauthorized,
+    /// GitHub has nothing at that address, or this account cannot see it:
+    /// GitHub answers both the same way.
+    NotFound,
+    Offline,
     Other(String),
 }
 
@@ -21,6 +27,15 @@ impl From<loupe_github::Error> for LoadError {
     fn from(error: loupe_github::Error) -> Self {
         match error {
             loupe_github::Error::Unauthorized => LoadError::Unauthorized,
+            loupe_github::Error::Http { status: 404, .. } => LoadError::NotFound,
+            loupe_github::Error::GraphQl(messages)
+                if messages
+                    .iter()
+                    .any(|message| message.starts_with("Could not resolve to")) =>
+            {
+                LoadError::NotFound
+            }
+            loupe_github::Error::Transport(_) => LoadError::Offline,
             other => LoadError::Other(other.to_string()),
         }
     }
@@ -31,6 +46,8 @@ impl LoadError {
         match self {
             LoadError::NotConnected => "GitHub is not connected",
             LoadError::Unauthorized => "GitHub rejected the token",
+            LoadError::NotFound => "Not found on GitHub",
+            LoadError::Offline => "Can't reach GitHub",
             LoadError::Other(_) => "Could not load from GitHub",
         }
     }
@@ -46,6 +63,10 @@ impl LoadError {
             LoadError::Unauthorized => {
                 "The token is missing, revoked, or lacks a scope. Sign in again in Settings.".into()
             }
+            LoadError::NotFound => {
+                "It doesn't exist, or this account doesn't have access to it.".into()
+            }
+            LoadError::Offline => "Check your connection, then try again.".into(),
             LoadError::Other(message) => message.clone(),
         }
     }
@@ -166,4 +187,58 @@ pub fn load_error(
     on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     ui::load_error(error.message(), on_retry)
+}
+
+/// A page that failed to load as a whole: the reason in plain words in the
+/// middle of the panel, Retry, and Open on GitHub so the user can check the
+/// address in the browser. `what` names the page's object ("Pull request")
+/// for the not-found title.
+pub fn load_failed_page(
+    error: &LoadError,
+    what: &str,
+    url: String,
+    on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    use gpui_kit::assets::IconName;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::h_flex;
+
+    use crate::ui::ControlSize as _;
+
+    let icon = match error {
+        LoadError::NotFound => IconName::FileX,
+        LoadError::Offline => IconName::Unplug,
+        LoadError::NotConnected | LoadError::Unauthorized => IconName::Key,
+        LoadError::Other(_) => IconName::TriangleAlert,
+    };
+    let title = match error {
+        LoadError::NotFound => format!("{what} not found"),
+        _ => error.title().to_owned(),
+    };
+    // Retrying cannot bring back a page GitHub says does not exist, so a
+    // missing page offers the browser alone.
+    let missing = matches!(error, LoadError::NotFound);
+    ui::empty_state(icon, title, error.detail()).action(
+        h_flex()
+            .gap_2()
+            .when(!missing, |row| {
+                row.child(
+                    Button::new("load-failed-retry")
+                        .outline()
+                        .control()
+                        .icon(IconName::RefreshCw)
+                        .label("Retry")
+                        .on_click(on_retry),
+                )
+            })
+            .child(
+                Button::new("load-failed-open")
+                    .when(missing, |button| button.outline())
+                    .when(!missing, |button| button.ghost())
+                    .control()
+                    .icon(IconName::ExternalLink)
+                    .label("Open on GitHub")
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            ),
+    )
 }

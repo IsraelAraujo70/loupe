@@ -23,21 +23,21 @@ use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
 
-/// How many checks passed, failed, or are still going.
+/// How many checks passed, failed, are still going, or were skipped.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ChecksSummary {
     pub(super) passing: u32,
     pub(super) failing: u32,
     pub(super) pending: u32,
+    pub(super) skipped: u32,
 }
 
 impl ChecksSummary {
     pub(super) fn of(runs: &[CheckRun]) -> Self {
         runs.iter().fold(Self::default(), |mut summary, run| {
             match run.status {
-                CheckStatus::Passed | CheckStatus::Neutral | CheckStatus::Skipped => {
-                    summary.passing += 1
-                }
+                CheckStatus::Passed | CheckStatus::Neutral => summary.passing += 1,
+                CheckStatus::Skipped => summary.skipped += 1,
                 CheckStatus::Failed | CheckStatus::Cancelled => summary.failing += 1,
                 CheckStatus::Queued | CheckStatus::Running | CheckStatus::ActionRequired => {
                     summary.pending += 1
@@ -47,12 +47,14 @@ impl ChecksSummary {
         })
     }
 
-    /// `3 passing / 1 failing / 2 pending`, leaving out the zero counts.
+    /// `3 passing / 1 failing / 2 pending / 1 skipped`, leaving out the
+    /// zero counts.
     pub(super) fn label(&self) -> String {
         let parts: Vec<String> = [
             (self.passing, "passing"),
             (self.failing, "failing"),
             (self.pending, "pending"),
+            (self.skipped, "skipped"),
         ]
         .into_iter()
         .filter(|(count, _)| *count > 0)
@@ -76,11 +78,17 @@ pub(crate) fn format_duration(seconds: i64) -> String {
     }
 }
 
-/// The time a check took, or what it is doing while it has no end time.
+/// The time a check took, what it is doing while it has no end time, or
+/// the outcome in words when it did not run to a verdict: an icon alone does
+/// not say "skipped".
 fn run_duration(run: &CheckRun) -> Option<String> {
     match run.status {
         CheckStatus::Queued => Some("queued".into()),
         CheckStatus::Running => Some("running".into()),
+        CheckStatus::Skipped => Some("skipped".into()),
+        CheckStatus::Cancelled => Some("cancelled".into()),
+        CheckStatus::Neutral => Some("neutral".into()),
+        CheckStatus::ActionRequired => Some("action required".into()),
         _ => match (run.started_at, run.completed_at) {
             (Some(start), Some(end)) => Some(format_duration((end - start).num_seconds())),
             _ => None,
@@ -570,7 +578,7 @@ impl ChecksTab {
             .child(
                 div()
                     .flex_none()
-                    .w_16()
+                    .w_24()
                     .text_right()
                     .text_size(scale::meta())
                     .text_color(muted)
@@ -687,12 +695,16 @@ mod tests {
         assert_eq!(
             summary,
             ChecksSummary {
-                passing: 4,
+                passing: 3,
                 failing: 2,
-                pending: 3
+                pending: 3,
+                skipped: 1
             }
         );
-        assert_eq!(summary.label(), "4 passing / 2 failing / 3 pending");
+        assert_eq!(
+            summary.label(),
+            "3 passing / 2 failing / 3 pending / 1 skipped"
+        );
     }
 
     #[test]
@@ -729,6 +741,11 @@ mod tests {
             Some("queued")
         );
         assert_eq!(run_duration(&run(CheckStatus::Passed)), None);
+
+        let mut skipped = run(CheckStatus::Skipped);
+        skipped.started_at = at(1_000);
+        skipped.completed_at = at(1_000);
+        assert_eq!(run_duration(&skipped).as_deref(), Some("skipped"));
     }
 
     #[test]

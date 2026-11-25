@@ -12,6 +12,7 @@ use loupe_github::{LineAnchor, NewThread, NodeId, Side};
 use super::model::composer_label;
 use crate::github::common::{self, Submit};
 use crate::theme::scale;
+use crate::ui;
 
 /// Where the composer sits and what it would send.
 #[derive(Clone, Debug)]
@@ -220,7 +221,10 @@ impl Render for ComposerView {
                             .primary()
                             .small()
                             .label("Add review comment")
-                            .tooltip("Add review comment (⌘↵)")
+                            .tooltip(format!(
+                                "Add review comment ({})",
+                                ui::shortcut("cmd-enter")
+                            ))
                             .loading(busy)
                             .disabled(busy || empty)
                             .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),

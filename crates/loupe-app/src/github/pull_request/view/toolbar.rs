@@ -917,11 +917,11 @@ impl PullRequestView {
                             .text_size(scale::meta())
                             .text_color(muted)
                             .child(if busy {
-                                "Submitting…"
+                                "Submitting…".to_owned()
                             } else if may_approve {
-                                "⌘↵ submits as a comment."
+                                format!("{} submits as a comment.", ui::shortcut("cmd-enter"))
                             } else {
-                                "You are the author, so you can only comment."
+                                "You are the author, so you can only comment.".to_owned()
                             }),
                     )
                     .child(

@@ -103,8 +103,7 @@ fn author_line(author: &Author) -> AuthorLine {
 
 /// The Cmd+Enter keyboard hint.
 fn send_hint() -> Option<AnyElement> {
-    Keystroke::parse("cmd-enter")
-        .ok()
+    crate::ui::platform_keystroke("cmd-enter")
         .map(|keystroke| Kbd::new(keystroke).into_any_element())
 }
 
@@ -117,7 +116,7 @@ impl IssueView {
             .h_5()
             .gap_2()
             .items_center()
-            .child(crate::ui::section_label("Comments", cx))
+            .child(crate::ui::section_title("Comments"))
             .map(|row| match count {
                 0 => row.child(
                     div()

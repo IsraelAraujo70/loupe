@@ -430,7 +430,7 @@ impl ThreadView {
                         .small()
                         .icon(IconName::Reply)
                         .label("Reply")
-                        .tooltip("Reply (⌘↵)")
+                        .tooltip(format!("Reply ({})", ui::shortcut("cmd-enter")))
                         .loading(reply_busy)
                         .disabled(reply_disabled)
                         .on_click(cx.listener(|this, _, _, cx| this.submit_reply(cx))),
@@ -563,7 +563,7 @@ impl ThreadView {
                                     .outline()
                                     .small()
                                     .label("Save")
-                                    .tooltip("Save (⌘↵)")
+                                    .tooltip(format!("Save ({})", ui::shortcut("cmd-enter")))
                                     .loading(busy)
                                     .disabled(busy)
                                     .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),

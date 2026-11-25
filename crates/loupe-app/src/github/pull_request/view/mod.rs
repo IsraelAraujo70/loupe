@@ -17,7 +17,7 @@ use chrono::{DateTime, Local, Utc};
 use futures::StreamExt as _;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::skeleton::Skeleton;
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Selectable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::stack_merge::run_stack_merge;
@@ -180,6 +180,9 @@ pub struct PullRequestView {
     /// panel just opened, and what the user types next belongs there.
     focus_review_body: bool,
     conversation_scroll: ScrollHandle,
+    /// Details opened in a window too narrow to show the side column on
+    /// its own.
+    details_open: bool,
     guide_scroll: ScrollHandle,
     commits_scroll: ScrollHandle,
     checks_scroll: ScrollHandle,
@@ -285,6 +288,7 @@ impl PullRequestView {
             clear_review_body: false,
             focus_review_body: false,
             conversation_scroll: ScrollHandle::new(),
+            details_open: false,
             guide_scroll: ScrollHandle::new(),
             commits_scroll: ScrollHandle::new(),
             checks_scroll: ScrollHandle::new(),
@@ -1133,40 +1137,88 @@ impl PullRequestView {
         ui::page_header(format!("{}", self.pr)).icon(gpui_kit::assets::IconName::GitPullRequest)
     }
 
+    /// The page in the shape it will load into, so nothing moves when the
+    /// pull request arrives: the state and branch band, the tabs (named from
+    /// the first frame), the status card, the description, and the side
+    /// column's sections.
     fn render_loading(&self, cx: &App) -> Div {
         let border = cx.theme().border;
+        let tabs = PrTab::ALL.into_iter().map(|tab| {
+            ui::section_tab(("pr-tab-loading", tab.index()), tab.title()).icon(tab.icon())
+        });
+        let line = |width: f32| Skeleton::new().secondary().h_3().w(relative(width));
+        let side_section = |_| {
+            v_flex()
+                .gap_2()
+                .child(Skeleton::new().h_3().w_20())
+                .child(Skeleton::new().secondary().h_3().w_32())
+        };
         v_flex()
             .size_full()
             .child(self.placeholder_header())
             .child(
                 h_flex()
                     .flex_none()
+                    .h(scale::band_height())
                     .px(scale::content_inset())
-                    .py_2()
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(border)
+                    .gap_2()
+                    .child(
+                        Skeleton::new()
+                            .h(scale::chip_height())
+                            .w_16()
+                            .rounded_full(),
+                    )
                     .child(Skeleton::new().size_4().rounded_full())
-                    .child(Skeleton::new().h_3().w_40())
-                    .child(Skeleton::new().secondary().h_3().w_24()),
+                    .child(Skeleton::new().secondary().h_3().w_24())
+                    .child(Skeleton::new().secondary().h(scale::chip_height()).w_32()),
             )
+            .child(ui::section_tabs("pr-tabs-loading", self.tab.index()).tabs(tabs))
             .child(
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .items_start()
-                    .child(div().flex_1().py_3().child(ui::skeleton_rows(8)))
                     .child(
                         v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .p(scale::content_inset())
+                            .gap_4()
+                            .child(
+                                ui::card(cx)
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(Skeleton::new().size_6().rounded_full())
+                                            .child(Skeleton::new().h_3().w_32()),
+                                    )
+                                    .child(line(0.35)),
+                            )
+                            .child(
+                                ui::card(cx)
+                                    .gap_3()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(Skeleton::new().size_4().rounded_full())
+                                            .child(Skeleton::new().h_3().w_40()),
+                                    )
+                                    .child(line(0.8))
+                                    .child(line(0.72))
+                                    .child(line(0.6))
+                                    .child(line(0.4)),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_none()
                             .w(scale::side_width())
                             .h_full()
                             .p_4()
-                            .gap_3()
+                            .gap_6()
                             .border_l_1()
                             .border_color(border)
-                            .child(Skeleton::new().h_3().w_20())
-                            .child(Skeleton::new().secondary().h_3().w_32())
-                            .child(Skeleton::new().h_3().w_20()),
+                            .children((0..4).map(side_section)),
                     ),
             )
     }
@@ -1175,13 +1227,20 @@ impl PullRequestView {
         v_flex()
             .size_full()
             .child(self.placeholder_header())
-            .child(common::load_error(
+            .child(common::load_failed_page(
                 error,
+                "Pull request",
+                self.pr.url(),
                 cx.listener(|this, _, _, cx| this.reload(cx)),
             ))
     }
 
-    fn render_tabs(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tabs(
+        &self,
+        detail: &PullRequestDetail,
+        narrow: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let guide_count = self
             .loaded
             .as_ref()
@@ -1199,7 +1258,27 @@ impl PullRequestView {
                     cx.notify();
                 }))
         });
-        ui::section_tabs("pr-tabs", self.tab.index()).tabs(tabs)
+        let details = (narrow && self.tab.has_side_column()).then(|| {
+            let name = if self.details_open {
+                "Hide details"
+            } else {
+                "Show details"
+            };
+            ui::icon_button(
+                "pr-details-toggle",
+                gpui_kit::assets::IconName::PanelRight,
+                name,
+            )
+            .label("Details")
+            .selected(self.details_open)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.details_open = !this.details_open;
+                cx.notify();
+            }))
+        });
+        ui::section_tabs("pr-tabs", self.tab.index())
+            .tabs(tabs)
+            .maybe_trailing(details)
     }
 
     fn render_tab_content(
@@ -1334,12 +1413,15 @@ impl Render for PullRequestView {
             }
             .into_any_element();
         };
+        let narrow = window.viewport_size().width
+            < scale::side_column_breakpoint().to_pixels(window.rem_size());
+        let side = self.tab.has_side_column() && (!narrow || self.details_open);
         v_flex()
             .size_full()
             .child(self.render_header(&detail, cx))
             .children(self.render_title_edit(cx))
             .child(self.render_panel_band(&detail, cx))
-            .child(self.render_tabs(&detail, cx))
+            .child(self.render_tabs(&detail, narrow, cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -1352,7 +1434,7 @@ impl Render for PullRequestView {
                             .min_h_0()
                             .child(self.render_tab_content(&detail, &loaded, cx)),
                     )
-                    .when(self.tab.has_side_column(), |row| {
+                    .when(side, |row| {
                         row.child(self.render_side(&detail, &loaded, cx))
                     }),
             )

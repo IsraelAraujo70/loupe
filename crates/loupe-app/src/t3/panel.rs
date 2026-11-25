@@ -384,8 +384,7 @@ impl Render for LinkedThreads {
             PanelState::NotConnected => v_flex()
                 .items_start()
                 .gap_2()
-                .child(ui::empty_line(IconName::Unplug, "T3 is not connected", cx))
-                .child(Self::settings_button("Connect in Settings…"))
+                .child(Self::settings_button("Connect T3 in Settings…"))
                 .into_any_element(),
             PanelState::Loading => v_flex()
                 .gap_2()

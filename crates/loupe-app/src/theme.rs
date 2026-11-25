@@ -495,6 +495,11 @@ pub mod scale {
     pub fn side_width() -> Rems {
         rems(296. / BASE)
     }
+    /// A window narrower than this, 1200 px, folds a page's side column
+    /// behind a Details toggle so the main column keeps room to read.
+    pub fn side_column_breakpoint() -> Rems {
+        rems(1200. / BASE)
+    }
     /// Wide side columns (Linear issue and project properties), 360 px.
     pub fn side_wide_width() -> Rems {
         rems(360. / BASE)

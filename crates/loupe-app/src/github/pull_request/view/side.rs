@@ -1,5 +1,6 @@
-//! The side column: reviewers, labels, assignees, and the Linear and T3
-//! panels.
+//! The side column: the linked Linear issues first, then reviewers,
+//! labels, assignees, and the T3 panel. The approval and comment counts
+//! live in the merge box beside it.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::Button;
@@ -8,7 +9,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::{Label, PullRequestDetail, Reviewer, ReviewerKind, ReviewerState};
 
-use super::model::{approvals, comment_count};
 use super::{Loaded, PullRequestView};
 use crate::github::common::Loadable;
 use crate::github::pr_row::hint;
@@ -37,27 +37,6 @@ fn reviewer_style(state: ReviewerState) -> (IconName, Hsla, &'static str) {
         }
         ReviewerState::Dismissed => (IconName::Ban, tokens::text_faint(), "Review dismissed"),
     }
-}
-
-/// One Activity counter: icon, name, and the count on the right.
-fn activity_row(
-    id: &'static str,
-    icon: IconName,
-    name: &'static str,
-    count: usize,
-    cx: &App,
-) -> Stateful<Div> {
-    let theme = cx.theme();
-    h_flex()
-        .id(id)
-        .role(Role::ListItem)
-        .aria_label(format!("{name}: {count}"))
-        .gap_2()
-        .items_center()
-        .text_size(scale::body())
-        .child(Icon::new(icon).small().text_color(theme.muted_foreground))
-        .child(div().flex_1().child(name))
-        .child(ui::count_badge(count, cx))
 }
 
 /// A person row: 20 px avatar with initials fallback, then the login.
@@ -157,22 +136,6 @@ impl PullRequestView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
-        let activity = v_flex()
-            .gap_2()
-            .child(activity_row(
-                "pr-activity-approvals",
-                IconName::CircleCheck,
-                "Approvals",
-                approvals(detail).done,
-                cx,
-            ))
-            .child(activity_row(
-                "pr-activity-comments",
-                IconName::MessageSquare,
-                "Comments",
-                comment_count(detail),
-                cx,
-            ));
         let reviewers = if detail.reviewers.is_empty() {
             ui::empty_line(IconName::UserRound, "No reviewers", cx).into_any_element()
         } else {
@@ -242,9 +205,7 @@ impl PullRequestView {
         ui::side_panel("pr-side", ui::SideEdge::Trailing, scale::side_width())
             .track_scroll(&self.side_scroll)
             .child(v_flex().p_4().children(ui::side_sections(vec![
-                ui::side_section("Activity")
-                    .child(activity)
-                    .into_any_element(),
+                loaded.linear.clone().into_any_element(),
                 ui::side_section("Reviewers")
                     .child(reviewers)
                     .into_any_element(),
@@ -255,7 +216,6 @@ impl PullRequestView {
                 ui::side_section("Assignees")
                     .child(assignees)
                     .into_any_element(),
-                loaded.linear.clone().into_any_element(),
                 loaded.t3.clone().into_any_element(),
             ])))
             .into_any_element()

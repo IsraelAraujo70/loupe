@@ -1504,10 +1504,9 @@ fn command_row(label: &'static str, zone: Zone, keys: Option<&'static str>) -> C
                     .text_size(scale::body())
                     .child(label),
             )
-            .when_some(
-                keys.and_then(|keys| Keystroke::parse(keys).ok()),
-                |row, keys| row.child(Kbd::new(keys).outline()),
-            )
+            .when_some(keys.and_then(crate::ui::platform_keystroke), |row, keys| {
+                row.child(Kbd::new(keys).outline())
+            })
     })
 }
 
@@ -1634,7 +1633,7 @@ fn hint(keys: &'static str, action: &'static str, muted: Hsla) -> impl IntoEleme
         .gap_1()
         .text_size(scale::meta())
         .text_color(muted)
-        .when_some(Keystroke::parse(keys).ok(), |row, keys| {
+        .when_some(crate::ui::platform_keystroke(keys), |row, keys| {
             row.child(Kbd::new(keys).outline())
         })
         .child(div().child(action))
@@ -1667,7 +1666,7 @@ impl PaletteView {
             .footer(|_, _, cx| {
                 let muted = cx.theme().muted_foreground;
                 footer(cx)
-                    .child(hint("up", "Move", muted))
+                    .child(hint("↑↓", "Move", muted))
                     .child(hint("enter", "Select", muted))
                     .child(hint("escape", "Close", muted))
             })
@@ -1806,7 +1805,7 @@ impl PaletteView {
             .footer(|_, _, cx| {
                 let muted = cx.theme().muted_foreground;
                 footer(cx)
-                    .child(hint("up", "Move", muted))
+                    .child(hint("↑↓", "Move", muted))
                     .child(hint("enter", "Open", muted))
                     .child(hint("cmd-enter", "New tab", muted))
                     .child(hint("escape", "Close", muted))
