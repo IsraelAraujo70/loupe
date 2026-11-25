@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use loupe_github::{ActionsJob, PrRef, PullRequestDetail, Side};
+use loupe_github::{ActionsJob, PrRef, PullRequestDetail, ReviewEvent, Side};
 
 /// What a tab is built from.
 #[derive(Clone)]
@@ -33,5 +33,12 @@ pub enum PrTabEvent {
         path: String,
         line: Option<u32>,
         side: Side,
+    },
+    /// Submit a review to `pr`: this pull request, or another of its stack
+    /// whose Guide chapter is on screen.
+    SubmitReview {
+        pr: PrRef,
+        event: ReviewEvent,
+        body: String,
     },
 }

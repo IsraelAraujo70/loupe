@@ -115,6 +115,11 @@ pub fn palette_search(query: &str, team_key: Option<&str>, cx: &mut App) -> Task
     palette::search(query, team_key, cx)
 }
 
+/// The palette row of the issue a query names exactly, with its title.
+pub fn palette_issue(identifier: &str, cx: &mut App) -> Task<Vec<PaletteItem>> {
+    palette::find(identifier, cx)
+}
+
 /// The connected workspace's logo, for the sidebar's mark: `None` when
 /// Linear is not connected, the workspace has no logo, or it has not been
 /// read yet.
