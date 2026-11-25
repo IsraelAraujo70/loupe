@@ -996,9 +996,13 @@ fn new_tab_button(closed: &[ClosedTabGroup], cx: &mut Context<Workspace>) -> Any
         .flex_none()
         .debug_selector(|| "new-tab".into())
         .child(
-            ui::icon_button("new-tab", IconName::Plus, "New tab (⌘T)")
-                .small()
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
+            ui::icon_button(
+                "new-tab",
+                IconName::Plus,
+                format!("New tab ({})", ui::shortcut("cmd-t")),
+            )
+            .small()
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
         );
     if closed.is_empty() {
         return button.into_any_element();
@@ -1065,21 +1069,33 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
         .items_center()
         .window_drag_area()
         .child(
-            ui::icon_button("toggle-sidebar", IconName::PanelLeft, "Toggle sidebar (⌘B)")
-                .small()
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
+            ui::icon_button(
+                "toggle-sidebar",
+                IconName::PanelLeft,
+                format!("Toggle sidebar ({})", ui::shortcut("cmd-b")),
+            )
+            .small()
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
         )
         .child(
-            ui::icon_button("go-back", IconName::ChevronLeft, "Back (⌘[)")
-                .small()
-                .disabled(!can_back)
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(GoBack), cx)),
+            ui::icon_button(
+                "go-back",
+                IconName::ChevronLeft,
+                format!("Back ({})", ui::shortcut("cmd-[")),
+            )
+            .small()
+            .disabled(!can_back)
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(GoBack), cx)),
         )
         .child(
-            ui::icon_button("go-forward", IconName::ChevronRight, "Forward (⌘])")
-                .small()
-                .disabled(!can_forward)
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(GoForward), cx)),
+            ui::icon_button(
+                "go-forward",
+                IconName::ChevronRight,
+                format!("Forward ({})", ui::shortcut("cmd-]")),
+            )
+            .small()
+            .disabled(!can_forward)
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(GoForward), cx)),
         )
         .children(tab_list)
         .child(new_tab_button(&closed, cx))

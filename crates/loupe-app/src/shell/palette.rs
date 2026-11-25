@@ -1504,10 +1504,9 @@ fn command_row(label: &'static str, zone: Zone, keys: Option<&'static str>) -> C
                     .text_size(scale::body())
                     .child(label),
             )
-            .when_some(
-                keys.and_then(|keys| Keystroke::parse(keys).ok()),
-                |row, keys| row.child(Kbd::new(keys).outline()),
-            )
+            .when_some(keys.and_then(crate::ui::platform_keystroke), |row, keys| {
+                row.child(Kbd::new(keys).outline())
+            })
     })
 }
 
@@ -1634,7 +1633,7 @@ fn hint(keys: &'static str, action: &'static str, muted: Hsla) -> impl IntoEleme
         .gap_1()
         .text_size(scale::meta())
         .text_color(muted)
-        .when_some(Keystroke::parse(keys).ok(), |row, keys| {
+        .when_some(crate::ui::platform_keystroke(keys), |row, keys| {
             row.child(Kbd::new(keys).outline())
         })
         .child(div().child(action))

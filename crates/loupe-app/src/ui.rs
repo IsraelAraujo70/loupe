@@ -139,6 +139,25 @@ fn base_avatar(url: SharedString, size: Pixels) -> Avatar {
     }
 }
 
+/// A shortcut written with `cmd` for the platform key, as the app binds it:
+/// Cmd on macOS, Ctrl elsewhere.
+pub fn platform_keystroke(keys: &'static str) -> Option<Keystroke> {
+    let mut keystroke = Keystroke::parse(keys).ok()?;
+    if !cfg!(target_os = "macos") && keystroke.modifiers.platform {
+        keystroke.modifiers.platform = false;
+        keystroke.modifiers.control = true;
+    }
+    Some(keystroke)
+}
+
+/// [`platform_keystroke`] as text for a tooltip or a placeholder: `⌘K` on
+/// macOS, `Ctrl+K` elsewhere.
+pub fn shortcut(keys: &'static str) -> String {
+    platform_keystroke(keys)
+        .map(|keystroke| gpui_kit::component::kbd::Kbd::format(&keystroke))
+        .unwrap_or_default()
+}
+
 /// The one header row of a screen: icon, title, count, then
 /// actions on the right; back and forward live in the top bar. 44 px, a window drag
 /// area. Build it with [`page_header`].

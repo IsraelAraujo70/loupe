@@ -41,6 +41,19 @@ const ITEM_KEYS: &str = "Workspace && !Input";
 /// focus.
 const SETTINGS_KEYS: &str = "SettingsView && !Input";
 
+/// A shortcut on the platform key: Cmd on macOS, Ctrl elsewhere, where the
+/// Super key belongs to the desktop. `primary!("shift-a")` is Cmd+Shift+A
+/// or Ctrl+Shift+A.
+macro_rules! primary {
+    ($keys:literal) => {
+        if cfg!(target_os = "macos") {
+            concat!("cmd-", $keys)
+        } else {
+            concat!("ctrl-", $keys)
+        }
+    };
+}
+
 /// The browsers' refresh keys: Cmd+R and Cmd+Shift+R on macOS, Ctrl+R and
 /// Ctrl+Shift+R elsewhere. Bound without a key context, so they work from a
 /// text field too; no field binds them.
@@ -73,42 +86,42 @@ pub fn init(cx: &mut App) {
 /// these bindings.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("cmd-[", GoBack, None),
-        KeyBinding::new("cmd-b", ToggleSidebar, None),
-        KeyBinding::new("cmd-k", OpenPalette, None),
-        KeyBinding::new("cmd-shift-a", SearchTabs, None),
-        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new(primary!("["), GoBack, None),
+        KeyBinding::new(primary!("b"), ToggleSidebar, None),
+        KeyBinding::new(primary!("k"), OpenPalette, None),
+        KeyBinding::new(primary!("shift-a"), SearchTabs, None),
+        KeyBinding::new(primary!(","), OpenSettings, None),
         KeyBinding::new(REFRESH_KEYS.0, RefreshPage, None),
         KeyBinding::new(REFRESH_KEYS.1, RefreshAllTabs, None),
         KeyBinding::new("pagedown", ScrollPageDown, Some("Workspace")),
         KeyBinding::new("pageup", ScrollPageUp, Some("Workspace")),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-shift-w", CloseWindow, None),
-        KeyBinding::new("cmd-]", GoForward, None),
-        KeyBinding::new("cmd-t", NewTab, None),
-        KeyBinding::new("cmd-w", CloseTab, None),
+        KeyBinding::new(primary!("q"), Quit, None),
+        KeyBinding::new(primary!("shift-w"), CloseWindow, None),
+        KeyBinding::new(primary!("]"), GoForward, None),
+        KeyBinding::new(primary!("t"), NewTab, None),
+        KeyBinding::new(primary!("w"), CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
-        KeyBinding::new("cmd-1", ActivateTab1, None),
-        KeyBinding::new("cmd-2", ActivateTab2, None),
-        KeyBinding::new("cmd-3", ActivateTab3, None),
-        KeyBinding::new("cmd-4", ActivateTab4, None),
-        KeyBinding::new("cmd-5", ActivateTab5, None),
-        KeyBinding::new("cmd-6", ActivateTab6, None),
-        KeyBinding::new("cmd-7", ActivateTab7, None),
-        KeyBinding::new("cmd-8", ActivateTab8, None),
-        KeyBinding::new("cmd-9", ActivateLastTab, None),
+        KeyBinding::new(primary!("1"), ActivateTab1, None),
+        KeyBinding::new(primary!("2"), ActivateTab2, None),
+        KeyBinding::new(primary!("3"), ActivateTab3, None),
+        KeyBinding::new(primary!("4"), ActivateTab4, None),
+        KeyBinding::new(primary!("5"), ActivateTab5, None),
+        KeyBinding::new(primary!("6"), ActivateTab6, None),
+        KeyBinding::new(primary!("7"), ActivateTab7, None),
+        KeyBinding::new(primary!("8"), ActivateTab8, None),
+        KeyBinding::new(primary!("9"), ActivateLastTab, None),
         // Zed's and VS Code's key for splitting to the right.
-        KeyBinding::new("cmd-\\", SplitRight, None),
-        KeyBinding::new("cmd-shift-\\", SplitDown, None),
+        KeyBinding::new(primary!("\\"), SplitRight, None),
+        KeyBinding::new(primary!("shift-\\"), SplitDown, None),
         // The palette's Cmd+Enter opens the result in a new tab.
-        KeyBinding::new("cmd-enter", PaletteOpenInNewTab, Some("Command")),
-        KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new(primary!("enter"), PaletteOpenInNewTab, Some("Command")),
+        KeyBinding::new(primary!("m"), Minimize, None),
         // The first binding is the one the View menu shows.
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd-+", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ResetZoom, None),
+        KeyBinding::new(primary!("="), ZoomIn, None),
+        KeyBinding::new(primary!("+"), ZoomIn, None),
+        KeyBinding::new(primary!("-"), ZoomOut, None),
+        KeyBinding::new(primary!("0"), ResetZoom, None),
         // Text fields keep the letter: GPUI prefers typing when one is focused.
         KeyBinding::new("f", crate::linear::OpenFilter, Some("TeamView")),
         KeyBinding::new("f", crate::github::OpenReviewsFilter, Some("InboxView")),
@@ -146,7 +159,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", SelectPrevious, Some(LIST_KEYS)),
         KeyBinding::new("enter", OpenSelected, Some(LIST_KEYS)),
         KeyBinding::new("o", OpenSelected, Some(LIST_KEYS)),
-        KeyBinding::new("cmd-a", crate::github::SelectTabRows, Some(LIST_KEYS)),
+        KeyBinding::new(primary!("a"), crate::github::SelectTabRows, Some(LIST_KEYS)),
         KeyBinding::new("right", crate::github::OpenStack, Some(LIST_KEYS)),
         KeyBinding::new("left", crate::github::CloseStack, Some(LIST_KEYS)),
         KeyBinding::new(
@@ -157,15 +170,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("/", FocusSettingsSearch, Some(SETTINGS_KEYS)),
         // The context menu of an issue or a pull request, on Linear's keys
         // where Linear has one. An issue's page binds S, P, A, and L itself.
-        KeyBinding::new("cmd-enter", OpenItemInNewTab, Some(ITEM_KEYS)),
-        KeyBinding::new("cmd-shift-enter", OpenItemSideBySide, Some(ITEM_KEYS)),
+        KeyBinding::new(primary!("enter"), OpenItemInNewTab, Some(ITEM_KEYS)),
+        KeyBinding::new(primary!("shift-enter"), OpenItemSideBySide, Some(ITEM_KEYS)),
         // Linux reports Shift with punctuation as the shifted character, so
         // each Shift key is bound both ways; the last is the one shown.
-        KeyBinding::new("cmd-<", CopyItemLink, Some(ITEM_KEYS)),
-        KeyBinding::new("cmd-shift-,", CopyItemLink, Some(ITEM_KEYS)),
-        KeyBinding::new("cmd-.", CopyItemId, Some(ITEM_KEYS)),
-        KeyBinding::new("cmd->", CopyItemBranch, Some(ITEM_KEYS)),
-        KeyBinding::new("cmd-shift-.", CopyItemBranch, Some(ITEM_KEYS)),
+        KeyBinding::new(primary!("<"), CopyItemLink, Some(ITEM_KEYS)),
+        KeyBinding::new(primary!("shift-,"), CopyItemLink, Some(ITEM_KEYS)),
+        KeyBinding::new(primary!("."), CopyItemId, Some(ITEM_KEYS)),
+        KeyBinding::new(primary!(">"), CopyItemBranch, Some(ITEM_KEYS)),
+        KeyBinding::new(primary!("shift-."), CopyItemBranch, Some(ITEM_KEYS)),
         KeyBinding::new("s", crate::linear::ChangeState, Some(ITEM_KEYS)),
         KeyBinding::new("p", crate::linear::ChangePriority, Some(ITEM_KEYS)),
         KeyBinding::new("a", crate::linear::ChangeAssignee, Some(ITEM_KEYS)),

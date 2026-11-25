@@ -3005,6 +3005,13 @@ mod tests {
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
 
+    /// Select all on the platform key, as `menus::bind_keys` binds it.
+    const SELECT_ALL: &str = if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    };
+
     pub(super) fn pr(owner: &str, number: u64) -> PrSummary {
         let at = Utc::now();
         PrSummary {
@@ -3926,7 +3933,7 @@ mod tests {
         );
 
         // Cmd+A picks the whole tab, every group.
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes(SELECT_ALL);
         assert_eq!(picked(&view, cx), [2, 3, 5, 4]);
 
         // A new sort keeps the selection and reorders what the bar opens.
@@ -3949,7 +3956,7 @@ mod tests {
         assert_eq!(picked(&view, cx), [4, 5], "unfolding picks nothing back");
         click(cx, "reviews-group-Requested from you");
         cx.simulate_keystrokes("escape");
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes(SELECT_ALL);
         assert_eq!(picked(&view, cx), [4, 5]);
         click(cx, "reviews-group-Requested from you");
         assert_eq!(
@@ -3970,7 +3977,7 @@ mod tests {
         click(cx, "reviews-tab-All");
         assert!(picked(&view, cx).is_empty(), "another tab clears it");
         click(cx, "reviews-tab-Involved");
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes(SELECT_ALL);
         assert_eq!(picked(&view, cx), [4, 5]);
 
         // Changing the filters clears the selection; a sort does not.
@@ -4052,7 +4059,7 @@ mod tests {
                 view.selection = super::Selection::default();
                 cx.notify();
             });
-            cx.simulate_keystrokes("cmd-a");
+            cx.simulate_keystrokes(SELECT_ALL);
             assert_eq!(picked(view, cx).len(), count as usize);
         };
         let confirm = |view: &Entity<InboxView>, cx: &mut VisualTestContext| {
@@ -4093,12 +4100,12 @@ mod tests {
         let offered = |view: &Entity<InboxView>, cx: &mut VisualTestContext| {
             view.update(cx, |view, cx| view.view_group_name(cx))
         };
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes(SELECT_ALL);
         assert!(!picked(&view, cx).is_empty());
         assert_eq!(offered(&view, cx), None, "no saved view is open");
 
         view.update(cx, |view, cx| view.save_as_new("Ready to ship", cx));
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes(SELECT_ALL);
         assert_eq!(offered(&view, cx).as_deref(), Some("Ready to ship"));
 
         view.update(cx, |view, cx| {
@@ -4119,7 +4126,7 @@ mod tests {
             view.set_tab(ReviewTab::All, cx);
             view.save_as_new("Ready to ship", cx);
         });
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes(SELECT_ALL);
         let pick = |view: &Entity<InboxView>, cx: &mut VisualTestContext| {
             view.update(cx, |view, cx| view.view_pick(cx))
         };
@@ -4137,7 +4144,7 @@ mod tests {
             view.keep_in_sync = true;
             view.toggle_group(ReviewGroup::Step(NextStep::ReadyToMerge), cx);
         });
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes(SELECT_ALL);
         let Some(super::GroupPick::View {
             sync: Some(sync), ..
         }) = pick(&view, cx)
