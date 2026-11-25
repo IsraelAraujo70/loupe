@@ -1269,6 +1269,7 @@ impl PullRequestView {
                 gpui_kit::assets::IconName::PanelRight,
                 name,
             )
+            .label("Details")
             .selected(self.details_open)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.details_open = !this.details_open;
