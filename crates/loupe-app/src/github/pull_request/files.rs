@@ -5,16 +5,18 @@
 mod composer;
 mod header;
 mod model;
+mod sticky;
 mod tree;
 mod tree_view;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffFile, DiffFileStatus, DiffHoverHighlight, DiffLinePosition,
     DiffLineRange, DiffState,
@@ -37,9 +39,11 @@ use self::model::{
     file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
     to_diff_side, to_side, viewed_counts,
 };
+use self::sticky::HeaderWatch;
 use self::tree::{
-    GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, file_tint, folder_tint,
-    into_tree_order, move_down, move_left, move_right, move_up, tree_rows, viewed_mark,
+    GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
+    file_tint, folder_tint, into_tree_order, move_down, move_left, move_right, move_up, tree_rows,
+    viewed_mark,
 };
 use self::tree_view::{RowView, StickyFolders};
 use super::tab::{PrTabContext, PrTabEvent};
@@ -69,6 +73,9 @@ const FADE_WIDTH: f32 = 32.;
 /// The note under a file with no diff, and for a diff GitHub left out, the
 /// path to load and whether it is loading.
 type NoDiffNote = (ElementId, SharedString, Option<(String, bool)>);
+
+/// What a file's header in the diff shows.
+type HeaderFor = Rc<dyn Fn(&DiffFile) -> header::HeaderContent>;
 
 struct ThreadSlot {
     view: Entity<ThreadView>,
@@ -100,6 +107,8 @@ pub struct FilesTab {
     /// Why loading a left-out diff failed, by path.
     patch_errors: HashMap<String, String>,
     diff: Option<Entity<DiffState>>,
+    /// Where the diff drew its file headers, to tell the file at its top.
+    headers: Rc<RefCell<HeaderWatch>>,
     layout: DiffLayout,
     viewed_error: Option<String>,
     viewed_pending: HashSet<String>,
@@ -136,6 +145,7 @@ impl FilesTab {
             patch_loads: HashMap::new(),
             patch_errors: HashMap::new(),
             diff: None,
+            headers: Rc::default(),
             layout: Settings::get(cx).diff_layout,
             viewed_error: None,
             viewed_pending: HashSet::new(),
@@ -288,6 +298,9 @@ impl FilesTab {
                 self.diff = Some(cx.new(|cx| DiffState::new(loaded.docs, cx).with_mode(mode)));
             }
         }
+        // The diff starts over on its first file, which can open past that
+        // file's header, so no header tells it.
+        self.headers.borrow_mut().jumped_to(0);
         self.collapse_viewed(cx);
         if let Some(slot) = &self.composer
             && !self
@@ -538,9 +551,18 @@ impl FilesTab {
                 .get(path)
                 .is_some_and(|hunks| find_line(hunks, line_no, side).is_some())
         });
+        let headers = self.headers.clone();
         state.update(cx, |state, cx| {
             state.set_file_collapsed(path, false, cx);
             if let Some(line_no) = line.filter(|_| has_exact_line) {
+                // The line may sit far from its file's header.
+                if let Some(file) = state
+                    .files()
+                    .iter()
+                    .position(|file| file.path().as_ref() == path)
+                {
+                    headers.borrow_mut().jumped_to(file);
+                }
                 state.scroll_to_line(
                     DiffLinePosition::new(path.to_owned(), to_diff_side(side), line_no as usize),
                     cx,
@@ -919,6 +941,18 @@ impl FilesTab {
         cx.notify();
     }
 
+    /// Selects the file whose lines reached the top of the diff, scrolling
+    /// the tree only as far as it takes to show it.
+    fn follow_diff(&mut self, path: &str, cx: &mut Context<Self>) {
+        let rows = self.current_rows(cx);
+        let Some(ix) = rows.iter().position(|row| row.path == path) else {
+            return;
+        };
+        self.selected = Some(path.to_owned());
+        self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
     fn open_row(&mut self, row: &TreeRow, cx: &mut Context<Self>) {
         match row.kind {
             RowKind::Dir(_) => self.toggle_folder(&row.path, cx),
@@ -1002,6 +1036,7 @@ impl FilesTab {
             .as_deref()
             .and_then(|path| rows.iter().position(|row| row.path == path));
         let active = selected.and_then(|ix| active_folder(rows, ix));
+        let starts = distinct_starts(rows);
         let muted = cx.theme().muted_foreground;
         let foreground = cx.theme().foreground;
         rows.iter()
@@ -1030,6 +1065,7 @@ impl FilesTab {
                             depth: row.depth,
                             folder: Some(dir.expanded),
                             label: dir.label.clone().into(),
+                            name_from: 0,
                             // Names stay neutral; the status letter carries
                             // the color.
                             label_color: if viewed == ViewedMark::All {
@@ -1076,6 +1112,7 @@ impl FilesTab {
                             depth: row.depth,
                             folder: None,
                             label: split_path(&file.path).1.to_owned().into(),
+                            name_from: starts[ix],
                             label_color: if viewed { muted } else { foreground },
                             icon: assets::file_icon(&file.path),
                             icon_color: muted,
@@ -1243,10 +1280,10 @@ impl FilesTab {
         // keeps the scroll offset to itself (`DiffState::horizontal_scroll`
         // is crate-private), so a bar of Loupe's own could not be true.
         let runs_on = !wrap && self.long_files().next().is_some();
-        let header = {
+        let content: HeaderFor = {
             let (viewed, sizes, weak) = (viewed.clone(), sizes.clone(), weak.clone());
             let fade = if runs_on { dp(FADE_WIDTH) } else { px(0.) };
-            move |file: &DiffFile, _: &mut Window, _: &mut App| {
+            Rc::new(move |file: &DiffFile| {
                 let path = file.path().clone();
                 let title = match (file.original_path(), file.modified_path()) {
                     (Some(old), Some(new)) if old != new => format!("{old} → {new}").into(),
@@ -1262,7 +1299,7 @@ impl FilesTab {
                 };
                 let weak = weak.clone();
                 let toggle_path = path.to_string();
-                header::file_header(header::HeaderContent {
+                header::HeaderContent {
                     viewed: viewed.contains(path.as_ref()),
                     title,
                     path,
@@ -1274,9 +1311,33 @@ impl FilesTab {
                         weak.update(cx, |this, cx| this.toggle_viewed(&toggle_path, checked, cx))
                             .ok();
                     }),
-                })
+                    on_drawn: None,
+                }
+            })
+        };
+        let file_ixs: Rc<HashMap<SharedString, usize>> = Rc::new(
+            state
+                .read(cx)
+                .files()
+                .iter()
+                .enumerate()
+                .map(|(ix, file)| (file.path().clone(), ix))
+                .collect(),
+        );
+        let header = {
+            let (content, watch) = (content.clone(), self.headers.clone());
+            move |file: &DiffFile, _: &mut Window, _: &mut App| {
+                let mut header = content(file);
+                if let Some(&ix) = file_ixs.get(file.path()) {
+                    let watch = watch.clone();
+                    header.on_drawn = Some(Rc::new(move |bounds, viewport| {
+                        watch.borrow_mut().record(ix, bounds, viewport)
+                    }));
+                }
+                header::file_header(header)
             }
         };
+        let pinned = self.pinned_header(state, content, cx);
         div()
             .debug_selector(|| "files-diff".into())
             .relative()
@@ -1374,7 +1435,133 @@ impl FilesTab {
                         )),
                 )
             })
+            .child(pinned)
             .into_any_element()
+    }
+
+    /// The header of the file at the top of the diff, pinned over its lines
+    /// while they scroll as the files tree pins folders, and the tree's
+    /// selection following that file.
+    fn pinned_header(
+        &self,
+        state: &Entity<DiffState>,
+        content: HeaderFor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let watch = self.headers.clone();
+        let state = state.clone();
+        let weak = cx.entity().downgrade();
+        canvas(
+            move |bounds, window, cx| {
+                // A header's text sits under its row's top border and padding.
+                let inset = window.rem_size() * 0.25 + px(1.);
+                let (before, top) = watch.borrow_mut().finish_frame(f32::from(inset));
+                let file = top?;
+                let (path, mut header) = {
+                    let state = state.read(cx);
+                    let file = state.files().get(file)?;
+                    (file.path().clone(), content(file))
+                };
+                if before.is_some() && before != top {
+                    let (weak, path) = (weak.clone(), path.clone());
+                    cx.defer(move |cx| {
+                        weak.update(cx, |tab, cx| tab.follow_diff(&path, cx)).ok();
+                    });
+                }
+                let (headers, viewport) = {
+                    let watch = watch.borrow();
+                    (watch.headers().to_vec(), watch.viewport())
+                };
+                // Before any header was drawn, such as when the diff opens
+                // past its first one, the diff's part of the screen is ours.
+                let viewport = if viewport.size.width > px(0.) {
+                    viewport
+                } else {
+                    bounds
+                };
+                // Marked from here, the file folds and its header takes the
+                // top, the next file's lines under it.
+                header.on_viewed = {
+                    let (weak, path) = (weak.clone(), path.to_string());
+                    Rc::new(move |checked, _, cx| {
+                        weak.update(cx, |tab, cx| {
+                            tab.toggle_viewed(&path, checked, cx);
+                            tab.scroll_to(&path, cx);
+                        })
+                        .ok();
+                    })
+                };
+                let collapse = {
+                    let (state, path) = (state.clone(), path.clone());
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                        state.update(cx, |state, cx| {
+                            state.set_file_collapsed(&path, true, cx);
+                            state.scroll_to_file(&path, cx);
+                        })
+                    }
+                };
+                let width = viewport.size.width;
+                let mut row = h_flex()
+                    .id("files-pinned-header")
+                    .debug_selector(|| "pinned-header".into())
+                    .role(Role::Group)
+                    .aria_label(format!("Current file {path}"))
+                    .occlude()
+                    .w(width)
+                    .pl_1()
+                    .pr_3()
+                    .py_1()
+                    .gap_1()
+                    .bg(tokens::background())
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("pinned-collapse")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::ChevronDown)
+                            .accessibility_label(format!("Collapse {path}"))
+                            .on_click(collapse),
+                    )
+                    .child(div().flex_1().min_w_0().child(header::file_header(header)))
+                    .into_any_element();
+                let row_size = row.layout_as_root(
+                    size(AvailableSpace::Definite(width), AvailableSpace::MinContent),
+                    window,
+                    cx,
+                );
+                let offset =
+                    sticky::pinned_top(&headers, file, row_size.height.into(), inset.into())?;
+                let mut shade = div()
+                    .w(width)
+                    .h(dp(6.))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(tokens::edge_shadow(), 0.),
+                        linear_color_stop(tokens::edge_shadow().opacity(0.), 1.),
+                    ))
+                    .into_any_element();
+                shade.layout_as_root(AvailableSpace::min_size(), window, cx);
+                let origin = viewport.origin + point(px(0.), px(offset));
+                window.with_content_mask(Some(ContentMask { bounds: viewport }), |window| {
+                    row.prepaint_at(origin, window, cx);
+                    shade.prepaint_at(origin + point(px(0.), row_size.height), window, cx);
+                });
+                Some((row, shade, viewport))
+            },
+            |_, pinned, window, cx| {
+                let Some((mut row, mut shade, viewport)) = pinned else {
+                    return;
+                };
+                window.with_content_mask(Some(ContentMask { bounds: viewport }), |window| {
+                    row.paint(window, cx);
+                    shade.paint(window, cx);
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element()
     }
 
     fn loaded_view(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1589,6 +1776,14 @@ mod tests {
         cx: &mut TestAppContext,
         file: ChangedFile,
     ) -> (VisualTestContext, Entity<FilesTab>) {
+        open_files_tab_with_files(cx, vec![file])
+    }
+
+    /// The files tab alone in a window, with `files` loaded.
+    fn open_files_tab_with_files(
+        cx: &mut TestAppContext,
+        files: Vec<ChangedFile>,
+    ) -> (VisualTestContext, Entity<FilesTab>) {
         let (handle, tab) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::init(cx);
@@ -1619,7 +1814,7 @@ mod tests {
         cx.run_until_parked();
         tab.update(&mut cx, |tab, cx| {
             tab.finish_load(
-                Ok(build_files(vec![file], git_patch, |patch| {
+                Ok(build_files(files, git_patch, |patch| {
                     parse_patch(patch).ok()
                 })),
                 cx,
@@ -1866,5 +2061,72 @@ mod tests {
 
         cx.update(|_, cx| update_settings(cx, |settings| settings.diff_wrap = true));
         assert_viewed_on_screen(cx, "lines wrap");
+    }
+
+    fn added(path: &str, lines: usize) -> ChangedFile {
+        let body: String = (1..=lines).map(|line| format!("+line {line}\n")).collect();
+        ChangedFile {
+            path: path.into(),
+            previous_path: None,
+            status: FileStatus::Added,
+            additions: lines as u32,
+            deletions: 0,
+            patch: Some(format!("@@ -0,0 +1,{lines} @@\n{body}")),
+            viewed: ViewedState::Unviewed,
+        }
+    }
+
+    fn scroll_diff(cx: &mut VisualTestContext, by: f32) {
+        let (_, diff) = panes(cx);
+        dispatch(
+            cx,
+            ScrollEvent {
+                position: point(diff.left() + px(200.), diff.top() + px(200.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
+                ..ScrollEvent::default()
+            }
+            .to_platform_input(),
+        );
+        panes(cx);
+    }
+
+    #[gpui_kit::test]
+    fn the_file_at_the_top_keeps_its_header_and_the_tree_follows(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_files_tab_with_files(
+            cx,
+            vec![added("src/long.rs", 300), added("src/next.rs", 100)],
+        );
+        let cx = &mut cx;
+        let (_, diff) = panes(cx);
+        assert!(
+            cx.debug_bounds("pinned-header").is_none(),
+            "at the top the file's own header is in place"
+        );
+
+        scroll_diff(cx, 1500.);
+        let pinned = cx
+            .debug_bounds("pinned-header")
+            .expect("in the middle of a long file its header stays on screen");
+        // Inside the diff's own 1 px border.
+        assert!(
+            pinned.top() - diff.top() <= px(1.)
+                && pinned.left() >= diff.left()
+                && pinned.right() <= diff.right(),
+            "pinned at the top of the diff: {pinned:?} in {diff:?}"
+        );
+        let viewed = cx
+            .debug_bounds("header-viewed")
+            .expect("the pinned header has Viewed");
+        assert!(viewed.top() >= pinned.top() && viewed.bottom() <= pinned.bottom());
+
+        // A wheel's steps, each shorter than the screen, into the next file.
+        for _ in 0..9 {
+            scroll_diff(cx, 600.);
+        }
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
+            Some("src/next.rs"),
+            "the tree selects the file that reached the top"
+        );
     }
 }

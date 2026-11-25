@@ -14,6 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::FilesTab;
+use super::header::{ELLIPSIS, cut_name, text_width};
 use super::tree::{TreeRow, ViewedMark, sticky_folders};
 use crate::assets;
 use crate::theme::scale::{self, dp};
@@ -35,6 +36,9 @@ pub struct RowView {
     /// `Some(expanded)` for a folder.
     pub folder: Option<bool>,
     pub label: SharedString,
+    /// Where a file's name stops sharing its start with a sibling's
+    /// (`tree::distinct_starts`).
+    pub name_from: usize,
     pub label_color: Hsla,
     pub icon: &'static str,
     /// The icon's color: muted, or the state color of a folder whose files
@@ -146,30 +150,28 @@ pub fn row(
                     None => div().flex_none().size(dp(ICON_SIZE)).into_any_element(),
                 })
                 .child(icon(view.icon, view.icon_color))
-                .child({
+                .child(if folder_row {
                     let (head, between, tail) = split_label(&view.label);
-                    let folder = folder_row;
+                    // A folder's name is whole at the tree's opening width;
+                    // in a narrower tree it is cut at its end, and the lanes
+                    // beside it keep their place.
                     h_flex()
                         .min_w_0()
                         .ml(dp(4.))
                         .text_size(scale::body())
                         .text_color(view.label_color)
-                        // A file's stem gives way and its extension
-                        // stays. A folder's name is whole at the tree's
-                        // opening width; in a narrower tree it is cut at
-                        // its end, and the lanes beside it keep their place.
-                        .when(folder, |label| label.flex_shrink(1.).overflow_hidden())
-                        .when(!folder, |label| label.flex_1())
-                        .child(
-                            div()
-                                .when(folder, |part| part.flex_none())
-                                .when(!folder, |part| part.min_w_0().truncate())
-                                .child(head),
-                        )
+                        .flex_shrink(1.)
+                        .overflow_hidden()
+                        .child(div().flex_none().child(head))
                         .when(!between.is_empty(), |label| {
                             label.child(div().flex_none().text_color(muted).child(between))
                         })
                         .child(div().flex_none().child(tail))
+                        .into_any_element()
+                } else {
+                    file_name(view.label.clone(), view.name_from)
+                        .text_color(view.label_color)
+                        .into_any_element()
                 })
                 // What is left of a folder's row, so its lanes sit at the
                 // trailing edge like a file's.
@@ -239,12 +241,11 @@ const STAT_LANE: f32 = 56.;
 /// tree at its opening width, a folded folder name still fits whole.
 const LANE_GAP: f32 = 8.;
 
-/// A label as its first part, what stands between, and its last part. A
-/// folded path of three or more folders shows its first and last whole with
-/// "/…/" between: the first is what differs between two such rows
+/// A folder's label as its first part, what stands between, and its last
+/// part. A folded path of three or more folders shows its first and last
+/// whole with "/…/" between: the first is what differs between two such rows
 /// (development, production) and the last is the folder the rows under it
-/// belong to. A file name is its stem and its extension. The row's tooltip
-/// and accessible name have the whole path.
+/// belong to. The row's tooltip and accessible name have the whole path.
 fn split_label(label: &str) -> (SharedString, SharedString, SharedString) {
     let none = SharedString::default;
     let folders: Vec<&str> = label.split('/').collect();
@@ -259,14 +260,59 @@ fn split_label(label: &str) -> (SharedString, SharedString, SharedString) {
             none(),
             (*last).to_owned().into(),
         ),
-        _ => match label.rfind('.') {
-            Some(dot) if dot > 0 => {
-                let (stem, extension) = label.split_at(dot);
-                (stem.to_owned().into(), none(), extension.to_owned().into())
-            }
-            _ => (label.to_owned().into(), none(), none()),
-        },
+        _ => (label.to_owned().into(), none(), none()),
     }
+}
+
+/// A file name that fits `max`, as `width` measures text. A name too long to
+/// show whole drops the start it shares with a sibling, up to `from`
+/// (`…repository.ts`), so the part that tells the two apart stays; what
+/// still does not fit loses the end of its stem and keeps its extension, as
+/// a name of its own does (`…repos….ts`, `foo-audit.inte….ts`).
+fn abbreviate_name(name: &str, from: usize, max: f32, width: impl Fn(&str) -> f32) -> String {
+    if width(name) <= max {
+        return name.to_owned();
+    }
+    if from > 0 && from < name.len() {
+        let rest = &name[from..];
+        let led = |text: &str| width(&format!("{ELLIPSIS}{text}"));
+        if led(rest) <= max {
+            return format!("{ELLIPSIS}{rest}");
+        }
+        let cut = cut_name(rest, max, &led);
+        if cut.len() > ELLIPSIS.len() {
+            return format!("{ELLIPSIS}{cut}");
+        }
+    }
+    cut_name(name, max, &width)
+}
+
+/// A file's name in the room its row leaves, cut as `abbreviate_name` cuts
+/// it, so siblings with the same start still read apart in a narrow tree.
+fn file_name(name: SharedString, from: usize) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .ml(dp(4.))
+        .text_size(scale::body())
+        .child(
+            canvas(
+                move |bounds, window, cx| {
+                    let label: SharedString = {
+                        let measure = text_width(window, FontWeight::NORMAL);
+                        abbreviate_name(&name, from, f32::from(bounds.size.width), measure).into()
+                    };
+                    let mut text = div().whitespace_nowrap().child(label).into_any_element();
+                    let size = text.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let top = bounds.top() + (bounds.size.height - size.height) / 2.;
+                    text.prepaint_at(point(bounds.left(), top), window, cx);
+                    text
+                },
+                |_, mut text, window, cx| text.paint(window, cx),
+            )
+            .size_full(),
+        )
 }
 
 fn icon(path: &'static str, color: Hsla) -> Svg {
@@ -408,11 +454,16 @@ impl UniformListDecoration for StickyFolders {
 
 #[cfg(test)]
 mod tests {
-    use super::split_label;
+    use super::{abbreviate_name, split_label};
 
     fn parts(label: &str) -> String {
         let (head, between, tail) = split_label(label);
         format!("{head}|{between}|{tail}")
+    }
+
+    /// One unit per character, so a width is a character count.
+    fn chars(text: &str) -> f32 {
+        text.chars().count() as f32
     }
 
     #[test]
@@ -422,8 +473,49 @@ mod tests {
             "development|/…/|hooli"
         );
         assert_eq!(parts("src/shell"), "src/||shell");
-        assert_eq!(parts("terragrunt.hcl"), "terragrunt||.hcl");
         assert_eq!(parts("accounts"), "accounts||");
-        assert_eq!(parts(".gitignore"), ".gitignore||");
+        assert_eq!(parts("my.config"), "my.config||");
+    }
+
+    #[test]
+    fn a_name_that_fits_is_whole() {
+        let name = "collaborator.repository.ts";
+        assert_eq!(abbreviate_name(name, 13, chars(name), chars), name);
+        assert_eq!(abbreviate_name(name, 0, 40., chars), name);
+    }
+
+    #[test]
+    fn siblings_with_one_start_keep_the_part_that_differs() {
+        let names = [
+            "collaborator.controller.ts",
+            "collaborator.repository.ts",
+            "collaborator.service.ts",
+        ];
+        let cut: Vec<String> = names
+            .iter()
+            .map(|name| abbreviate_name(name, 13, 15., chars))
+            .collect();
+        assert_eq!(cut, ["…controller.ts", "…repository.ts", "…service.ts"]);
+        // Narrower still, the part that differs leads and the extension stays.
+        let cut: Vec<String> = names
+            .iter()
+            .map(|name| abbreviate_name(name, 13, 9., chars))
+            .collect();
+        assert_eq!(cut, ["…cont….ts", "…repo….ts", "…serv….ts"]);
+    }
+
+    #[test]
+    fn a_name_of_its_own_loses_the_end_of_its_stem() {
+        assert_eq!(
+            abbreviate_name("foo-audit.interceptor.spec.ts", 0, 18., chars),
+            "foo-audit.inte….ts"
+        );
+        // With no room for the extension, the part that differs still leads.
+        assert_eq!(
+            abbreviate_name("collaborator.repository.ts", 13, 4., chars),
+            "…re…"
+        );
+        assert_eq!(abbreviate_name("Makefile", 0, 5., chars), "Make…");
+        assert_eq!(abbreviate_name("Makefile", 0, 0., chars), "");
     }
 }

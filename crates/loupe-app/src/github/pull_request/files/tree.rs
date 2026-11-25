@@ -6,7 +6,7 @@
 //! case, and a chain of folders with a single child folder and no files
 //! shows as one compact row (`src/lib/http`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use loupe_github::{ChangedFile, FileStatus};
 
@@ -316,6 +316,69 @@ pub fn active_folder(rows: &[TreeRow], selected: usize) -> Option<usize> {
     }
 }
 
+/// Where each file's name stops sharing its start with a sibling file's,
+/// at the start of a word (after `.`, `-`, `_`, or a space) and never past
+/// the last word before the extension, so a name cut short keeps the part
+/// that tells it apart: of `collaborator.service.ts` and
+/// `collaborator.repository.ts`, the part after `collaborator.`. The part
+/// kept is the end of no other sibling's name from one of its words on, so
+/// `atelier_cave_dark.rs` keeps `cave_dark.rs` beside `atelier_cave_light.rs`
+/// and `atelier_dune_dark.rs`. 0 for a folder and for a name whose start is
+/// its own.
+pub fn distinct_starts(rows: &[TreeRow]) -> Vec<usize> {
+    let mut starts = vec![0; rows.len()];
+    let mut siblings: HashMap<Option<usize>, Vec<(&str, usize)>> = HashMap::new();
+    for (ix, row) in rows.iter().enumerate() {
+        if let RowKind::File { .. } = row.kind {
+            let name = row.path.rsplit('/').next().unwrap_or(&row.path);
+            siblings.entry(row.parent).or_default().push((name, ix));
+        }
+    }
+    for mut names in siblings.into_values() {
+        // How many names end in each of their own word-led ends.
+        let mut ends: HashMap<&str, usize> = HashMap::new();
+        for &(name, _) in &names {
+            for start in word_starts(name) {
+                *ends.entry(&name[start..]).or_default() += 1;
+            }
+        }
+        // In sorted order a name shares the most with a neighbor.
+        names.sort_unstable();
+        for (position, &(name, ix)) in names.iter().enumerate() {
+            let shared = [position.checked_sub(1), Some(position + 1)]
+                .into_iter()
+                .flatten()
+                .filter_map(|other| names.get(other))
+                .map(|&(other, _)| common_prefix(name, other))
+                .max()
+                .unwrap_or(0);
+            let stem = name.rfind('.').filter(|&dot| dot > 0).unwrap_or(name.len());
+            let latest = shared.min(stem);
+            starts[ix] = word_starts(name)
+                .filter(|&start| start <= latest && ends.get(&name[start..]) == Some(&1))
+                .last()
+                .unwrap_or(0);
+        }
+    }
+    starts
+}
+
+/// Where the words of a file name start, first to last.
+fn word_starts(name: &str) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(0).chain(name.match_indices(SEPARATORS).map(|(ix, _)| ix + 1))
+}
+
+/// What separates the words of a file name.
+const SEPARATORS: [char; 4] = ['.', '-', '_', ' '];
+
+/// The length in bytes of the start `a` and `b` share.
+fn common_prefix(a: &str, b: &str) -> usize {
+    a.char_indices()
+        .zip(b.chars())
+        .find(|((_, x), y)| x != y)
+        .map_or(a.len().min(b.len()), |((ix, _), _)| ix)
+}
+
 /// How many of a folder's files are viewed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewedMark {
@@ -376,9 +439,9 @@ mod tests {
     use loupe_github::{ChangedFile, FileStatus, ViewedState};
 
     use super::{
-        GitTint, Move, RowKind, Sticky, TreeRow, ViewedMark, active_folder, folder_tint,
-        into_tree_order, move_down, move_left, move_right, move_up, sticky_folders, tree_rows,
-        viewed_mark,
+        GitTint, Move, RowKind, Sticky, TreeRow, ViewedMark, active_folder, distinct_starts,
+        folder_tint, into_tree_order, move_down, move_left, move_right, move_up, sticky_folders,
+        tree_rows, viewed_mark,
     };
 
     fn file(path: &str, additions: u32, deletions: u32) -> ChangedFile {
@@ -589,6 +652,64 @@ mod tests {
         );
         assert_eq!(active_folder(&rows, http), Some(http));
         assert_eq!(active_folder(&rows, find(&rows, "README.md")), None);
+    }
+
+    #[test]
+    fn a_name_keeps_from_where_it_parts_from_its_siblings() {
+        let files = vec![
+            file("api/collaborator/collaborator.controller.ts", 1, 0),
+            file("api/collaborator/collaborator.repository.ts", 1, 0),
+            file("api/collaborator/collaborator.repository.spec.ts", 1, 0),
+            file("api/collaborator/foo-audit.interceptor.spec.ts", 1, 0),
+            file("api/collaborator/bar-audit.interceptor.spec.ts", 1, 0),
+            file("api/collaborator/index.ts", 1, 0),
+            file("api/account/account.ts", 1, 0),
+            file("api/account/accounts.module.ts", 1, 0),
+            file("web/collaborator.controller.ts", 1, 0),
+            file("themes/atelier_cave_dark.rs", 1, 0),
+            file("themes/atelier_cave_light.rs", 1, 0),
+            file("themes/atelier_dune_dark.rs", 1, 0),
+        ];
+        let rows = tree_rows(&files, "", &HashSet::new());
+        let starts = distinct_starts(&rows);
+        let start = |path: &str| {
+            let ix = find(&rows, path);
+            let name = path.rsplit('/').next().unwrap();
+            name[starts[ix]..].to_owned()
+        };
+        assert_eq!(
+            start("api/collaborator/collaborator.controller.ts"),
+            "controller.ts"
+        );
+        assert_eq!(
+            start("api/collaborator/collaborator.repository.ts"),
+            "repository.ts"
+        );
+        assert_eq!(
+            start("api/collaborator/collaborator.repository.spec.ts"),
+            "repository.spec.ts"
+        );
+        // Siblings that part at their first letter keep their whole start.
+        assert_eq!(
+            start("api/collaborator/foo-audit.interceptor.spec.ts"),
+            "foo-audit.interceptor.spec.ts"
+        );
+        assert_eq!(start("api/collaborator/index.ts"), "index.ts");
+        // A shared start that ends inside a word keeps the word.
+        assert_eq!(
+            start("api/account/accounts.module.ts"),
+            "accounts.module.ts"
+        );
+        // A file alone in its folder, and folders, keep everything.
+        assert_eq!(
+            start("web/collaborator.controller.ts"),
+            "collaborator.controller.ts"
+        );
+        // What is kept ends no other sibling's name.
+        assert_eq!(start("themes/atelier_cave_dark.rs"), "cave_dark.rs");
+        assert_eq!(start("themes/atelier_cave_light.rs"), "light.rs");
+        assert_eq!(start("themes/atelier_dune_dark.rs"), "dune_dark.rs");
+        assert_eq!(starts[find(&rows, "api")], 0);
     }
 
     #[test]
