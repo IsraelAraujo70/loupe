@@ -23,6 +23,8 @@ anyhow.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
 futures.workspace = true
+# Word emphasis inside a diff's changed lines (github/pull_request/files/emphasis.rs).
+similar = { workspace = true, features = ["unicode"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true

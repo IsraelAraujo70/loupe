@@ -8,6 +8,7 @@ use gpui_kit::component::diff::{DiffFile, DiffMode, DiffSide};
 use loupe_github::diff::{AnchorError, Hunk, git_patch};
 use loupe_github::{ChangedFile, FileStatus, LineAnchor, NodeId, ReviewThread, Side, ViewedState};
 
+use super::emphasis::PLAIN;
 use crate::github::highlight::language_for_path;
 use crate::store::DiffLayout;
 
@@ -247,7 +248,13 @@ pub fn file_doc(file: &ChangedFile, patch: Option<String>) -> (Option<DiffFile>,
             .and_then(|parsed| parsed.into_iter().next())
     };
     let missing = match patch.as_deref().map(parse) {
-        Some(Some(doc)) => return (Some(doc.with_language(language_for_path(&file.path))), None),
+        Some(Some(doc)) => {
+            let language = match language_for_path(&file.path) {
+                "text" => PLAIN,
+                language => language,
+            };
+            return (Some(doc.with_language(language)), None);
+        }
         Some(None) => Some(Missing::Unreadable),
         None if file.additions + file.deletions > 0 => Some(Missing::Omitted),
         None => None,
