@@ -1224,7 +1224,9 @@ impl FilesTab {
 fn tint_color(tint: GitTint) -> Hsla {
     match tint {
         GitTint::Created => tokens::open(),
-        GitTint::Modified => tokens::pending(),
+        // Nearly every file of a pull request is modified, so its letter
+        // stays quiet and color marks the files that are new, gone, or moved.
+        GitTint::Modified => tokens::text_muted(),
         GitTint::Deleted => tokens::closed(),
         GitTint::Renamed => tokens::link(),
     }
