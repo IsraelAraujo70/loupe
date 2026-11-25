@@ -605,6 +605,18 @@ pub fn section_label(text: impl Into<SharedString>, cx: &App) -> Div {
     group_title(text).text_color(cx.theme().muted_foreground)
 }
 
+/// A section title in a page's main column (an issue's Pull requests, Links,
+/// and Comments; a pull request's Comments): 14 px, semibold, in the text
+/// color, so the page's own sections stand over the headings inside the
+/// prose they hold.
+pub fn section_title(text: impl Into<SharedString>) -> Div {
+    let text: SharedString = text.into();
+    div()
+        .text_size(scale::title())
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(text)
+}
+
 /// A group title, the heading of a group of content (a section of a list,
 /// a board column, a card): 13 px, semibold, in the text color. One step
 /// under the page title (14 px) and one over a section label, which has

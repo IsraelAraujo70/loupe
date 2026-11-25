@@ -12,10 +12,10 @@ use crate::route::Route;
 use crate::shell::OpenOnClick as _;
 use crate::theme::scale::dp;
 
-fn section(title: &'static str, rows: Vec<Stateful<Div>>, cx: &App) -> AnyElement {
+fn section(title: &'static str, rows: Vec<Stateful<Div>>) -> AnyElement {
     v_flex()
         .gap_2()
-        .child(crate::ui::section_label(title, cx))
+        .child(crate::ui::section_title(title))
         .child(v_flex().gap_1().children(rows))
         .into_any_element()
 }
@@ -80,7 +80,7 @@ pub(super) fn pull_requests(attachments: &[Attachment], cx: &App) -> Option<AnyE
             )
         })
         .collect();
-    (!rows.is_empty()).then(|| section("Pull requests", rows, cx))
+    (!rows.is_empty()).then(|| section("Pull requests", rows))
 }
 
 /// The linked pull requests as header buttons, two at most: the mark in the
@@ -162,5 +162,5 @@ pub(super) fn other_attachments(attachments: &[Attachment], cx: &App) -> Option<
                 .on_open(move |event, window, cx| crate::shell::open_link(&url, event, window, cx))
         })
         .collect();
-    (!rows.is_empty()).then(|| section("Links", rows, cx))
+    (!rows.is_empty()).then(|| section("Links", rows))
 }

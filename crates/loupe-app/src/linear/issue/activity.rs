@@ -116,7 +116,7 @@ impl IssueView {
             .h_5()
             .gap_2()
             .items_center()
-            .child(crate::ui::section_label("Comments", cx))
+            .child(crate::ui::section_title("Comments"))
             .map(|row| match count {
                 0 => row.child(
                     div()
