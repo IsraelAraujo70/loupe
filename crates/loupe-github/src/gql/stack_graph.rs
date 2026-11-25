@@ -310,11 +310,13 @@ impl GitHub {
                 if child.state != PrState::Open {
                     continue;
                 }
-                if nodes_by_num.contains_key(&child.pr.number) {
-                    continue;
-                }
+                // The pull request on screen is already known when it sits in
+                // the middle of the stack, but the ones built on it are not.
                 if !child.cross_repository && !child.head_ref.is_empty() {
                     frontier.push_back(child.head_ref.clone());
+                }
+                if nodes_by_num.contains_key(&child.pr.number) {
+                    continue;
                 }
                 nodes_by_num.insert(child.pr.number, child);
                 if nodes_by_num.len() > MAX_STACK_NODES {
