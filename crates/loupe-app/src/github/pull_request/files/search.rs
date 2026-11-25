@@ -7,7 +7,7 @@ use loupe_github::diff::{Hunk, LineKind};
 
 /// How many lines before a match the diff scrolls to, so the match lands
 /// under the pinned file header instead of behind it.
-const LEAD: usize = 3;
+pub const LEAD: usize = 3;
 
 /// A line of the diff that holds the text.
 #[derive(Clone, Debug, PartialEq, Eq)]

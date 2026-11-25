@@ -3,6 +3,7 @@
 //! annotations.
 
 mod composer;
+mod expand;
 mod header;
 mod model;
 mod search;
@@ -12,6 +13,7 @@ mod tree_view;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -39,6 +41,7 @@ use loupe_github::{
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
+use self::expand::{Direction, Gap, Source};
 use self::model::{
     LoadedFiles, Missing, PlacedThread, Placement, anchor_error_message, build_files, diff_mode,
     file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
@@ -109,6 +112,29 @@ struct ComposerSlot {
     _events: Subscription,
 }
 
+/// The lines a file shows between its hunks beyond its patch.
+#[derive(Default)]
+struct Expansion {
+    /// The file at the commit the diff shows, once read.
+    source: Option<Arc<Source>>,
+    /// The new-side lines revealed, in the order asked.
+    revealed: Vec<Range<u32>>,
+    /// The patch's hunks with the revealed lines merged in.
+    shown: Option<Arc<Vec<Hunk>>>,
+    /// The read of the file under way, and the gap that asked for it.
+    read: Option<(Task<()>, u32)>,
+    /// Why the file could not be read, and the gap that asked.
+    error: Option<(u32, String)>,
+}
+
+/// One gap between hunks and what its controls show.
+struct GapBar {
+    path: String,
+    gap: Gap,
+    busy: bool,
+    error: Option<SharedString>,
+}
+
 /// The find bar over the diff and the lines it found.
 struct Find {
     input: Entity<InputState>,
@@ -147,6 +173,8 @@ pub struct FilesTab {
     patch_loads: HashMap<String, Task<()>>,
     /// Why loading a left-out diff failed, by path.
     patch_errors: HashMap<String, String>,
+    /// The lines revealed between hunks, by path.
+    expansions: HashMap<String, Expansion>,
     diff: Option<Entity<DiffState>>,
     /// Where the diff drew its file headers, to tell the file at its top.
     headers: Rc<RefCell<HeaderWatch>>,
@@ -226,6 +254,7 @@ impl FilesTab {
             missing: HashMap::new(),
             patch_loads: HashMap::new(),
             patch_errors: HashMap::new(),
+            expansions: HashMap::new(),
             diff: None,
             headers: Rc::default(),
             layout: Settings::get(cx).diff_layout,
@@ -283,6 +312,7 @@ impl FilesTab {
             self.hunks.clear();
             self.patch_loads.clear();
             self.patch_errors.clear();
+            self.expansions.clear();
             self.diff = None;
         }
         if head_changed || matches!(self.load, Loadable::Failed(_)) {
@@ -438,11 +468,18 @@ impl FilesTab {
         self.files = loaded.files;
         self.hunks = loaded.hunks;
         self.missing = loaded.missing;
+        self.expansions.clear();
         let mode = diff_mode(self.layout);
         match &self.diff {
             Some(state) => state.update(cx, |state, cx| state.set_files(loaded.docs, cx)),
             None => {
-                self.diff = Some(cx.new(|cx| DiffState::new(loaded.docs, cx).with_mode(mode)));
+                // Every line given is shown: the lines revealed between
+                // hunks are context the component would fold away again.
+                self.diff = Some(cx.new(|cx| {
+                    DiffState::new(loaded.docs, cx)
+                        .with_mode(mode)
+                        .with_context_lines(None)
+                }));
             }
         }
         // The diff starts over on its first file, which can open past that
@@ -570,6 +607,7 @@ impl FilesTab {
     /// Puts a loaded diff (`None` for a binary file) in the viewer, opens the
     /// file, and keeps it on screen.
     fn apply_omitted_patch(&mut self, path: &str, patch: Option<String>, cx: &mut Context<Self>) {
+        self.expansions.remove(path);
         let Some(file) = self.files.iter_mut().find(|file| file.path == path) else {
             return;
         };
@@ -625,6 +663,140 @@ impl FilesTab {
         }
         self.threads_dirty = true;
         self.run_find(false, cx);
+    }
+
+    /// The hunks the diff shows for `path`: its patch's, with any lines
+    /// revealed between them.
+    fn shown_hunks(&self, path: &str) -> Option<&Arc<Vec<Hunk>>> {
+        self.expansions
+            .get(path)
+            .and_then(|expansion| expansion.shown.as_ref())
+            .or_else(|| self.hunks.get(path))
+    }
+
+    /// Reveals what `direction` asks of the gap at new-side line `start` in
+    /// `path`, reading the file at the commit the diff shows the first time.
+    /// The text is kept by commit and path, which never change.
+    fn expand_gap(&mut self, path: &str, start: u32, direction: Direction, cx: &mut Context<Self>) {
+        if !self.hunks.contains_key(path) {
+            return;
+        }
+        match self.expansions.get(path) {
+            Some(expansion) if expansion.source.is_some() => {
+                return self.reveal_gap(path, start, direction, cx);
+            }
+            Some(expansion) if expansion.read.is_some() => return,
+            _ => {}
+        }
+        let repo = self.context.pr.repo.clone();
+        let sha = match &self.commit {
+            Some(commit) => commit.oid.clone(),
+            None => self.context.detail.head_oid.clone(),
+        };
+        let key = crate::cache::github_key(cx, &format!("file-text/{}/{sha}/{path}", repo.url()));
+        let (read_path, owned_path) = (path.to_owned(), path.to_owned());
+        let task = common::run(
+            cx,
+            move |gh| {
+                if let Some(text) = key.as_deref().and_then(crate::cache::get::<String>) {
+                    return Ok(text);
+                }
+                let bytes = gh.raw_contents(&repo, &read_path, &sha)?;
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if let Some(key) = &key {
+                    crate::cache::put(key, &text);
+                }
+                Ok(text)
+            },
+            move |this, result, cx| {
+                let Some(expansion) = this.expansions.get_mut(&owned_path) else {
+                    return;
+                };
+                expansion.read = None;
+                match result {
+                    Ok(text) => {
+                        expansion.source = Some(Arc::new(Source::new(&text)));
+                        this.reveal_gap(&owned_path, start, direction, cx);
+                    }
+                    Err(error) => expansion.error = Some((start, error.message())),
+                }
+            },
+        );
+        let expansion = self.expansions.entry(path.to_owned()).or_default();
+        expansion.error = None;
+        expansion.read = Some((task, start));
+        cx.notify();
+    }
+
+    /// Reveals what `direction` asks of the gap at new-side line `start` in
+    /// `path` from the file read, and scrolls the revealed lines under the
+    /// pinned header.
+    fn reveal_gap(&mut self, path: &str, start: u32, direction: Direction, cx: &mut Context<Self>) {
+        let Some(hunks) = self.hunks.get(path).cloned() else {
+            return;
+        };
+        let Some(file) = self.files.iter().find(|file| file.path == path).cloned() else {
+            return;
+        };
+        let Some(expansion) = self.expansions.get_mut(path) else {
+            return;
+        };
+        let Some(source) = expansion.source.clone() else {
+            return;
+        };
+        let current = expansion.shown.clone().unwrap_or_else(|| hunks.clone());
+        let Some(gap) = expand::gaps(&current, Some(source.line_count()))
+            .into_iter()
+            .find(|gap| gap.start == start)
+        else {
+            return;
+        };
+        let lines = gap.reveal(direction);
+        expansion.error = None;
+        expansion.revealed.push(lines.clone());
+        let shown = Arc::new(expand::expanded(&hunks, &source, &expansion.revealed));
+        expansion.shown = Some(shown.clone());
+        let file = ChangedFile {
+            patch: Some(expand::patch_text(&shown)),
+            ..file
+        };
+        let (Some(doc), None) = file_doc(&file, git_patch(&file)) else {
+            return;
+        };
+        let lead = expand::lead(&shown, lines.start, search::LEAD);
+        if let Some(state) = &self.diff {
+            let headers = self.headers.clone();
+            state.update(cx, |state, cx| {
+                let docs = state
+                    .files()
+                    .iter()
+                    .map(|existing| {
+                        if existing.path().as_ref() == path {
+                            doc.clone()
+                        } else {
+                            existing.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                state.set_files(docs, cx);
+                if let Some(ix) = state
+                    .files()
+                    .iter()
+                    .position(|file| file.path().as_ref() == path)
+                {
+                    headers.borrow_mut().jumped_to(ix);
+                }
+                match lead {
+                    Some((line, side)) => state.scroll_to_line(
+                        DiffLinePosition::new(path.to_owned(), to_diff_side(side), line as usize),
+                        cx,
+                    ),
+                    None => state.scroll_to_file(path, cx),
+                }
+            });
+        }
+        self.run_find(false, cx);
+        cx.notify();
     }
 
     /// Places the pull request's threads in the diff and keeps one entity per
@@ -820,7 +992,7 @@ impl FilesTab {
             .and_then(|ix| self.find.matches.get(ix))
             .cloned();
         let files = self.files.iter().map(|file| {
-            let hunks = self.hunks.get(&file.path);
+            let hunks = self.shown_hunks(&file.path);
             (
                 file.path.as_str(),
                 hunks.map_or(&[][..], |hunks| hunks.as_slice()),
@@ -830,8 +1002,9 @@ impl FilesTab {
         self.find.query = query.clone();
         if !query.is_empty() {
             let lines: usize = self
-                .hunks
-                .values()
+                .files
+                .iter()
+                .filter_map(|file| self.shown_hunks(&file.path))
                 .flat_map(|hunks| hunks.iter())
                 .map(|hunk| hunk.lines.len())
                 .sum();
@@ -1243,9 +1416,19 @@ impl FilesTab {
     /// The files with a line that runs past the panel while lines scroll.
     fn long_files(&self) -> impl Iterator<Item = &ChangedFile> {
         self.files.iter().filter(|file| {
-            file.patch
-                .as_deref()
-                .is_some_and(|patch| patch.lines().any(|line| line.chars().count() > LONG_LINE))
+            match self
+                .expansions
+                .get(&file.path)
+                .and_then(|expansion| expansion.shown.as_ref())
+            {
+                Some(hunks) => hunks
+                    .iter()
+                    .flat_map(|hunk| &hunk.lines)
+                    .any(|line| line.text.chars().count() > LONG_LINE),
+                None => file.patch.as_deref().is_some_and(|patch| {
+                    patch.lines().any(|line| line.chars().count() > LONG_LINE)
+                }),
+            }
         })
     }
 
@@ -1743,6 +1926,50 @@ impl FilesTab {
                 .then(|| (path.clone(), self.patch_loads.contains_key(path)));
             notes.push((id, note, load));
         }
+        // Each gap between hunks goes under the line above it, or under the
+        // header, after any thread there, so it sits right over the hunk
+        // that follows.
+        let mut bars: HashMap<ElementId, GapBar> = HashMap::new();
+        for file in self
+            .files
+            .iter()
+            .filter(|file| expand::expandable(file.status))
+        {
+            let Some(hunks) = self.shown_hunks(&file.path) else {
+                continue;
+            };
+            let expansion = self.expansions.get(&file.path);
+            let total = expansion
+                .and_then(|expansion| expansion.source.as_ref())
+                .map(|source| source.line_count());
+            let busy = expansion.is_some_and(|expansion| expansion.read.is_some());
+            let error = expansion.and_then(|expansion| expansion.error.as_ref());
+            for gap in expand::gaps(hunks, total) {
+                let id = ElementId::Name(SharedString::from(format!(
+                    "gap:{}:{}",
+                    file.path, gap.start
+                )));
+                annotations.push(match gap.above {
+                    Some((line, side)) => DiffAnnotation::line(
+                        id.clone(),
+                        DiffLinePosition::new(file.path.clone(), to_diff_side(side), line as usize),
+                    ),
+                    None => DiffAnnotation::file(id.clone(), file.path.clone()),
+                });
+                let error = error
+                    .filter(|(start, _)| *start == gap.start)
+                    .map(|(_, error)| SharedString::from(error.clone()));
+                bars.insert(
+                    id,
+                    GapBar {
+                        path: file.path.clone(),
+                        gap,
+                        busy,
+                        error,
+                    },
+                );
+            }
+        }
 
         // Each file's size, for its header, as GitHub counts it.
         let sizes: Rc<HashMap<String, (u32, u32)>> = Rc::new(
@@ -1766,8 +1993,12 @@ impl FilesTab {
             theme.group_box,
             theme.radius_lg,
         );
+        // The fill of the component's hunk rows, so a gap's controls and the
+        // next hunk's header read as one band.
+        let fold = theme.muted.opacity(0.35);
         let add_weak = weak.clone();
         let load_weak = weak.clone();
+        let gap_weak = weak.clone();
         // While lines scroll, whether some line runs past the panel: the
         // toolbar says so in words and the panel's edge fades. The
         // component draws its own horizontal bar only while it scrolls and
@@ -1852,6 +2083,9 @@ impl FilesTab {
                     .decorations(decorations)
                     .annotations(annotations)
                     .render_annotation(move |annotation, _, _| {
+                        if let Some(bar) = bars.get(annotation.id()) {
+                            return gap_bar(bar, &gap_weak, muted, fold);
+                        }
                         // Threads and the composer sit in a card under their
                         // line, inset from the gutter like a review comment.
                         let card = div()
@@ -2132,6 +2366,61 @@ fn tint_color(tint: GitTint) -> Hsla {
     }
 }
 
+/// The controls of one gap between hunks, as GitHub draws them: Expand
+/// down under a hunk, Expand up over one, and the whole gap with its count.
+fn gap_bar(bar: &GapBar, weak: &WeakEntity<FilesTab>, muted: Hsla, fill: Hsla) -> AnyElement {
+    let GapBar {
+        path,
+        gap,
+        busy,
+        error,
+    } = bar;
+    let start = gap.start;
+    let control = |direction: Direction| {
+        let lines = gap.reveal(direction);
+        let name = match gap.end {
+            None => format!("Show the lines after line {} of {path}", start - 1),
+            Some(_) => format!("Show lines {} to {} of {path}", lines.start, lines.end - 1),
+        };
+        let (icon, tooltip) = match direction {
+            Direction::Down => (IconName::ArrowDown, "Expand down"),
+            Direction::Up => (IconName::ArrowUp, "Expand up"),
+            Direction::All => (IconName::ChevronsUpDown, "Expand all"),
+        };
+        let (weak, path) = (weak.clone(), path.clone());
+        let button = Button::new(SharedString::from(format!(
+            "expand-{direction:?}:{path}:{start}"
+        )))
+        .ghost()
+        .small()
+        .icon(icon)
+        .text_color(muted)
+        .accessibility_label(name)
+        .loading(*busy)
+        .disabled(*busy)
+        .on_click(move |_, _, cx| {
+            weak.update(cx, |this, cx| this.expand_gap(&path, start, direction, cx))
+                .ok();
+        });
+        match (direction, gap.hidden()) {
+            (Direction::All, Some(1)) => button.label("1 unchanged line"),
+            (Direction::All, Some(hidden)) => button.label(format!("{hidden} unchanged lines")),
+            _ => button.tooltip(tooltip),
+        }
+    };
+    h_flex()
+        .w_full()
+        .px_2()
+        .gap_1()
+        .items_center()
+        .bg(fill)
+        .text_size(scale::meta())
+        .text_color(muted)
+        .children(gap.directions().into_iter().map(control))
+        .children(error.clone())
+        .into_any_element()
+}
+
 fn skeleton(cx: &App) -> impl IntoElement {
     const WIDTHS: [f32; 5] = [0.9, 0.65, 0.8, 0.5, 0.75];
     let tree_right = Settings::get(cx).file_tree_position == FileTreePosition::Right;
@@ -2214,6 +2503,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::{DateTime, Utc};
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
     use gpui_kit::{
         AppContext as _, Bounds, Entity, InputEvent as _, Modifiers, MouseButton, MouseDownEvent,
         MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, TestAppContext,
@@ -2225,6 +2515,7 @@ mod tests {
         PullRequestDetail, RepoRef, ViewedState,
     };
 
+    use super::expand::{Direction, Source};
     use super::model::build_files;
     use super::{FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_WIDTH, FilesTab, PrTabContext};
     use crate::services::{Accounts, Services};
@@ -2763,5 +3054,94 @@ mod tests {
             before,
             "the current match stays where it was"
         );
+    }
+
+    /// A file of 101 lines whose line 10 changed and that gained a line
+    /// after line 60, with its patch and its text at the head commit.
+    fn far_apart() -> (ChangedFile, String) {
+        let patch = "@@ -7,7 +7,7 @@\n line 7\n line 8\n line 9\n-line 10\n+LINE 10\n line 11\n line 12\n line 13\n@@ -57,7 +57,8 @@\n line 57\n line 58\n line 59\n-line 60\n+LINE 60\n+line 60b\n line 61\n line 62\n line 63";
+        let text: String = (1..=100)
+            .map(|line| match line {
+                10 => "LINE 10\n".to_owned(),
+                60 => "LINE 60\nline 60b\n".to_owned(),
+                line => format!("line {line}\n"),
+            })
+            .collect();
+        let file = ChangedFile {
+            path: "src/lib.rs".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            additions: 3,
+            deletions: 2,
+            patch: Some(patch.into()),
+            viewed: ViewedState::Unviewed,
+        };
+        (file, text)
+    }
+
+    #[gpui_kit::test]
+    fn expanding_a_gap_shows_its_lines_to_find_but_not_to_comment(cx: &mut TestAppContext) {
+        let (file, text) = far_apart();
+        let (mut cx, tab) = open_files_tab_with(cx, file);
+        let cx = &mut cx;
+        draw(cx);
+        let hunks = |cx: &mut VisualTestContext| {
+            tab.read_with(cx, |tab, _| {
+                tab.shown_hunks("src/lib.rs").map(|hunks| hunks.len())
+            })
+        };
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.open_find(window, cx)));
+        cx.simulate_input("line 30");
+        draw(cx);
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 0);
+
+        // Without GitHub the read fails, and the gap says why.
+        tab.update(cx, |tab, cx| {
+            tab.expand_gap("src/lib.rs", 14, Direction::Down, cx)
+        });
+        cx.run_until_parked();
+        let error = tab.read_with(cx, |tab, _| tab.expansions["src/lib.rs"].error.clone());
+        assert_eq!(error.map(|(start, _)| start), Some(14));
+
+        tab.update(cx, |tab, cx| {
+            let expansion = tab.expansions.entry("src/lib.rs".into()).or_default();
+            expansion.source = Some(Arc::new(Source::new(&text)));
+            tab.expand_gap("src/lib.rs", 14, Direction::Down, cx);
+        });
+        draw(cx);
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.find.matches.len()),
+            1,
+            "a revealed line is searched"
+        );
+        assert_eq!(hunks(cx), Some(2), "lines 34 to 56 still part the hunks");
+        let (additions, deletions) = tab.read_with(cx, |tab, cx| {
+            let file = &tab.diff.as_ref().expect("diff").read(cx).files()[0];
+            (file.additions(), file.deletions())
+        });
+        assert_eq!(
+            (additions, deletions),
+            (3, 2),
+            "revealed lines are unchanged lines"
+        );
+
+        tab.update(cx, |tab, cx| {
+            tab.expand_gap("src/lib.rs", 34, Direction::All, cx)
+        });
+        draw(cx);
+        assert_eq!(hunks(cx), Some(1), "the whole gap joins the two hunks");
+
+        let target = |line: usize, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                tab.update(cx, |tab, cx| {
+                    let range = DiffLineRange::new("src/lib.rs", DiffSide::Modified, line, line);
+                    tab.open_composer(&range, window, cx);
+                    let slot = tab.composer.as_ref().expect("composer");
+                    slot.view.read(cx).target().anchor.is_ok()
+                })
+            })
+        };
+        assert!(target(11, cx), "a line of the patch takes a comment");
+        assert!(!target(30, cx), "GitHub anchors comments only to the patch");
     }
 }
