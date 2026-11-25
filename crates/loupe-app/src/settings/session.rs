@@ -141,7 +141,7 @@ fn finish_linear_check(
             }
             Err(error) => {
                 eprintln!("loupe: a linear key did not connect: {error}");
-                keys.failed.push((key, error.to_string()));
+                keys.failed.push((key, error.kind()));
             }
         }
     }
@@ -278,8 +278,8 @@ struct LinearKeys {
     /// The keys Linear accepted, with whose they are, in connection order;
     /// one per workspace.
     connected: Vec<(String, loupe_linear::Viewer)>,
-    /// Stored keys that did not connect, with why (safe to show).
-    failed: Vec<(String, String)>,
+    /// Stored keys that did not connect, with why.
+    failed: Vec<(String, loupe_linear::ErrorKind)>,
     /// `LINEAR_API_KEY`, used while no key is stored and never stored.
     from_env: Option<String>,
 }
@@ -415,15 +415,11 @@ fn set_linear_keys(keys: LinearKeys, cx: &mut App) {
             .map(|index| keys.connected[index].0.clone())
             .filter(|key| !key.is_empty()),
     );
-    let failed: Vec<String> = keys
-        .failed
-        .iter()
-        .map(|(_, message)| message.clone())
-        .collect();
+    let failed: Vec<loupe_linear::ErrorKind> = keys.failed.iter().map(|(_, kind)| *kind).collect();
     let state = match active {
         Some(index) => Connection::Connected(keys.connected[index].1.clone()),
         None => match failed.first() {
-            Some(message) => Connection::Failed(message.clone()),
+            Some(kind) => Connection::Failed(kind.message()),
             None => Connection::Disconnected,
         },
     };
@@ -539,7 +535,7 @@ mod tests {
     #[test]
     fn failed_keys_are_kept_and_the_environment_key_is_not() {
         let mut keys = LinearKeys {
-            failed: vec![("lin_down".into(), "Could not reach Linear".into())],
+            failed: vec![("lin_down".into(), loupe_linear::ErrorKind::Offline)],
             from_env: Some("lin_env".into()),
             ..LinearKeys::default()
         };

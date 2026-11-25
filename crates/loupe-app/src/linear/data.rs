@@ -91,19 +91,10 @@ pub fn same_client(a: &Option<Arc<Linear>>, b: &Option<Arc<Linear>>) -> bool {
     }
 }
 
-/// A short message for the user. Never includes the API key.
+/// The failure in plain words, from the one mapping in `loupe_linear`. Never
+/// includes the API key or anything Linear sent back.
 pub fn error_text(error: &loupe_linear::Error) -> SharedString {
-    use loupe_linear::Error;
-    match error {
-        Error::Unauthorized => "Linear rejected the API key. Check it in Settings.".into(),
-        Error::Transport(_) => "Could not reach Linear.".into(),
-        Error::GraphQl(messages) => match messages.first() {
-            Some(message) => format!("Linear: {message}").into(),
-            None => "Linear: the request failed.".into(),
-        },
-        Error::Http { status, .. } => format!("Linear returned HTTP {status}.").into(),
-        Error::Decode(_) => "Linear sent an unexpected answer.".into(),
-    }
+    error.message().into()
 }
 
 /// The key owner's user id, for "me" in filters. The session validates the
@@ -234,11 +225,10 @@ fn cached<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{error_text, workspace_for_repo};
+    use super::workspace_for_repo;
     use crate::services::{Accounts, LinearWorkspace, Services};
     use crate::store::{Settings, WorkspaceMapping};
     use gpui_kit::TestAppContext;
-    use loupe_linear::Error;
 
     fn mapping(github: &str, workspace_id: &str) -> WorkspaceMapping {
         WorkspaceMapping {
@@ -286,43 +276,5 @@ mod tests {
             // Not mapped: the active one.
             assert_eq!(read("acme", "web", cx), "hooli");
         });
-    }
-
-    #[test]
-    fn each_error_has_a_short_message() {
-        assert_eq!(
-            error_text(&Error::Unauthorized),
-            "Linear rejected the API key. Check it in Settings."
-        );
-        assert_eq!(
-            error_text(&Error::Transport("dns".into())),
-            "Could not reach Linear."
-        );
-        assert_eq!(
-            error_text(&Error::GraphQl(vec!["Entity not found".into(), "x".into()])),
-            "Linear: Entity not found"
-        );
-        assert_eq!(
-            error_text(&Error::Http {
-                status: 502,
-                message: "bad gateway".into()
-            }),
-            "Linear returned HTTP 502."
-        );
-        assert_eq!(
-            error_text(&Error::Decode("missing field".into())),
-            "Linear sent an unexpected answer."
-        );
-    }
-
-    #[test]
-    fn details_of_the_failure_never_reach_the_user() {
-        let leaky = Error::Transport("lin_api_secret".into());
-        assert!(!error_text(&leaky).contains("lin_api_secret"));
-        let leaky = Error::Http {
-            status: 401,
-            message: "lin_api_secret".into(),
-        };
-        assert!(!error_text(&leaky).contains("lin_api_secret"));
     }
 }

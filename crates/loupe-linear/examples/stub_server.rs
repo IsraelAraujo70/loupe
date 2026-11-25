@@ -7,8 +7,11 @@
 //!     LOUPE_LINEAR_ENDPOINT=http://127.0.0.1:8787/graphql ./target/debug/loupe
 //!
 //! `POST /fail-on` makes every mutation fail until `POST /fail-off`, to show
-//! that the app rolls back optimistic edits. Single-threaded and HTTP/1.1
-//! only; it ignores the API key.
+//! that the app rolls back optimistic edits. `POST /fail/<mode>` makes every
+//! request fail the way Linear does (`offline`, `unauthorized`, `forbidden`,
+//! `rate-limited`, `server`) until `POST /fail-off`; every mode but
+//! `unauthorized` lets the `Viewer` check through, as a key that worked until
+//! now would. Single-threaded and HTTP/1.1 only; it ignores the API key.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -61,22 +64,85 @@ fn serve(stub: &mut Stub, stream: TcpStream) -> std::io::Result<()> {
         }
         "/fail-off" => {
             stub.fail_mutations = false;
-            json!({ "failMutations": false })
+            stub.fail_mode = None;
+            json!({ "failMutations": false, "failMode": null })
         }
-        _ => match serde_json::from_slice::<Value>(&body) {
-            Ok(request) => stub.handle(&request),
-            Err(error) => graphql_error(&format!("bad request body: {error}"), "BAD_REQUEST"),
-        },
+        _ => {
+            if let Some(mode) = path.strip_prefix("/fail/") {
+                stub.fail_mode = Some(mode.to_owned());
+                return reply(
+                    stream,
+                    "200 OK",
+                    "application/json",
+                    &json!({ "failMode": mode }).to_string(),
+                );
+            }
+            match serde_json::from_slice::<Value>(&body) {
+                Ok(request) => {
+                    let operation = request["operationName"].as_str().unwrap_or_default();
+                    if let Some(mode) = stub.fail_mode.as_deref()
+                        && (mode == "unauthorized" || operation != "Viewer")
+                    {
+                        return fail(stream, mode);
+                    }
+                    stub.handle(&request)
+                }
+                Err(error) => graphql_error(&format!("bad request body: {error}"), "BAD_REQUEST"),
+            }
+        }
     };
-    let text = response.to_string();
-    let mut stream = stream;
+    reply(stream, "200 OK", "application/json", &response.to_string())
+}
+
+fn reply(
+    mut stream: TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        text.len(),
-        text
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
     )?;
     stream.flush()
+}
+
+/// Answers the way Linear does when `mode` is what went wrong. `offline`
+/// drops the connection without an answer.
+fn fail(stream: TcpStream, mode: &str) -> std::io::Result<()> {
+    let json = "application/json";
+    match mode {
+        "offline" => Ok(()),
+        "unauthorized" => reply(
+            stream,
+            "401 Unauthorized",
+            json,
+            &graphql_error(
+                "Authentication required, not authenticated",
+                "AUTHENTICATION_ERROR",
+            )
+            .to_string(),
+        ),
+        "forbidden" => reply(
+            stream,
+            "200 OK",
+            json,
+            &graphql_error("You do not have access to this resource", "FORBIDDEN").to_string(),
+        ),
+        "rate-limited" => reply(
+            stream,
+            "400 Bad Request",
+            json,
+            &graphql_error("Rate limit exceeded", "RATELIMITED").to_string(),
+        ),
+        _ => reply(
+            stream,
+            "502 Bad Gateway",
+            "text/html",
+            "<html><body>stub: bad gateway</body></html>",
+        ),
+    }
 }
 
 fn graphql_error(message: &str, code: &str) -> Value {
@@ -102,6 +168,7 @@ struct Stub {
     /// Detail-only fields (description, creator, comments, attachments) by id.
     details: BTreeMap<String, Map<String, Value>>,
     fail_mutations: bool,
+    fail_mode: Option<String>,
     next_number: u64,
 }
 
@@ -115,6 +182,7 @@ impl Stub {
             order: Vec::new(),
             details: BTreeMap::new(),
             fail_mutations: false,
+            fail_mode: None,
             next_number: 900,
         };
         let lists = [
