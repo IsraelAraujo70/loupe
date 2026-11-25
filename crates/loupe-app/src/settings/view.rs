@@ -27,6 +27,21 @@ pub fn settings_view(window: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|cx| SettingsView::new(window, cx)).into()
 }
 
+/// The section the next Settings page scrolls to. A screen that sends the
+/// user to Settings for one thing sets it with [`open_section`]; the page
+/// takes it once it has laid out and clears it.
+#[derive(Default)]
+struct PendingSection(Option<Section>);
+
+impl Global for PendingSection {}
+
+/// Opens Settings scrolled to `section`, so "Open Settings…" lands on the
+/// account it is about instead of on General.
+pub fn open_section(section: Section, window: &mut Window, cx: &mut App) {
+    cx.set_global(PendingSection(Some(section)));
+    crate::shell::navigate(crate::route::Route::Settings, window, cx);
+}
+
 /// The width of the page's column of cards.
 const PAGE_WIDTH: f32 = 820.;
 
@@ -120,6 +135,7 @@ impl SettingsView {
             cx.observe_global::<crate::services::Accounts>(|_, cx| cx.notify()),
             cx.observe_global::<crate::services::Services>(|_, cx| cx.notify()),
             cx.observe_global::<Settings>(|_, cx| cx.notify()),
+            cx.observe_global::<PendingSection>(|_, cx| cx.notify()),
             cx.subscribe(&guide_executable, |_, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let raw = input.read(cx).value().trim().to_owned();
@@ -228,16 +244,18 @@ impl SettingsView {
     /// Scrolls the page so the section at `index` sits where the first one
     /// sits at the top of the page, under the same 24 px of padding, or as
     /// far as the page goes.
-    fn go_to(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Returns false while the page has not laid out yet.
+    fn go_to(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
         let (Some(first), Some(target)) = (
             self.scroll.bounds_for_item(0),
             self.scroll.bounds_for_item(index),
         ) else {
-            return;
+            return false;
         };
         let distance = (target.top() - first.top()).min(self.scroll.max_offset().y);
         self.scroll.set_offset(point(px(0.), -distance.max(px(0.))));
         cx.notify();
+        true
     }
 
     fn restore_defaults(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
@@ -939,7 +957,9 @@ impl SettingsView {
                     .debug_selector(move || format!("settings-nav-{}", section.id()))
                     .role(Role::Link)
                     .aria_label(section.title())
-                    .on_click(cx.listener(move |this, _, _, cx| this.go_to(index, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.go_to(index, cx);
+                    }))
                     .child(
                         svg()
                             .path(section.icon().path())
@@ -1131,6 +1151,17 @@ impl Render for SettingsView {
         let query = self.search.read(cx).value().to_string();
         let found = catalog::search(&query);
         let shown: Vec<Section> = found.iter().map(|(section, _)| *section).collect();
+        if let Some(section) = cx
+            .try_global::<PendingSection>()
+            .and_then(|pending| pending.0)
+        {
+            let at = shown.iter().position(|shown| *shown == section);
+            if at.is_none_or(|index| self.go_to(index, cx)) {
+                cx.set_global(PendingSection(None));
+            } else {
+                cx.notify();
+            }
+        }
         let reading = self.reading(&shown);
 
         let mut page = v_flex()
@@ -1259,6 +1290,28 @@ mod tests {
 
         search(&view, "", &mut cx);
         assert!(cx.debug_bounds("settings-general").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn a_screen_can_open_settings_at_a_section(cx: &mut TestAppContext) {
+        let (view, mut cx) = open(cx);
+        let page_top = cx.debug_bounds("settings-general").expect("General").top();
+        cx.update(|_, cx| cx.set_global(super::PendingSection(Some(Section::Linear))));
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        }
+        let top = cx.debug_bounds("settings-linear").expect("Linear").top();
+        assert!(
+            (top - page_top).abs() < px(2.),
+            "Linear starts where the page starts ({top:?} vs {page_top:?})"
+        );
+        let reading = cx.update(|_, cx| view.read(cx).reading(&Section::ALL));
+        assert_eq!(reading, Some(Section::Linear));
+        let pending = cx.update(|_, cx| cx.global::<super::PendingSection>().0);
+        assert_eq!(pending, None, "the request is spent once the page is there");
     }
 
     #[gpui_kit::test]
