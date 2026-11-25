@@ -38,3 +38,4 @@
 - Entry 038: a one-line change, so the pull request has more than 250 commits.
 - Entry 039: a one-line change, so the pull request has more than 250 commits.
 - Entry 040: a one-line change, so the pull request has more than 250 commits.
+- Entry 041: a one-line change, so the pull request has more than 250 commits.
