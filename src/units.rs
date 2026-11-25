@@ -15,9 +15,9 @@ pub enum Unit {
 }
 
 /// Grams in one ounce.
-pub const GRAMS_PER_OUNCE: f64 = 28.35;
-/// Millilitres in one US cup.
-pub const MILLILITRES_PER_CUP: f64 = 240.0;
+pub const GRAMS_PER_OUNCE: f64 = 28.349_523;
+/// Millilitres in one metric cup.
+pub const MILLILITRES_PER_CUP: f64 = 250.0;
 
 impl Unit {
     /// The short label shown next to an amount.
@@ -31,7 +31,7 @@ impl Unit {
             Unit::Tablespoon => "tbsp",
             Unit::Teaspoon => "tsp",
             Unit::Ounce => "oz",
-            Unit::Piece => "pc",
+            Unit::Piece => "pcs",
         }
     }
 
@@ -45,7 +45,7 @@ impl Unit {
 pub fn to_grams(amount: f64, from: Unit) -> Option<f64> {
     match from {
         Unit::Gram => Some(amount),
-        Unit::Kilogram => Some(amount * 1000.0),
+        Unit::Kilogram => Some(amount * 1_000.0),
         Unit::Ounce => Some(amount * GRAMS_PER_OUNCE),
         _ => None,
     }
