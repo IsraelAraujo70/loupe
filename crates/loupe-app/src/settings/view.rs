@@ -1068,6 +1068,7 @@ fn shortcut_row(index: usize, colors: Palette, cx: &App) -> AnyElement {
 fn updates_row(entry: &Entry, colors: Palette, cx: &App) -> AnyElement {
     let state = updater::state(cx);
     let status: SharedString = match &state {
+        UpdateState::Disabled => "Update checks are off in builds from the code.".into(),
         UpdateState::SignedOut => "Sign in to GitHub to check for updates.".into(),
         UpdateState::NotChecked => entry.description.into(),
         UpdateState::Checking => "Checking for updates…".into(),
@@ -1099,7 +1100,10 @@ fn updates_row(entry: &Entry, colors: Palette, cx: &App) -> AnyElement {
             .loading(state == UpdateState::Checking)
             .disabled(matches!(
                 state,
-                UpdateState::SignedOut | UpdateState::Checking | UpdateState::Installing
+                UpdateState::Disabled
+                    | UpdateState::SignedOut
+                    | UpdateState::Checking
+                    | UpdateState::Installing
             ))
             .on_click(|_, _, cx| updater::check_now(cx)),
     };

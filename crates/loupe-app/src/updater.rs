@@ -7,6 +7,25 @@ use gpui_kit::{
 };
 use std::time::Duration;
 
+/// The version `Cargo.toml` carries. Release builds overwrite it before
+/// compiling, so a binary that still reports it was built from the code.
+const SOURCE_VERSION: &str = "0.1.0";
+
+/// A build from the code or a run with an isolated data directory must not
+/// offer to replace itself with a published release. Naming a test tag is an
+/// explicit request to exercise the update path, so it overrides both.
+fn checks_enabled(version: &str, data_dir_overridden: bool, test_tag: bool) -> bool {
+    test_tag || (version != SOURCE_VERSION && !data_dir_overridden)
+}
+
+fn enabled() -> bool {
+    checks_enabled(
+        env!("CARGO_PKG_VERSION"),
+        std::env::var_os("LOUPE_DATA_DIR").is_some(),
+        std::env::var_os("LOUPE_UPDATE_TEST_TAG").is_some(),
+    )
+}
+
 #[derive(Default)]
 enum Status {
     /// Not checked yet.
@@ -78,7 +97,7 @@ pub fn confirm_start() {
 
 fn check(cx: &mut App) {
     let state = cx.global::<Updater>();
-    if matches!(state.status, Status::Installing) {
+    if matches!(state.status, Status::Installing) || !enabled() {
         return;
     }
     let Some(token) = state.token.clone().filter(|v| !v.is_empty()) else {
@@ -125,6 +144,8 @@ fn check(cx: &mut App) {
 /// Where updates stand, for Settings > About.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateState {
+    /// A build from the code or an isolated run: checks are off.
+    Disabled,
     /// No GitHub account to read the releases with.
     SignedOut,
     NotChecked,
@@ -142,6 +163,9 @@ pub enum UpdateState {
 
 /// Where updates stand now.
 pub fn state(cx: &App) -> UpdateState {
+    if !enabled() {
+        return UpdateState::Disabled;
+    }
     let Some(updater) = cx.try_global::<Updater>() else {
         return UpdateState::SignedOut;
     };
@@ -293,4 +317,35 @@ pub fn render<T: 'static>(cx: &mut Context<T>) -> impl IntoElement {
             )
             .child(label),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SOURCE_VERSION, checks_enabled};
+
+    #[test]
+    fn a_build_from_the_code_never_checks() {
+        assert!(!checks_enabled(SOURCE_VERSION, false, false));
+    }
+
+    #[test]
+    fn an_isolated_data_directory_never_checks() {
+        assert!(!checks_enabled("0.1.51", true, false));
+    }
+
+    #[test]
+    fn a_release_build_checks() {
+        assert!(checks_enabled("0.1.51", false, false));
+        assert!(checks_enabled("0.1.1-rc.3", false, false));
+    }
+
+    #[test]
+    fn a_test_tag_checks_even_from_the_code_with_an_isolated_data_directory() {
+        assert!(checks_enabled(SOURCE_VERSION, true, true));
+    }
+
+    #[test]
+    fn the_source_version_matches_cargo_toml() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), SOURCE_VERSION);
+    }
 }

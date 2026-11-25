@@ -21,7 +21,9 @@ secret to that identity. The identity string alone does not install a certificat
 Never export the private key to logs. No new third-party crates are introduced;
 loupe-update is a workspace crate using existing ureq, serde and anyhow.
 
-The installed app checks after GitHub sign-in and every hour. It uses that same
+The installed app checks after GitHub sign-in and every hour. A build from the code (the
+version `Cargo.toml` carries, `0.1.0`) and any run with `LOUPE_DATA_DIR` set never check, so
+a development build is not offered a release; `LOUPE_UPDATE_TEST_TAG` still forces the check. It uses that same
 credential for release metadata and the authenticated asset API. Fine-grained
 PATs require Contents: read on this repository. Stable releases only are offered.
 A quiet button beside the tabs shows the version and asks to update and restart.
