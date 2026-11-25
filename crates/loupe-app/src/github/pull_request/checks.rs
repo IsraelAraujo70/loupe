@@ -1,7 +1,7 @@
 //! The checks tab: the loaded detail's checks, the end of a failed Actions
 //! job's log on demand, and re-running failed jobs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
@@ -12,7 +12,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{ActionsJob, CheckRun, CheckStatus, PullRequestDetail, RepoRef, StepLog};
+use loupe_github::{
+    ActionsJob, CheckRun, CheckSource, CheckStatus, PullRequestDetail, RepoRef, StepLog,
+};
 
 use super::tab::{PrTabContext, PrTabEvent};
 use crate::github::common::{self, Submit};
@@ -206,9 +208,10 @@ enum JobLog {
     Failed(String),
 }
 
-/// The checks tab: a summary card, then one 36 px row per check run. A failed
-/// Actions job can show the end of its failed step's log, and the card can
-/// re-run every failed job.
+/// The checks tab: a summary card, then the checks grouped by the workflow
+/// and event that ran them, as on GitHub's checks page, one row per job. A
+/// failed Actions job can show the end of its failed step's log, and the
+/// card can re-run every failed job.
 pub struct ChecksTab {
     context: PrTabContext,
     /// Logs by Actions job id, for the jobs whose log is open.
@@ -221,6 +224,8 @@ pub struct ChecksTab {
     /// no checks at all for a moment.
     rerun_jobs: Vec<u64>,
     freshness: Freshness,
+    /// The groups the user folded.
+    folded: HashSet<CheckSource>,
 }
 
 impl EventEmitter<PrTabEvent> for ChecksTab {}
@@ -242,6 +247,7 @@ impl ChecksTab {
             rerun_task: None,
             rerun_jobs: Vec::new(),
             freshness: Freshness::default(),
+            folded: HashSet::new(),
         }
     }
 
@@ -508,14 +514,16 @@ impl ChecksTab {
         let job = failed_job(run);
         let log_open = job.is_some_and(|job| self.logs.contains_key(&job.job_id));
         let route = check_route(&self.context.pr.repo, &self.context.detail.head_ref, run);
+        let full_name = run.full_name();
         ui::list_row(("check", ix), cx)
-            .when_some(run.description.clone(), |row, description| {
-                row.role(Role::ListItem)
-                    .aria_label(format!("{}: {description}", run.name))
+            .role(Role::ListItem)
+            .aria_label(match &run.description {
+                Some(description) => format!("{full_name}: {description}"),
+                None => full_name.clone(),
             })
-            .when_some(route.clone(), |row, route| {
+            .when_some(route, |row, route| {
                 row.role(Role::Button)
-                    .aria_label(format!("{}, open its run", run.name))
+                    .aria_label(format!("{full_name}, open its run"))
                     .opens(route)
             })
             .child(Icon::new(icon).small().text_color(color))
@@ -532,15 +540,6 @@ impl ChecksTab {
                             .truncate()
                             .child(run.name.clone()),
                     )
-                    .when_some(run.workflow.clone(), |row, workflow| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_size(scale::meta())
-                                .text_color(muted)
-                                .child(workflow),
-                        )
-                    })
                     .when_some(run.description.clone(), |row, description| {
                         let tip = description.clone();
                         row.child(
@@ -568,9 +567,9 @@ impl ChecksTab {
                         .icon(IconName::ScrollText)
                         .label(if log_open { "Hide log" } else { "Log" })
                         .accessibility_label(if log_open {
-                            format!("Hide the log of {}", run.name)
+                            format!("Hide the log of {full_name}")
                         } else {
-                            format!("Show the log of {}", run.name)
+                            format!("Show the log of {full_name}")
                         })
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_log(job, cx))),
                 )
@@ -589,20 +588,6 @@ impl ChecksTab {
                     .flex_none()
                     .w_6()
                     .justify_center()
-                    .children(route.map(|route| {
-                        ui::icon_button(("check-run", ix), IconName::Workflow, "Open in Actions")
-                            .xsmall()
-                            .accessibility_label(format!("Open {} in Actions", run.name))
-                            .on_click(move |event, window, cx| {
-                                crate::shell::open(route.clone(), event, window, cx)
-                            })
-                    })),
-            )
-            .child(
-                h_flex()
-                    .flex_none()
-                    .w_6()
-                    .justify_center()
                     .children(url.map(|url| {
                         ui::icon_button(
                             ("check-details", ix),
@@ -610,9 +595,57 @@ impl ChecksTab {
                             "Open details in browser",
                         )
                         .xsmall()
+                        .accessibility_label(format!(
+                            "Open the details of {full_name} in the browser"
+                        ))
                         .on_click(move |_, _, cx| cx.open_url(&url))
                     })),
             )
+    }
+
+    /// A group's heading: the workflow and the event that ran it, as on
+    /// GitHub's checks page, and how many checks it holds. A click folds it.
+    fn source_header(
+        &self,
+        source: &CheckSource,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let folded = self.folded.contains(source);
+        let muted = cx.theme().muted_foreground;
+        let (title, event) = match source {
+            CheckSource::Workflow { name, event } => (name.clone(), event.clone()),
+            CheckSource::Other => ("Other checks".to_owned(), None),
+        };
+        let spoken = match &event {
+            Some(event) => format!("{title} on {event}"),
+            None => title.clone(),
+        };
+        let noun = if count == 1 { "check" } else { "checks" };
+        let toggle = source.clone();
+        ui::list_group_header(
+            SharedString::from(format!("check-source-{spoken}")),
+            folded,
+            cx,
+        )
+        .aria_label(format!("{spoken}, {count} {noun}"))
+        .aria_expanded(!folded)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if !this.folded.remove(&toggle) {
+                this.folded.insert(toggle.clone());
+            }
+            cx.notify();
+        }))
+        .child(ui::group_title(title).min_w_0().truncate())
+        .children(event.map(|event| {
+            div()
+                .flex_none()
+                .text_size(scale::meta())
+                .text_color(muted)
+                .child(format!("on {event}"))
+        }))
+        .child(ui::count_badge(count, cx))
+        .into_any_element()
     }
 }
 
@@ -632,10 +665,18 @@ impl Render for ChecksTab {
         }
         let card = self.summary_card(cx).into_any_element();
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (ix, run) in detail.checks.runs.iter().enumerate() {
-            rows.push(self.check_row(ix, run, cx).into_any_element());
-            if let Some(panel) = failed_job(run).and_then(|job| self.log_panel(job.job_id, cx)) {
-                rows.push(panel);
+        for (source, members) in detail.checks.by_source() {
+            rows.push(self.source_header(&source, members.len(), cx));
+            if self.folded.contains(&source) {
+                continue;
+            }
+            for ix in members {
+                let run = &detail.checks.runs[ix];
+                rows.push(self.check_row(ix, run, cx).into_any_element());
+                if let Some(panel) = failed_job(run).and_then(|job| self.log_panel(job.job_id, cx))
+                {
+                    rows.push(panel);
+                }
             }
         }
         v_flex()
@@ -664,6 +705,7 @@ mod tests {
         CheckRun {
             name: "build".into(),
             workflow: None,
+            event: None,
             description: None,
             status,
             started_at: None,

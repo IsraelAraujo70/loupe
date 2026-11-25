@@ -773,6 +773,7 @@ pub(super) mod tests {
         CheckRun {
             name: "ci".into(),
             workflow: None,
+            event: None,
             description: None,
             status,
             started_at: None,
