@@ -193,17 +193,38 @@ impl GitHub {
         head_oid: &str,
         file: &ChangedFile,
     ) -> Result<Option<String>> {
+        let merge_base = self.merge_base(&pr.repo, base_oid, head_oid)?;
+        self.patch_since(&pr.repo, &merge_base, head_oid, file)
+    }
+
+    /// The commit GitHub diffs `head_oid` against: the merge base of
+    /// `base_oid` and `head_oid`. One call, so loading many left-out diffs
+    /// asks for it once.
+    pub fn merge_base(&self, repo: &RepoRef, base_oid: &str, head_oid: &str) -> Result<String> {
         let compare = self.rest(
             RestMethod::Get,
             &format!(
                 "/repos/{}/{}/compare/{}...{}?per_page=1",
-                pr.repo.owner,
-                pr.repo.name,
+                repo.owner,
+                repo.name,
                 query_value(base_oid),
                 query_value(head_oid)
             ),
         )?;
-        let merge_base = parse_merge_base(&compare)?;
+        parse_merge_base(&compare)
+    }
+
+    /// The diff of `file` from `merge_base` (see [`GitHub::merge_base`]) to
+    /// `head_oid`, read from the two versions of the file: one call for an
+    /// added or removed file, two otherwise. `None` when either version is
+    /// binary.
+    pub fn patch_since(
+        &self,
+        repo: &RepoRef,
+        merge_base: &str,
+        head_oid: &str,
+        file: &ChangedFile,
+    ) -> Result<Option<String>> {
         let old_path = match file.status {
             FileStatus::Renamed | FileStatus::Copied => {
                 file.previous_path.as_deref().unwrap_or(&file.path)
@@ -212,11 +233,11 @@ impl GitHub {
         };
         let old = match file.status {
             FileStatus::Added => Vec::new(),
-            _ => self.raw_contents(&pr.repo, old_path, &merge_base)?,
+            _ => self.raw_contents(repo, old_path, merge_base)?,
         };
         let new = match file.status {
             FileStatus::Removed => Vec::new(),
-            _ => self.raw_contents(&pr.repo, &file.path, head_oid)?,
+            _ => self.raw_contents(repo, &file.path, head_oid)?,
         };
         Ok(crate::diff::text_patch(&old, &new))
     }
@@ -465,8 +486,8 @@ impl GitHub {
         Ok(body)
     }
 
-    /// Records the rate limit and reads the status and body. A 401 is the
-    /// only status it turns into an error.
+    /// Records the rate limit and reads the status and body. A 401 and a
+    /// refusal for a rate limit are the only statuses it turns into an error.
     fn read_response(
         &self,
         mut response: ureq::http::Response<ureq::Body>,
@@ -481,6 +502,10 @@ impl GitHub {
             .map_err(|error| Error::Decode(error.to_string()))?;
         if status == 401 {
             return Err(Error::Unauthorized);
+        }
+        if let Some(refusal) = crate::rate::refusal(status, response.headers(), &message_of(&body))
+        {
+            return Err(refusal);
         }
         Ok((status, body))
     }
@@ -601,13 +626,20 @@ pub enum PullRequestPoll {
     Changed(Option<String>),
 }
 
-/// The error a non-2xx REST response stands for, with GitHub's `message`.
-pub(crate) fn http_error(status: u16, body: &[u8]) -> Error {
-    let message = serde_json::from_slice::<Value>(body)
+/// The `message` GitHub put in an error body, or an empty text.
+fn message_of(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|value| value["message"].as_str().map(str::to_owned))
-        .unwrap_or_default();
-    Error::Http { status, message }
+        .unwrap_or_default()
+}
+
+/// The error a non-2xx REST response stands for, with GitHub's `message`.
+pub(crate) fn http_error(status: u16, body: &[u8]) -> Error {
+    Error::Http {
+        status,
+        message: message_of(body),
+    }
 }
 
 /// Whether a failed request goes out again: a read that met a gateway error
