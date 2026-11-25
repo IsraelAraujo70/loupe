@@ -623,15 +623,10 @@ mod tests {
         let hooks_dir = dest.join(".git/hooks");
         fs::create_dir_all(&hooks_dir).unwrap();
         let hook_path = hooks_dir.join("post-checkout");
-        fs::write(
+        crate::test_support::write_executable(
             &hook_path,
-            format!("#!/bin/sh\ntouch {}\n", hook_marker.display()),
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+            &format!("#!/bin/sh\ntouch {}\n", hook_marker.display()),
+        );
 
         run_with_home(&["fetch", "--depth=1", src.to_str().unwrap(), &sha]);
         run_with_home(&["checkout", "--detach", "-q", "FETCH_HEAD"]);
