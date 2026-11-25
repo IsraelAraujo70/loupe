@@ -543,7 +543,11 @@ impl PullRequestView {
                             .ok();
                     }
                     GuideAction::OpenSettings => {
-                        crate::shell::navigate(crate::route::Route::Settings, window, cx);
+                        crate::settings::view::open_section(
+                            crate::settings::catalog::Section::GuidedReview,
+                            window,
+                            cx,
+                        );
                     }
                     GuideAction::RecheckClaude => {
                         crate::github::guide_service::recheck_availability(cx);
@@ -624,7 +628,8 @@ impl PullRequestView {
             cx.notify();
             return;
         }
-        if let Some(closed) = self.commit.take()
+        let closed = self.commit.take();
+        if let Some(closed) = &closed
             && closed.files.read(cx).wrote_viewed()
             && let Some(loaded) = &self.loaded
         {
@@ -632,13 +637,15 @@ impl PullRequestView {
                 .files
                 .update(cx, |files, cx| files.refresh_viewed(cx));
         }
+        // Going commit to commit keeps looking for the same text.
+        let find = closed.and_then(|closed| closed.files.read(cx).open_find_text(cx));
         if let (Some(oid), Some(detail)) = (oid, self.detail.value()) {
             let context = PrTabContext {
                 pr: self.pr.clone(),
                 detail: detail.clone(),
             };
             let oid = oid.to_owned();
-            let files = cx.new(|cx| FilesTab::for_commit(context, oid.clone(), window, cx));
+            let files = cx.new(|cx| FilesTab::for_commit(context, oid.clone(), find, window, cx));
             let events = cx.subscribe_in(&files, window, Self::reload_on_tab_event::<FilesTab>);
             self.commit = Some(CommitDiff {
                 oid,
