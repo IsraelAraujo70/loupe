@@ -237,7 +237,10 @@ pub fn send_hint(cx: &App) -> Div {
         .items_center()
         .text_size(scale::meta())
         .text_color(cx.theme().muted_foreground)
-        .children(platform_keystroke("cmd-enter").map(gpui_kit::component::kbd::Kbd::new))
+        .children(
+            platform_keystroke("cmd-enter")
+                .map(|keystroke| gpui_kit::component::kbd::Kbd::new(keystroke).outline()),
+        )
         .child("to send")
 }
 
