@@ -174,10 +174,32 @@ pub fn platform_keystroke(keys: &'static str) -> Option<Keystroke> {
     Some(keystroke)
 }
 
-/// [`platform_keystroke`] as text for a tooltip or a placeholder: `⌘K` on
-/// macOS, `Ctrl+K` elsewhere.
+/// [`platform_keystroke`] as text for a key the keymap does not bind (a text
+/// field's submit key): `⌘⏎` on macOS, `Ctrl+Enter` elsewhere. A key of an
+/// action Loupe binds goes through [`bound_shortcut`].
 pub fn shortcut(keys: &'static str) -> String {
     platform_keystroke(keys)
+        .map(|keystroke| gpui_kit::component::kbd::Kbd::format(&keystroke))
+        .unwrap_or_default()
+}
+
+/// The first key of the last binding of `action` in the keymap, which is
+/// the one the menus and tooltips show: what the app answers to on this
+/// platform, never a key written beside the binding.
+pub fn bound_keystroke(action: &dyn Action, cx: &App) -> Option<Keystroke> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let binding = keymap.bindings_for_action(action).last()?;
+    binding
+        .keystrokes()
+        .first()
+        .map(|key| key.as_keystroke().clone())
+}
+
+/// [`bound_keystroke`] as text for a tooltip: `⌘K` on macOS, `Ctrl+K`
+/// elsewhere. Empty when the action has no key.
+pub fn bound_shortcut(action: &dyn Action, cx: &App) -> String {
+    bound_keystroke(action, cx)
         .map(|keystroke| gpui_kit::component::kbd::Kbd::format(&keystroke))
         .unwrap_or_default()
 }

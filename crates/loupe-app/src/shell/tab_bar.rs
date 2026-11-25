@@ -999,7 +999,7 @@ fn new_tab_button(closed: &[ClosedTabGroup], cx: &mut Context<Workspace>) -> Any
             ui::icon_button(
                 "new-tab",
                 IconName::Plus,
-                format!("New tab ({})", ui::shortcut("cmd-t")),
+                format!("New tab ({})", ui::bound_shortcut(&NewTab, cx)),
             )
             .small()
             .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
@@ -1072,7 +1072,10 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
             ui::icon_button(
                 "toggle-sidebar",
                 IconName::PanelLeft,
-                format!("Toggle sidebar ({})", ui::shortcut("cmd-b")),
+                format!(
+                    "Toggle sidebar ({})",
+                    ui::bound_shortcut(&ToggleSidebar, cx)
+                ),
             )
             .small()
             .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
@@ -1081,7 +1084,7 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
             ui::icon_button(
                 "go-back",
                 IconName::ChevronLeft,
-                format!("Back ({})", ui::shortcut("cmd-[")),
+                format!("Back ({})", ui::bound_shortcut(&GoBack, cx)),
             )
             .small()
             .disabled(!can_back)
@@ -1091,7 +1094,7 @@ pub(super) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
             ui::icon_button(
                 "go-forward",
                 IconName::ChevronRight,
-                format!("Forward ({})", ui::shortcut("cmd-]")),
+                format!("Forward ({})", ui::bound_shortcut(&GoForward, cx)),
             )
             .small()
             .disabled(!can_forward)
