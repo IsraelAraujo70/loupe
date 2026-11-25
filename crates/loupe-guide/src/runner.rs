@@ -15,6 +15,9 @@ use thiserror::Error;
 /// Default wall-clock cap for one local Claude Code review guide run.
 pub const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(900);
 
+/// The id the prompt gives the step that lists mechanical folders.
+const MECHANICAL_STEP_ID: &str = "mechanical";
+
 /// Least time left in a run's budget worth spending on a repair run.
 const MIN_REPAIR_BUDGET: Duration = Duration::from_secs(60);
 
@@ -288,6 +291,9 @@ struct GuideCheck {
     /// Step index, snippet index, and why, for each snippet that is not in
     /// the pull request's diff.
     invented: Vec<(usize, usize, String)>,
+    /// Indices of steps that explain a part of the change without citing
+    /// a single line of it (the overview and the mechanical step need none).
+    uncited: Vec<usize>,
     /// Folders over [`MUST_COVER_PERCENT`] of the changed lines that no step
     /// explains, largest first.
     unexplained: Vec<ChangedFolder>,
@@ -299,7 +305,7 @@ impl GuideCheck {
     }
 
     fn problem_count(&self) -> usize {
-        self.invented.len() + self.unexplained.len()
+        self.invented.len() + self.uncited.len() + self.unexplained.len()
     }
 
     /// One line per problem, for the repair prompt.
@@ -312,6 +318,12 @@ impl GuideCheck {
                 step.id, snippet.path, snippet.start_line, snippet.end_line
             )
         });
+        let uncited = self.uncited.iter().map(|step_ix| {
+            format!(
+                "Step `{}` cites no snippet: add the lines of the diff that best show what it explains.",
+                guide.steps[*step_ix].id
+            )
+        });
         let folders = self.unexplained.iter().map(|folder| {
             let share = folder.per_mille(map.total_lines);
             format!(
@@ -322,7 +334,7 @@ impl GuideCheck {
                 folder.files.len()
             )
         });
-        snippets.chain(folders).collect()
+        snippets.chain(uncited).chain(folders).collect()
     }
 }
 
@@ -340,15 +352,22 @@ fn check_guide(
         .map(|file| (file.path.as_str(), file))
         .collect();
     let mut invented = Vec::new();
+    let mut uncited = Vec::new();
     let mut cited: HashSet<&str> = HashSet::new();
     for (step_ix, step) in guide.steps.iter().enumerate() {
+        let mut real = 0;
         for (snip_ix, snippet) in step.snippets.iter().enumerate() {
             match snippet_problem(snippet, &by_path, checkout) {
                 Some(why) => invented.push((step_ix, snip_ix, why)),
                 None => {
+                    real += 1;
                     cited.insert(snippet.path.as_str());
                 }
             }
+        }
+        let needs_snippet = step.kind != StepKind::Overview && step.id != MECHANICAL_STEP_ID;
+        if real == 0 && step.snippets.is_empty() && needs_snippet {
+            uncited.push(step_ix);
         }
     }
     for removed in &guide.removed_tests {
@@ -362,6 +381,7 @@ fn check_guide(
         .collect();
     GuideCheck {
         invented,
+        uncited,
         unexplained,
     }
 }
@@ -1393,9 +1413,16 @@ mod check_tests {
     #[cfg(unix)]
     #[test]
     fn a_repair_that_cites_real_lines_and_covers_the_copy_replaces_the_draft() {
+        let uncited = GuideStep {
+            id: "copy".into(),
+            kind: StepKind::Subsystem,
+            title: "The copy".into(),
+            explanation: "Explains without code.".into(),
+            snippets: Vec::new(),
+        };
         let draft = guide(
             vec![snippet(5, 7, REAL), snippet(5, 6, INVENTED)],
-            Vec::new(),
+            vec![uncited],
         );
         let mut fixed = guide(vec![snippet(5, 7, REAL)], vec![mechanical()]);
         fixed.decisions[0].snippet_index = Some(0);
@@ -1408,6 +1435,9 @@ mod check_tests {
         ));
         assert!(repair.contains(
             "Folder `crates/ai2` (99.0% of the changed lines, 1 files) is not explained by any step"
+        ));
+        assert!(repair.contains(
+            "Step `copy` cites no snippet: add the lines of the diff that best show what it explains."
         ));
         assert!(repair.contains("## First draft"));
         assert_eq!(generated, fixed);
