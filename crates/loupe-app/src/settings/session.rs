@@ -10,7 +10,7 @@ use loupe_linear::Linear;
 use loupe_t3::T3;
 
 use crate::services::{self, Accounts, Connection, LinearWorkspace, Services};
-use crate::settings::auth::{self, DiscoveredToken, TokenSource};
+use crate::settings::auth::{self, DiscoveredToken, Discovery, TokenSource};
 use crate::store::{self, Secret, Settings};
 
 /// Called once at startup, after the `Settings`, `Services` and `Accounts`
@@ -86,12 +86,12 @@ pub fn discover_github(cx: &mut App) {
 }
 
 /// Applies the discovery result unless the user signed in or out while it ran.
-fn finish_github_discovery(found: Result<Option<DiscoveredToken>, String>, cx: &mut App) {
+fn finish_github_discovery(found: Result<Discovery, String>, cx: &mut App) {
     if !matches!(Accounts::get(cx).github, Connection::Checking) {
         return;
     }
     match found {
-        Ok(Some(DiscoveredToken {
+        Ok(Discovery::Found(DiscoveredToken {
             token,
             source,
             viewer,
@@ -103,9 +103,12 @@ fn finish_github_discovery(found: Result<Option<DiscoveredToken>, String>, cx: &
             );
             connect_github(token, viewer, cx);
         }
-        Ok(None) => {
-            eprintln!("loupe: github not connected");
-            apply(cx, |_, accounts| accounts.github = Connection::Disconnected);
+        Ok(Discovery::NotFound { saved_rejected }) => {
+            eprintln!("loupe: github not connected (saved token rejected: {saved_rejected})");
+            apply(cx, |_, accounts| {
+                accounts.github = Connection::Disconnected;
+                accounts.github_saved_token_rejected = saved_rejected;
+            });
         }
         Err(message) => {
             eprintln!("loupe: github not reachable: {message}");
@@ -464,6 +467,7 @@ fn connect_github(token: String, viewer: Viewer, cx: &mut App) {
     apply(cx, |services, accounts| {
         services.github = Some(client);
         accounts.github = Connection::Connected(viewer);
+        accounts.github_saved_token_rejected = false;
     });
 }
 
