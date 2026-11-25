@@ -43,3 +43,4 @@
 - Entry 043: a one-line change, so the pull request has more than 250 commits.
 - Entry 044: a one-line change, so the pull request has more than 250 commits.
 - Entry 045: a one-line change, so the pull request has more than 250 commits.
+- Entry 046: a one-line change, so the pull request has more than 250 commits.
