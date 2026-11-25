@@ -1292,6 +1292,7 @@ mod tests {
     fn escape_in_a_menu_gives_the_focus_back_to_its_chip(cx: &mut TestAppContext) {
         let (mut cx, _) = refusing_linear(cx);
         let cx = &mut cx;
+        cx.update(|_, cx| crate::shell::menus::bind_keys(cx));
         let form = open_form(cx);
         let (description, search, state, priority) = cx.update(|_, cx| {
             let form = form.read(cx);
