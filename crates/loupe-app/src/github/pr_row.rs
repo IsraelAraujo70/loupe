@@ -365,20 +365,12 @@ fn viewer_chip(summary: &PrSummary) -> Option<Tag> {
         Some(ReviewStanding::ChangesSinceReview) => ui::tinted_chip(tokens::accent()),
         _ => ui::chip(),
     };
-    // The chip gives way before the title: it shrinks first, down to its
-    // icon, and only then does the title lose its end.
-    let mut chip = chip
-        .gap_1()
-        .min_w_7()
-        .overflow_hidden()
-        .child(Icon::new(icon).with_size(scale::icon_xs()).flex_none())
-        .child(div().min_w_0().truncate().child(label));
-    chip.style().flex_shrink = Some(CHIP_YIELD);
-    Some(chip)
+    Some(
+        chip.gap_1()
+            .child(Icon::new(icon).with_size(scale::icon_xs()))
+            .child(label),
+    )
 }
-
-/// How much faster a state chip shrinks than the title beside it.
-const CHIP_YIELD: f32 = 1000.;
 
 /// `n` with a comma between thousands, as the tooltips write counts.
 fn grouped(n: u32) -> String {
@@ -632,13 +624,11 @@ pub fn pr_row(
                 .child(number),
         )
         // The title, and right after it the review decision when the pull
-        // request has one: the chip takes room from a long title only on
-        // its own row, and no row carries an empty lane for it.
+        // request has one: no row carries an empty lane for it.
         .child(
             h_flex()
                 .flex_1()
                 .min_w_0()
-                .gap_2()
                 .items_center()
                 .child(
                     div()
@@ -650,12 +640,27 @@ pub fn pr_row(
                 .children(place.map(|place| {
                     div()
                         .flex_none()
+                        .ml_2()
                         .text_size(scale::meta())
                         .text_color(muted)
                         .child(format!("{}/{}", place.position, place.total))
                 }))
-                .children(viewer_chip)
-                .children(decision.map(review_chip)),
+                // The chips only take the room the title leaves. One that
+                // does not fit whole wraps onto a second line that is cut
+                // off, so it is shown whole or not at all; the empty first
+                // item keeps the first line from holding a chip that does
+                // not fit.
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h(scale::chip_height())
+                        .flex_wrap()
+                        .overflow_hidden()
+                        .child(div().h_full())
+                        .children(viewer_chip.map(|chip| chip.ml_2()))
+                        .children(decision.map(|decision| review_chip(decision).ml_2())),
+                ),
         )
         // The author, before the columns every section shares, and only
         // where authors differ: on the viewer's own pull requests its width
