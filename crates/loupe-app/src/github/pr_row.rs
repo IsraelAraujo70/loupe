@@ -10,7 +10,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::queue::SizeClass;
+use loupe_github::queue::{QueueGroup, SizeClass};
 use loupe_github::reviews::{self, Sort, SortDir, SortKey};
 use loupe_github::{ChecksState, PrRef, PrState, PrSummary, ReviewDecision, ReviewStanding};
 
@@ -257,6 +257,9 @@ pub struct Lanes {
     pub author: bool,
     pub comments: bool,
     pub age_from: AgeFrom,
+    /// The queue group the rows sit under, whose heading already says
+    /// their state: a row in it shows no state chip.
+    pub group: Option<QueueGroup>,
 }
 
 impl Lanes {
@@ -271,6 +274,7 @@ impl Lanes {
             author,
             comments: rows.iter().any(|row| row.comment_count > 0),
             age_from,
+            group: None,
         }
     }
 }
@@ -361,12 +365,20 @@ fn viewer_chip(summary: &PrSummary) -> Option<Tag> {
         Some(ReviewStanding::ChangesSinceReview) => ui::tinted_chip(tokens::accent()),
         _ => ui::chip(),
     };
-    Some(
-        chip.gap_1()
-            .child(Icon::new(icon).with_size(scale::icon_xs()))
-            .child(label),
-    )
+    // The chip gives way before the title: it shrinks first, down to its
+    // icon, and only then does the title lose its end.
+    let mut chip = chip
+        .gap_1()
+        .min_w_7()
+        .overflow_hidden()
+        .child(Icon::new(icon).with_size(scale::icon_xs()).flex_none())
+        .child(div().min_w_0().truncate().child(label));
+    chip.style().flex_shrink = Some(CHIP_YIELD);
+    Some(chip)
 }
+
+/// How much faster a state chip shrinks than the title beside it.
+const CHIP_YIELD: f32 = 1000.;
 
 /// `n` with a comma between thousands, as the tooltips write counts.
 fn grouped(n: u32) -> String {
@@ -480,6 +492,7 @@ pub fn pr_row(
         author: show_author,
         comments: show_comments,
         age_from,
+        group: _,
     } = lanes;
     let theme = cx.theme();
     let muted = theme.muted_foreground;
@@ -518,11 +531,14 @@ pub fn pr_row(
         }
         None => format!("{reference} {}{by}{state}{size}", summary.title),
     };
-    let viewer_chip = viewer_chip(summary);
-    // With a state chip in front, "Review required" says nothing more.
+    let has_state = viewer_state(summary).is_some();
+    // Under a heading that already says the state, the chip would only
+    // take the title's room.
+    let viewer_chip = viewer_chip(summary).filter(|_| lanes.group != Some(QueueGroup::of(summary)));
+    // With a state in front, "Review required" says nothing more.
     let decision = summary
         .review_decision
-        .filter(|decision| viewer_chip.is_none() || *decision != ReviewDecision::ReviewRequired);
+        .filter(|decision| !has_state || *decision != ReviewDecision::ReviewRequired);
     let item = Item::pull_request(summary);
     let pr = summary.pr.clone();
     let row = ui::list_row(SharedString::from(format!("pr-row-{id}")), cx)
@@ -1074,6 +1090,7 @@ pub(super) mod tests {
                         author: true,
                         comments: true,
                         age_from: AgeFrom::Updated,
+                        group: None,
                     },
                     false,
                     Some(RowSelect {

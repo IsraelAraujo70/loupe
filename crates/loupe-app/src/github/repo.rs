@@ -86,6 +86,29 @@ impl Section {
     }
 }
 
+/// The pull requests the list shows: the loaded pages, and on Open the
+/// ones that wait on the viewer from `queue` (asked of them or reviewed by
+/// them) that no loaded page holds yet, so a review asked of you is never
+/// left on a page not loaded. The pages keep GitHub's order (latest update
+/// first), and each one from the queue goes where its update falls in it.
+fn listed(page: &Page<PrSummary>, queue: &[PrSummary], filter: PrListFilter) -> Vec<PrSummary> {
+    let mut items = page.items.clone();
+    if filter != PrListFilter::Open {
+        return items;
+    }
+    for pr in queue {
+        if items.iter().any(|known| known.pr == pr.pr) {
+            continue;
+        }
+        let at = items
+            .iter()
+            .position(|known| known.updated_at < pr.updated_at)
+            .unwrap_or(items.len());
+        items.insert(at, pr.clone());
+    }
+    items
+}
+
 /// The open pull requests as a review queue: grouped by what they ask of
 /// the viewer, in QueueGroup's order, each group in GitHub's order (latest
 /// update first). A stack is one line in the group of its most urgent pull
@@ -220,6 +243,13 @@ pub struct RepoView {
     filter: PrListFilter,
     search: Entity<InputState>,
     list: Loadable<Page<PrSummary>>,
+    /// On Open, the pull requests that wait on the viewer wherever they are
+    /// in the list's pages.
+    queue: Vec<PrSummary>,
+    /// The row at the top of the reading area when Load more was pressed,
+    /// and how far below the area's top it was, to put it back there once
+    /// the new rows are laid out.
+    anchor: Option<(Spot, Pixels)>,
     more: Option<Result<(), LoadError>>,
     scroll: ScrollHandle,
     /// The list's children (the column heading, then a row per pull
@@ -234,6 +264,7 @@ pub struct RepoView {
     folded: HashSet<QueueGroup>,
     _load: Option<Task<()>>,
     _more: Option<Task<()>>,
+    _queue: Option<Task<()>>,
     _debounce: Option<Task<()>>,
     _search_changes: Subscription,
 }
@@ -263,6 +294,9 @@ fn build(repo: RepoRef, window: &mut Window, cx: &mut App) -> Entity<RepoView> {
             expanded: HashSet::new(),
             folded: HashSet::new(),
             _load: None,
+            queue: Vec::new(),
+            anchor: None,
+            _queue: None,
             _more: None,
             _debounce: None,
             _search_changes: changes,
@@ -278,12 +312,12 @@ impl RepoView {
     /// column heading for the first and from its group's heading for the
     /// first of a group. Rows of a folded group or stack are not on screen.
     fn spots(&self) -> Vec<(Spot, RangeInclusive<usize>)> {
-        let Some(page) = self.list.value() else {
+        let Some(items) = self.items() else {
             return Vec::new();
         };
         let mut out: Vec<(Spot, RangeInclusive<usize>)> = Vec::new();
         let mut child = 1;
-        for section in sections(&page.items, self.filter) {
+        for section in sections(&items, self.filter) {
             let mut top = if out.is_empty() { 0 } else { child };
             if let Some(group) = section.group {
                 child += 1;
@@ -295,7 +329,7 @@ impl RepoView {
                 let (stack, members) = match line {
                     Line::Pr(at) => (None, vec![at]),
                     Line::Stack(members) => {
-                        let base = page.items[members[0]].pr.clone();
+                        let base = items[members[0]].pr.clone();
                         let open = self.expanded.contains(&base);
                         (Some(base), if open { members } else { Vec::new() })
                     }
@@ -306,10 +340,7 @@ impl RepoView {
                     child += 1;
                 }
                 for member in members {
-                    out.push((
-                        Spot::Pr(page.items[member].pr.clone()),
-                        top.min(child)..=child,
-                    ));
+                    out.push((Spot::Pr(items[member].pr.clone()), top.min(child)..=child));
                     top = child;
                     child += 1;
                 }
@@ -364,15 +395,13 @@ impl RepoView {
 
     /// The base of the stack whose rows hold pr.
     fn stack_of(&self, pr: &PrRef) -> Option<PrRef> {
-        let page = self.list.value()?;
-        sections(&page.items, self.filter)
+        let items = self.items()?;
+        sections(&items, self.filter)
             .into_iter()
             .flat_map(|section| section.lines)
             .find_map(|line| match line {
-                Line::Stack(members)
-                    if members.iter().any(|&member| page.items[member].pr == *pr) =>
-                {
-                    Some(page.items[members[0]].pr.clone())
+                Line::Stack(members) if members.iter().any(|&member| items[member].pr == *pr) => {
+                    Some(items[members[0]].pr.clone())
                 }
                 _ => None,
             })
@@ -396,18 +425,70 @@ impl RepoView {
         true
     }
 
+    /// The pull requests on screen, before grouping: [`listed`].
+    fn items(&self) -> Option<Vec<PrSummary>> {
+        let page = self.list.value()?;
+        Some(listed(page, &self.queue, self.filter))
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.list.start_refresh();
         self.more = None;
         self._more = None;
+        self.anchor = None;
         let repo = self.repo.clone();
         let filter = self.filter;
         let text = search_text(&self.search.read(cx).value());
+        let (queue_repo, queue_text) = (repo.clone(), text.clone());
         self._load = Some(common::run(
             cx,
             move |gh| gh.repo_pull_requests(&repo, filter, text.as_deref(), None),
             |view, result, _| view.list.finish(result),
         ));
+        // Without it the list still reads by the pages loaded, so a failed
+        // read leaves the queue empty rather than the page in error.
+        self._queue = (filter == PrListFilter::Open).then(|| {
+            common::run(
+                cx,
+                move |gh| gh.repo_review_queue(&queue_repo, queue_text.as_deref()),
+                |view, result, cx| {
+                    view.queue = result.unwrap_or_default();
+                    cx.notify();
+                },
+            )
+        });
+        if filter != PrListFilter::Open {
+            self.queue.clear();
+        }
+        cx.notify();
+    }
+
+    /// The row at the top of the reading area, and how far below the
+    /// area's top it starts.
+    fn reading_anchor(&self) -> Option<(Spot, Pixels)> {
+        let viewport = self.scroll.bounds();
+        self.spots().into_iter().find_map(|(spot, children)| {
+            let bounds = self.rows.bounds_for_item(*children.end())?;
+            (bounds.bottom() > viewport.top()).then(|| (spot, bounds.top() - viewport.top()))
+        })
+    }
+
+    /// Scrolls the row Load more left at the top of the reading area back
+    /// to where it was, once the new rows are laid out above or below it.
+    fn restore_anchor(&mut self, cx: &mut Context<Self>) {
+        let Some((spot, at)) = self.anchor.take() else {
+            return;
+        };
+        let Some((_, children)) = self.spots().into_iter().find(|(known, _)| *known == spot) else {
+            return;
+        };
+        let Some(bounds) = self.rows.bounds_for_item(*children.end()) else {
+            return;
+        };
+        let viewport = self.scroll.bounds();
+        let mut offset = self.scroll.offset();
+        offset.y -= bounds.top() - viewport.top() - at;
+        self.scroll.set_offset(offset);
         cx.notify();
     }
 
@@ -432,6 +513,7 @@ impl RepoView {
             |view, result, _| match result {
                 Ok(next) => {
                     view.more = None;
+                    view.anchor = view.reading_anchor();
                     if let Loadable::Loaded(page) = &mut view.list {
                         page.items.extend(next.items);
                         page.next_cursor = next.next_cursor;
@@ -561,13 +643,21 @@ impl Render for RepoView {
             }
             Loadable::Loaded(page) | Loadable::Refreshing(page) => {
                 let page = page.clone();
+                let items = listed(&page, &self.queue, self.filter);
                 let loading_more = matches!(self.more, Some(Ok(())));
-                let rows: Vec<&PrSummary> = page.items.iter().collect();
+                let rows: Vec<&PrSummary> = items.iter().collect();
                 let lanes = Lanes::for_rows(&rows, true, AgeFrom::Updated);
+                if self.anchor.is_some() {
+                    cx.on_next_frame(window, |view, _, cx| view.restore_anchor(cx));
+                }
                 let cursor = self.cursor.clone().filter(|_| focused);
                 let mut children: Vec<AnyElement> =
                     vec![column_header(false, lanes, None, None, cx).into_any_element()];
-                for section in sections(&page.items, self.filter) {
+                for section in sections(&items, self.filter) {
+                    let lanes = Lanes {
+                        group: section.group,
+                        ..lanes
+                    };
                     if let Some(group) = section.group {
                         let folded = self.folded.contains(&group);
                         children.push(
@@ -584,7 +674,7 @@ impl Render for RepoView {
                     for line in section.lines {
                         let members = match line {
                             Line::Pr(at) => {
-                                let summary = &page.items[at];
+                                let summary = &items[at];
                                 let at_cursor = cursor == Some(Spot::Pr(summary.pr.clone()));
                                 children.push(
                                     pr_row(summary, lanes, at_cursor, None, None, None, cx)
@@ -595,7 +685,7 @@ impl Render for RepoView {
                             Line::Stack(members) => members,
                         };
                         let stacked: Vec<&PrSummary> =
-                            members.iter().map(|&member| &page.items[member]).collect();
+                            members.iter().map(|&member| &items[member]).collect();
                         let base = stacked[0].pr.clone();
                         let expanded = self.expanded.contains(&base);
                         let toggle = base.clone();
@@ -914,7 +1004,7 @@ mod tests {
     use loupe_github::queue::QueueGroup;
     use loupe_github::{Page, PrListFilter, PrSummary, RepoRef, RepoSummary, ReviewStanding};
 
-    use super::{Line, Spot, build, candidates, search_text, sections};
+    use super::{Line, Spot, build, candidates, listed, search_text, sections};
     use crate::github::common::Loadable;
     use crate::github::pr_row::tests::summary;
 
@@ -1085,6 +1175,32 @@ mod tests {
         let only = sections(&items, PrListFilter::Open);
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].group, None);
+    }
+
+    /// A review asked of you on a page the list has not loaded still comes
+    /// first; another list keeps only what its pages hold.
+    #[test]
+    fn a_review_asked_on_a_page_not_loaded_still_leads_the_queue() {
+        let page = Page {
+            items: vec![summary("x", 1, 0), summary("x", 2, 0)],
+            total_count: 40,
+            next_cursor: Some("next".into()),
+        };
+        let mut asked = with(
+            Some(ReviewStanding::Requested),
+            false,
+            on(39, "main", "far"),
+        );
+        asked.updated_at = page.items[0].updated_at - chrono::Duration::days(30);
+        let queue = [asked.clone(), page.items[0].clone()];
+        let items = listed(&page, &queue, PrListFilter::Open);
+        let numbers: Vec<u64> = items.iter().map(|pr| pr.pr.number).collect();
+        assert_eq!(numbers.len(), 3, "each pull request once");
+        assert_eq!(numbers[2], 39, "newest update first");
+        let groups = sections(&items, PrListFilter::Open);
+        assert_eq!(groups[0].group, Some(QueueGroup::ReviewRequested));
+        assert_eq!(groups[0].lines, [Line::Pr(2)]);
+        assert_eq!(listed(&page, &queue, PrListFilter::Closed).len(), 2);
     }
 
     /// Enter opens the stack under the cursor, J walks into its rows in
