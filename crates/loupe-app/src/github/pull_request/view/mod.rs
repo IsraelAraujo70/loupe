@@ -218,9 +218,9 @@ pub struct PullRequestView {
     /// tab without a focus of its own (Conversation, Guide, Commits).
     focus: FocusHandle,
     conversation_scroll: ScrollHandle,
-    /// Details opened in a window too narrow to show the side column on
-    /// its own.
-    details_open: bool,
+    /// The widths of the header's title line and its actions on the last
+    /// frame, which decide what fits.
+    header_measure: Rc<header::HeaderMeasure>,
     guide_scroll: ScrollHandle,
     commits_scroll: ScrollHandle,
     checks_scroll: ScrollHandle,
@@ -332,7 +332,7 @@ impl PullRequestView {
             focus_review_body: false,
             focus: cx.focus_handle(),
             conversation_scroll: ScrollHandle::new(),
-            details_open: false,
+            header_measure: Rc::default(),
             guide_scroll: ScrollHandle::new(),
             commits_scroll: ScrollHandle::new(),
             checks_scroll: ScrollHandle::new(),
@@ -342,7 +342,12 @@ impl PullRequestView {
             commits_error: None,
             write_task: None,
             guide_review_task: None,
-            subscriptions: vec![submit_on_secondary_enter],
+            // The details column leaves out Linear and T3 while they are not
+            // connected, so connecting one brings its section back.
+            subscriptions: vec![
+                submit_on_secondary_enter,
+                cx.observe_global::<crate::services::Services>(|_, cx| cx.notify()),
+            ],
             last_fetch: Instant::now(),
             checked_at: None,
             checks_etag: None,
@@ -1325,10 +1330,10 @@ impl PullRequestView {
     }
 
     /// The page in the shape it will load into, so nothing moves when the
-    /// pull request arrives: the state and branch band, the tabs (named from
-    /// the first frame), the status card, the description, and the side
-    /// column's sections.
-    fn render_loading(&self, cx: &App) -> Div {
+    /// pull request arrives: the title's line and the meta line, the tabs
+    /// (named from the first frame), the status card, the description, and
+    /// the side column's sections while it is open.
+    fn render_loading(&self, details_open: bool, cx: &App) -> Div {
         let border = cx.theme().border;
         let tabs = PrTab::ALL.into_iter().map(|tab| {
             ui::section_tab(("pr-tab-loading", tab.index()), tab.title()).icon(tab.icon())
@@ -1340,24 +1345,42 @@ impl PullRequestView {
                 .child(Skeleton::new().h_3().w_20())
                 .child(Skeleton::new().secondary().h_3().w_32())
         };
+        let reference = SharedString::from(self.pr.to_string());
         v_flex()
             .size_full()
-            .child(self.placeholder_header())
             .child(
-                h_flex()
+                v_flex()
                     .flex_none()
-                    .h(scale::band_height())
+                    .w_full()
                     .px(scale::content_inset())
+                    .py_2()
                     .gap_2()
                     .child(
-                        Skeleton::new()
-                            .h(scale::chip_height())
-                            .w_16()
-                            .rounded_full(),
+                        h_flex()
+                            .id("pr-title-loading")
+                            .role(Role::Heading)
+                            .aria_label(reference.clone())
+                            .h(scale::control_height())
+                            .items_center()
+                            .text_size(scale::heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(reference),
                     )
-                    .child(Skeleton::new().size_4().rounded_full())
-                    .child(Skeleton::new().secondary().h_3().w_24())
-                    .child(Skeleton::new().secondary().h(scale::chip_height()).w_32()),
+                    .child(
+                        h_flex()
+                            .h(scale::chip_height())
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Skeleton::new()
+                                    .h(scale::chip_height())
+                                    .w_16()
+                                    .rounded_full(),
+                            )
+                            .child(Skeleton::new().size_4().rounded_full())
+                            .child(Skeleton::new().secondary().h_3().w_24())
+                            .child(Skeleton::new().secondary().h(scale::chip_height()).w_32()),
+                    ),
             )
             .child(ui::section_tabs("pr-tabs-loading", self.tab.index()).tabs(tabs))
             .child(
@@ -1396,17 +1419,19 @@ impl PullRequestView {
                                     .child(line(0.4)),
                             ),
                     )
-                    .child(
-                        v_flex()
-                            .flex_none()
-                            .w(scale::side_width())
-                            .h_full()
-                            .p_4()
-                            .gap_6()
-                            .border_l_1()
-                            .border_color(border)
-                            .children((0..4).map(side_section)),
-                    ),
+                    .when(details_open && self.tab.has_side_column(), |row| {
+                        row.child(
+                            v_flex()
+                                .flex_none()
+                                .w(scale::side_width())
+                                .h_full()
+                                .p_4()
+                                .gap_6()
+                                .border_l_1()
+                                .border_color(border)
+                                .children((0..2).map(side_section)),
+                        )
+                    }),
             )
     }
 
@@ -1422,10 +1447,14 @@ impl PullRequestView {
             ))
     }
 
+    /// The tabs, and at their trailing edge the toggle of the details
+    /// column on the tabs that have one. `wide` is the window's width
+    /// class, whose choice the toggle keeps.
     fn render_tabs(
         &self,
         detail: &PullRequestDetail,
-        narrow: bool,
+        wide: bool,
+        details_open: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let guide_count = self
@@ -1445,23 +1474,21 @@ impl PullRequestView {
                     cx.notify();
                 }))
         });
-        let details = (narrow && self.tab.has_side_column()).then(|| {
-            let name = if self.details_open {
-                "Hide details"
+        let details = self.tab.has_side_column().then(|| {
+            use gpui_kit::assets::IconName;
+            let (name, icon) = if details_open {
+                ("Hide details", IconName::PanelRightClose)
             } else {
-                "Show details"
+                ("Show details", IconName::PanelRightOpen)
             };
-            ui::icon_button(
-                "pr-details-toggle",
-                gpui_kit::assets::IconName::PanelRight,
-                name,
-            )
-            .label("Details")
-            .selected(self.details_open)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.details_open = !this.details_open;
-                cx.notify();
-            }))
+            ui::icon_button("pr-details-toggle", icon, name)
+                .label("Details")
+                .selected(details_open)
+                .on_click(move |_, _, cx| {
+                    crate::store::update_settings(cx, |settings| {
+                        settings.pr_details.set_open(wide, !details_open)
+                    });
+                })
         });
         ui::section_tabs("pr-tabs", self.tab.index())
             .tabs(tabs)
@@ -1636,22 +1663,23 @@ impl Render for PullRequestView {
             .size_full()
             .key_context("PullRequestView")
             .track_focus(&self.focus);
+        let wide = window.viewport_size().width
+            >= scale::side_column_breakpoint().to_pixels(window.rem_size());
+        let details_open = crate::store::Settings::get(cx).pr_details.is_open(wide);
         let (Some(detail), Some(loaded)) = (self.detail.value().cloned(), self.loaded.clone())
         else {
             return page
                 .child(match &self.detail {
                     Loadable::Failed(error) => self.render_failed(error, cx),
-                    _ => self.render_loading(cx),
+                    _ => self.render_loading(details_open, cx),
                 })
                 .into_any_element();
         };
-        let narrow = window.viewport_size().width
-            < scale::side_column_breakpoint().to_pixels(window.rem_size());
-        let side = self.tab.has_side_column() && (!narrow || self.details_open);
-        page.child(self.render_header(&detail, cx))
+        let side = self.tab.has_side_column() && details_open;
+        page.child(self.render_header(&detail, window, cx))
             .children(self.render_title_edit(cx))
             .child(self.render_panel_band(&detail, cx))
-            .child(self.render_tabs(&detail, narrow, cx))
+            .child(self.render_tabs(&detail, wide, details_open, cx))
             .child(
                 h_flex()
                     .flex_1()

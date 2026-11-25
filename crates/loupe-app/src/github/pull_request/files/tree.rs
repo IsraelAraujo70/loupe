@@ -186,6 +186,69 @@ impl Emitter<'_> {
     }
 }
 
+/// Above this many files a tree opens as an overview of its folders.
+pub const LARGE_TREE: usize = 200;
+/// How many rows the overview opens to: about one screen of the tree.
+const OVERVIEW_ROWS: usize = 40;
+
+/// The folders a tree of `files` opens with closed. Up to [`LARGE_TREE`]
+/// files it opens whole. A larger tree opens from the top a level at a time
+/// while the level fits in [`OVERVIEW_ROWS`]; a level that does not still
+/// opens the folder holding most of the files (`crates/` in a Rust
+/// monorepo), so the first screen lists the folders that split the work,
+/// each with its count, instead of the first few hundred files.
+pub fn initial_collapsed(files: &[ChangedFile]) -> HashSet<String> {
+    if files.len() <= LARGE_TREE {
+        return HashSet::new();
+    }
+    let rows = tree_rows(files, "", &HashSet::new());
+    let mut children: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
+    for (ix, row) in rows.iter().enumerate() {
+        children.entry(row.parent).or_default().push(ix);
+    }
+    let count = |folder: usize| children.get(&Some(folder)).map_or(0, Vec::len);
+    let folders_in = |rows_in: &[usize]| -> Vec<usize> {
+        rows_in
+            .iter()
+            .copied()
+            .filter(|&ix| rows[ix].dir().is_some())
+            .collect()
+    };
+    let top = children.get(&None).cloned().unwrap_or_default();
+    let mut shown = top.len();
+    let mut frontier = folders_in(&top);
+    let mut open = HashSet::new();
+    while !frontier.is_empty() {
+        let level: usize = frontier.iter().map(|&folder| count(folder)).sum();
+        let opening = if shown + level <= OVERVIEW_ROWS {
+            frontier.clone()
+        } else {
+            let lead = frontier.iter().copied().find(|&folder| {
+                rows[folder]
+                    .dir()
+                    .is_some_and(|dir| dir.files.len() * 5 >= files.len() * 4)
+            });
+            match lead {
+                Some(lead) => vec![lead],
+                None => break,
+            }
+        };
+        frontier = Vec::new();
+        for folder in opening {
+            shown += count(folder);
+            open.insert(folder);
+            frontier.extend(folders_in(
+                children.get(&Some(folder)).map_or(&[], Vec::as_slice),
+            ));
+        }
+    }
+    rows.iter()
+        .enumerate()
+        .filter(|(ix, row)| row.dir().is_some() && !open.contains(ix))
+        .map(|(_, row)| row.path.clone())
+        .collect()
+}
+
 /// Reorders `files` into the tree's order, so the diff below reads in the
 /// same order as the list beside it.
 pub fn into_tree_order(files: Vec<ChangedFile>) -> Vec<ChangedFile> {
@@ -293,6 +356,25 @@ pub fn sticky_folders(rows: &[TreeRow], top: usize) -> Option<Sticky> {
         }
     }
     None
+}
+
+/// The row that stands for `path`: its own, or while a closed folder hides
+/// it, the innermost folder on screen that holds it, so the tree still
+/// shows where the diff is.
+pub fn shown_row(rows: &[TreeRow], path: &str) -> Option<usize> {
+    if let Some(ix) = rows.iter().position(|row| row.path == path) {
+        return Some(ix);
+    }
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.dir().is_some()
+                && path
+                    .strip_prefix(row.path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|(_, row)| row.path.len())
+        .map(|(ix, _)| ix)
 }
 
 /// The folders holding `ix`, outermost first.
@@ -443,9 +525,9 @@ mod tests {
     use loupe_github::{ChangedFile, FileStatus, ViewedState};
 
     use super::{
-        GitTint, Move, RowKind, Sticky, TreeRow, ViewedMark, active_folder, distinct_starts,
-        folder_tint, into_tree_order, move_down, move_left, move_right, move_up, sticky_folders,
-        tree_rows, viewed_mark,
+        GitTint, LARGE_TREE, Move, RowKind, Sticky, TreeRow, ViewedMark, active_folder,
+        distinct_starts, folder_tint, initial_collapsed, into_tree_order, move_down, move_left,
+        move_right, move_up, shown_row, sticky_folders, tree_rows, viewed_mark,
     };
 
     fn file(path: &str, additions: u32, deletions: u32) -> ChangedFile {
@@ -522,6 +604,107 @@ mod tests {
         assert_eq!(rows[4].parent, Some(3));
         assert_eq!(rows[3].parent, Some(2));
         assert_eq!(rows[8].parent, None);
+    }
+
+    #[test]
+    fn a_folder_whose_only_child_is_a_folder_shares_its_row() {
+        // `ai2/src` holds `prompts/` beside files, so it is not a chain;
+        // `call/src` is, all the way down to the folder with the files.
+        let files = vec![
+            file("crates/ai2/Cargo.toml", 1, 0),
+            file("crates/ai2/src/ai2.rs", 1, 0),
+            file("crates/ai2/src/prompts/base.rs", 1, 0),
+            file("crates/call/src/room/mod.rs", 1, 0),
+        ];
+        let rows = tree_rows(&files, "", &HashSet::new());
+        assert_eq!(
+            outline(&files, &rows),
+            [
+                "crates/ [4] +4 -0",
+                "  ai2/ [3] +3 -0",
+                "    src/ [2] +2 -0",
+                "      prompts/ [1] +1 -0",
+                "        crates/ai2/src/prompts/base.rs",
+                "      crates/ai2/src/ai2.rs",
+                "    crates/ai2/Cargo.toml",
+                "  call/src/room/ [1] +1 -0",
+                "    crates/call/src/room/mod.rs",
+            ]
+        );
+    }
+
+    /// A pull request shaped like zed#3174: nearly every file under
+    /// `crates/`, split over many crates, beside a few root files.
+    fn monorepo(crates: usize, files_per_crate: usize) -> Vec<ChangedFile> {
+        let mut files = vec![
+            file("Cargo.lock", 1, 1),
+            file("Cargo.toml", 1, 0),
+            file("script/bump.py", 1, 0),
+        ];
+        for krate in 0..crates {
+            for ix in 0..files_per_crate {
+                files.push(file(&format!("crates/c{krate:02}/src/f{ix}.rs"), 2, 0));
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn a_small_tree_opens_whole() {
+        let files = monorepo(10, 10);
+        assert!(files.len() <= LARGE_TREE);
+        assert!(initial_collapsed(&files).is_empty());
+    }
+
+    #[test]
+    fn a_large_tree_opens_as_an_overview_of_its_folders() {
+        let files = monorepo(36, 10);
+        assert!(files.len() > LARGE_TREE);
+        let collapsed = initial_collapsed(&files);
+        let rows = tree_rows(&files, "", &collapsed);
+        let shown = outline(&files, &rows);
+        // The top level and its crates do not fit a screen together, but
+        // `crates/` holds most of the files, so it opens on its crates,
+        // each closed with its count; the rest of the top stays closed.
+        assert_eq!(shown[0], "crates/ [360] +720 -0");
+        assert_eq!(shown[1], "  > c00/src/ [10] +20 -0");
+        assert_eq!(shown[36], "  > c35/src/ [10] +20 -0");
+        assert_eq!(
+            &shown[37..],
+            ["> script/ [1] +1 -0", "Cargo.lock", "Cargo.toml"]
+        );
+        assert!(rows.len() <= 40, "the overview fits a screen");
+        assert!(collapsed.contains("script"));
+        assert!(!collapsed.contains("crates"));
+    }
+
+    #[test]
+    fn an_overview_opens_every_level_that_fits_a_screen() {
+        // Three folders of 70 files: the top level fits, its files do not.
+        let files: Vec<ChangedFile> = ["api", "web", "docs"]
+            .iter()
+            .flat_map(|dir| (0..70).map(move |ix| file(&format!("{dir}/f{ix}.rs"), 1, 0)))
+            .collect();
+        let rows = tree_rows(&files, "", &initial_collapsed(&files));
+        assert_eq!(
+            outline(&files, &rows),
+            [
+                "> api/ [70] +70 -0",
+                "> docs/ [70] +70 -0",
+                "> web/ [70] +70 -0"
+            ]
+        );
+        // Ten folders of two subfolders each open down to the subfolders.
+        let files: Vec<ChangedFile> = (0..10)
+            .flat_map(|top| {
+                (0..2).flat_map(move |sub| {
+                    (0..11).map(move |ix| file(&format!("t{top}/s{sub}/f{ix}.rs"), 1, 0))
+                })
+            })
+            .collect();
+        let rows = tree_rows(&files, "", &initial_collapsed(&files));
+        assert_eq!(rows.len(), 30);
+        assert_eq!(outline(&files, &rows)[1], "  > s0/ [11] +11 -0");
     }
 
     #[test]
@@ -643,6 +826,21 @@ mod tests {
         );
         // Past `src`, the root-level files pin nothing.
         assert_eq!(sticky_folders(&rows, find(&rows, "Cargo.toml")), None);
+    }
+
+    #[test]
+    fn a_hidden_file_shows_as_the_innermost_folder_on_screen() {
+        let files = sample();
+        let client = "src/lib/http/client.rs";
+        let rows = tree_rows(&files, "", &HashSet::new());
+        assert_eq!(shown_row(&rows, client), Some(find(&rows, client)));
+        let rows = tree_rows(&files, "", &HashSet::from(["src/lib/http".to_owned()]));
+        assert_eq!(shown_row(&rows, client), Some(find(&rows, "src/lib/http")));
+        let collapsed = HashSet::from(["src".to_owned(), "src/lib/http".to_owned()]);
+        let rows = tree_rows(&files, "", &collapsed);
+        assert_eq!(shown_row(&rows, client), Some(find(&rows, "src")));
+        // `src` is not a folder of `srcs/a.rs`.
+        assert_eq!(shown_row(&rows, "srcs/a.rs"), None);
     }
 
     #[test]
