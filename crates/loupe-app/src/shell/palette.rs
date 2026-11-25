@@ -41,8 +41,9 @@ use loupe_linear::{IssueSummary, Team};
 use crate::linear::issue_menu::{self, Field, FieldChoice};
 use crate::route::Route;
 use crate::services::Services;
-use crate::shell::actions::PaletteOpenInNewTab;
-use crate::shell::actions::SearchTabs;
+use crate::shell::actions::{
+    PaletteOpenInNewTab, SearchTabs, SplitDown, SplitLeft, SplitRight, SplitUp,
+};
 use crate::shell::item_menu::{self, Command as ItemCommand, Item, Place};
 use crate::shell::panes::{OpenTab, Zone};
 use crate::shell::{
@@ -818,17 +819,21 @@ impl RemoteResults {
 }
 
 /// The commands the palette runs on the panes, with their keys.
-const PANE_COMMANDS: [(&str, Zone, Option<&str>); 4] = [
-    ("Split right", Zone::Right, Some("cmd-\\")),
-    ("Split left", Zone::Left, None),
-    ("Split up", Zone::Up, None),
-    ("Split down", Zone::Down, Some("cmd-shift-\\")),
+const PANE_COMMANDS: [PaneCommand; 4] = [
+    ("Split right", Zone::Right, || Box::new(SplitRight)),
+    ("Split left", Zone::Left, || Box::new(SplitLeft)),
+    ("Split up", Zone::Up, || Box::new(SplitUp)),
+    ("Split down", Zone::Down, || Box::new(SplitDown)),
 ];
+
+/// A pane command's label, where it splits, and its action, whose key the
+/// row shows when the keymap binds one.
+type PaneCommand = (&'static str, Zone, fn() -> Box<dyn Action>);
 
 /// The pane commands typed text names: it starts one's label and holds
 /// at least "spl", so a short query for a page ("li", "do") never puts a
 /// split under Enter. None for a narrowed query, which lists pages.
-fn pane_commands(parsed: &ParsedQuery) -> Vec<(&'static str, Zone, Option<&'static str>)> {
+fn pane_commands(parsed: &ParsedQuery) -> Vec<PaneCommand> {
     let text = parsed.text().trim().to_lowercase();
     if parsed.is_narrowed() || text.len() < 3 {
         return Vec::new();
@@ -1477,7 +1482,13 @@ fn tab_row(tab: OpenTab, panes: usize) -> CommandItem {
     })
 }
 
-fn command_row(label: &'static str, zone: Zone, keys: Option<&'static str>) -> CommandItem {
+fn command_row(
+    label: &'static str,
+    zone: Zone,
+    action: fn() -> Box<dyn Action>,
+    cx: &App,
+) -> CommandItem {
+    let keys = crate::ui::bound_keystroke(action().as_ref(), cx);
     let icon = match zone {
         Zone::Left | Zone::Right | Zone::Center => IconName::Columns2,
         Zone::Up | Zone::Down => IconName::Rows2,
@@ -1504,21 +1515,10 @@ fn command_row(label: &'static str, zone: Zone, keys: Option<&'static str>) -> C
                     .text_size(scale::body())
                     .child(label),
             )
-            .when_some(keys.and_then(crate::ui::platform_keystroke), |row, keys| {
+            .when_some(keys.clone(), |row, keys| {
                 row.child(Kbd::new(keys).outline())
             })
     })
-}
-
-/// The key the menus show for `action`: the last one bound.
-fn shown_key(action: &dyn Action, cx: &App) -> Option<Keystroke> {
-    let keymap = cx.key_bindings();
-    let keymap = keymap.borrow();
-    let binding = keymap.bindings_for_action(action).last()?;
-    binding
-        .keystrokes()
-        .first()
-        .map(|key| key.as_keystroke().clone())
 }
 
 /// A command of the item the palette was opened on: its icon, its palette
@@ -1528,7 +1528,7 @@ fn item_command_row(command: ItemCommand, item: &Item, cx: &App) -> CommandItem 
     let icon = command.icon(item);
     let key = command
         .action()
-        .and_then(|action| shown_key(action.as_ref(), cx));
+        .and_then(|action| crate::ui::bound_keystroke(action.as_ref(), cx));
     let id = SharedString::from(format!("palette-item-{command:?}"));
     CommandItem::new().label(label).child(move |_, cx| {
         let muted = cx.theme().muted_foreground;
@@ -1628,15 +1628,18 @@ fn status_row(label: impl Into<SharedString>, muted: Hsla) -> impl IntoElement {
 }
 
 /// A key hint in the footer: the key as `Kbd`, then what it does.
-fn hint(keys: &'static str, action: &'static str, muted: Hsla) -> impl IntoElement {
+fn hint(keys: Option<Keystroke>, action: &'static str, muted: Hsla) -> impl IntoElement {
     h_flex()
         .gap_1()
         .text_size(scale::meta())
         .text_color(muted)
-        .when_some(crate::ui::platform_keystroke(keys), |row, keys| {
-            row.child(Kbd::new(keys).outline())
-        })
+        .when_some(keys, |row, keys| row.child(Kbd::new(keys).outline()))
         .child(div().child(action))
+}
+
+/// The footer's fixed keys, which no binding of Loupe's names.
+fn fixed_key(keys: &'static str) -> Option<Keystroke> {
+    Keystroke::parse(keys).ok()
 }
 
 impl PaletteView {
@@ -1666,9 +1669,9 @@ impl PaletteView {
             .footer(|_, _, cx| {
                 let muted = cx.theme().muted_foreground;
                 footer(cx)
-                    .child(hint("↑↓", "Move", muted))
-                    .child(hint("enter", "Select", muted))
-                    .child(hint("escape", "Close", muted))
+                    .child(hint(fixed_key("↑↓"), "Move", muted))
+                    .child(hint(fixed_key("enter"), "Select", muted))
+                    .child(hint(fixed_key("escape"), "Close", muted))
             })
             .on_confirm(move |path, window, cx| {
                 let picked = view
@@ -1805,10 +1808,14 @@ impl PaletteView {
             .footer(|_, _, cx| {
                 let muted = cx.theme().muted_foreground;
                 footer(cx)
-                    .child(hint("↑↓", "Move", muted))
-                    .child(hint("enter", "Open", muted))
-                    .child(hint("cmd-enter", "New tab", muted))
-                    .child(hint("escape", "Close", muted))
+                    .child(hint(fixed_key("↑↓"), "Move", muted))
+                    .child(hint(fixed_key("enter"), "Open", muted))
+                    .child(hint(
+                        crate::ui::bound_keystroke(&PaletteOpenInNewTab, cx),
+                        "New tab",
+                        muted,
+                    ))
+                    .child(hint(fixed_key("escape"), "Close", muted))
             })
             .on_confirm(move |path, window, cx| {
                 let command = view
@@ -1867,7 +1874,7 @@ impl PaletteView {
                 CommandGroup::new().label("Commands").items(
                     pane_commands
                         .into_iter()
-                        .map(|(label, zone, keys)| command_row(label, zone, keys)),
+                        .map(|(label, zone, action)| command_row(label, zone, action, cx)),
                 ),
             );
         }

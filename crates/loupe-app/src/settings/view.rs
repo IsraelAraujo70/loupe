@@ -1032,6 +1032,9 @@ fn shortcut_row(index: usize, colors: Palette, cx: &App) -> AnyElement {
         return div().into_any_element();
     };
     h_flex()
+        .id(("settings-shortcut", index))
+        .role(Role::Group)
+        .aria_label(format!("{}: {}", shortcut.label, shortcut.keys_text(cx)))
         .w_full()
         .h(dp(40.))
         .gap_4()
