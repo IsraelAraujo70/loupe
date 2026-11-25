@@ -1,6 +1,6 @@
 //! Long and noisy comments, as on GitHub: a comment folds to its header, a
-//! body taller than the window shows cut with "Show more", `<details>`
-//! blocks start closed, and long code blocks scroll on their own.
+//! tall body shows cut with "Show more", `<details>` blocks start closed, and
+//! long code blocks scroll on their own.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,6 +16,18 @@ use crate::github::widgets;
 use crate::theme::{scale, tokens};
 use crate::ui;
 
+/// Comment and review bodies taller than this show cut, with "Show more":
+/// low enough that a long bot comment leaves the next one in view.
+fn max_comment_height() -> Pixels {
+    scale::dp(360.)
+}
+/// What a cut description leaves of the conversation's height: the card's
+/// header, padding, and "Show more" (about 104 px), plus a scroll-wheel
+/// notch, so some resting scroll position shows the header and the button
+/// together.
+fn description_chrome() -> Pixels {
+    scale::dp(192.)
+}
 /// The fade over the bottom of a cut body.
 fn fade_height() -> Pixels {
     scale::dp(72.)
@@ -31,8 +43,11 @@ pub(super) struct Folds {
     uncapped: HashSet<NodeId>,
     /// Each body's full height in the last layout.
     heights: HashMap<NodeId, Pixels>,
-    /// The window's height in the last layout: a body taller than this is
-    /// cut. Until the first layout nothing is.
+    /// The area the conversation scrolls in, which the page around this tab
+    /// owns.
+    scroll: Option<ScrollHandle>,
+    /// That area's height in the last layout. The description is cut to it;
+    /// until the first layout it is not cut.
     viewport: Option<Pixels>,
     /// `<details>` blocks toggled away from how they start, by
     /// `{node}/{index path}`.
@@ -74,6 +89,14 @@ pub(super) fn hidden_tag(reason: Option<&str>) -> impl IntoElement {
 }
 
 impl ConversationTab {
+    /// Cuts the description against `scroll`, the handle of the area this
+    /// tab scrolls in, so a cut description's header and "Show more" share
+    /// one screen of it.
+    pub(crate) fn follow_scroll(mut self, scroll: ScrollHandle) -> Self {
+        self.folds.scroll = Some(scroll);
+        self
+    }
+
     /// The header button that folds the comment `id` to its header or
     /// unfolds it.
     pub(super) fn fold_button(&self, id: &NodeId, folded: bool, cx: &mut Context<Self>) -> Button {
@@ -98,10 +121,12 @@ impl ConversationTab {
         }))
     }
 
-    /// A Markdown body cut at the window's height with "Show more" when it
-    /// is taller, so a description that fits on one screen reads whole. Its
-    /// full height and the window's are measured after layout, so the cut
-    /// and the button show from the next frame on.
+    /// A Markdown body cut with "Show more" when it is taller than its cap:
+    /// the description's cap is the conversation's own height, so a
+    /// description that fits on one screen reads whole, and a comment's or a
+    /// review's is [`max_comment_height`]. The body's full height and the
+    /// conversation's are measured after layout, so the cut and the button
+    /// show from the next frame on.
     pub(super) fn capped_body(
         &self,
         id: &NodeId,
@@ -110,7 +135,13 @@ impl ConversationTab {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let uncapped = self.folds.uncapped.contains(id);
-        let cap = self.folds.viewport;
+        let cap = if *id == self.context.detail.id && self.folds.scroll.is_some() {
+            self.folds
+                .viewport
+                .map(|viewport| (viewport - description_chrome()).max(max_comment_height()))
+        } else {
+            Some(max_comment_height())
+        };
         let tall = cap.is_some_and(|cap| {
             self.folds
                 .heights
@@ -123,21 +154,24 @@ impl ConversationTab {
         let mut frame = v_flex()
             .relative()
             .w_full()
-            .on_children_prepainted(move |bounds, window, cx| {
+            .on_children_prepainted(move |bounds, _, cx| {
                 let Some(height) = bounds.first().map(|bounds| bounds.size.height) else {
                     return;
                 };
-                let viewport = window.viewport_size().height;
                 let view = view.clone();
                 let key = measured.clone();
                 cx.defer(move |cx| {
                     view.update(cx, |this, cx| {
+                        let viewport = this
+                            .folds
+                            .scroll
+                            .as_ref()
+                            .map(|scroll| scroll.bounds().size.height)
+                            .filter(|height| *height > Pixels::ZERO);
                         let folds = &mut this.folds;
-                        if folds.heights.get(&key) != Some(&height)
-                            || folds.viewport != Some(viewport)
-                        {
+                        if folds.heights.get(&key) != Some(&height) || folds.viewport != viewport {
                             folds.heights.insert(key, height);
-                            folds.viewport = Some(viewport);
+                            folds.viewport = viewport;
                             cx.notify();
                         }
                     })
