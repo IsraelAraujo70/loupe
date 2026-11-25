@@ -33,14 +33,13 @@ pub fn side_panel(id: impl Into<ElementId>, edge: SideEdge, width: Rems) -> Stat
         })
 }
 
-/// One titled section inside a side panel: 24 px heading row (section label,
-/// optional count badge, optional trailing action) over its body. Build with
+/// One titled section inside a side panel: 24 px heading row (section label
+/// and optional count badge) over its body. Build with
 /// [`side_section`].
 #[derive(IntoElement)]
 pub struct SideSection {
     title: SharedString,
     count: Option<usize>,
-    action: Option<AnyElement>,
     children: Vec<AnyElement>,
 }
 
@@ -49,7 +48,6 @@ pub fn side_section(title: impl Into<SharedString>) -> SideSection {
     SideSection {
         title: title.into(),
         count: None,
-        action: None,
         children: Vec::new(),
     }
 }
@@ -57,11 +55,6 @@ pub fn side_section(title: impl Into<SharedString>) -> SideSection {
 impl SideSection {
     pub fn count(mut self, count: usize) -> Self {
         self.count = Some(count);
-        self
-    }
-
-    pub fn maybe_action(mut self, action: Option<impl IntoElement>) -> Self {
-        self.action = action.map(IntoElement::into_any_element);
         self
     }
 }
@@ -86,9 +79,7 @@ impl RenderOnce for SideSection {
                     .child(super::section_label(self.title, cx))
                     .when_some(self.count, |row, count| {
                         row.child(super::count_badge(count, cx))
-                    })
-                    .child(div().flex_1())
-                    .children(self.action),
+                    }),
             )
             .children(self.children)
     }
