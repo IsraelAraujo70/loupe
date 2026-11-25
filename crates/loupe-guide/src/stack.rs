@@ -25,7 +25,7 @@ use crate::prompt::{
 };
 use crate::runner::{
     AgentRequest, CancelToken, DEFAULT_AGENT_TIMEOUT, GuideRunError, ProgressEvent, checkout_pr,
-    ready_executable, run_agent, run_in_checkout_with_timeout,
+    ready_executable, run_agent, run_in_checkout_with_timeout, sort_by_changed_lines,
 };
 use crate::schema::{GuideValidationError, ReviewGuide, validate};
 
@@ -301,9 +301,10 @@ fn generate_stack_with(
         }
         let ChapterRequest {
             mut input,
-            changed_files,
+            mut changed_files,
             reuse,
         } = request;
+        sort_by_changed_lines(&mut changed_files, &input.files);
         if let Some(chapter) = reuse.filter(|c| {
             c.head_oid == input.head_oid
                 && c.pr_number == input.pr_number
