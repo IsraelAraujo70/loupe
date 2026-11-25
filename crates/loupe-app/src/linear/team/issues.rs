@@ -472,7 +472,7 @@ fn sort_order_between(above: Option<f64>, below: Option<f64>) -> Option<f64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use chrono::{DateTime, NaiveDate, Utc};
     use loupe_linear::filter::{FilterClause, ME, MatchContext, SetField, SetOp};
     use loupe_linear::views::{CompletedWindow, Grouping, Ordering, ViewConfig};
@@ -503,7 +503,7 @@ mod tests {
         }
     }
 
-    fn team() -> Team {
+    pub(in crate::linear::team) fn team() -> Team {
         Team {
             id: "t1".into(),
             key: "ENG".into(),
@@ -522,7 +522,12 @@ mod tests {
         }
     }
 
-    fn issue(id: &str, state_id: &str, priority: Priority, updated: &str) -> IssueSummary {
+    pub(in crate::linear::team) fn issue(
+        id: &str,
+        state_id: &str,
+        priority: Priority,
+        updated: &str,
+    ) -> IssueSummary {
         let kind = match state_id {
             "doing" => StateType::Started,
             "done" => StateType::Completed,

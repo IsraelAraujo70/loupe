@@ -19,9 +19,18 @@ use crate::shell::navigate;
 use crate::store::{Settings, update_settings};
 use crate::theme::{self, Zoom};
 
-/// Where the list keys (J, K, the arrows, Enter, O) act: a screen with a
-/// row cursor (Reviews, the Inbox), while no text field has the focus.
-const LIST_KEYS: &str = "(InboxView || NotificationsView) && !Input";
+/// Where the list keys (J, K, the arrows, Enter) act: a screen with a row
+/// cursor (Reviews, the Inbox, My issues, a team's list, a repository's pull
+/// requests, Actions, a pull request's checks, Projects), while no text
+/// field has the focus.
+pub(crate) const LIST_KEYS: &str = "(InboxView || NotificationsView || MyIssues || TeamView || RepoView \
+                         || RunsView || ChecksTab || ProjectsView) && !Input";
+
+/// Where the keys only Reviews and the Inbox handle act: O (open the row),
+/// the arrows that open and fold a stack, Cmd+A, and Escape. Elsewhere O
+/// stays the first key of O then W, Linear's workspace switcher, which a
+/// one-key binding on a page would take over.
+const STACK_LIST_KEYS: &str = "(InboxView || NotificationsView) && !Input";
 
 /// Where an issue's single-letter keys act: its screen, while no text field
 /// has the focus.
@@ -159,14 +168,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("k", SelectPrevious, Some(LIST_KEYS)),
         KeyBinding::new("up", SelectPrevious, Some(LIST_KEYS)),
         KeyBinding::new("enter", OpenSelected, Some(LIST_KEYS)),
-        KeyBinding::new("o", OpenSelected, Some(LIST_KEYS)),
-        KeyBinding::new(primary!("a"), crate::github::SelectTabRows, Some(LIST_KEYS)),
-        KeyBinding::new("right", crate::github::OpenStack, Some(LIST_KEYS)),
-        KeyBinding::new("left", crate::github::CloseStack, Some(LIST_KEYS)),
+        KeyBinding::new("o", OpenSelected, Some(STACK_LIST_KEYS)),
+        KeyBinding::new(
+            primary!("a"),
+            crate::github::SelectTabRows,
+            Some(STACK_LIST_KEYS),
+        ),
+        KeyBinding::new("right", crate::github::OpenStack, Some(STACK_LIST_KEYS)),
+        KeyBinding::new("left", crate::github::CloseStack, Some(STACK_LIST_KEYS)),
         KeyBinding::new(
             "escape",
             crate::github::ClearReviewsSelection,
-            Some(LIST_KEYS),
+            Some(STACK_LIST_KEYS),
         ),
         KeyBinding::new("/", FocusSettingsSearch, Some(SETTINGS_KEYS)),
         // The context menu of an issue or a pull request, on Linear's keys

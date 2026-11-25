@@ -485,6 +485,11 @@ impl Workspace {
                     Some(target) => target.focus(window, cx),
                     None => this.focus.focus(window, cx),
                 }
+                // GPUI draws no frame for focus a focus-lost listener moves,
+                // so a page that takes the focus as it renders (a list
+                // reached by switching tabs) would wait for an unrelated
+                // redraw before its keys work.
+                cx.defer_in(window, |_, window, _| window.refresh());
             }),
             cx.observe(&sidebar, |_, _, cx| cx.notify()),
             cx.observe_global_in::<Services>(window, Self::services_changed),

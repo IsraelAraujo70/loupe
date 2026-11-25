@@ -4,6 +4,7 @@
 //! that drag by their heading into another order), the grouped list, and the
 //! "Load more" row.
 
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -15,8 +16,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_linear::IssueSummary;
 use loupe_linear::views::{DisplayProperty, Grouping, Layout, Ordering};
+use loupe_linear::{IssueSummary, Team};
 
 use super::issues::{self, DropTarget, Group, GroupMark};
 use super::{More, TeamView};
@@ -26,8 +27,8 @@ use crate::route::Route;
 use crate::shell::OpenOnClick as _;
 use crate::shell::item_menu::{Item, with_item_menu};
 use crate::theme::scale::dp;
-use crate::ui;
 use crate::ui::MenuTriggerExt as _;
+use crate::ui::{self, ListRowFocus as _};
 
 /// How close to a side of the board, in px, a dragged card starts to scroll
 /// it.
@@ -130,7 +131,94 @@ impl TeamView {
         issues::visible(listed, &config, &context, now)
     }
 
-    pub(super) fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The groups the body shows for the loaded issues, in order, and how
+    /// many issues the view keeps before a group is hidden: what the board
+    /// and the list draw, and what the list's keyboard cursor walks.
+    fn with_groups<R>(
+        &self,
+        team: &Team,
+        listed: &[IssueSummary],
+        f: impl FnOnce(usize, Vec<Group<'_>>) -> R,
+    ) -> R {
+        let board = self.page.draft.layout == Layout::Board;
+        let shown = self.with_drops(listed, team);
+        let visible = self.visible_issues(&shown);
+        let mut groups = issues::group_issues(&visible, self.page.draft.group_by, team);
+        if board {
+            issues::order_columns(&mut groups, &self.page.draft.column_order);
+        }
+        if !self.page.draft.show_empty_columns || !board {
+            groups.retain(|group| !group.issues.is_empty());
+        }
+        groups.retain(|group| !self.page.draft.hidden_groups.contains(&group.key));
+        f(visible.len(), groups)
+    }
+
+    /// The issues of the list layout, top to bottom, as the list draws
+    /// them. Empty on the board, which has no keyboard cursor.
+    pub(super) fn list_lines(&self) -> Vec<ListLine> {
+        if self.page.draft.layout == Layout::Board {
+            return Vec::new();
+        }
+        let (Loadable::Ready(team), Loadable::Ready(listed)) = (&self.team, &self.issues) else {
+            return Vec::new();
+        };
+        let flat = self.page.draft.group_by == Grouping::None;
+        self.with_groups(team, listed, |_, groups| {
+            let mut lines = Vec::new();
+            let mut child = 0;
+            for group in groups {
+                let heading = child;
+                if !flat {
+                    child += 1;
+                }
+                for (at, issue) in group.issues.iter().enumerate() {
+                    let top = if at == 0 && !flat { heading } else { child };
+                    lines.push(ListLine {
+                        id: issue.id.clone(),
+                        route: issue_route(issue),
+                        children: top..=child,
+                    });
+                    child += 1;
+                }
+            }
+            lines
+        })
+    }
+
+    /// Moves the keyboard cursor one row of the list and scrolls it into
+    /// view, with its group's heading when it is the group's first row.
+    /// On the board the key goes on to whoever handles it next.
+    pub(super) fn move_cursor(&mut self, down: bool, cx: &mut Context<Self>) {
+        let lines = self.list_lines();
+        let ids: Vec<String> = lines.iter().map(|line| line.id.clone()).collect();
+        let Some(next) = ui::step_cursor(&ids, self.cursor.as_ref(), down) else {
+            cx.propagate();
+            return;
+        };
+        if let Some(line) = lines.iter().find(|line| line.id == next) {
+            ui::scroll_to_rows(&self.list_scroll, &self.list_rows, line.children.clone());
+        }
+        self.cursor = Some(next);
+        cx.notify();
+    }
+
+    /// Enter or O: opens the issue under the cursor in this tab. With no
+    /// cursor the key goes on to whoever handles it next.
+    pub(super) fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let line = self
+            .list_lines()
+            .into_iter()
+            .find(|line| self.cursor.as_ref() == Some(&line.id));
+        match line {
+            Some(line) => crate::shell::navigate(line.route, window, cx),
+            None => cx.propagate(),
+        }
+    }
+
+    /// `focused` says whether the view has the focus, and so whether the
+    /// list's row under the keyboard cursor shows it.
+    pub(super) fn render_body(&self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let board = self.page.draft.layout == Layout::Board;
         let (team, listed) = match (&self.team, &self.issues) {
             (Loadable::Failed(message), _) | (_, Loadable::Failed(message)) => {
@@ -143,53 +231,45 @@ impl TeamView {
             _ if board => return widgets::skeleton_board(cx),
             _ => return div().py_2().child(ui::skeleton_rows(8)).into_any_element(),
         };
-        let shown = self.with_drops(listed, team);
-        let visible = self.visible_issues(&shown);
-        if visible.is_empty() && self.next_cursor.is_none() {
-            let filtered = !self.filters().is_empty();
-            let state = ui::empty_state(
-                IconName::Inbox.into(),
-                if filtered {
-                    "No issues match these filters"
-                } else {
-                    "No issues"
-                },
-                if filtered {
-                    "Change or clear the filters to see more."
-                } else {
-                    "Issues of this team show up here."
-                },
-            );
-            return state
-                .when(filtered, |state| {
-                    state.action(
-                        Button::new("empty-clear")
-                            .outline()
-                            .small()
-                            .label("Clear filters")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.edit_filters(Vec::clear, cx);
-                                this.sync_search_box(window, cx);
-                            })),
-                    )
-                })
-                .into_any_element();
-        }
+        self.with_groups(team, listed, |visible, groups| {
+            if visible == 0 && self.next_cursor.is_none() {
+                let filtered = !self.filters().is_empty();
+                let state = ui::empty_state(
+                    IconName::Inbox.into(),
+                    if filtered {
+                        "No issues match these filters"
+                    } else {
+                        "No issues"
+                    },
+                    if filtered {
+                        "Change or clear the filters to see more."
+                    } else {
+                        "Issues of this team show up here."
+                    },
+                );
+                return state
+                    .when(filtered, |state| {
+                        state.action(
+                            Button::new("empty-clear")
+                                .outline()
+                                .small()
+                                .label("Clear filters")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.edit_filters(Vec::clear, cx);
+                                    this.sync_search_box(window, cx);
+                                })),
+                        )
+                    })
+                    .into_any_element();
+            }
 
-        let now = Utc::now();
-        let mut groups = issues::group_issues(&visible, self.page.draft.group_by, team);
-        if board {
-            issues::order_columns(&mut groups, &self.page.draft.column_order);
-        }
-        if !self.page.draft.show_empty_columns || !board {
-            groups.retain(|group| !group.issues.is_empty());
-        }
-        groups.retain(|group| !self.page.draft.hidden_groups.contains(&group.key));
-        if board {
-            self.render_board(groups, now, cx)
-        } else {
-            self.render_list(groups, now, cx)
-        }
+            let now = Utc::now();
+            if board {
+                self.render_board(groups, now, cx)
+            } else {
+                self.render_list(groups, now, focused, cx)
+            }
+        })
     }
 
     fn render_board(
@@ -300,49 +380,51 @@ impl TeamView {
             .into_any_element()
     }
 
+    /// The list layout: per group its heading (none when not grouped), then
+    /// its rows, all children of one list so the keyboard cursor finds its
+    /// row among them (`list_lines` walks the same order).
     fn render_list(
         &self,
         groups: Vec<Group<'_>>,
         now: DateTime<Utc>,
+        focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let props = self.page.draft.properties.clone();
         let flat = self.page.draft.group_by == Grouping::None;
-        let sections: Vec<AnyElement> = groups
-            .into_iter()
-            .map(|group| {
-                let rows: Vec<AnyElement> = group
-                    .issues
-                    .iter()
-                    .map(|issue| {
-                        with_item_menu(
-                            widgets::issue_row(issue, now, &props, cx).opens(issue_route(issue)),
-                            Item::issue(issue),
-                        )
-                        .into_any_element()
-                    })
-                    .collect();
-                v_flex()
-                    .when(!flat, |section| {
-                        section.child(
-                            group_header(&group, cx)
-                                .h(dp(widgets::ROW_HEIGHT))
-                                .px_5()
-                                .bg(cx.theme().muted.opacity(0.35))
-                                .border_b_1()
-                                .border_color(cx.theme().border),
-                        )
-                    })
-                    .children(rows)
-                    .into_any_element()
-            })
-            .collect();
+        let cursor = self.cursor.as_ref().filter(|_| focused);
+        let mut children: Vec<AnyElement> = Vec::new();
+        for group in groups {
+            if !flat {
+                children.push(
+                    group_header(&group, cx)
+                        .h(dp(widgets::ROW_HEIGHT))
+                        .px_5()
+                        .bg(cx.theme().muted.opacity(0.35))
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .into_any_element(),
+                );
+            }
+            for issue in &group.issues {
+                let row = widgets::issue_row(issue, now, &props, cx)
+                    .keyboard_focus(cursor == Some(&issue.id), cx)
+                    .opens(issue_route(issue));
+                children.push(with_item_menu(row, Item::issue(issue)).into_any_element());
+            }
+        }
         div()
             .id("team-list")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .child(v_flex().children(sections))
+            .track_scroll(&self.list_scroll)
+            .child(
+                v_flex()
+                    .id("team-rows")
+                    .track_scroll(&self.list_rows)
+                    .children(children),
+            )
             .children(self.render_load_more(cx))
             .into_any_element()
     }
@@ -386,6 +468,16 @@ impl TeamView {
                 .into_any_element(),
         )
     }
+}
+
+/// One issue of the team's list as it is on screen: its id, the route that
+/// opens it, and the list's children to bring into view when the keyboard
+/// cursor comes to it (its row, with its group's heading above its group's
+/// first row).
+pub(super) struct ListLine {
+    pub id: String,
+    pub route: Route,
+    pub children: RangeInclusive<usize>,
 }
 
 /// The least width of a column with no card, in px: its heading may be
@@ -767,7 +859,16 @@ fn issue_route(issue: &IssueSummary) -> Route {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext};
+    use loupe_linear::Priority;
+    use loupe_linear::views::Layout;
+
+    use super::super::TeamView;
+    use super::super::issues::tests::{issue, team};
     use super::{EDGE_ZONE, edge_scroll_speed};
+    use crate::linear::data::Loadable;
 
     #[test]
     fn a_dragged_card_scrolls_the_board_only_near_its_sides() {
@@ -788,6 +889,57 @@ mod tests {
         assert_eq!(
             edge_scroll_speed(left, right, left + 10.),
             -edge_scroll_speed(left, right, right - 10.)
+        );
+    }
+
+    /// The keyboard cursor walks the list layout in the order it draws its
+    /// rows, group by group, and brings a group's heading into view with its
+    /// first row. The board has no cursor.
+    #[gpui_kit::test]
+    fn the_cursor_walks_the_list_and_not_the_board(cx: &mut TestAppContext) {
+        let (mut cx, view) = crate::ui::open_list(cx, |window, cx| {
+            cx.new(|cx| {
+                let (team, name) = ("t1".into(), "Engineering".into());
+                TeamView::new(team, name, None, Some("p1".into()), window, cx)
+            })
+        });
+        let cx = &mut cx;
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.team = Loadable::Ready(Arc::new(team()));
+            view.issues = Loadable::Ready(vec![
+                issue("1", "doing", Priority::None, "2026-10-03T00:00:00Z"),
+                issue("2", "todo", Priority::None, "2026-10-02T00:00:00Z"),
+                issue("3", "todo", Priority::None, "2026-10-01T00:00:00Z"),
+            ]);
+            cx.notify();
+        });
+        let lines = view.read_with(cx, |view, _| view.list_lines());
+        let children: Vec<_> = lines.iter().map(|line| line.children.clone()).collect();
+        assert_eq!(
+            children,
+            [0..=1, 2..=2, 3..=4],
+            "two groups, each under its heading"
+        );
+        let step = |down: bool, cx: &mut VisualTestContext| {
+            view.update(cx, |view, cx| {
+                view.move_cursor(down, cx);
+                view.cursor.clone()
+            })
+        };
+        let id = |at: usize| Some(lines[at].id.clone());
+        assert_eq!(step(true, cx), id(0), "the first J lands on the first row");
+        assert_eq!(step(true, cx), id(1));
+        assert_eq!(step(true, cx), id(2), "on into the next group");
+        assert_eq!(step(true, cx), id(2), "and the cursor stops at the end");
+        assert_eq!(step(false, cx), id(1));
+
+        view.update(cx, |view, _| view.page.draft.layout = Layout::Board);
+        assert!(view.read_with(cx, |view, _| view.list_lines().is_empty()));
+        assert_eq!(
+            step(true, cx),
+            id(1),
+            "on the board J leaves the cursor alone"
         );
     }
 }

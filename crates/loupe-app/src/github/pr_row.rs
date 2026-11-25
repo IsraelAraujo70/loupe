@@ -783,7 +783,7 @@ pub fn stack_row(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -797,7 +797,7 @@ mod tests {
 
     use super::{AgeFrom, Lanes, RowSelect, SelectGesture, pr_row};
 
-    fn summary(repo: &str, number: u64, comments: u32) -> PrSummary {
+    pub(in crate::github) fn summary(repo: &str, number: u64, comments: u32) -> PrSummary {
         let at = Utc::now();
         PrSummary {
             id: format!("PR_{number}"),

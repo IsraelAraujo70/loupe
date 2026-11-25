@@ -492,7 +492,8 @@ impl PullRequestView {
         }
         crate::github::guide_service::probe_availability_if_needed(cx);
         let files = cx.new(|cx| FilesTab::new(context.clone(), window, cx));
-        let checks = cx.new(|_| ChecksTab::new(context));
+        let checks_scroll = self.checks_scroll.clone();
+        let checks = cx.new(|cx| ChecksTab::new(context, checks_scroll, cx));
         self.subscriptions.push(cx.subscribe_in(
             &conversation,
             window,

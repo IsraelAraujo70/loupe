@@ -12,12 +12,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{Page, PrListFilter, PrSummary, RepoRef, RepoSummary};
+use loupe_github::{Page, PrListFilter, PrRef, PrSummary, RepoRef, RepoSummary};
 
 use super::common::{self, LoadError, Loadable};
 use super::pr_row::{AgeFrom, Lanes, column_header, pr_row};
 use crate::route::Route;
 use crate::shell::Refreshable as _;
+use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::shell::navigate;
 use crate::store::{Settings, update_settings};
 use crate::theme::scale;
@@ -105,6 +106,12 @@ pub struct RepoView {
     list: Loadable<Page<PrSummary>>,
     more: Option<Result<(), LoadError>>,
     scroll: ScrollHandle,
+    /// The list's children (the column heading, then a row per pull
+    /// request), to scroll the keyboard cursor's row into view.
+    rows: ScrollHandle,
+    focus: FocusHandle,
+    /// The pull request under the keyboard cursor (J and K, or the arrows).
+    cursor: Option<PrRef>,
     _load: Option<Task<()>>,
     _more: Option<Task<()>>,
     _debounce: Option<Task<()>>,
@@ -112,6 +119,10 @@ pub struct RepoView {
 }
 
 pub fn view(repo: RepoRef, window: &mut Window, cx: &mut App) -> AnyView {
+    build(repo, window, cx).into()
+}
+
+fn build(repo: RepoRef, window: &mut Window, cx: &mut App) -> Entity<RepoView> {
     cx.new(|cx| {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search pull requests"));
         let changes = cx.subscribe(&search, |view: &mut RepoView, _, event: &InputEvent, cx| {
@@ -126,6 +137,9 @@ pub fn view(repo: RepoRef, window: &mut Window, cx: &mut App) -> AnyView {
             list: Loadable::Loading,
             more: None,
             scroll: ScrollHandle::new(),
+            rows: ScrollHandle::new(),
+            focus: cx.focus_handle(),
+            cursor: None,
             _load: None,
             _more: None,
             _debounce: None,
@@ -134,10 +148,49 @@ pub fn view(repo: RepoRef, window: &mut Window, cx: &mut App) -> AnyView {
         view.reload(cx);
         view
     })
-    .into()
 }
 
 impl RepoView {
+    /// The pull requests on screen, top to bottom.
+    fn listed(&self) -> Vec<PrRef> {
+        self.list
+            .value()
+            .map(|page| {
+                page.items
+                    .iter()
+                    .map(|summary| summary.pr.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Moves the keyboard cursor one row and scrolls it into view, with the
+    /// column heading when it is the first row.
+    fn move_cursor(&mut self, down: bool, cx: &mut Context<Self>) {
+        let listed = self.listed();
+        let Some(next) = ui::step_cursor(&listed, self.cursor.as_ref(), down) else {
+            return;
+        };
+        let at = listed.iter().position(|pr| *pr == next).unwrap_or(0);
+        let row = at + 1;
+        ui::scroll_to_rows(
+            &self.scroll,
+            &self.rows,
+            if at == 0 { 0 } else { row }..=row,
+        );
+        self.cursor = Some(next);
+        cx.notify();
+    }
+
+    /// Enter or O: opens the pull request under the cursor in this tab.
+    /// With no cursor the key goes on to whoever handles it next.
+    fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.cursor.clone().filter(|pr| self.listed().contains(pr)) {
+            Some(pr) => navigate(Route::PullRequest(pr), window, cx),
+            None => cx.propagate(),
+        }
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.list.start_refresh();
         self.more = None;
@@ -282,7 +335,11 @@ impl crate::shell::Refreshable for RepoView {
 }
 
 impl Render for RepoView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if crate::shell::page_may_take_focus(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        let focused = self.focus.is_focused(window);
         let body = match &self.list {
             Loadable::Failed(error) => {
                 common::load_error(error, cx.listener(|view, _, _, cx| view.reload(cx)))
@@ -302,13 +359,15 @@ impl Render for RepoView {
                 let loading_more = matches!(self.more, Some(Ok(())));
                 let rows: Vec<&PrSummary> = page.items.iter().collect();
                 let lanes = Lanes::for_rows(&rows, true, AgeFrom::Updated);
+                let cursor = self.cursor.as_ref().filter(|_| focused);
                 ui::list_container()
+                    .id("repo-rows")
+                    .track_scroll(&self.rows)
                     .child(column_header(false, lanes, None, None, cx))
-                    .children(
-                        page.items
-                            .iter()
-                            .map(|summary| pr_row(summary, lanes, false, None, None, None, cx)),
-                    )
+                    .children(page.items.iter().map(|summary| {
+                        let at_cursor = cursor == Some(&summary.pr);
+                        pr_row(summary, lanes, at_cursor, None, None, None, cx)
+                    }))
                     .when(page.next_cursor.is_some(), |column| {
                         column.child(
                             h_flex().py_3().justify_center().child(
@@ -338,7 +397,17 @@ impl Render for RepoView {
             }
         };
         v_flex()
+            .id("repo-page")
+            .role(Role::Group)
+            .aria_label(self.repo.to_string())
             .size_full()
+            .key_context("RepoView")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.move_cursor(false, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
+            )
             .child(self.header(cx))
             .child(repo_tabs(
                 &self.repo,
@@ -555,9 +624,12 @@ impl Render for AddRepository {
 
 #[cfg(test)]
 mod tests {
-    use loupe_github::{RepoRef, RepoSummary};
+    use gpui_kit::{TestAppContext, VisualTestContext};
+    use loupe_github::{Page, RepoRef, RepoSummary};
 
-    use super::{candidates, search_text};
+    use super::{build, candidates, search_text};
+    use crate::github::common::Loadable;
+    use crate::github::pr_row::tests::summary;
 
     fn repo(slug: &str) -> RepoSummary {
         RepoSummary {
@@ -584,5 +656,34 @@ mod tests {
     fn blank_search_is_none() {
         assert_eq!(search_text("  "), None);
         assert_eq!(search_text(" fix "), Some("fix".into()));
+    }
+
+    /// J and K walk the pull requests from the first, stopping at either
+    /// end; no row holds the cursor before a key.
+    #[gpui_kit::test]
+    fn j_and_k_walk_the_pull_requests(cx: &mut TestAppContext) {
+        let repo = RepoRef::new("a", "x");
+        let (mut cx, view) = crate::ui::open_list(cx, move |window, cx| build(repo, window, cx));
+        let cx = &mut cx;
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.list = Loadable::Loaded(Page {
+                items: vec![summary("x", 1, 0), summary("x", 2, 0), summary("x", 3, 0)],
+                total_count: 3,
+                next_cursor: None,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let cursor = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.cursor.as_ref().map(|pr| pr.number))
+        };
+        assert_eq!(cursor(cx), None);
+        cx.simulate_keystrokes("j");
+        assert_eq!(cursor(cx), Some(1), "the first J lands on the first row");
+        cx.simulate_keystrokes("j j j");
+        assert_eq!(cursor(cx), Some(3), "and stops at the last");
+        cx.simulate_keystrokes("k");
+        assert_eq!(cursor(cx), Some(2));
     }
 }
