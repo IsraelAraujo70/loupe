@@ -432,8 +432,12 @@ impl IssueView {
             .child(
                 v_flex()
                     .w_full()
-                    // On the header's own edge, with 760 px of text at most.
+                    // 760 px of text at most, centered in the space the
+                    // Properties panel leaves, so a wide window splits its
+                    // spare width on both sides instead of opening one gap
+                    // before the panel.
                     .max_w(dp(crate::ui::READING_WIDTH + 32.))
+                    .mx_auto()
                     .px(crate::theme::scale::content_inset())
                     .py_5()
                     .gap_5()
@@ -460,6 +464,7 @@ impl IssueView {
                 .flex_none()
                 .w_full()
                 .max_w(dp(crate::ui::READING_WIDTH + 32.))
+                .mx_auto()
                 .px(crate::theme::scale::content_inset())
                 .pt_2()
                 .pb_3()
