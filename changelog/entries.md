@@ -97,3 +97,4 @@
 - Entry 097: a one-line change, so the pull request has more than 250 commits.
 - Entry 098: a one-line change, so the pull request has more than 250 commits.
 - Entry 099: a one-line change, so the pull request has more than 250 commits.
+- Entry 100: a one-line change, so the pull request has more than 250 commits.
