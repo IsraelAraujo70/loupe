@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::user_settings::{ForwardedSettings, UserSettings};
+
 /// Exact set of built-in Claude Code tools permitted during guided review.
 /// Read-only filesystem inspection inside the temporary checkout only.
 pub const READ_ONLY_TOOLS: &str = "Read,Grep,Glob";
@@ -20,7 +22,8 @@ pub const DISALLOWED_TOOLS: &str = "Bash,Edit,Write,MultiEdit,NotebookEdit,WebFe
 /// Tools allowed to appear in Claude Code's `init` event.
 pub const PERMITTED_INIT_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "StructuredOutput"];
 
-/// Model choice for local guided review generation.
+/// Model choice for local guided review generation. Always passed to Claude
+/// Code as `--model`, so the CLI's own default never decides.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuideModel {
@@ -28,22 +31,47 @@ pub enum GuideModel {
     Sonnet,
     Opus,
     Haiku,
+    Fable,
+    /// Any other name, such as a full model id or a name a proxy serves.
     Custom(String),
 }
 
 impl GuideModel {
-    pub const PRESETS: [(&'static str, &'static str); 3] = [
-        ("sonnet", "Claude Sonnet (recommended)"),
-        ("opus", "Claude Opus"),
-        ("haiku", "Claude Haiku (fast)"),
+    /// The aliases Claude Code accepts for its latest models, in menu order.
+    pub const PRESETS: [GuideModel; 4] = [
+        GuideModel::Sonnet,
+        GuideModel::Opus,
+        GuideModel::Haiku,
+        GuideModel::Fable,
     ];
 
+    /// `name` as a model: a preset when it is one's alias, else a custom
+    /// name. `None` when it is blank.
+    pub fn from_name(name: &str) -> Option<GuideModel> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        Some(
+            Self::PRESETS
+                .into_iter()
+                .find(|preset| preset.as_cli_arg() == name)
+                .unwrap_or_else(|| GuideModel::Custom(name.to_owned())),
+        )
+    }
+
+    /// The `--model` value. Never empty: a blank custom name (only possible
+    /// in a hand-edited settings file) falls back to the default model.
     pub fn as_cli_arg(&self) -> &str {
         match self {
             GuideModel::Sonnet => "sonnet",
             GuideModel::Opus => "opus",
             GuideModel::Haiku => "haiku",
-            GuideModel::Custom(name) => name.trim(),
+            GuideModel::Fable => "fable",
+            GuideModel::Custom(name) => match name.trim() {
+                "" => "sonnet",
+                name => name,
+            },
         }
     }
 
@@ -52,7 +80,8 @@ impl GuideModel {
             GuideModel::Sonnet => "Claude Sonnet".into(),
             GuideModel::Opus => "Claude Opus".into(),
             GuideModel::Haiku => "Claude Haiku".into(),
-            GuideModel::Custom(name) => name.clone(),
+            GuideModel::Fable => "Claude Fable".into(),
+            GuideModel::Custom(_) => self.as_cli_arg().to_owned(),
         }
     }
 }
@@ -167,8 +196,9 @@ fn executable_name() -> &'static str {
     }
 }
 
-/// Checks whether Claude Code is installed and authenticated.
-/// Never logs or returns tokens or credentials.
+/// Checks whether Claude Code is installed and authenticated, the same way a
+/// guide run is: with the connection part of the user's Claude Code settings
+/// (`apiKeyHelper`, `env`). Never logs or returns tokens or credentials.
 pub fn check_availability(custom: Option<&Path>) -> ClaudeAvailability {
     let Some(path) = resolve_executable(custom) else {
         let tried = custom
@@ -177,7 +207,7 @@ pub fn check_availability(custom: Option<&Path>) -> ClaudeAvailability {
         return ClaudeAvailability::NotInstalled { tried };
     };
 
-    let version = match run_quick(&path, &["--version"], Duration::from_secs(5)) {
+    let version = match run_quick(&path, &["--version"], None, Duration::from_secs(5)) {
         Ok(out) if out.status_ok => out.stdout.trim().to_owned(),
         _ => {
             return ClaudeAvailability::NotInstalled {
@@ -186,9 +216,12 @@ pub fn check_availability(custom: Option<&Path>) -> ClaudeAvailability {
         }
     };
 
+    let user_settings = ForwardedSettings::load();
+    let forwarded = user_settings.forwarded();
     match run_quick(
         &path,
         &["auth", "status", "--json"],
+        forwarded.map(ForwardedSettings::path),
         Duration::from_secs(10),
     ) {
         Ok(out) => {
@@ -201,7 +234,7 @@ pub fn check_availability(custom: Option<&Path>) -> ClaudeAvailability {
             } else {
                 ClaudeAvailability::NotLoggedIn {
                     path,
-                    detail: "Claude Code is installed, but no active login was detected. Run `claude auth login` in your terminal.".into(),
+                    detail: not_logged_in_detail(&user_settings),
                 }
             }
         }
@@ -212,13 +245,33 @@ pub fn check_availability(custom: Option<&Path>) -> ClaudeAvailability {
     }
 }
 
+fn not_logged_in_detail(user_settings: &UserSettings) -> String {
+    let base = "Claude Code is installed, but it found no way to sign in: no `claude auth login`, \
+                no ANTHROPIC_API_KEY, and no apiKeyHelper or ANTHROPIC_AUTH_TOKEN in its settings. \
+                Run `claude auth login` in your terminal, or set up your proxy in ~/.claude/settings.json.";
+    match user_settings {
+        UserSettings::Unreadable { path, reason } => {
+            format!("{base} Loupe could not use {} ({reason}).", path.display())
+        }
+        UserSettings::None | UserSettings::Forwarded(_) => base.to_owned(),
+    }
+}
+
 struct QuickOutput {
     status_ok: bool,
     stdout: String,
 }
 
-fn run_quick(exe: &Path, args: &[&str], timeout: Duration) -> Result<QuickOutput, String> {
+fn run_quick(
+    exe: &Path,
+    args: &[&str],
+    settings: Option<&Path>,
+    timeout: Duration,
+) -> Result<QuickOutput, String> {
     let mut cmd = Command::new(exe);
+    if let Some(settings) = settings {
+        cmd.arg("--settings").arg(settings);
+    }
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -273,41 +326,61 @@ const SAFE_ENV_ALLOWLIST: &[&str] = &[
     "CLAUDE_CODE_USE_FOUNDRY",
 ];
 
-fn apply_safe_env(cmd: &mut Command) {
-    let preserved: Vec<(&str, OsString)> = SAFE_ENV_ALLOWLIST
+/// The whole environment of a Claude Code subprocess: the allowlisted part
+/// of `parent` (which keeps `HOME` and `CLAUDE_CONFIG_DIR`, so Claude Code
+/// finds the user's login and configuration), then the hardening flags.
+fn child_env(parent: impl Fn(&str) -> Option<OsString>) -> Vec<(&'static str, OsString)> {
+    let mut env: Vec<(&'static str, OsString)> = SAFE_ENV_ALLOWLIST
         .iter()
-        .filter_map(|&key| std::env::var_os(key).map(|val| (key, val)))
+        .filter_map(|&key| parent(key).map(|val| (key, val)))
         .collect();
+    env.extend(
+        [
+            ("CLAUDE_CODE_RESTRICTED", "1"),
+            ("CLAUDE_CODE_SAFE_MODE", "1"),
+            ("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1"),
+            // Defense-in-depth in case a future CLI release invokes git inside the checkout.
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "core.fsmonitor"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+            ("GIT_CONFIG_KEY_1", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_1", "/dev/null"),
+        ]
+        .map(|(key, val)| (key, OsString::from(val))),
+    );
+    env
+}
+
+fn apply_safe_env(cmd: &mut Command) {
+    let env = child_env(|key| std::env::var_os(key));
     cmd.env_clear();
-    for (key, val) in preserved {
-        cmd.env(key, val);
-    }
-    cmd.env("CLAUDE_CODE_RESTRICTED", "1");
-    cmd.env("CLAUDE_CODE_SAFE_MODE", "1");
-    cmd.env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1");
-    // Defense-in-depth in case a future CLI release invokes git inside the checkout.
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
-    cmd.env("GIT_CONFIG_COUNT", "2");
-    cmd.env("GIT_CONFIG_KEY_0", "core.fsmonitor");
-    cmd.env("GIT_CONFIG_VALUE_0", "false");
-    cmd.env("GIT_CONFIG_KEY_1", "core.hooksPath");
-    cmd.env("GIT_CONFIG_VALUE_1", "/dev/null");
+    cmd.envs(env);
 }
 
 /// Builds the hardened headless Claude Code command for a temporary checkout.
 ///
 /// The prompt is fed through `stdin` (never argv) so large PR diffs never hit
 /// OS argument limits and untrusted content never appears in process listings.
+/// `settings` is the file of forwarded user connection settings, if any.
+///
+/// Claude Code starts in `workdir`, an empty private directory, and reaches
+/// the checkout through `--add-dir`: whatever Claude Code or a credential
+/// helper it runs resolves relative to its working directory (an
+/// `apiKeyHelper`, an AWS `credential_process`, a relative certificate path)
+/// never lands in the pull request's files.
 pub fn build_command(
     exe: &Path,
+    workdir: &Path,
     checkout_dir: &Path,
     config: &ClaudeConfig,
+    settings: Option<&Path>,
     schema_json: &str,
     system_prompt: &str,
 ) -> Command {
     let mut cmd = Command::new(exe);
-    cmd.current_dir(checkout_dir)
+    cmd.current_dir(workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -342,7 +415,12 @@ pub fn build_command(
             system_prompt,
             "--json-schema",
             schema_json,
-        ]);
+        ])
+        .arg("--add-dir")
+        .arg(checkout_dir);
+    if let Some(settings) = settings {
+        cmd.arg("--settings").arg(settings);
+    }
     apply_safe_env(&mut cmd);
     cmd
 }
@@ -494,10 +572,128 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
 mod tests {
     use std::path::Path;
 
+    use std::ffi::OsString;
+
     use super::{
         ClaudeConfig, DISALLOWED_TOOLS, GuideEffort, GuideModel, READ_ONLY_TOOLS, StreamEvent,
-        build_command, parse_stream_line, unexpected_init_tools,
+        build_command, child_env, parse_stream_line, unexpected_init_tools,
     };
+
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn command_for(model: GuideModel, settings: Option<&Path>) -> std::process::Command {
+        let config = ClaudeConfig {
+            model,
+            ..ClaudeConfig::default()
+        };
+        build_command(
+            Path::new("/usr/bin/claude"),
+            Path::new("/tmp/workdir"),
+            Path::new("/tmp/checkout"),
+            &config,
+            settings,
+            "{}",
+            "system",
+        )
+    }
+
+    /// The single `--model` value of `cmd`.
+    fn model_arg(cmd: &std::process::Command) -> String {
+        let args = args_of(cmd);
+        let flags: Vec<usize> = (0..args.len())
+            .filter(|&ix| args[ix] == "--model")
+            .collect();
+        assert_eq!(flags.len(), 1, "exactly one --model in {args:?}");
+        args[flags[0] + 1].clone()
+    }
+
+    #[test]
+    fn the_command_always_passes_the_model_from_settings() {
+        for (model, expected) in [
+            (GuideModel::Sonnet, "sonnet"),
+            (GuideModel::Opus, "opus"),
+            (GuideModel::Haiku, "haiku"),
+            (GuideModel::Fable, "fable"),
+            (GuideModel::Custom(" proxy-large ".into()), "proxy-large"),
+            // Only a hand-edited settings file can hold a blank name; the CLI
+            // default must still never decide.
+            (GuideModel::Custom("  ".into()), "sonnet"),
+        ] {
+            assert_eq!(
+                model_arg(&command_for(model.clone(), None)),
+                expected,
+                "{model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_model_name_becomes_a_preset_or_a_custom_name() {
+        assert_eq!(GuideModel::from_name(" opus "), Some(GuideModel::Opus));
+        assert_eq!(
+            GuideModel::from_name("claude-sonnet-5-5"),
+            Some(GuideModel::Custom("claude-sonnet-5-5".into()))
+        );
+        assert_eq!(GuideModel::from_name("   "), None);
+    }
+
+    #[test]
+    fn the_child_reads_the_user_configuration_and_never_gets_github_or_linear_tokens() {
+        let parent = |key: &str| -> Option<OsString> {
+            let value = match key {
+                "PATH" => "/usr/bin",
+                "HOME" => "/home/me",
+                "CLAUDE_CONFIG_DIR" => "/home/me/.config/claude",
+                "GITHUB_TOKEN" => "ghp_parent",
+                "GH_TOKEN" => "gho_parent",
+                "LINEAR_API_KEY" => "lin_api_parent",
+                "LOUPE_DATA_DIR" => "/tmp/loupe",
+                _ => return None,
+            };
+            Some(value.into())
+        };
+        let env = child_env(parent);
+        let get = |key: &str| {
+            env.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(get("HOME").as_deref(), Some("/home/me"));
+        assert_eq!(
+            get("CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/home/me/.config/claude")
+        );
+        for secret in [
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "LINEAR_API_KEY",
+            "LOUPE_DATA_DIR",
+        ] {
+            assert_eq!(get(secret), None, "{secret} must not reach Claude Code");
+        }
+        assert_eq!(get("CLAUDE_CODE_RESTRICTED").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn forwarded_user_settings_are_passed_as_a_settings_file() {
+        let args = args_of(&command_for(
+            GuideModel::Sonnet,
+            Some(Path::new("/tmp/loupe-claude-settings-1/settings.json")),
+        ));
+        let at = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings");
+        assert_eq!(args[at + 1], "/tmp/loupe-claude-settings-1/settings.json");
+        assert!(args.contains(&"--restricted".to_owned()));
+        assert!(
+            !args_of(&command_for(GuideModel::Sonnet, None)).contains(&"--settings".to_owned())
+        );
+    }
 
     #[test]
     fn build_command_enforces_read_only_sandbox_and_scrubs_secrets() {
@@ -508,8 +704,10 @@ mod tests {
         };
         let cmd = build_command(
             Path::new("/usr/bin/claude"),
+            Path::new("/tmp/workdir"),
             Path::new("/tmp/checkout"),
             &config,
+            None,
             r#"{"type":"object"}"#,
             "system",
         );
@@ -526,7 +724,14 @@ mod tests {
         assert!(args.contains(&"--disable-slash-commands".to_owned()));
         assert!(args.contains(&"--no-session-persistence".to_owned()));
         assert!(args.contains(&"--no-chrome".to_owned()));
-        assert!(!args.contains(&"--add-dir".to_owned()));
+        // The checkout is the only directory added; Claude Code itself starts
+        // in the private working directory.
+        assert_eq!(
+            args.iter().filter(|a| *a == "--add-dir").count(),
+            1,
+            "exactly one --add-dir"
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp/workdir")));
         assert!(!args.contains(&"--dangerously-skip-permissions".to_owned()));
         assert!(!args.contains(&"bypassPermissions".to_owned()));
 
@@ -543,6 +748,7 @@ mod tests {
         assert_eq!(arg_value("--permission-prompts"), Some("none"));
         assert_eq!(arg_value("--output-format"), Some("stream-json"));
         assert_eq!(arg_value("--model"), Some("sonnet"));
+        assert_eq!(arg_value("--add-dir"), Some("/tmp/checkout"));
         assert_eq!(arg_value("--effort"), Some("medium"));
 
         // Verify no write, network, or shell tool is in `--tools`.
@@ -657,7 +863,9 @@ mod tests {
         let mut cmd = build_command(
             &stub,
             &std::env::temp_dir(),
+            &std::env::temp_dir(),
             &ClaudeConfig::default(),
+            None,
             r#"{"type":"object"}"#,
             "system",
         );
