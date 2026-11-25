@@ -79,3 +79,4 @@
 - Entry 079: a one-line change, so the pull request has more than 250 commits.
 - Entry 080: a one-line change, so the pull request has more than 250 commits.
 - Entry 081: a one-line change, so the pull request has more than 250 commits.
+- Entry 082: a one-line change, so the pull request has more than 250 commits.
