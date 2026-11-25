@@ -701,7 +701,7 @@ mod tests {
             "structured_output": { "headline": "Stack headline", "why": "Stack why." },
         });
         let stub = record.with_extension("sh");
-        crate::test_support::write_executable(
+        loupe_test_support::write_executable(
             &stub,
             &format!(
                 "#!/bin/sh\n{{ echo '=====RUN'; cat; }} >> '{record}'\necho '{{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-stub\",\"tools\":[\"Read\"]}}'\ncase \"$*\" in\n  *'\"steps\"'*) echo '{chapter}' ;;\n  *) echo '{overview}' ;;\nesac\n",

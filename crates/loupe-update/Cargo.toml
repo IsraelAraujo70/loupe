@@ -8,3 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+loupe-test-support.workspace = true

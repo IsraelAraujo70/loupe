@@ -10,6 +10,7 @@ Loupe is a native macOS client for reviewing GitHub pull requests next to the Li
 | `loupe-guide` | Guided PR review schema, validation, safe local Claude Code runner | no |
 | `loupe-linear` | Linear GraphQL client and domain types | no |
 | `loupe-t3` | T3 Code server client | no |
+| `loupe-test-support` | Test-only helpers shared by the crates' tests (dev-dependency, never shipped) | no |
 | `loupe-app` | The GPUI app (binary `loupe`) | yes |
 
 The API crates are blocking (`ureq`) and pure: they parse wire JSON into domain types at the boundary and never expose wire types. The app runs every call on a background thread with `services::background` and awaits it from `cx.spawn`.

@@ -8,8 +8,6 @@ pub mod prompt;
 pub mod runner;
 pub mod schema;
 pub mod stack;
-#[cfg(all(test, unix))]
-mod test_support;
 pub mod user_settings;
 
 pub use checkout::{CheckoutError, TempCheckout, snapshot_tree};

@@ -320,7 +320,7 @@ mod tests {
         std::fs::create_dir_all(&trusted).unwrap();
         let marker = root.join("pwned");
         let evil = checkout.join("key.sh");
-        crate::test_support::write_executable(
+        loupe_test_support::write_executable(
             &evil,
             &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
         );

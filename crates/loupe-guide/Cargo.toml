@@ -10,3 +10,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 whatlang = "0.18"
+
+[dev-dependencies]
+loupe-test-support.workspace = true

@@ -299,9 +299,9 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod install_tests {
     use super::{confirm_start, rolled_back};
+    use loupe_test_support::write_executable;
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         process::{Child, Command},
         time::{Duration, Instant},
@@ -339,11 +339,8 @@ mod install_tests {
                     marker.display()
                 )
             };
-            fs::write(&target, format!("#!/bin/sh\n{}\n", mark(OLD))).unwrap();
-            fs::write(&source, format!("#!/bin/sh\n{}\n", new_body(&mark("new")))).unwrap();
-            for path in [&source, &target] {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            write_executable(&target, &format!("#!/bin/sh\n{}\n", mark(OLD)));
+            write_executable(&source, &format!("#!/bin/sh\n{}\n", new_body(&mark("new"))));
             fs::create_dir_all(notice.parent().unwrap()).unwrap();
             fs::write(&notice, "v0.0.1\n").unwrap();
             let script = stage.join("install.sh");

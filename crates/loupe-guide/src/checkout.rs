@@ -623,7 +623,7 @@ mod tests {
         let hooks_dir = dest.join(".git/hooks");
         fs::create_dir_all(&hooks_dir).unwrap();
         let hook_path = hooks_dir.join("post-checkout");
-        crate::test_support::write_executable(
+        loupe_test_support::write_executable(
             &hook_path,
             &format!("#!/bin/sh\ntouch {}\n", hook_marker.display()),
         );
