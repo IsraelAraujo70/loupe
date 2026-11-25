@@ -10,8 +10,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use loupe_github::queue::SizeClass;
 use loupe_github::reviews::{self, Sort, SortDir, SortKey};
-use loupe_github::{ChecksState, PrRef, PrSummary, ReviewDecision};
+use loupe_github::{ChecksState, PrRef, PrState, PrSummary, ReviewDecision, ReviewStanding};
 
 use super::live::Change;
 use super::widgets;
@@ -168,7 +169,7 @@ pub fn column_header(
                     .w(dp(REPO_LANE)),
             )
         })
-        .child(heading(SortKey::Changes, "Changes", CHANGES_LANE, false))
+        .child(heading(SortKey::Changes, "Size", CHANGES_LANE, false))
         .when(lanes.comments, |row| {
             row.child(heading(SortKey::Comments, "Comments", COMMENTS_LANE, false))
         })
@@ -328,6 +329,133 @@ fn review_chip(decision: ReviewDecision) -> Tag {
     }
 }
 
+/// What an open pull request asks of the viewer, as a label and its icon:
+/// a draft, a review asked of them, commits since their review, or their
+/// review on the head. Their own pull requests, those they have no part
+/// in, and closed ones have none.
+pub fn viewer_state(summary: &PrSummary) -> Option<(&'static str, IconName)> {
+    if summary.state != PrState::Open {
+        return None;
+    }
+    if summary.is_draft {
+        return Some(("Draft", IconName::GitPullRequestDraft));
+    }
+    match summary.viewer_review? {
+        ReviewStanding::Requested => Some(("Review requested", IconName::Eye)),
+        ReviewStanding::ChangesSinceReview => {
+            Some(("Changes since your review", IconName::GitCommitHorizontal))
+        }
+        ReviewStanding::Reviewed => Some(("Reviewed", IconName::Check)),
+        ReviewStanding::Authored => None,
+    }
+}
+
+/// [`viewer_state`] as a chip with its icon, in the color of what it asks:
+/// pending for a review asked, the accent for commits not seen yet (as the
+/// unread dot), the draft color for a draft, and neutral once reviewed.
+fn viewer_chip(summary: &PrSummary) -> Option<Tag> {
+    let (label, icon) = viewer_state(summary)?;
+    let chip = match summary.viewer_review {
+        _ if summary.is_draft => ui::tinted_chip(tokens::draft()),
+        Some(ReviewStanding::Requested) => ui::tinted_chip(tokens::pending()),
+        Some(ReviewStanding::ChangesSinceReview) => ui::tinted_chip(tokens::accent()),
+        _ => ui::chip(),
+    };
+    Some(
+        chip.gap_1()
+            .child(Icon::new(icon).with_size(scale::icon_xs()))
+            .child(label),
+    )
+}
+
+/// `n` with a comma between thousands, as the tooltips write counts.
+fn grouped(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (at, digit) in digits.chars().enumerate() {
+        if at > 0 && (digits.len() - at).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// What the size lane says to a tooltip and a screen reader: the class, the
+/// lines it covers, and the lines added and removed.
+pub fn size_description(additions: u32, deletions: u32) -> String {
+    let class = SizeClass::of(additions, deletions);
+    format!(
+        "Size {}, {} · +{} −{}",
+        class.label(),
+        class.range(),
+        grouped(additions),
+        grouped(deletions)
+    )
+}
+
+/// The size class of a stack's rows added up, as its row's name says it.
+fn size_description_short(rows: &[&PrSummary]) -> String {
+    let (additions, deletions) = rows.iter().fold((0u32, 0u32), |sum, row| {
+        (
+            sum.0.saturating_add(row.additions),
+            sum.1.saturating_add(row.deletions),
+        )
+    });
+    format!("size {}", SizeClass::of(additions, deletions).label())
+}
+
+/// The size lane: a meter of four bars, one per class, filled up to the
+/// pull request's, then the class. The lines added and removed are in its
+/// tooltip.
+fn size_lane(id: SharedString, additions: u32, deletions: u32, cx: &App) -> Div {
+    let theme = cx.theme();
+    let class = SizeClass::of(additions, deletions);
+    let tip = size_description(additions, deletions);
+    let selector = id.clone();
+    lane(CHANGES_LANE).child(
+        h_flex()
+            .id(id)
+            .debug_selector(move || selector.to_string())
+            .gap_1p5()
+            .items_center()
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .child(
+                h_flex()
+                    .h_2p5()
+                    .gap_0p5()
+                    .items_end()
+                    .children(SizeClass::ALL.iter().map(|step| {
+                        div()
+                            .w(px(2.))
+                            .rounded_t(px(1.))
+                            .map(|bar| match step {
+                                SizeClass::S => bar.h_1(),
+                                SizeClass::M => bar.h_1p5(),
+                                SizeClass::L => bar.h_2(),
+                                SizeClass::Xl => bar.h_2p5(),
+                            })
+                            .bg(if *step <= class {
+                                theme.muted_foreground
+                            } else {
+                                theme.border
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .w_5()
+                    .text_size(scale::meta())
+                    .text_color(if class == SizeClass::Xl {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .child(class.label()),
+            ),
+    )
+}
+
 /// One 32 px row: state icon, `#number`, the title with its review decision
 /// right after it, then fixed lanes on the right for the author and the
 /// repository (as `lanes` asks), diff size, comments, checks, and age.
@@ -376,11 +504,25 @@ pub fn pr_row(
     } else {
         String::new()
     };
+    let state = viewer_state(summary)
+        .map(|(label, _)| format!(", {}", label.to_lowercase()))
+        .unwrap_or_default();
+    let size = format!(
+        ", size {}",
+        SizeClass::of(summary.additions, summary.deletions).label()
+    );
     let name = match marked {
-        Some(Change::Entered) => format!("{reference} {}{by}, new", summary.title),
-        Some(Change::Updated) => format!("{reference} {}{by}, updated", summary.title),
-        None => format!("{reference} {}{by}", summary.title),
+        Some(Change::Entered) => format!("{reference} {}{by}{state}{size}, new", summary.title),
+        Some(Change::Updated) => {
+            format!("{reference} {}{by}{state}{size}, updated", summary.title)
+        }
+        None => format!("{reference} {}{by}{state}{size}", summary.title),
     };
+    let viewer_chip = viewer_chip(summary);
+    // With a state chip in front, "Review required" says nothing more.
+    let decision = summary
+        .review_decision
+        .filter(|decision| viewer_chip.is_none() || *decision != ReviewDecision::ReviewRequired);
     let item = Item::pull_request(summary);
     let pr = summary.pr.clone();
     let row = ui::list_row(SharedString::from(format!("pr-row-{id}")), cx)
@@ -496,7 +638,8 @@ pub fn pr_row(
                         .text_color(muted)
                         .child(format!("{}/{}", place.position, place.total))
                 }))
-                .children(summary.review_decision.map(review_chip)),
+                .children(viewer_chip)
+                .children(decision.map(review_chip)),
         )
         // The author, before the columns every section shares, and only
         // where authors differ: on the viewer's own pull requests its width
@@ -519,7 +662,12 @@ pub fn pr_row(
                     .child(repo),
             )
         })
-        .child(lane(CHANGES_LANE).child(widgets::diff_stat(summary.additions, summary.deletions)))
+        .child(size_lane(
+            SharedString::from(format!("pr-size-{id}")),
+            summary.additions,
+            summary.deletions,
+            cx,
+        ))
         .when(show_comments, |row| {
             row.child(
                 lane(COMMENTS_LANE)
@@ -600,24 +748,29 @@ pub fn stack_summary(rows: &[&PrSummary], total: usize) -> String {
     } else {
         format!("{shown} PRs")
     };
+    if let Some(checks) = stack_checks(rows) {
+        text.push_str(" · ");
+        text.push_str(&checks);
+    }
+    text
+}
+
+/// How many of a stack's rows fail their checks, or if none does, how many
+/// still run them.
+fn stack_checks(rows: &[&PrSummary]) -> Option<String> {
     let count = |state: ChecksState| {
         rows.iter()
             .filter(|summary| summary.checks == Some(state))
             .count()
     };
     let (failing, running) = (count(ChecksState::Failing), count(ChecksState::Pending));
-    let checks = match (failing, running) {
+    match (failing, running) {
         (0, 0) => None,
         (0, 1) => Some("1 check running".to_owned()),
         (0, running) => Some(format!("{running} checks running")),
         (1, _) => Some("1 check failing".to_owned()),
         (failing, _) => Some(format!("{failing} checks failing")),
-    };
-    if let Some(checks) = checks {
-        text.push_str(" · ");
-        text.push_str(&checks);
     }
-    text
 }
 
 /// The worst of the rows' checks: failing over running over passing.
@@ -650,7 +803,18 @@ pub fn stack_row(
     let muted = theme.muted_foreground;
     let rows = stack.rows;
     let summary = stack_summary(rows, stack.total);
-    let name = format!("Stack {}, {summary}", stack.name);
+    let name = format!(
+        "Stack {}, {summary}, {}",
+        stack.name,
+        size_description_short(rows)
+    );
+    // The chip names the line as a stack and how many it holds, in merge
+    // order under it; the name keeps the base's title.
+    let count = if rows.len() < stack.total {
+        format!("Stack · {} of {}", rows.len(), stack.total)
+    } else {
+        format!("Stack · {}", stack.total)
+    };
     let (additions, deletions, comments) = rows.iter().fold((0, 0, 0), |sum, row| {
         (
             sum.0 + row.additions,
@@ -716,6 +880,7 @@ pub fn stack_row(
                 .min_w_0()
                 .gap_2()
                 .items_center()
+                .child(ui::chip().child(count))
                 .child(
                     div()
                         .min_w_0()
@@ -723,13 +888,13 @@ pub fn stack_row(
                         .text_size(scale::body())
                         .child(stack.name.to_owned()),
                 )
-                .child(
+                .children(stack_checks(rows).map(|checks| {
                     div()
                         .flex_none()
                         .text_size(scale::meta())
                         .text_color(muted)
-                        .child(summary),
-                ),
+                        .child(checks)
+                })),
         )
         .when(lanes.author, |row| {
             row.child(match author {
@@ -748,7 +913,12 @@ pub fn stack_row(
                     .children(repo.map(|repo| repo.name)),
             )
         })
-        .child(lane(CHANGES_LANE).child(widgets::diff_stat(additions, deletions)))
+        .child(size_lane(
+            SharedString::from(format!("{}-size", stack.id)),
+            additions,
+            deletions,
+            cx,
+        ))
         .when(lanes.comments, |row| {
             row.child(
                 lane(COMMENTS_LANE)
@@ -824,6 +994,7 @@ pub(super) mod tests {
             mergeable: loupe_github::Mergeable::Unknown,
             review_requests: Vec::new(),
             reviewed_by: Vec::new(),
+            viewer_review: None,
         }
     }
 
@@ -888,6 +1059,7 @@ pub(super) mod tests {
                 mergeable: loupe_github::Mergeable::Unknown,
                 review_requests: Vec::new(),
                 reviewed_by: Vec::new(),
+                viewer_review: None,
             };
             let picks = self.picks.clone();
             let parent_clicks = self.parent_clicks.clone();

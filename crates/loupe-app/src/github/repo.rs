@@ -2,6 +2,8 @@
 //! repository; and the header and tabs (Pull requests · Actions) every page
 //! of a repository shares.
 
+use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
@@ -12,10 +14,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use loupe_github::queue::{self, QueueGroup};
 use loupe_github::{Page, PrListFilter, PrRef, PrSummary, RepoRef, RepoSummary};
 
 use super::common::{self, LoadError, Loadable};
-use super::pr_row::{AgeFrom, Lanes, column_header, pr_row};
+use super::pr_row::{AgeFrom, Lanes, StackPlace, StackRow, column_header, pr_row, stack_row};
 use crate::route::Route;
 use crate::shell::Refreshable as _;
 use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
@@ -45,6 +48,119 @@ fn filter_icon(filter: PrListFilter) -> IconName {
 fn search_text(raw: &str) -> Option<String> {
     let text = raw.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// A place the keyboard cursor rests on: a pull request's row, or a stack's
+/// row by the pull request at its base.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Spot {
+    Pr(PrRef),
+    Stack(PrRef),
+}
+
+/// One line of the list: a pull request, or a stack of them base first, as
+/// indices into the loaded page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Line {
+    Pr(usize),
+    Stack(Vec<usize>),
+}
+
+/// The lines under one heading. A list that does not group, or whose rows
+/// all fall in one group, has one section without a heading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Section {
+    group: Option<QueueGroup>,
+    lines: Vec<Line>,
+}
+
+impl Section {
+    fn count(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|line| match line {
+                Line::Pr(_) => 1,
+                Line::Stack(members) => members.len(),
+            })
+            .sum()
+    }
+}
+
+/// The open pull requests as a review queue: grouped by what they ask of
+/// the viewer, in QueueGroup's order, each group in GitHub's order (latest
+/// update first). A stack is one line in the group of its most urgent pull
+/// request, where its first one comes. Closed, merged, and all pull
+/// requests keep GitHub's order, ungrouped and unstacked.
+fn sections(items: &[PrSummary], filter: PrListFilter) -> Vec<Section> {
+    if filter != PrListFilter::Open {
+        return vec![Section {
+            group: None,
+            lines: (0..items.len()).map(Line::Pr).collect(),
+        }];
+    }
+    let refs: Vec<&PrSummary> = items.iter().collect();
+    let stacks = queue::stacks(&refs);
+    let in_stack: HashMap<usize, usize> = stacks
+        .iter()
+        .enumerate()
+        .flat_map(|(at, members)| members.iter().map(move |&member| (member, at)))
+        .collect();
+    let mut lines: Vec<(QueueGroup, Line)> = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        let Some(&stack) = in_stack.get(&at) else {
+            lines.push((QueueGroup::of(item), Line::Pr(at)));
+            continue;
+        };
+        let members = &stacks[stack];
+        if members.iter().min() != Some(&at) {
+            continue;
+        }
+        let group = members
+            .iter()
+            .map(|&member| QueueGroup::of(&items[member]))
+            .min()
+            .unwrap_or(QueueGroup::NotReviewed);
+        lines.push((group, Line::Stack(members.clone())));
+    }
+    lines.sort_by_key(|(group, _)| *group);
+    let mut out: Vec<Section> = Vec::new();
+    for (group, line) in lines {
+        match out.last_mut() {
+            Some(section) if section.group == Some(group) => section.lines.push(line),
+            _ => out.push(Section {
+                group: Some(group),
+                lines: vec![line],
+            }),
+        }
+    }
+    if let [only] = out.as_mut_slice() {
+        only.group = None;
+    }
+    out
+}
+
+/// A group's 32 px heading on the rows' grid: a chevron over the state
+/// icons that says whether it is folded, its name over the numbers, then
+/// its count. A click folds or unfolds it.
+fn group_heading(group: QueueGroup, folded: bool, count: usize, cx: &App) -> Stateful<Div> {
+    let label = group.label();
+    let id = format!("repo-group-{}", label.to_lowercase().replace(' ', "-"));
+    ui::list_row(SharedString::from(id.clone()), cx)
+        .debug_selector(move || id.clone())
+        .role(Role::Button)
+        .aria_label(format!("{label}, {count}"))
+        .aria_expanded(!folded)
+        .child(
+            Icon::new(if folded {
+                IconName::ChevronRight
+            } else {
+                IconName::ChevronDown
+            })
+            .with_size(scale::icon_md())
+            .text_color(cx.theme().muted_foreground),
+        )
+        .child(ui::group_title(label))
+        .child(ui::count_badge(count, cx))
 }
 
 /// The pages of a repository, as the tabs under its header.
@@ -110,8 +226,12 @@ pub struct RepoView {
     /// request), to scroll the keyboard cursor's row into view.
     rows: ScrollHandle,
     focus: FocusHandle,
-    /// The pull request under the keyboard cursor (J and K, or the arrows).
-    cursor: Option<PrRef>,
+    /// The row under the keyboard cursor (J and K, or the arrows).
+    cursor: Option<Spot>,
+    /// Stacks shown open, by the pull request at their base.
+    expanded: HashSet<PrRef>,
+    /// Groups folded to their heading.
+    folded: HashSet<QueueGroup>,
     _load: Option<Task<()>>,
     _more: Option<Task<()>>,
     _debounce: Option<Task<()>>,
@@ -140,6 +260,8 @@ fn build(repo: RepoRef, window: &mut Window, cx: &mut App) -> Entity<RepoView> {
             rows: ScrollHandle::new(),
             focus: crate::shell::page_focus(cx),
             cursor: None,
+            expanded: HashSet::new(),
+            folded: HashSet::new(),
             _load: None,
             _more: None,
             _debounce: None,
@@ -151,44 +273,127 @@ fn build(repo: RepoRef, window: &mut Window, cx: &mut App) -> Entity<RepoView> {
 }
 
 impl RepoView {
-    /// The pull requests on screen, top to bottom.
-    fn listed(&self) -> Vec<PrRef> {
-        self.list
-            .value()
-            .map(|page| {
-                page.items
-                    .iter()
-                    .map(|summary| summary.pr.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// The rows the cursor can rest on, top to bottom, each with the
+    /// children of the list to scroll into view for it: its own, from the
+    /// column heading for the first and from its group's heading for the
+    /// first of a group. Rows of a folded group or stack are not on screen.
+    fn spots(&self) -> Vec<(Spot, RangeInclusive<usize>)> {
+        let Some(page) = self.list.value() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(Spot, RangeInclusive<usize>)> = Vec::new();
+        let mut child = 1;
+        for section in sections(&page.items, self.filter) {
+            let mut top = if out.is_empty() { 0 } else { child };
+            if let Some(group) = section.group {
+                child += 1;
+                if self.folded.contains(&group) {
+                    continue;
+                }
+            }
+            for line in section.lines {
+                let (stack, members) = match line {
+                    Line::Pr(at) => (None, vec![at]),
+                    Line::Stack(members) => {
+                        let base = page.items[members[0]].pr.clone();
+                        let open = self.expanded.contains(&base);
+                        (Some(base), if open { members } else { Vec::new() })
+                    }
+                };
+                if let Some(base) = stack {
+                    out.push((Spot::Stack(base), top.min(child)..=child));
+                    top = child;
+                    child += 1;
+                }
+                for member in members {
+                    out.push((
+                        Spot::Pr(page.items[member].pr.clone()),
+                        top.min(child)..=child,
+                    ));
+                    top = child;
+                    child += 1;
+                }
+            }
+        }
+        out
     }
 
     /// Moves the keyboard cursor one row and scrolls it into view, with the
-    /// column heading when it is the first row.
+    /// heading over it when it is the first row of the list or its group.
     fn move_cursor(&mut self, down: bool, cx: &mut Context<Self>) {
-        let listed = self.listed();
+        let spots = self.spots();
+        let listed: Vec<Spot> = spots.iter().map(|(spot, _)| spot.clone()).collect();
         let Some(next) = ui::step_cursor(&listed, self.cursor.as_ref(), down) else {
             return;
         };
-        let at = listed.iter().position(|pr| *pr == next).unwrap_or(0);
-        let row = at + 1;
-        ui::scroll_to_rows(
-            &self.scroll,
-            &self.rows,
-            if at == 0 { 0 } else { row }..=row,
-        );
+        if let Some((_, children)) = spots.into_iter().find(|(spot, _)| *spot == next) {
+            ui::scroll_to_rows(&self.scroll, &self.rows, children);
+        }
         self.cursor = Some(next);
         cx.notify();
     }
 
-    /// Enter or O: opens the pull request under the cursor in this tab.
-    /// With no cursor the key goes on to whoever handles it next.
+    /// Enter or O: opens the pull request under the cursor in this tab, or
+    /// opens or folds the stack under it. With no cursor the key goes on to
+    /// whoever handles it next.
     fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.cursor.clone().filter(|pr| self.listed().contains(pr)) {
-            Some(pr) => navigate(Route::PullRequest(pr), window, cx),
+        let on_screen = self
+            .cursor
+            .clone()
+            .filter(|cursor| self.spots().iter().any(|(spot, _)| spot == cursor));
+        match on_screen {
+            Some(Spot::Pr(pr)) => navigate(Route::PullRequest(pr), window, cx),
+            Some(Spot::Stack(base)) => self.toggle_stack(&base, cx),
             None => cx.propagate(),
         }
+    }
+
+    fn toggle_stack(&mut self, base: &PrRef, cx: &mut Context<Self>) {
+        if !self.expanded.remove(base) {
+            self.expanded.insert(base.clone());
+        }
+        cx.notify();
+    }
+
+    fn toggle_group(&mut self, group: QueueGroup, cx: &mut Context<Self>) {
+        if !self.folded.remove(&group) {
+            self.folded.insert(group);
+        }
+        cx.notify();
+    }
+
+    /// The base of the stack whose rows hold pr.
+    fn stack_of(&self, pr: &PrRef) -> Option<PrRef> {
+        let page = self.list.value()?;
+        sections(&page.items, self.filter)
+            .into_iter()
+            .flat_map(|section| section.lines)
+            .find_map(|line| match line {
+                Line::Stack(members)
+                    if members.iter().any(|&member| page.items[member].pr == *pr) =>
+                {
+                    Some(page.items[members[0]].pr.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// Right opens the folded stack under the cursor; Left folds the open
+    /// one under it, or the one whose row it is on, and puts the cursor on
+    /// the stack. Whether the key did anything.
+    fn arrow(&mut self, open: bool, cx: &mut Context<Self>) -> bool {
+        let base = match (self.cursor.clone(), open) {
+            (Some(Spot::Stack(base)), true) if !self.expanded.contains(&base) => base,
+            (Some(Spot::Stack(base)), false) if self.expanded.contains(&base) => base,
+            (Some(Spot::Pr(pr)), false) => match self.stack_of(&pr) {
+                Some(base) if self.expanded.contains(&base) => base,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        self.cursor = Some(Spot::Stack(base.clone()));
+        self.toggle_stack(&base, cx);
+        true
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -359,15 +564,82 @@ impl Render for RepoView {
                 let loading_more = matches!(self.more, Some(Ok(())));
                 let rows: Vec<&PrSummary> = page.items.iter().collect();
                 let lanes = Lanes::for_rows(&rows, true, AgeFrom::Updated);
-                let cursor = self.cursor.as_ref().filter(|_| focused);
+                let cursor = self.cursor.clone().filter(|_| focused);
+                let mut children: Vec<AnyElement> =
+                    vec![column_header(false, lanes, None, None, cx).into_any_element()];
+                for section in sections(&page.items, self.filter) {
+                    if let Some(group) = section.group {
+                        let folded = self.folded.contains(&group);
+                        children.push(
+                            group_heading(group, folded, section.count(), cx)
+                                .on_click(
+                                    cx.listener(move |view, _, _, cx| view.toggle_group(group, cx)),
+                                )
+                                .into_any_element(),
+                        );
+                        if folded {
+                            continue;
+                        }
+                    }
+                    for line in section.lines {
+                        let members = match line {
+                            Line::Pr(at) => {
+                                let summary = &page.items[at];
+                                let at_cursor = cursor == Some(Spot::Pr(summary.pr.clone()));
+                                children.push(
+                                    pr_row(summary, lanes, at_cursor, None, None, None, cx)
+                                        .into_any_element(),
+                                );
+                                continue;
+                            }
+                            Line::Stack(members) => members,
+                        };
+                        let stacked: Vec<&PrSummary> =
+                            members.iter().map(|&member| &page.items[member]).collect();
+                        let base = stacked[0].pr.clone();
+                        let expanded = self.expanded.contains(&base);
+                        let toggle = base.clone();
+                        children.push(
+                            stack_row(
+                                StackRow {
+                                    id: SharedString::from(format!("repo-stack-{}", base.number)),
+                                    name: &stacked[0].title,
+                                    rows: &stacked,
+                                    total: stacked.len(),
+                                    expanded,
+                                },
+                                lanes,
+                                cursor == Some(Spot::Stack(base)),
+                                None,
+                                cx,
+                            )
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.toggle_stack(&toggle, cx)),
+                            )
+                            .into_any_element(),
+                        );
+                        if !expanded {
+                            continue;
+                        }
+                        let total = stacked.len();
+                        for (at, summary) in stacked.iter().enumerate() {
+                            let place = StackPlace {
+                                position: at + 1,
+                                total,
+                                last: at + 1 == total,
+                            };
+                            let at_cursor = cursor == Some(Spot::Pr(summary.pr.clone()));
+                            children.push(
+                                pr_row(summary, lanes, at_cursor, None, Some(place), None, cx)
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
                 ui::list_container()
                     .id("repo-rows")
                     .track_scroll(&self.rows)
-                    .child(column_header(false, lanes, None, None, cx))
-                    .children(page.items.iter().map(|summary| {
-                        let at_cursor = cursor == Some(&summary.pr);
-                        pr_row(summary, lanes, at_cursor, None, None, None, cx)
-                    }))
+                    .children(children)
                     .when(page.next_cursor.is_some(), |column| {
                         column.child(
                             h_flex().py_3().justify_center().child(
@@ -408,6 +680,20 @@ impl Render for RepoView {
             .on_action(
                 cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
             )
+            // Right and Left open and fold the stack under the cursor, as
+            // on Reviews, while the list itself has the focus.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let keystroke = &event.keystroke;
+                if !this.focus.is_focused(window)
+                    || keystroke.modifiers.modified()
+                    || !matches!(keystroke.key.as_str(), "right" | "left")
+                {
+                    return;
+                }
+                if this.arrow(keystroke.key == "right", cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(self.header(cx))
             .child(repo_tabs(
                 &self.repo,
@@ -625,9 +911,10 @@ impl Render for AddRepository {
 #[cfg(test)]
 mod tests {
     use gpui_kit::{TestAppContext, VisualTestContext};
-    use loupe_github::{Page, RepoRef, RepoSummary};
+    use loupe_github::queue::QueueGroup;
+    use loupe_github::{Page, PrListFilter, PrSummary, RepoRef, RepoSummary, ReviewStanding};
 
-    use super::{build, candidates, search_text};
+    use super::{Line, Spot, build, candidates, search_text, sections};
     use crate::github::common::Loadable;
     use crate::github::pr_row::tests::summary;
 
@@ -676,7 +963,10 @@ mod tests {
         });
         cx.run_until_parked();
         let cursor = |cx: &mut VisualTestContext| {
-            view.read_with(cx, |view, _| view.cursor.as_ref().map(|pr| pr.number))
+            view.read_with(cx, |view, _| match &view.cursor {
+                Some(Spot::Pr(pr)) => Some(pr.number),
+                _ => None,
+            })
         };
         assert_eq!(cursor(cx), None);
         cx.simulate_keystrokes("j");
@@ -685,5 +975,155 @@ mod tests {
         assert_eq!(cursor(cx), Some(3), "and stops at the last");
         cx.simulate_keystrokes("k");
         assert_eq!(cursor(cx), Some(2));
+    }
+
+    fn on(number: u64, base: &str, head: &str) -> PrSummary {
+        PrSummary {
+            base_ref: base.into(),
+            head_ref: head.into(),
+            ..summary("x", number, 0)
+        }
+    }
+
+    fn with(review: Option<ReviewStanding>, draft: bool, pr: PrSummary) -> PrSummary {
+        PrSummary {
+            viewer_review: review,
+            is_draft: draft,
+            ..pr
+        }
+    }
+
+    /// The loupe fixture as GitHub lists it (newest first): what asks for
+    /// the viewer comes first, the draft stack is one line in merge order,
+    /// and the drafts close the list.
+    fn queue() -> Vec<PrSummary> {
+        vec![
+            with(
+                Some(ReviewStanding::Authored),
+                false,
+                on(196, "main", "refactor"),
+            ),
+            with(
+                Some(ReviewStanding::Authored),
+                true,
+                on(186, "base", "stack-1"),
+            ),
+            with(
+                Some(ReviewStanding::Authored),
+                true,
+                on(188, "stack-2", "stack-3"),
+            ),
+            with(
+                Some(ReviewStanding::Authored),
+                true,
+                on(187, "stack-1", "stack-2"),
+            ),
+            with(
+                Some(ReviewStanding::Reviewed),
+                false,
+                on(50, "main", "done"),
+            ),
+            with(
+                Some(ReviewStanding::Authored),
+                true,
+                on(189, "base", "large"),
+            ),
+            with(None, false, on(60, "main", "other")),
+            with(
+                Some(ReviewStanding::ChangesSinceReview),
+                false,
+                on(44, "main", "deps"),
+            ),
+            with(
+                Some(ReviewStanding::Requested),
+                false,
+                on(70, "main", "asked"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn open_pull_requests_read_as_a_review_queue() {
+        let items = queue();
+        let queue = sections(&items, PrListFilter::Open);
+        let groups: Vec<Option<QueueGroup>> = queue.iter().map(|section| section.group).collect();
+        assert_eq!(
+            groups,
+            [
+                Some(QueueGroup::ReviewRequested),
+                Some(QueueGroup::ChangesSinceReview),
+                Some(QueueGroup::NotReviewed),
+                Some(QueueGroup::Yours),
+                Some(QueueGroup::Reviewed),
+                Some(QueueGroup::Draft),
+            ]
+        );
+        let firsts: Vec<&Line> = queue.iter().map(|section| &section.lines[0]).collect();
+        assert_eq!(
+            firsts,
+            [
+                &Line::Pr(8),
+                &Line::Pr(7),
+                &Line::Pr(6),
+                &Line::Pr(0),
+                &Line::Pr(4),
+                &Line::Stack(Vec::from([1, 3, 2])),
+            ],
+            "the draft stack is one line, base first"
+        );
+        assert_eq!(queue[5].lines.get(1), Some(&Line::Pr(5)));
+        assert_eq!(queue[5].count(), 4);
+        let closed = sections(&items, PrListFilter::Closed);
+        assert_eq!(closed.len(), 1, "other lists keep GitHub's order");
+        assert_eq!(closed[0].group, None);
+        assert_eq!(closed[0].lines.len(), items.len());
+    }
+
+    #[test]
+    fn a_list_in_one_group_has_no_heading() {
+        let items = vec![summary("x", 1, 0), summary("x", 2, 0)];
+        let only = sections(&items, PrListFilter::Open);
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].group, None);
+    }
+
+    /// Enter opens the stack under the cursor, J walks into its rows in
+    /// merge order, Left folds it back with the cursor on its row.
+    #[gpui_kit::test]
+    fn the_keys_open_and_fold_a_stack(cx: &mut TestAppContext) {
+        let repo = RepoRef::new("a", "x");
+        let (mut cx, view) = crate::ui::open_list(cx, move |window, cx| build(repo, window, cx));
+        let cx = &mut cx;
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let items: Vec<PrSummary> = queue().into_iter().skip(1).take(3).collect();
+            view.list = Loadable::Loaded(Page {
+                total_count: items.len() as u32,
+                items,
+                next_cursor: None,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let cursor = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.cursor.clone());
+        let number = |spot: Option<Spot>| match spot {
+            Some(Spot::Pr(pr)) => Some(pr.number),
+            Some(Spot::Stack(base)) => Some(base.number + 1000),
+            None => None,
+        };
+        cx.simulate_keystrokes("j");
+        assert_eq!(number(cursor(cx)), Some(1186), "the stack's row first");
+        cx.simulate_keystrokes("j");
+        assert_eq!(number(cursor(cx)), Some(1186), "folded, it is the only row");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("j j j");
+        assert_eq!(number(cursor(cx)), Some(188), "base first: 186, 187, 188");
+        cx.simulate_keystrokes("k");
+        assert_eq!(number(cursor(cx)), Some(187));
+        cx.simulate_keystrokes("left");
+        assert_eq!(number(cursor(cx)), Some(1186));
+        assert!(view.read_with(cx, |view, _| view.expanded.is_empty()));
+        cx.simulate_keystrokes("right");
+        assert!(!view.read_with(cx, |view, _| view.expanded.is_empty()));
     }
 }

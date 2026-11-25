@@ -12,6 +12,7 @@ mod error;
 mod gql;
 mod ids;
 mod merge;
+pub mod queue;
 mod rate;
 mod rest;
 pub mod reviews;
