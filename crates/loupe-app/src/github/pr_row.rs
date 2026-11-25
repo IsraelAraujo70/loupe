@@ -20,7 +20,7 @@ use crate::shell::item_menu::{Item, with_item_menu};
 use crate::shell::{OpenOnClick as _, open};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
-use crate::ui;
+use crate::ui::{self, ListRowFocus as _};
 
 /// `child` with a hover tooltip naming what it shows.
 pub fn hint(
@@ -284,8 +284,8 @@ fn review_chip(decision: ReviewDecision) -> Tag {
 /// One 32 px row: state icon, `#number`, the title with its review decision
 /// right after it, then fixed lanes on the right for the author and the
 /// repository (as `lanes` asks), diff size, comments, checks, and age.
-/// Fixed lanes keep every column on one spine down the list. `selected`
-/// marks the row under the keyboard cursor. Clicking it opens
+/// Fixed lanes keep every column on one spine down the list. `focused`
+/// marks the row under the keyboard cursor while the list has the focus. Clicking it opens
 /// `Route::PullRequest`. With `select`, a checkbox lane leads the row and a
 /// Shift+click picks instead of opening. With `place`, the row sits inside
 /// an open stack: indented past the stack's chevron, on the line linking the
@@ -294,7 +294,7 @@ fn review_chip(decision: ReviewDecision) -> Tag {
 pub fn pr_row(
     summary: &PrSummary,
     lanes: Lanes,
-    selected: bool,
+    focused: bool,
     select: Option<RowSelect>,
     place: Option<StackPlace>,
     marked: Option<Change>,
@@ -339,22 +339,10 @@ pub fn pr_row(
         .aria_label(name)
         .relative()
         .group(ROW_GROUP)
-        // The keyboard cursor: a fill and the accent on the leading edge.
-        .when(selected, |row| {
-            row.bg(theme.list_active).child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_1p5()
-                    .bottom_1p5()
-                    .w(px(2.))
-                    .rounded(px(1.))
-                    .bg(tokens::accent()),
-            )
-        })
-        // Came or changed in the last refresh: the unread dot, in the edge
-        // the keyboard cursor's accent takes when it is on the row.
-        .when(marked.is_some() && !selected, |row| {
+        .keyboard_focus(focused, cx)
+        // Came or changed in the last refresh: the unread dot in the
+        // leading edge.
+        .when(marked.is_some(), |row| {
             row.child(
                 div()
                     .absolute()
@@ -603,7 +591,7 @@ fn worst_checks(rows: &[&PrSummary]) -> Option<ChecksState> {
 pub fn stack_row(
     stack: StackRow<'_>,
     lanes: Lanes,
-    selected: bool,
+    focused: bool,
     lead: Option<Div>,
     cx: &App,
 ) -> Stateful<Div> {
@@ -643,18 +631,7 @@ pub fn stack_row(
         .aria_expanded(stack.expanded)
         .relative()
         .group(ROW_GROUP)
-        .when(selected, |row| {
-            row.bg(theme.list_active).child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_1p5()
-                    .bottom_1p5()
-                    .w(px(2.))
-                    .rounded(px(1.))
-                    .bg(tokens::accent()),
-            )
-        })
+        .keyboard_focus(focused, cx)
         .child(
             div()
                 .absolute()

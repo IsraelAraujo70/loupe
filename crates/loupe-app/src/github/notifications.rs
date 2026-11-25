@@ -19,14 +19,16 @@ use loupe_github::{
 
 use super::common::{self, Loadable, Submit};
 use super::notification_filter::{self as filter, Term};
+use super::{CloseStack, OpenStack};
 use crate::route::Route;
 use crate::shell::OpenOnClick as _;
 use crate::shell::Refreshable as _;
+use crate::shell::actions::{OpenSelected, SelectNext, SelectPrevious};
 use crate::shell::item_menu::{Item, PrItem, with_item_menu};
 use crate::store::{Settings, update_settings};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
-use crate::ui;
+use crate::ui::{self, ListRowFocus as _};
 
 /// Repository groups, newest group first; inside a group unread first, then
 /// newest first.
@@ -271,6 +273,25 @@ pub struct NotificationsView {
     /// saved as a chip.
     query: Entity<InputState>,
     _query_events: Subscription,
+    focus: FocusHandle,
+    /// The line under the keyboard cursor (J and K, or the arrows).
+    cursor: Option<Spot>,
+}
+
+/// A line the keyboard cursor can stand on: a notification's row, with the
+/// stack it sits in when it is one of an open stack's rows, or a stack's
+/// own row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Spot {
+    Row { id: String, stack: Option<String> },
+    Stack(String),
+}
+
+/// One repository of the list as it is on screen: whether it is folded, and
+/// its lines top to bottom.
+struct GroupShown {
+    collapsed: bool,
+    spots: Vec<Spot>,
 }
 
 /// What "Mark all as read" marks.
@@ -318,6 +339,10 @@ pub(super) fn mark_threads_read(gh: &GitHub, ids: &[String]) -> loupe_github::Re
 }
 
 pub fn view(window: &mut Window, cx: &mut App) -> AnyView {
+    build(window, cx).into()
+}
+
+fn build(window: &mut Window, cx: &mut App) -> Entity<NotificationsView> {
     cx.new(|cx| {
         let query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter: org:, repo:, or text"));
@@ -355,14 +380,159 @@ pub fn view(window: &mut Window, cx: &mut App) -> AnyView {
             _mark_all: None,
             query,
             _query_events: query_events,
+            focus: cx.focus_handle(),
+            cursor: None,
         };
         view.reload(cx);
         view
     })
-    .into()
 }
 
 impl NotificationsView {
+    /// The list as it is on screen, one entry per repository: the same
+    /// filter, groups, and stacks the rows are drawn from.
+    fn groups_shown(&self, cx: &App) -> Vec<GroupShown> {
+        let Some(list) = self.list.value() else {
+            return Vec::new();
+        };
+        let terms = self.terms(cx);
+        let list: Vec<Notification> = filter::apply(&terms, list).into_iter().cloned().collect();
+        group(&list)
+            .into_iter()
+            .map(|(repo, items)| {
+                let mut spots = Vec::new();
+                for stack in stacks(&items) {
+                    match stack.as_slice() {
+                        [] => {}
+                        [single] => spots.push(Spot::Row {
+                            id: single.id.clone(),
+                            stack: None,
+                        }),
+                        [first, ..] => {
+                            let key = stack_key(&repo, first);
+                            let open = self.expanded.contains(&key);
+                            spots.push(Spot::Stack(key.clone()));
+                            if open {
+                                spots.extend(stack.iter().map(|item| Spot::Row {
+                                    id: item.id.clone(),
+                                    stack: Some(key.clone()),
+                                }));
+                            }
+                        }
+                    }
+                }
+                GroupShown {
+                    collapsed: self.collapsed.contains(&repo),
+                    spots,
+                }
+            })
+            .collect()
+    }
+
+    /// The cursor, while its line is on screen.
+    fn cursor_on_screen(&self, cx: &App) -> Option<Spot> {
+        let cursor = self.cursor.clone()?;
+        self.groups_shown(cx)
+            .iter()
+            .any(|group| !group.collapsed && group.spots.contains(&cursor))
+            .then_some(cursor)
+    }
+
+    /// Moves the keyboard cursor one line and scrolls it into view.
+    fn move_cursor(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let groups = self.groups_shown(cx);
+        let spots: Vec<Spot> = groups
+            .iter()
+            .filter(|group| !group.collapsed)
+            .flat_map(|group| group.spots.iter().cloned())
+            .collect();
+        let Some(next) = super::inbox::step_cursor(&spots, self.cursor.as_ref(), down) else {
+            return;
+        };
+        // The line's place in the scrolled content, from the fixed heights
+        // of what is above it: 8 px of padding, then per repository a
+        // heading, its lines unless it is folded, and an 8 px gap.
+        let rem = window.rem_size();
+        let row = scale::row_height().to_pixels(rem);
+        let gap = rems(0.5).to_pixels(rem);
+        let mut top = gap;
+        for group in &groups {
+            top += row;
+            if !group.collapsed {
+                if let Some(index) = group.spots.iter().position(|spot| *spot == next) {
+                    top += row * index as f32;
+                    break;
+                }
+                top += row * group.spots.len() as f32;
+            }
+            top += gap;
+        }
+        let viewport = self.scroll.bounds().size.height;
+        let mut offset = self.scroll.offset();
+        if top < -offset.y {
+            offset.y = -(top - row).max(px(0.));
+        } else if top + row > -offset.y + viewport {
+            offset.y = -(top + row + gap - viewport);
+        }
+        self.scroll.set_offset(offset);
+        self.cursor = Some(next);
+        cx.notify();
+    }
+
+    /// Enter or O: opens the notification under the cursor in this tab, or
+    /// opens or folds the stack under it. With no cursor the key goes on to
+    /// whoever handles it next.
+    fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.cursor_on_screen(cx) {
+            Some(Spot::Row { id, .. }) => {
+                let notification = self
+                    .list
+                    .value()
+                    .and_then(|list| list.iter().find(|item| item.id == id))
+                    .cloned();
+                if let Some(notification) = notification {
+                    self.open(&notification, None, window, cx);
+                }
+            }
+            Some(Spot::Stack(key)) => self.toggle_stack(&key, cx),
+            None => cx.propagate(),
+        }
+    }
+
+    /// Right arrow: opens the folded stack under the cursor.
+    fn open_stack(&mut self, cx: &mut Context<Self>) {
+        match self.cursor_on_screen(cx) {
+            Some(Spot::Stack(key)) if !self.expanded.contains(&key) => self.toggle_stack(&key, cx),
+            _ => cx.propagate(),
+        }
+    }
+
+    /// Left arrow: folds the open stack under the cursor, or the one whose
+    /// row the cursor is on.
+    fn close_stack(&mut self, cx: &mut Context<Self>) {
+        let key = match self.cursor_on_screen(cx) {
+            Some(Spot::Stack(key)) => Some(key),
+            Some(Spot::Row { stack, .. }) => stack,
+            None => None,
+        };
+        match key.filter(|key| self.expanded.contains(key)) {
+            Some(key) => self.toggle_stack(&key, cx),
+            None => cx.propagate(),
+        }
+    }
+
+    /// Opens or folds a stack. Folding it brings the cursor from one of its
+    /// rows up to the stack's own row.
+    fn toggle_stack(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.expanded.remove(key) {
+            self.expanded.insert(key.to_owned());
+        } else if matches!(&self.cursor, Some(Spot::Row { stack: Some(stack), .. }) if stack == key)
+        {
+            self.cursor = Some(Spot::Stack(key.to_owned()));
+        }
+        cx.notify();
+    }
+
     /// The filter in force: the saved terms, then the one being typed.
     fn terms(&self, cx: &App) -> Vec<Term> {
         let mut terms = filter::from_tokens(&Settings::get(cx).notification_filter);
@@ -482,10 +652,12 @@ impl NotificationsView {
 
     /// Opens a notification's pull request (in a background tab for a middle
     /// click or a Cmd-click) or its page on GitHub, and marks it read.
+    /// Opens what `notification` is about. A click opens it as the click's
+    /// modifiers ask; the keyboard (no `event`) opens it in this tab.
     fn open(
         &mut self,
         notification: &Notification,
-        event: &ClickEvent,
+        event: Option<&ClickEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -496,7 +668,10 @@ impl NotificationsView {
             .ci_of(notification)
             .and_then(|ci| ci.pull_request.clone());
         match target(notification, pull.as_ref()) {
-            Target::PullRequest(route) => crate::shell::open(route, event, window, cx),
+            Target::PullRequest(route) => match event {
+                Some(event) => crate::shell::open(route, event, window, cx),
+                None => crate::shell::navigate(route, window, cx),
+            },
             Target::Web(url) => cx.open_url(&url),
         }
     }
@@ -769,28 +944,39 @@ impl NotificationsView {
 
     /// The rows of one stack: a single notification is its own row; several
     /// that read the same are one row that opens into a row for each.
+    /// `focused` says whether the list has the focus, and so whether the
+    /// row under the keyboard cursor shows it.
     fn stack_rows(
         &self,
         repo: &RepoRef,
         stack: &[&Notification],
         runs: &HashMap<String, FailedRun>,
+        focused: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let [first, ..] = stack else {
             return Vec::new();
         };
+        let at = |spot: Spot| focused && self.cursor.as_ref() == Some(&spot);
         if stack.len() == 1 {
-            return vec![self.row(stack, None, false, runs, cx)];
+            let cursor = at(Spot::Row {
+                id: first.id.clone(),
+                stack: None,
+            });
+            return vec![self.row(stack, None, false, cursor, runs, cx)];
         }
         let key = stack_key(repo, first);
         let open = self.expanded.contains(&key);
-        let mut rows = vec![self.row(stack, Some((key, open)), false, runs, cx)];
+        let cursor = at(Spot::Stack(key.clone()));
+        let mut rows = vec![self.row(stack, Some((key.clone(), open)), false, cursor, runs, cx)];
         if open {
-            rows.extend(
-                stack
-                    .iter()
-                    .map(|item| self.row(&[*item], None, true, runs, cx)),
-            );
+            rows.extend(stack.iter().map(|item| {
+                let cursor = at(Spot::Row {
+                    id: item.id.clone(),
+                    stack: Some(key.clone()),
+                });
+                self.row(&[*item], None, true, cursor, runs, cx)
+            }));
         }
         rows
     }
@@ -810,6 +996,7 @@ impl NotificationsView {
         stack: &[&Notification],
         fold: Option<(String, bool)>,
         nested: bool,
+        cursor: bool,
         runs: &HashMap<String, FailedRun>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -882,21 +1069,18 @@ impl NotificationsView {
         .aria_label(name)
         .relative()
         .group("notification")
+        .keyboard_focus(cursor, cx)
         .when(nested, |row| row.pl_6())
         .gap_2()
         .child(ui::list_row_divider(cx));
-        let row =
-            match fold {
-                Some((key, _)) => row.on_click(cx.listener(move |view, _, _, cx| {
-                    if !view.expanded.remove(&key) {
-                        view.expanded.insert(key.clone());
-                    }
-                    cx.notify();
-                })),
-                None => row.on_open(cx.listener(move |view, event, window, cx| {
-                    view.open(&clicked, event, window, cx)
-                })),
-            };
+        let row = match fold {
+            Some((key, _)) => {
+                row.on_click(cx.listener(move |view, _, _, cx| view.toggle_stack(&key, cx)))
+            }
+            None => row.on_open(cx.listener(move |view, event, window, cx| {
+                view.open(&clicked, Some(event), window, cx)
+            })),
+        };
         let slot = || h_flex().flex_none().items_center().justify_center();
         let exact = notification
             .updated_at
@@ -1099,7 +1283,11 @@ impl crate::shell::Refreshable for NotificationsView {
 }
 
 impl Render for NotificationsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if crate::shell::page_may_take_focus(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        let focused = self.focus.is_focused(window);
         let terms = self.terms(cx);
         let body = match &self.list {
             Loadable::Failed(error) => {
@@ -1173,18 +1361,32 @@ impl Render for NotificationsView {
                         v_flex()
                             .child(self.group_header(&repo, items.len(), unread, cx))
                             .when(!collapsed, |group| {
-                                group.children(
-                                    stacks(&items)
-                                        .iter()
-                                        .flat_map(|stack| self.stack_rows(&repo, stack, &runs, cx)),
-                                )
+                                group.children(stacks(&items).iter().flat_map(|stack| {
+                                    self.stack_rows(&repo, stack, &runs, focused, cx)
+                                }))
                             })
                     }))
                     .into_any_element()
             }
         };
         v_flex()
+            .id("inbox-page")
+            .role(Role::Group)
+            .aria_label("Inbox")
             .size_full()
+            .key_context("NotificationsView")
+            .track_focus(&self.focus)
+            .on_action(
+                cx.listener(|this, _: &SelectNext, window, cx| this.move_cursor(true, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
+                this.move_cursor(false, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &OpenSelected, window, cx| this.open_cursor(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &OpenStack, _, cx| this.open_stack(cx)))
+            .on_action(cx.listener(|this, _: &CloseStack, _, cx| this.close_stack(cx)))
             .child(self.header(&terms, cx))
             .child(self.toolbar(&terms, cx))
             .child(
@@ -1206,12 +1408,19 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use super::{
-        MarkAll, WorkflowRun, failed_branches, failed_jobs_text, group, mark_all_plan, match_runs,
-        menu_item, reason_label, workflow_run,
+    use gpui_kit::{
+        Bounds, Entity, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px, size,
     };
+
+    use super::{
+        MarkAll, NotificationsView, Spot, WorkflowRun, build, failed_branches, failed_jobs_text,
+        group, mark_all_plan, match_runs, menu_item, reason_label, stack_key, workflow_run,
+    };
+    use crate::github::common::Loadable;
     use crate::github::notification_filter::parse;
+    use crate::services::{Accounts, Services};
     use crate::shell::item_menu::{Item, PrItem};
+    use crate::store::Settings;
 
     fn notification(id: &str, repo: &str, unread: bool, seconds: i64) -> Notification {
         let repo = RepoRef::parse(repo).expect("repo");
@@ -1407,5 +1616,88 @@ mod tests {
                 url: "https://github.com/acme/api/issues/4".into(),
             })
         );
+    }
+
+    fn open(cx: &mut TestAppContext) -> (VisualTestContext, Entity<NotificationsView>) {
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(Settings::default());
+            cx.set_global(Services::default());
+            cx.set_global(Accounts::default());
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1280.), px(820.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                build,
+            )
+            .expect("open the window")
+        });
+        (VisualTestContext::from_window(handle, cx), view)
+    }
+
+    #[gpui_kit::test]
+    fn the_keyboard_walks_the_rows_and_opens_and_folds_a_stack(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        cx.run_until_parked();
+        let same = |id: &str, seconds| Notification {
+            title: "CI failed".into(),
+            ..notification(id, "o/r", true, seconds)
+        };
+        let list = vec![
+            notification("a", "o/r", true, 40),
+            same("b", 30),
+            same("c", 20),
+            notification("d", "o/r", true, 10),
+        ];
+        let key = stack_key(&list[1].repo, &list[1]);
+        view.update(cx, |view, cx| {
+            view.list = Loadable::Loaded(list);
+            cx.notify();
+        });
+        let step = |down: bool, cx: &mut VisualTestContext| {
+            view.update_in(cx, |view, window, cx| {
+                view.move_cursor(down, window, cx);
+                view.cursor.clone()
+            })
+        };
+        let row = |id: &str, stack: Option<&String>| {
+            Some(Spot::Row {
+                id: id.into(),
+                stack: stack.cloned(),
+            })
+        };
+        let stack = Some(Spot::Stack(key.clone()));
+
+        assert_eq!(
+            step(true, cx),
+            row("a", None),
+            "the first J lands on the first row"
+        );
+        assert_eq!(step(true, cx), stack);
+        assert_eq!(
+            step(true, cx),
+            row("d", None),
+            "folded, J steps past its rows"
+        );
+        assert_eq!(step(true, cx), row("d", None), "and stops at the end");
+        assert_eq!(step(false, cx), stack);
+
+        view.update(cx, |view, cx| view.open_stack(cx));
+        assert_eq!(step(true, cx), row("b", Some(&key)));
+        assert_eq!(step(true, cx), row("c", Some(&key)));
+        // Left on a row inside folds the stack and brings the cursor up.
+        view.update(cx, |view, cx| view.close_stack(cx));
+        assert_eq!(view.read_with(cx, |view, _| view.cursor.clone()), stack);
+        assert!(view.read_with(cx, |view, _| !view.expanded.contains(&key)));
+        // Enter on the stack's row opens it too.
+        view.update_in(cx, |view, window, cx| view.open_cursor(window, cx));
+        assert!(view.read_with(cx, |view, _| view.expanded.contains(&key)));
     }
 }

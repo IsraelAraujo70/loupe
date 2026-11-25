@@ -105,10 +105,11 @@ gpui_kit::actions!(
         SelectTabRows,
         /// Escape on the Reviews screen: drop the selection.
         ClearReviewsSelection,
-        /// Right arrow on the Reviews screen: open the stack under the cursor.
+        /// Right arrow on the Reviews screen and in the Inbox: open the stack
+        /// under the cursor.
         OpenStack,
-        /// Left arrow on the Reviews screen: fold the stack under the cursor,
-        /// or the one its row is in.
+        /// Left arrow on the Reviews screen and in the Inbox: fold the stack
+        /// under the cursor, or the one its row is in.
         CloseStack
     ]
 );
@@ -582,7 +583,11 @@ fn threads_of(notifications: &[GitHubNotification], prs: &[PrRef]) -> Vec<String
 /// screen in order: one step from `current`, staying at either end. With no
 /// cursor yet, or one whose pull request left the list, it starts at the
 /// first row going down and at the last going up.
-fn step_cursor<T: PartialEq + Clone>(rows: &[T], current: Option<&T>, down: bool) -> Option<T> {
+pub(super) fn step_cursor<T: PartialEq + Clone>(
+    rows: &[T],
+    current: Option<&T>,
+    down: bool,
+) -> Option<T> {
     let last = rows.len().checked_sub(1)?;
     let at = current.and_then(|pr| rows.iter().position(|row| row == pr));
     let next = match (at, down) {
@@ -2572,13 +2577,15 @@ impl InboxView {
     }
 
     /// One group of the open tab: its heading, which folds it, and its rows
-    /// unless it is folded.
+    /// unless it is folded. `focused` says whether the list has the focus,
+    /// and so whether the row under the keyboard cursor shows it.
     fn group(
         &self,
         tab: ReviewTab,
         group: Group<'_>,
         on_select: OnSelect,
         showing: bool,
+        focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let step = group.step;
@@ -2614,7 +2621,7 @@ impl InboxView {
             pr_row(
                 summary,
                 lanes,
-                self.cursor.as_ref() == Some(&Spot::Pr(summary.pr.clone())),
+                focused && self.cursor.as_ref() == Some(&Spot::Pr(summary.pr.clone())),
                 Some(RowSelect {
                     checked: self.selection.contains(&summary.pr),
                     showing,
@@ -2633,7 +2640,7 @@ impl InboxView {
                     Line::Pr(summary) => elements.push(row(summary, None, cx)),
                     Line::Stack { stack, rows } => {
                         let expanded = self.expanded.contains(&stack.key);
-                        elements.push(self.stack_line(stack, rows, lanes, showing, cx));
+                        elements.push(self.stack_line(stack, rows, lanes, showing, focused, cx));
                         if expanded {
                             for (at, summary) in rows.iter().enumerate() {
                                 let place = StackPlace {
@@ -2664,6 +2671,7 @@ impl InboxView {
         rows: &[&PrSummary],
         lanes: Lanes,
         showing: bool,
+        focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = stack.key.element_id();
@@ -2706,7 +2714,7 @@ impl InboxView {
                 expanded: self.expanded.contains(&stack.key),
             },
             lanes,
-            self.cursor.as_ref() == Some(&Spot::Stack(stack.key.clone())),
+            focused && self.cursor.as_ref() == Some(&Spot::Stack(stack.key.clone())),
             Some(lead),
             cx,
         )
@@ -2803,6 +2811,7 @@ impl Render for InboxView {
         if crate::shell::page_may_take_focus(window, cx) {
             self.focus.focus(window, cx);
         }
+        let focused = self.focus.is_focused(window);
         self.settle_tab();
         let selection_bar = self.selection_bar(cx);
         if selection_bar.is_some() != self.bar_shown {
@@ -2878,7 +2887,7 @@ impl Render for InboxView {
                 let on_select = self.on_select(cx);
                 let groups: Vec<AnyElement> = groups
                     .into_iter()
-                    .map(|group| self.group(active, group, on_select.clone(), showing, cx))
+                    .map(|group| self.group(active, group, on_select.clone(), showing, focused, cx))
                     .collect();
                 let body = v_flex()
                     .gap_3()
@@ -2890,6 +2899,9 @@ impl Render for InboxView {
             }
         };
         v_flex()
+            .id("reviews-page")
+            .role(Role::Group)
+            .aria_label(self.title(cx))
             .size_full()
             .key_context("InboxView")
             .track_focus(&self.focus)

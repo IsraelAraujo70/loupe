@@ -33,6 +33,39 @@ pub fn list_row(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .hover(move |row| row.bg(hover))
 }
 
+/// The row under a list's keyboard cursor, while the list holds the focus.
+///
+/// Keyboard focus is the one state drawn as a ring: a 1 px accent line
+/// inside the row's edge, over the hover fill. Hover alone is the fill, and
+/// a selection keeps its own mark (a fill or a check), so focus, hover, and
+/// selection never read alike. The row also claims the accessibility focus
+/// (`aria_active_descendant`), so a screen reader follows the cursor while
+/// the key focus stays on the list; that needs the row's own role and a
+/// focused ancestor with a role.
+pub trait ListRowFocus {
+    fn keyboard_focus(self, focused: bool, cx: &App) -> Self;
+}
+
+impl ListRowFocus for Stateful<Div> {
+    fn keyboard_focus(self, focused: bool, cx: &App) -> Self {
+        if !focused {
+            return self;
+        }
+        let theme = cx.theme();
+        self.relative()
+            .bg(theme.list_hover)
+            .aria_active_descendant()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(tokens::accent()),
+            )
+    }
+}
+
 /// Hairline along the bottom of a `relative()` [`list_row`], inset to the row's
 /// content edge so the hover fill extends past it while wide tables stay easy
 /// to scan across columns.
