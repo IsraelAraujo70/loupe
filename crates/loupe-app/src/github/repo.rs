@@ -9,6 +9,7 @@ use std::time::Duration;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -162,16 +163,44 @@ fn sections(items: &[PrSummary], filter: PrListFilter) -> Vec<Section> {
     out
 }
 
+/// Whether a group's count covers only the pages loaded so far: true while
+/// pages are left, except for the groups the review search fills whole.
+fn counts_loaded_only(group: QueueGroup, more_pages: bool) -> bool {
+    more_pages
+        && !matches!(
+            group,
+            QueueGroup::ReviewRequested | QueueGroup::ChangesSinceReview | QueueGroup::Reviewed
+        )
+}
+
 /// A group's 32 px heading on the rows' grid: a chevron over the state
 /// icons that says whether it is folded, its name over the numbers, then
-/// its count. A click folds or unfolds it.
-fn group_heading(group: QueueGroup, folded: bool, count: usize, cx: &App) -> Stateful<Div> {
+/// its count, as "28+" when it counts only the loaded pages. A click folds
+/// or unfolds it.
+fn group_heading(
+    group: QueueGroup,
+    folded: bool,
+    count: usize,
+    loaded_only: bool,
+    cx: &App,
+) -> Stateful<Div> {
     let label = group.label();
     let id = format!("repo-group-{}", label.to_lowercase().replace(' ', "-"));
+    let (shown, name) = if loaded_only {
+        (
+            format!("{count}+"),
+            format!("{label}, {count} loaded, more on pages not loaded"),
+        )
+    } else {
+        (count.to_string(), format!("{label}, {count}"))
+    };
     ui::list_row(SharedString::from(id.clone()), cx)
-        .debug_selector(move || id.clone())
+        .debug_selector({
+            let id = id.clone();
+            move || id.clone()
+        })
         .role(Role::Button)
-        .aria_label(format!("{label}, {count}"))
+        .aria_label(name)
         .aria_expanded(!folded)
         .child(
             Icon::new(if folded {
@@ -183,7 +212,18 @@ fn group_heading(group: QueueGroup, folded: bool, count: usize, cx: &App) -> Sta
             .text_color(cx.theme().muted_foreground),
         )
         .child(ui::group_title(label))
-        .child(ui::count_badge(count, cx))
+        .child(
+            ui::count_badge(shown, cx)
+                .id(SharedString::from(format!("{id}-count")))
+                .when(loaded_only, |badge| {
+                    badge.tooltip(move |window, cx| {
+                        Tooltip::new(format!(
+                            "{count} among the pull requests loaded so far. Load more counts the rest."
+                        ))
+                        .build(window, cx)
+                    })
+                }),
+        )
 }
 
 /// The pages of a repository, as the tabs under its header.
@@ -661,11 +701,17 @@ impl Render for RepoView {
                     if let Some(group) = section.group {
                         let folded = self.folded.contains(&group);
                         children.push(
-                            group_heading(group, folded, section.count(), cx)
-                                .on_click(
-                                    cx.listener(move |view, _, _, cx| view.toggle_group(group, cx)),
-                                )
-                                .into_any_element(),
+                            group_heading(
+                                group,
+                                folded,
+                                section.count(),
+                                counts_loaded_only(group, page.next_cursor.is_some()),
+                                cx,
+                            )
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.toggle_group(group, cx)),
+                            )
+                            .into_any_element(),
                         );
                         if folded {
                             continue;
@@ -1004,7 +1050,7 @@ mod tests {
     use loupe_github::queue::QueueGroup;
     use loupe_github::{Page, PrListFilter, PrSummary, RepoRef, RepoSummary, ReviewStanding};
 
-    use super::{Line, Spot, build, candidates, listed, search_text, sections};
+    use super::{Line, Spot, build, candidates, counts_loaded_only, listed, search_text, sections};
     use crate::github::common::Loadable;
     use crate::github::pr_row::tests::summary;
 
@@ -1179,6 +1225,21 @@ mod tests {
 
     /// A review asked of you on a page the list has not loaded still comes
     /// first; another list keeps only what its pages hold.
+    #[test]
+    fn only_the_groups_the_review_search_fills_count_whole_while_pages_are_left() {
+        let loaded_only = [
+            QueueGroup::ReviewRequested,
+            QueueGroup::ChangesSinceReview,
+            QueueGroup::NotReviewed,
+            QueueGroup::Yours,
+            QueueGroup::Reviewed,
+            QueueGroup::Draft,
+        ]
+        .map(|group| counts_loaded_only(group, true));
+        assert_eq!(loaded_only, [false, false, true, true, false, true]);
+        assert!(!counts_loaded_only(QueueGroup::NotReviewed, false));
+    }
+
     #[test]
     fn a_review_asked_on_a_page_not_loaded_still_leads_the_queue() {
         let page = Page {

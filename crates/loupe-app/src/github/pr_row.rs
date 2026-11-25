@@ -322,14 +322,19 @@ fn none(cx: &App) -> Div {
 /// The review decision as a chip. A pull request whose repository asks for
 /// no review has no decision and shows no chip.
 fn review_chip(decision: ReviewDecision) -> Tag {
+    let color = match decision {
+        ReviewDecision::Approved => tokens::open(),
+        ReviewDecision::ChangesRequested => tokens::closed(),
+        ReviewDecision::ReviewRequired => tokens::pending(),
+    };
+    ui::tinted_chip(color).child(decision_label(decision))
+}
+
+fn decision_label(decision: ReviewDecision) -> &'static str {
     match decision {
-        ReviewDecision::Approved => ui::tinted_chip(tokens::open()).child("Approved"),
-        ReviewDecision::ChangesRequested => {
-            ui::tinted_chip(tokens::closed()).child("Changes requested")
-        }
-        ReviewDecision::ReviewRequired => {
-            ui::tinted_chip(tokens::pending()).child("Review required")
-        }
+        ReviewDecision::Approved => "Approved",
+        ReviewDecision::ChangesRequested => "Changes requested",
+        ReviewDecision::ReviewRequired => "Review required",
     }
 }
 
@@ -509,9 +514,17 @@ pub fn pr_row(
     } else {
         String::new()
     };
+    let has_state = viewer_state(summary).is_some();
+    // With a state in front, "Review required" says nothing more.
+    let decision = summary
+        .review_decision
+        .filter(|decision| !has_state || *decision != ReviewDecision::ReviewRequired);
     let state = viewer_state(summary)
-        .map(|(label, _)| format!(", {}", label.to_lowercase()))
-        .unwrap_or_default();
+        .map(|(label, _)| label)
+        .into_iter()
+        .chain(decision.map(decision_label))
+        .map(|label| format!(", {}", label.to_lowercase()))
+        .collect::<String>();
     let size = format!(
         ", size {}",
         SizeClass::of(summary.additions, summary.deletions).label()
@@ -523,14 +536,9 @@ pub fn pr_row(
         }
         None => format!("{reference} {}{by}{state}{size}", summary.title),
     };
-    let has_state = viewer_state(summary).is_some();
     // Under a heading that already says the state, the chip would only
     // take the title's room.
     let viewer_chip = viewer_chip(summary).filter(|_| lanes.group != Some(QueueGroup::of(summary)));
-    // With a state in front, "Review required" says nothing more.
-    let decision = summary
-        .review_decision
-        .filter(|decision| !has_state || *decision != ReviewDecision::ReviewRequired);
     let item = Item::pull_request(summary);
     let pr = summary.pr.clone();
     let row = ui::list_row(SharedString::from(format!("pr-row-{id}")), cx)
@@ -623,8 +631,9 @@ pub fn pr_row(
                 .text_color(muted)
                 .child(number),
         )
-        // The title, and right after it the review decision when the pull
-        // request has one: no row carries an empty lane for it.
+        // The title, and right after it the review decision and the state
+        // when the pull request has them: no row carries an empty lane for
+        // them.
         .child(
             h_flex()
                 .flex_1()
@@ -645,11 +654,12 @@ pub fn pr_row(
                         .text_color(muted)
                         .child(format!("{}/{}", place.position, place.total))
                 }))
-                // The chips only take the room the title leaves. One that
-                // does not fit whole wraps onto a second line that is cut
-                // off, so it is shown whole or not at all; the empty first
-                // item keeps the first line from holding a chip that does
-                // not fit.
+                // The decision always shows: the title gives way to it.
+                .children(decision.map(|decision| review_chip(decision).ml_2()))
+                // The state chip takes only the room the title leaves. If it
+                // does not fit whole it wraps onto a second line that is cut
+                // off, so it shows whole or not at all; the empty first item
+                // keeps the first line from holding a chip that does not fit.
                 .child(
                     h_flex()
                         .flex_1()
@@ -658,8 +668,7 @@ pub fn pr_row(
                         .flex_wrap()
                         .overflow_hidden()
                         .child(div().h_full())
-                        .children(viewer_chip.map(|chip| chip.ml_2()))
-                        .children(decision.map(|decision| review_chip(decision).ml_2())),
+                        .children(viewer_chip.map(|chip| chip.ml_2())),
                 ),
         )
         // The author, before the columns every section shares, and only
