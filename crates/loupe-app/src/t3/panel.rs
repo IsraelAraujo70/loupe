@@ -15,9 +15,7 @@ use loupe_t3::{Error, LinkedThread, PullRequestKey, ThreadStatus, thread_deep_li
 use super::dialog;
 use super::review::{self, Readiness};
 use crate::links::PrLinkContext;
-use crate::route::Route;
 use crate::services::{self, Services};
-use crate::shell;
 use crate::theme::scale;
 use crate::ui::{self, relative_time};
 
@@ -277,7 +275,13 @@ impl LinkedThreads {
             .icon(IconName::Settings)
             .label(label)
             .text_color(crate::theme::tokens::link())
-            .on_click(|_, window, cx| shell::navigate(Route::Settings, window, cx))
+            .on_click(|_, window, cx| {
+                crate::settings::view::open_section(
+                    crate::settings::catalog::Section::T3,
+                    window,
+                    cx,
+                )
+            })
     }
 
     fn rows(linked: &Linked, cx: &App) -> Vec<Stateful<Div>> {
