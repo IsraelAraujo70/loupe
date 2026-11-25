@@ -68,3 +68,4 @@
 - Entry 068: a one-line change, so the pull request has more than 250 commits.
 - Entry 069: a one-line change, so the pull request has more than 250 commits.
 - Entry 070: a one-line change, so the pull request has more than 250 commits.
+- Entry 071: a one-line change, so the pull request has more than 250 commits.
