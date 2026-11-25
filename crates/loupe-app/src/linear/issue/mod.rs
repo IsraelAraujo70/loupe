@@ -455,20 +455,42 @@ impl IssueView {
                     .children(links::other_attachments(&loaded.attachments, cx))
                     .child(self.render_comments(loaded, cx)),
             );
-        // The comment box stays at the foot of the column: one line while
-        // it is closed, an editor with its Comment button once it has the
-        // focus or a draft.
+        // The column fades out over its last 16 px, so a comment cut by the
+        // comment box reads as continuing under it. At the end of the page
+        // that strip is only the column's bottom padding.
+        let shade = crate::theme::tokens::panel();
+        let column = v_flex().relative().flex_1().min_h_0().child(scroll).child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h_4()
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(shade.opacity(0.), 0.),
+                    linear_color_stop(shade, 1.),
+                )),
+        );
+        // The comment box stays at the foot of the column, under a hairline:
+        // one line while it is closed, an editor with its Comment button once
+        // it has the focus or a draft.
         let focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
-        let main = v_flex().flex_1().min_w_0().h_full().child(scroll).child(
+        let main = v_flex().flex_1().min_w_0().h_full().child(column).child(
             div()
                 .flex_none()
                 .w_full()
-                .max_w(dp(crate::ui::READING_WIDTH + 32.))
-                .mx_auto()
-                .px(crate::theme::scale::content_inset())
-                .pt_2()
-                .pb_3()
-                .child(self.render_composer(focused, cx)),
+                .border_t_1()
+                .border_color(crate::theme::tokens::border_subtle())
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(dp(crate::ui::READING_WIDTH + 32.))
+                        .mx_auto()
+                        .px(crate::theme::scale::content_inset())
+                        .py_3()
+                        .child(self.render_composer(focused, cx)),
+                ),
         );
 
         let side = ui::side_panel(

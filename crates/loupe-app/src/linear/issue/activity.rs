@@ -1,9 +1,8 @@
 //! The comment thread and the new-comment box.
 
 use chrono::Utc;
-use gpui_kit::component::avatar::Avatar;
 use gpui_kit::component::input::Textarea;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_linear::{Author, Comment};
@@ -85,11 +84,11 @@ fn author_line(author: &Author) -> AuthorLine {
         Author::Bot { name, avatar_url } => AuthorLine {
             name: name.clone().into(),
             bot: true,
-            avatar: Avatar::new()
-                .with_size(Size::Size(size))
-                .name(name.clone())
-                .when_some(avatar_url.clone(), |avatar, url| avatar.src(url))
-                .into_any_element(),
+            avatar: crate::ui::avatar_named(
+                avatar_url.clone().unwrap_or_default(),
+                name.clone(),
+                size,
+            ),
         },
         Author::Unknown => AuthorLine {
             name: "Unknown".into(),

@@ -54,8 +54,19 @@ use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
-const PLACEHOLDER: &str =
-    "Search, or narrow with pr:, repo:, org:, issue:, tab:, or a team key like ENG-";
+const PLACEHOLDER: &str = "Search or run a command…";
+/// The prefixes the empty field offers as chips, with what each narrows to.
+const PREFIX_HINTS: [(&str, &str); 5] = [
+    ("pr:", "pull requests"),
+    ("repo:", "a repository"),
+    ("org:", "an organization"),
+    ("issue:", "Linear issues"),
+    ("tab:", "open tabs"),
+];
+/// Rows the list shows before it scrolls. Every row, a group's heading
+/// included, is 2 rem (a 20 px line between 6 px paddings), so a list this
+/// many rows tall ends on a row's edge instead of cutting one in half.
+const LIST_ROWS: f32 = 12.;
 /// What the field holds when the palette opens on the open tabs.
 const TABS_QUERY: &str = "tab: ";
 /// Rows of the Repositories section.
@@ -1305,8 +1316,15 @@ impl PaletteView {
     /// Puts `tab: ` in the field, in place of what it held, so the palette
     /// lists the open tabs.
     fn narrow_to_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.input
-            .update(cx, |input, cx| input.set_value(TABS_QUERY, window, cx));
+        self.start_query(TABS_QUERY, window, cx);
+    }
+
+    /// Puts `query` in the field, caret at its end, and lists what it asks for.
+    fn start_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_value(query, window, cx);
+            input.focus(window, cx);
+        });
         self.on_input_changed(window, cx);
     }
 
@@ -1663,7 +1681,7 @@ impl PaletteView {
             .searchable(false)
             .filterable(false)
             .bordered(false)
-            .max_h(dp(380.))
+            .max_h(list_max_height())
             .header(move |_, _, cx| field_header(&input, false, cx))
             .empty(move |_, _, cx| status_row(status.clone(), cx.theme().muted_foreground))
             .footer(|_, _, cx| {
@@ -1708,6 +1726,7 @@ fn field_header(input: &Entity<InputState>, tokens: bool, cx: &App) -> Div {
         .appearance(false)
         .p_0();
     div()
+        .debug_selector(|| "palette-field".into())
         .flex_none()
         .px_3()
         .border_b_1()
@@ -1719,8 +1738,46 @@ fn field_header(input: &Entity<InputState>, tokens: bool, cx: &App) -> Div {
         })
 }
 
+/// The list's height cap: [`LIST_ROWS`] rows under the list's 4 px inset.
+fn list_max_height() -> Rems {
+    rems(0.25 + 2. * LIST_ROWS)
+}
+
+/// Under the empty field, the prefixes that narrow the list, as chips that
+/// type themselves into the field.
+fn prefix_hints(view: WeakEntity<PaletteView>, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    h_flex()
+        .flex_wrap()
+        .gap_1()
+        .pb_2()
+        .text_size(scale::meta())
+        .text_color(muted)
+        .child(div().mr_1().child("Narrow with"))
+        .children(PREFIX_HINTS.iter().map(|&(prefix, narrows_to)| {
+            let view = view.clone();
+            let id = format!("palette-prefix-{}", prefix.trim_end_matches(':'));
+            let selector = id.clone();
+            crate::ui::chip_button(
+                SharedString::from(id),
+                format!("Narrow to {narrows_to} ({prefix})"),
+                cx,
+            )
+            .debug_selector(move || selector)
+            .child(prefix)
+            .on_click(move |_, window, cx| {
+                view.update(cx, |this, cx| {
+                    this.start_query(&format!("{prefix} "), window, cx)
+                })
+                .ok();
+            })
+        }))
+        .child(div().ml_1().child("or a team key like ENG-"))
+}
+
 fn footer(cx: &App) -> Div {
     h_flex()
+        .debug_selector(|| "palette-footer".into())
         .gap_4()
         .px_3()
         .py_2()
@@ -1736,6 +1793,10 @@ impl Render for PaletteView {
             self.render_search(cx)
         };
         div()
+            // One 20 px line for every row of the list, headings included,
+            // so each row is 2 rem tall and `LIST_ROWS` of them fill the list
+            // exactly. The list measures its rows with this text style.
+            .line_height(rems(1.25))
             .on_action(cx.listener(|this, _: &SearchTabs, window, cx| {
                 if this.picker.is_none() {
                     this.narrow_to_tabs(window, cx);
@@ -1793,6 +1854,7 @@ impl PaletteView {
 
         let view = cx.entity().downgrade();
         let input = self.input.clone();
+        let hints = self.input.read(cx).value().is_empty().then(|| view.clone());
         let status = if self.is_searching() {
             searching_label(&self.parsed)
         } else {
@@ -1802,8 +1864,12 @@ impl PaletteView {
             .searchable(false)
             .filterable(false)
             .bordered(false)
-            .max_h(dp(380.))
-            .header(move |_, _, cx| field_header(&input, true, cx))
+            .max_h(list_max_height())
+            .header(move |_, _, cx| {
+                field_header(&input, true, cx).when_some(hints.clone(), |header, view| {
+                    header.child(prefix_hints(view, cx))
+                })
+            })
             .empty(move |_, _, cx| status_row(status, cx.theme().muted_foreground))
             .footer(|_, _, cx| {
                 let muted = cx.theme().muted_foreground;
@@ -2525,12 +2591,16 @@ mod tests {
     mod field {
         use gpui_kit::base::actions::Cancel;
         use gpui_kit::{
-            AppContext as _, Context, Entity, IntoElement, Render, TestAppContext,
+            AppContext as _, Context, Entity, IntoElement, Modifiers, Render, TestAppContext,
             VisualTestContext, Window, div, px,
         };
 
-        use super::super::{PaletteSlot, PaletteView, Prefix, SEARCH_DEBOUNCE, toggle};
+        use super::super::{
+            LIST_ROWS, PaletteSlot, PaletteView, ParsedQuery, Prefix, SEARCH_DEBOUNCE,
+            item_commands, toggle,
+        };
         use crate::services::Services;
+        use crate::shell::item_menu::{Command, Item, Place};
         use crate::store::Settings;
 
         struct Blank;
@@ -2544,6 +2614,14 @@ mod tests {
         /// The palette open over an empty window, signed in nowhere, so no
         /// search leaves the machine.
         fn open_palette(cx: &mut TestAppContext) -> (VisualTestContext, Entity<PaletteView>) {
+            open_palette_on(None, cx)
+        }
+
+        /// [`open_palette`] on `target`'s commands.
+        fn open_palette_on(
+            target: Option<(Item, Place)>,
+            cx: &mut TestAppContext,
+        ) -> (VisualTestContext, Entity<PaletteView>) {
             let (handle, _) = cx.update(|cx| {
                 gpui_kit::init(cx);
                 crate::theme::init(cx);
@@ -2554,7 +2632,7 @@ mod tests {
             });
             let mut cx = VisualTestContext::from_window(handle, cx);
             cx.update(|window, cx| {
-                toggle(None, Vec::new(), window, cx);
+                toggle(target, Vec::new(), window, cx);
                 window.refresh();
                 window.draw(cx).clear(cx);
             });
@@ -2636,6 +2714,66 @@ mod tests {
                 .expect("a status row when nothing matched");
             // The dialog is still sliding in, so only the size compares.
             assert_eq!(settled.size, searching.size, "the palette keeps its layout");
+        }
+
+        /// Over an issue's commands the list runs past its height, and stops
+        /// on a row's edge: every row, a heading too, is 2 rem, and the list
+        /// is its 4 px inset and `LIST_ROWS` of them.
+        #[gpui_kit::test]
+        fn a_long_list_ends_on_a_row_edge(cx: &mut TestAppContext) {
+            use crate::linear::issue_menu::tests::issue;
+
+            let target = (Item::issue(&issue()), Place::Page);
+            let commands = item_commands(Some(&target), false, &ParsedQuery::parse(""));
+            assert_eq!(
+                commands[..2],
+                [Command::OpenInNewTab, Command::OpenSideBySide]
+            );
+            let (mut cx, _) = open_palette_on(Some(target), cx);
+            redraw(&mut cx);
+            let rem = cx.update(|window, _| window.rem_size());
+            let mut bounds = |selector| cx.debug_bounds(selector).expect(selector);
+            let field = bounds("palette-field");
+            let footer = bounds("palette-footer");
+            let first = bounds("palette-item-OpenInNewTab");
+            let second = bounds("palette-item-OpenSideBySide");
+
+            assert_eq!(second.origin.y - first.origin.y, rem * 2., "a row is 2 rem");
+            assert_eq!(
+                first.origin.y - field.bottom(),
+                rem * (0.25 + 2. + 0.375),
+                "the inset, the 2 rem heading, then the row's own padding"
+            );
+            assert_eq!(
+                footer.origin.y - field.bottom(),
+                rem * (0.25 + 2. * LIST_ROWS),
+                "the list is capped at whole rows"
+            );
+        }
+
+        /// The empty field offers the prefixes; a click types one in.
+        #[gpui_kit::test]
+        fn a_prefix_chip_types_its_prefix(cx: &mut TestAppContext) {
+            let (mut cx, view) = open_palette(cx);
+            redraw(&mut cx);
+            let chip = cx
+                .debug_bounds("palette-prefix-repo")
+                .expect("the prefixes under the empty field");
+            cx.simulate_click(chip.center(), Modifiers::none());
+            redraw(&mut cx);
+            let (text, narrowed) = cx.update(|_, cx| {
+                let view = view.read(cx);
+                (
+                    view.input.read(cx).value().to_string(),
+                    view.parsed.has(Prefix::Repo),
+                )
+            });
+            assert_eq!(text, "repo: ");
+            assert!(narrowed);
+            assert!(
+                cx.debug_bounds("palette-prefix-repo").is_none(),
+                "the chips leave once the field has text"
+            );
         }
 
         #[gpui_kit::test]
