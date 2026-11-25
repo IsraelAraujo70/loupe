@@ -113,6 +113,13 @@ const PULL_REQUEST_ROWS_QUERY: &str = concat!(
     pr_row_fragment!()
 );
 
+const PULL_REQUEST_ROW_QUERY: &str = concat!(
+    "query PullRequestRow($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) { ...PrRow } }
+}",
+    pr_row_fragment!()
+);
+
 const VIEWER_REPOSITORIES_QUERY: &str = concat!(
     "query ViewerRepositories {
   viewer {
@@ -194,6 +201,7 @@ pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("review_requested_count", REVIEW_REQUESTED_COUNT_QUERY),
     ("pull_request_repositories", PULL_REQUEST_REPOSITORIES_QUERY),
     ("pull_request_rows", PULL_REQUEST_ROWS_QUERY),
+    ("pull_request_row", PULL_REQUEST_ROW_QUERY),
 ];
 
 impl GitHub {
@@ -267,6 +275,33 @@ impl GitHub {
             );
         }
         Ok(rows)
+    }
+
+    /// The list row of pull request `pr`, as a search would return it, read
+    /// by its number alone. `None` when the repository has no such pull
+    /// request; a repository the token cannot see is an error.
+    pub fn pull_request_row(&self, pr: &PrRef) -> Result<Option<PrSummary>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Repository {
+            pull_request: Option<Value>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Option<Repository>,
+        }
+        let data: Data = self.graphql(
+            PULL_REQUEST_ROW_QUERY,
+            json!({ "owner": pr.repo.owner, "name": pr.repo.name, "number": pr.number }),
+        )?;
+        data.repository
+            .and_then(|repository| repository.pull_request)
+            .map(|node| {
+                serde_json::from_value::<WirePullRequest>(node)
+                    .map(WirePullRequest::into_summary)
+                    .map_err(|error| Error::Decode(error.to_string()))
+            })
+            .transpose()
     }
 
     /// Runs a raw search query (GitHub search syntax). `is:pr` is added when
@@ -1301,7 +1336,8 @@ mod tests {
                 "repository_labels",
                 "review_requested_count",
                 "pull_request_repositories",
-                "pull_request_rows"
+                "pull_request_rows",
+                "pull_request_row"
             ]
         );
     }
