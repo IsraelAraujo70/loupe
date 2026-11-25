@@ -755,7 +755,7 @@ impl RenderOnce for EmptyState {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let mut header = EmptyHeader::new()
-            .media(EmptyMedia::new().child(svg().path(self.icon.path()).size_5().text_color(muted)))
+            .media(EmptyMedia::new().child(svg().path(self.icon.path()).size_8().text_color(muted)))
             .title(EmptyTitle::new().child(self.title));
         if !self.detail.is_empty() {
             header = header.description(EmptyDescription::new().child(self.detail));
