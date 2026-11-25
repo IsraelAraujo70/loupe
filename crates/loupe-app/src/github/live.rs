@@ -244,6 +244,7 @@ mod tests {
             mergeable: Mergeable::Unknown,
             review_requests: Vec::new(),
             reviewed_by: Vec::new(),
+            viewer_review: None,
         }
     }
 
