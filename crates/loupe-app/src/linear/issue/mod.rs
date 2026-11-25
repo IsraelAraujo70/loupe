@@ -102,6 +102,8 @@ struct IssueView {
     /// Bumped on every load so a late answer to an older load is dropped.
     generation: u64,
     load: Loadable<Loaded>,
+    /// The load failed because Linear has no such issue (for this key).
+    missing: bool,
     team: Loadable<Arc<Team>>,
     /// The last failed property edit, shown until the next edit or dismissal.
     edit_error: Option<SharedString>,
@@ -165,6 +167,7 @@ impl IssueView {
             client: None,
             generation: 0,
             load: Loadable::Loading,
+            missing: false,
             team: Loadable::Loading,
             edit_error: None,
             picker: None,
@@ -186,6 +189,7 @@ impl IssueView {
         self.generation += 1;
         let generation = self.generation;
         self.load = Loadable::Loading;
+        self.missing = false;
         self.from_linear = None;
         self.team = Loadable::Loading;
         self.edit_labels.clear();
@@ -208,7 +212,10 @@ impl IssueView {
                         view.load = Loadable::Ready(Loaded::new(detail));
                         view.load_team(team_id, cx);
                     }
-                    Err(error) => view.load = Loadable::Failed(data::error_text(&error)),
+                    Err(error) => {
+                        view.missing = error.kind() == loupe_linear::ErrorKind::NotFound;
+                        view.load = Loadable::Failed(data::error_text(&error));
+                    }
                 }
                 cx.notify();
             })
@@ -656,7 +663,7 @@ impl Render for IssueView {
             }
         }
         if self.client.is_none() {
-            return widgets::not_connected(IconName::FileText, self.identifier.clone());
+            return widgets::not_connected(IconName::FileText, self.identifier.clone(), cx);
         }
         if crate::shell::page_may_take_focus(window, cx) {
             self.focus.focus(window, cx);
@@ -664,6 +671,14 @@ impl Render for IssueView {
         let header = self.render_header(cx);
         let body = match &self.load {
             Loadable::Loading => div().py_2().child(ui::skeleton_rows(6)).into_any_element(),
+            Loadable::Failed(_) if self.missing => {
+                widgets::issue_not_found(data::active_workspace(cx).map(|workspace| {
+                    format!(
+                        "https://linear.app/{}/issue/{}",
+                        workspace.viewer.organization.url_key, self.identifier
+                    )
+                }))
+            }
             Loadable::Failed(message) => {
                 widgets::load_error(message.clone(), cx.listener(|view, _, _, cx| view.load(cx)))
             }
