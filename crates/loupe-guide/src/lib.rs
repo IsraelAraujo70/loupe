@@ -3,6 +3,7 @@
 pub mod checkout;
 pub mod claude;
 pub mod language;
+mod private_dir;
 pub mod prompt;
 pub mod runner;
 pub mod schema;

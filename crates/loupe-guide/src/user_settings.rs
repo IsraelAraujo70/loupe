@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use crate::private_dir::PrivateDir;
+
 /// `env` keys forwarded by prefix: Anthropic's own connection variables
 /// (base URL, auth token, API key, custom headers, model aliases) and
 /// Vertex's per-model regions.
@@ -129,8 +131,9 @@ pub fn connection_settings(user: &Value, helper_dir: &Path) -> Option<Value> {
 /// process listings.
 #[derive(Debug)]
 pub(crate) struct ForwardedSettings {
-    dir: PathBuf,
     path: PathBuf,
+    /// Declared after `path` only for reading order; dropping it removes the file.
+    _dir: PrivateDir,
     secrets: Vec<String>,
 }
 
@@ -196,24 +199,10 @@ impl ForwardedSettings {
     }
 
     fn write(forwarded: &Value) -> std::io::Result<Self> {
-        let dir = std::env::temp_dir().join(format!(
-            "loupe-claude-settings-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&dir)?;
+        let dir = PrivateDir::create("loupe-claude-settings")?;
         let settings = Self {
-            path: dir.join("settings.json"),
-            dir,
+            path: dir.path().join("settings.json"),
+            _dir: dir,
             secrets: secret_values(forwarded),
         };
         let mut options = std::fs::OpenOptions::new();
@@ -239,12 +228,6 @@ impl ForwardedSettings {
         self.secrets
             .iter()
             .fold(text.to_owned(), |text, secret| text.replace(secret, "***"))
-    }
-}
-
-impl Drop for ForwardedSettings {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

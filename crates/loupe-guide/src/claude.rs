@@ -364,8 +364,15 @@ fn apply_safe_env(cmd: &mut Command) {
 /// The prompt is fed through `stdin` (never argv) so large PR diffs never hit
 /// OS argument limits and untrusted content never appears in process listings.
 /// `settings` is the file of forwarded user connection settings, if any.
+///
+/// Claude Code starts in `workdir`, an empty private directory, and reaches
+/// the checkout through `--add-dir`: whatever Claude Code or a credential
+/// helper it runs resolves relative to its working directory (an
+/// `apiKeyHelper`, an AWS `credential_process`, a relative certificate path)
+/// never lands in the pull request's files.
 pub fn build_command(
     exe: &Path,
+    workdir: &Path,
     checkout_dir: &Path,
     config: &ClaudeConfig,
     settings: Option<&Path>,
@@ -373,7 +380,7 @@ pub fn build_command(
     system_prompt: &str,
 ) -> Command {
     let mut cmd = Command::new(exe);
-    cmd.current_dir(checkout_dir)
+    cmd.current_dir(workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -408,7 +415,9 @@ pub fn build_command(
             system_prompt,
             "--json-schema",
             schema_json,
-        ]);
+        ])
+        .arg("--add-dir")
+        .arg(checkout_dir);
     if let Some(settings) = settings {
         cmd.arg("--settings").arg(settings);
     }
@@ -583,6 +592,7 @@ mod tests {
         };
         build_command(
             Path::new("/usr/bin/claude"),
+            Path::new("/tmp/workdir"),
             Path::new("/tmp/checkout"),
             &config,
             settings,
@@ -694,6 +704,7 @@ mod tests {
         };
         let cmd = build_command(
             Path::new("/usr/bin/claude"),
+            Path::new("/tmp/workdir"),
             Path::new("/tmp/checkout"),
             &config,
             None,
@@ -713,7 +724,14 @@ mod tests {
         assert!(args.contains(&"--disable-slash-commands".to_owned()));
         assert!(args.contains(&"--no-session-persistence".to_owned()));
         assert!(args.contains(&"--no-chrome".to_owned()));
-        assert!(!args.contains(&"--add-dir".to_owned()));
+        // The checkout is the only directory added; Claude Code itself starts
+        // in the private working directory.
+        assert_eq!(
+            args.iter().filter(|a| *a == "--add-dir").count(),
+            1,
+            "exactly one --add-dir"
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp/workdir")));
         assert!(!args.contains(&"--dangerously-skip-permissions".to_owned()));
         assert!(!args.contains(&"bypassPermissions".to_owned()));
 
@@ -730,6 +748,7 @@ mod tests {
         assert_eq!(arg_value("--permission-prompts"), Some("none"));
         assert_eq!(arg_value("--output-format"), Some("stream-json"));
         assert_eq!(arg_value("--model"), Some("sonnet"));
+        assert_eq!(arg_value("--add-dir"), Some("/tmp/checkout"));
         assert_eq!(arg_value("--effort"), Some("medium"));
 
         // Verify no write, network, or shell tool is in `--tools`.
@@ -843,6 +862,7 @@ mod tests {
 
         let mut cmd = build_command(
             &stub,
+            &std::env::temp_dir(),
             &std::env::temp_dir(),
             &ClaudeConfig::default(),
             None,

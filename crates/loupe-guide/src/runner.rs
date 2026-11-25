@@ -17,6 +17,7 @@ use crate::claude::{
     ClaudeAvailability, ClaudeConfig, StreamEvent, build_command, check_availability,
     parse_stream_line, unexpected_init_tools,
 };
+use crate::private_dir::PrivateDir;
 use crate::prompt::{GuidePromptInput, SYSTEM_PROMPT, build_user_prompt};
 use crate::schema::{GuideValidationError, ReviewGuide, guide_json_schema, validate};
 use crate::user_settings::ForwardedSettings;
@@ -175,7 +176,9 @@ pub fn run_in_checkout_with_timeout(
     on_progress(ProgressEvent::StartingAgent);
     let schema_json = serde_json::to_string(&guide_json_schema())
         .map_err(|err| GuideRunError::Spawn(err.to_string()))?;
-    let user_prompt = build_user_prompt(input);
+    let user_prompt = build_user_prompt(input, checkout_dir);
+    let workdir = PrivateDir::create("loupe-claude-work")
+        .map_err(|err| GuideRunError::Spawn(err.to_string()))?;
 
     // Kept alive until the child exits; its file is removed on drop.
     let user_settings = ForwardedSettings::load();
@@ -186,6 +189,7 @@ pub fn run_in_checkout_with_timeout(
     };
     let mut cmd = build_command(
         exe,
+        workdir.path(),
         checkout_dir,
         config,
         forwarded.map(ForwardedSettings::path),
@@ -505,6 +509,74 @@ mod tests {
         }
         assert!(!checkout_path.exists(), "temp checkout must be deleted");
         let _ = fs::remove_file(&stub);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// Claude Code, and every credential helper it runs (`apiKeyHelper`, an
+    /// AWS `credential_process`), resolves relative names from its working
+    /// directory. That directory must never be the pull request's checkout:
+    /// the agent starts in an empty private directory, removed afterwards,
+    /// and reaches the checkout only through `--add-dir`.
+    #[cfg(unix)]
+    #[test]
+    fn the_agent_never_runs_in_the_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (src, sha) = create_malicious_test_repo();
+        let record = std::env::temp_dir().join(format!("loupe-cwd-record-{}", std::process::id()));
+        let stub = std::env::temp_dir().join(format!("loupe-cwd-stub-{}.sh", std::process::id()));
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n{{ pwd; ls -A; prev=; for a in \"$@\"; do [ \"$prev\" = --add-dir ] && echo \"add-dir=$a\"; prev=$a; done; }} > '{}'\necho '{{\"type\":\"result\",\"is_error\":true,\"result\":\"stub\"}}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let checkout = TempCheckout::from_local_repo(&src, &sha).unwrap();
+        let input = GuidePromptInput {
+            repo: "acme/app".into(),
+            pr_number: 3,
+            title: "cwd".into(),
+            body: String::new(),
+            author: "alice".into(),
+            base_ref: "main".into(),
+            base_oid: sha.clone(),
+            head_ref: "feat".into(),
+            head_oid: sha.clone(),
+            commits: Vec::new(),
+            comments: Vec::new(),
+            files: Vec::new(),
+            previous_step_ids: Vec::new(),
+            language: crate::language::GuideLanguage::english(),
+        };
+        let _ = run_in_checkout(
+            &stub,
+            checkout.path(),
+            &input,
+            &ClaudeConfig::default(),
+            &CancelToken::new(),
+            |_| {},
+        );
+        let recorded = fs::read_to_string(&record).unwrap();
+        let mut lines = recorded.lines();
+        let cwd = PathBuf::from(lines.next().unwrap());
+        let rest: Vec<&str> = lines.collect();
+        let checkout_real = fs::canonicalize(checkout.path()).unwrap();
+        assert_ne!(cwd, checkout_real, "the agent ran in the checkout");
+        assert!(!cwd.starts_with(&checkout_real));
+        assert_eq!(
+            rest,
+            [format!("add-dir={}", checkout.path().display()).as_str()],
+            "the working directory must be empty and the checkout added once"
+        );
+        assert!(!cwd.exists(), "the working directory must be removed");
+
+        drop(checkout);
+        let _ = fs::remove_file(&stub);
+        let _ = fs::remove_file(&record);
         let _ = fs::remove_dir_all(&src);
     }
 
