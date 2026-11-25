@@ -9,7 +9,10 @@
 //! of its pull requests above one chapter at a time, opening on the chapter of
 //! the pull request on screen.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -18,12 +21,13 @@ use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{PrRef, PrState, PullRequestDetail, ReviewEvent, Side, StackNode};
+use loupe_github::{ChangedFile, PrRef, PrState, PullRequestDetail, ReviewEvent, Side, StackNode};
 use loupe_guide::{
     ChapterChange, DecisionCategory, DecisionPoint, DiffSnippet, FlowComparison, GuideLanguage,
     GuideReadState, GuideStep, RemovedTest, ReviewGuide, SnippetSide, StepChange, StoredGuide,
@@ -109,6 +113,72 @@ enum GuideReview {
     Failed(String),
 }
 
+/// Lines added and removed per changed file, by path.
+type LineCounts = HashMap<String, (u32, u32)>;
+
+/// Most files one folder of the uncovered list shows before "Show N more".
+const UNCOVERED_FILE_LIMIT: usize = 50;
+
+/// How the reader left the list of files the walkthrough cites nothing of.
+#[derive(Default)]
+struct UncoveredView {
+    /// The list is open; it starts folded to its one-line summary.
+    open: bool,
+    /// Folders the reader flipped from how they start: folded, except a
+    /// folder that is alone at the top.
+    flipped: HashSet<String>,
+    /// Folders that show every file, past `UNCOVERED_FILE_LIMIT`.
+    unclipped: HashSet<String>,
+    /// Lines added and removed per path, read once per head from the files
+    /// the Files tab keeps, under the key they were read from.
+    stats: RefCell<Option<(String, Rc<LineCounts>)>>,
+}
+
+/// One folder of the files the walkthrough cites nothing of.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UncoveredFolder {
+    /// From the repository root; empty for the root.
+    path: String,
+    /// Under its parent, with the folders that hold only one folder folded
+    /// into it, as `web/src`.
+    name: String,
+    /// Biggest change first.
+    folders: Vec<UncoveredFolder>,
+    /// Biggest change first.
+    files: Vec<UncoveredFile>,
+    /// Files in the folder and every folder under it.
+    file_count: usize,
+    additions: u32,
+    deletions: u32,
+    /// Whether any file under it has a known line count.
+    counted: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UncoveredFile {
+    /// Its place in the list the guide gave.
+    ix: usize,
+    path: String,
+    /// Lines added and removed, once the Files tab read them.
+    stat: Option<(u32, u32)>,
+}
+
+impl UncoveredFile {
+    fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+
+    fn lines(&self) -> u32 {
+        self.stat.map_or(0, |(added, removed)| added + removed)
+    }
+}
+
+impl UncoveredFolder {
+    fn lines(&self) -> u32 {
+        self.additions + self.deletions
+    }
+}
+
 pub struct GuideTab {
     context: PrTabContext,
     state: GuideViewState,
@@ -129,6 +199,7 @@ pub struct GuideTab {
     clear_review_body: bool,
     /// Reviews sent from this tab, by pull request number.
     reviews: HashMap<u64, GuideReview>,
+    uncovered: UncoveredView,
     _submit_on_secondary_enter: Subscription,
 }
 
@@ -168,6 +239,7 @@ impl GuideTab {
             review_body,
             clear_review_body: false,
             reviews: HashMap::new(),
+            uncovered: UncoveredView::default(),
             _submit_on_secondary_enter: submit_on_secondary_enter,
         }
     }
@@ -1420,58 +1492,375 @@ impl GuideTab {
             .into_any_element()
     }
 
+    /// Changed files the walkthrough cites no snippet of. Folded, one line
+    /// says how many there are, in how many folders, and how many lines they
+    /// change; a lone file is named there. Open, a tree of folders, the
+    /// biggest change first, leads to each file by its name.
     fn render_uncovered_files(&self, paths: &[String], cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let mono = cx.theme().mono_font_family.clone();
-        v_flex()
-            .debug_selector(|| "guide-uncovered-files".into())
+        let stats = self.uncovered_stats(cx);
+        let root = group_by_folder(paths, &stats);
+        let folders: HashSet<&str> = paths
+            .iter()
+            .map(|path| path.rsplit_once('/').map_or("", |(folder, _)| folder))
+            .collect();
+        let open = self.uncovered.open;
+        let theme = cx.theme();
+        let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+        let title = div()
+            .flex_none()
+            .text_size(scale::title())
+            .font_weight(FontWeight::SEMIBOLD)
+            .child("Files not covered by the guide");
+        let dot = || div().flex_none().text_color(muted).child("·");
+        let stat = root
+            .counted
+            .then(|| widgets::diff_stat(root.additions, root.deletions));
+        let spoken_stat = spoken_stat(root.counted.then_some((root.additions, root.deletions)));
+
+        if let [only] = paths {
+            let path = only.clone();
+            let ix = 0;
+            let file = h_flex()
+                .id(SharedString::from(format!("guide-uncovered-file-{ix}")))
+                .debug_selector(move || format!("guide-uncovered-file-{ix}"))
+                .role(Role::Button)
+                .aria_label(format!("Open {path} in Files"))
+                .min_w_0()
+                .px_1()
+                .gap_1()
+                .items_center()
+                .rounded(cx.theme().radius)
+                .hover(move |row| row.bg(hover))
+                .child(
+                    Icon::new(widgets::file_icon(&path))
+                        .with_size(scale::icon_sm())
+                        .text_color(muted),
+                )
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(scale::code())
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .when_some(path.rsplit_once('/'), |name, (folder, _)| {
+                            name.child(
+                                // Shrinks a thousand times faster than the
+                                // name, so the folder is gone before the
+                                // name loses a character.
+                                div()
+                                    .min_w_0()
+                                    .flex_shrink(1000.)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis_start()
+                                    .text_color(muted)
+                                    .child(format!("{folder}/")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .debug_selector(|| "guide-uncovered-file-name".into())
+                                .min_w_0()
+                                .truncate()
+                                .child(path.rsplit('/').next().unwrap_or(&path).to_owned()),
+                        ),
+                )
+                .tooltip({
+                    let path = path.clone();
+                    move |window, cx| Tooltip::new(path.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_file(path.clone(), None, Side::Right, cx);
+                }));
+            return ui::card(cx)
+                .id("guide-uncovered-files")
+                .debug_selector(|| "guide-uncovered-files".into())
+                .role(Role::Group)
+                .aria_label(format!(
+                    "Files not covered by the guide: 1 file{spoken_stat}"
+                ))
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .py_2()
+                .child(uncovered_icon())
+                .child(title)
+                .child(dot())
+                .child(file)
+                .when_some(stat, |row, stat| row.child(dot()).child(stat))
+                .into_any_element();
+        }
+
+        let summary = format!(
+            "{} in {}",
+            count_of(paths.len(), "file", "files"),
+            count_of(folders.len(), "folder", "folders")
+        );
+        let header = h_flex()
+            .id("guide-uncovered-toggle")
+            .debug_selector(|| "guide-uncovered-toggle".into())
+            .role(Role::Button)
+            .aria_label(format!(
+                "Files not covered by the guide, {summary}{spoken_stat}"
+            ))
+            .aria_expanded(open)
             .w_full()
+            .px(scale::card_padding())
+            .py_2()
             .gap_2()
+            .items_center()
+            .hover(move |row| row.bg(hover))
+            .child(chevron(!open, muted))
+            .child(uncovered_icon())
+            .child(title)
+            .child(dot())
             .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Icon::new(IconName::FileDiff)
-                            .with_size(scale::icon_sm())
-                            .text_color(tokens::pending()),
-                    )
-                    .child(
-                        div()
-                            .text_size(scale::title())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Files not covered by the guide"),
-                    )
-                    .child(ui::count_badge(paths.len(), cx)),
+                div()
+                    .flex_none()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(summary),
             )
-            .child(
-                ui::card(cx)
-                    .p_3()
-                    .gap_2()
-                    .child(div().text_size(scale::meta()).text_color(muted).child(
-                        "Changed in this pull request without a cited snippet in the walkthrough:",
-                    ))
-                    .child(h_flex().w_full().flex_wrap().gap_2().children(
-                        paths.iter().enumerate().map(|(ix, path)| {
-                            let open_path = path.clone();
-                            Button::new(SharedString::from(format!("guide-uncovered-file-{ix}")))
-                                .debug_selector(move || format!("guide-uncovered-file-{ix}"))
-                                .outline()
-                                .xsmall()
-                                .icon(IconName::FileDiff)
+            .when_some(stat, |row, stat| row.child(dot()).child(stat))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.uncovered.open = !this.uncovered.open;
+                cx.notify();
+            }));
+
+        let mut rows = Vec::new();
+        if open {
+            self.push_uncovered_rows(&root, 0, &mut rows, cx);
+        }
+        ui::card(cx)
+            .debug_selector(|| "guide-uncovered-files".into())
+            .p_0()
+            .gap_0()
+            .overflow_hidden()
+            .child(header)
+            .when(open, |card| {
+                card.child(
+                    v_flex()
+                        .id("guide-uncovered-tree")
+                        .role(Role::Tree)
+                        .aria_label("Files not covered by the guide")
+                        .w_full()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(tokens::border_subtle())
+                        .child(
+                            div()
+                                .px_2()
+                                .pb_1()
+                                .text_size(scale::meta())
+                                .text_color(muted)
                                 .child(
-                                    div()
-                                        .font_family(mono.clone())
-                                        .text_size(scale::code())
-                                        .child(path.clone()),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_file(open_path.clone(), None, Side::Right, cx);
-                                }))
-                        }),
-                    )),
-            )
+                                    "Changed in this pull request without a cited snippet in the \
+                                     walkthrough. Biggest changes first.",
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .max_w(dp(ui::READING_WIDTH))
+                                .children(rows),
+                        ),
+                )
+            })
             .into_any_element()
+    }
+
+    /// The rows of `folder`'s folders, then its files, `depth` levels in:
+    /// an open folder's own rows follow it.
+    fn push_uncovered_rows(
+        &self,
+        folder: &UncoveredFolder,
+        depth: usize,
+        rows: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = cx.theme();
+        let (muted, hover, radius) = (theme.muted_foreground, theme.list_hover, theme.radius);
+        let mono = theme.mono_font_family.clone();
+        let alone_at_top = depth == 0 && folder.files.is_empty() && folder.folders.len() == 1;
+        for child in &folder.folders {
+            let open = alone_at_top != self.uncovered.flipped.contains(&child.path);
+            let path = child.path.clone();
+            let files = count_of(child.file_count, "file", "files");
+            let spoken_stat =
+                spoken_stat(child.counted.then_some((child.additions, child.deletions)));
+            rows.push(
+                uncovered_row(
+                    SharedString::from(format!("guide-uncovered-folder-{path}")),
+                    depth,
+                    hover,
+                    radius,
+                )
+                .debug_selector({
+                    let path = path.clone();
+                    move || format!("guide-uncovered-folder-{path}")
+                })
+                .role(Role::TreeItem)
+                .aria_level(depth + 1)
+                .aria_expanded(open)
+                .aria_label(format!("{path}, {files}{spoken_stat}"))
+                .child(chevron(!open, muted))
+                .child(
+                    Icon::new(if open {
+                        IconName::FolderOpen
+                    } else {
+                        IconName::Folder
+                    })
+                    .with_size(scale::icon_sm())
+                    .text_color(muted),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_start()
+                        .font_family(mono.clone())
+                        .text_size(scale::code())
+                        .child(format!("{}/", child.name)),
+                )
+                .child(ui::count_badge(child.file_count, cx))
+                .child(div().flex_1())
+                .when(child.counted, |row| {
+                    row.child(stat_lane(child.additions, child.deletions))
+                })
+                .tooltip({
+                    let tip = format!("{path}/ · {files}");
+                    move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.uncovered.flipped.remove(&path) {
+                        this.uncovered.flipped.insert(path.clone());
+                    }
+                    cx.notify();
+                }))
+                .into_any_element(),
+            );
+            if open {
+                self.push_uncovered_rows(child, depth + 1, rows, cx);
+            }
+        }
+
+        let shown = if self.uncovered.unclipped.contains(&folder.path) {
+            folder.files.len()
+        } else {
+            folder.files.len().min(UNCOVERED_FILE_LIMIT)
+        };
+        for file in &folder.files[..shown] {
+            let ix = file.ix;
+            let path = file.path.clone();
+            let spoken_stat = spoken_stat(file.stat);
+            rows.push(
+                uncovered_row(
+                    SharedString::from(format!("guide-uncovered-file-{ix}")),
+                    depth,
+                    hover,
+                    radius,
+                )
+                .debug_selector(move || format!("guide-uncovered-file-{ix}"))
+                .role(Role::TreeItem)
+                .aria_level(depth + 1)
+                .aria_label(format!("Open {path} in Files{spoken_stat}"))
+                .child(div().flex_none().w_4())
+                .child(
+                    Icon::new(widgets::file_icon(&path))
+                        .with_size(scale::icon_sm())
+                        .text_color(muted),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(mono.clone())
+                        .text_size(scale::code())
+                        .child(file.name().to_owned()),
+                )
+                .child(div().flex_1())
+                .when_some(file.stat, |row, (added, removed)| {
+                    row.child(stat_lane(added, removed))
+                })
+                .tooltip({
+                    let path = path.clone();
+                    move |window, cx| Tooltip::new(path.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_file(path.clone(), None, Side::Right, cx);
+                }))
+                .into_any_element(),
+            );
+        }
+        let hidden = folder.files.len() - shown;
+        if hidden > 0 {
+            let path = folder.path.clone();
+            let label = format!("Show {} more", count_of(hidden, "file", "files"));
+            rows.push(
+                uncovered_row(
+                    SharedString::from(format!("guide-uncovered-more-{path}")),
+                    depth,
+                    hover,
+                    radius,
+                )
+                .role(Role::Button)
+                .aria_label(label.clone())
+                .text_color(muted)
+                .child(div().flex_none().w_4())
+                .child(
+                    Icon::new(IconName::ChevronsUpDown)
+                        .with_size(scale::icon_sm())
+                        .text_color(muted),
+                )
+                .child(div().text_size(scale::body()).child(label))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.uncovered.unclipped.insert(path.clone());
+                    cx.notify();
+                }))
+                .into_any_element(),
+            );
+        }
+    }
+
+    /// Lines added and removed per file of the pull request on screen, as
+    /// the Files tab read them for its head; empty until it has, and for a
+    /// chapter of another pull request of the stack.
+    fn uncovered_stats(&self, cx: &App) -> Rc<LineCounts> {
+        if matches!(self.state, GuideViewState::StackReady { .. })
+            && self.selected_chapter != Some(self.context.pr.number)
+        {
+            return Rc::default();
+        }
+        let detail = &self.context.detail;
+        let Some(key) = crate::cache::github_key(
+            cx,
+            &format!(
+                "files/{}/{}/{}/{}",
+                self.context.pr.url(),
+                detail.head_oid,
+                detail.base_ref,
+                detail.base_oid
+            ),
+        ) else {
+            return Rc::default();
+        };
+        let mut memo = self.uncovered.stats.borrow_mut();
+        if let Some((read, stats)) = memo.as_ref()
+            && *read == key
+        {
+            return stats.clone();
+        }
+        let Some(files) = crate::cache::get::<Vec<ChangedFile>>(&key) else {
+            return Rc::default();
+        };
+        let stats: Rc<LineCounts> = Rc::new(
+            files
+                .into_iter()
+                .map(|file| (file.path, (file.additions, file.deletions)))
+                .collect(),
+        );
+        *memo = Some((key, stats.clone()));
+        stats
     }
 
     fn render_steps(
@@ -2266,6 +2655,160 @@ impl Render for GuideTab {
     }
 }
 
+/// `count` and the noun that goes with it: "1 file", "21 files".
+fn count_of(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// What a screen reader hears after a name for its lines added and removed,
+/// or nothing while they are unknown.
+fn spoken_stat(stat: Option<(u32, u32)>) -> String {
+    stat.map_or(String::new(), |(added, removed)| {
+        format!(
+            ", {} added, {} removed",
+            count_of(added as usize, "line", "lines"),
+            removed
+        )
+    })
+}
+
+/// The chevron of a folding row: right while folded, down while open.
+fn chevron(folded: bool, color: Hsla) -> Div {
+    h_flex().flex_none().w_4().justify_center().child(
+        Icon::new(if folded {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        })
+        .small()
+        .text_color(color),
+    )
+}
+
+fn uncovered_icon() -> Icon {
+    Icon::new(IconName::FileDiff)
+        .with_size(scale::icon_sm())
+        .text_color(tokens::pending())
+}
+
+/// One row of the uncovered files' tree, `depth` folders in.
+fn uncovered_row(id: SharedString, depth: usize, hover: Hsla, radius: Pixels) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .w_full()
+        .h(scale::row_height())
+        .px_2()
+        .gap_2()
+        .items_center()
+        .rounded(radius)
+        .text_size(scale::body())
+        .hover(move |row| row.bg(hover))
+        .child(div().flex_none().w(rems(depth as f32)))
+}
+
+/// `+12 −3` at the trailing edge, in a lane that keeps one column down the
+/// tree.
+fn stat_lane(additions: u32, deletions: u32) -> Div {
+    h_flex()
+        .flex_none()
+        .min_w(dp(96.))
+        .justify_end()
+        .child(widgets::diff_stat(additions, deletions))
+}
+
+/// `paths` as a tree of folders. A folder that holds only one folder and
+/// no file is folded into it (`web/src`). Folders and files come biggest
+/// change first (lines added and removed, with `stats` per path), then by
+/// file count and name.
+fn group_by_folder(paths: &[String], stats: &LineCounts) -> UncoveredFolder {
+    #[derive(Default)]
+    struct Node<'a> {
+        folders: BTreeMap<&'a str, Node<'a>>,
+        files: Vec<(usize, &'a String)>,
+    }
+
+    fn build(
+        mut path: String,
+        mut name: String,
+        mut node: Node<'_>,
+        stats: &LineCounts,
+    ) -> UncoveredFolder {
+        while !path.is_empty() && node.files.is_empty() && node.folders.len() == 1 {
+            let Some((child, inner)) = node.folders.pop_first() else {
+                break;
+            };
+            path = format!("{path}/{child}");
+            name = format!("{name}/{child}");
+            node = inner;
+        }
+        let mut folders: Vec<UncoveredFolder> = node
+            .folders
+            .into_iter()
+            .map(|(child, inner)| {
+                let child_path = if path.is_empty() {
+                    child.to_owned()
+                } else {
+                    format!("{path}/{child}")
+                };
+                build(child_path, child.to_owned(), inner, stats)
+            })
+            .collect();
+        let mut files: Vec<UncoveredFile> = node
+            .files
+            .into_iter()
+            .map(|(ix, path)| UncoveredFile {
+                ix,
+                path: path.clone(),
+                stat: stats.get(path).copied(),
+            })
+            .collect();
+        folders.sort_by(|a, b| {
+            (Reverse(a.lines()), Reverse(a.file_count), &a.name).cmp(&(
+                Reverse(b.lines()),
+                Reverse(b.file_count),
+                &b.name,
+            ))
+        });
+        files.sort_by(|a, b| (Reverse(a.lines()), a.name()).cmp(&(Reverse(b.lines()), b.name())));
+        let (mut additions, mut deletions) = (0, 0);
+        let mut counted = false;
+        for (added, removed) in files.iter().filter_map(|file| file.stat) {
+            additions += added;
+            deletions += removed;
+            counted = true;
+        }
+        for folder in &folders {
+            additions += folder.additions;
+            deletions += folder.deletions;
+            counted |= folder.counted;
+        }
+        UncoveredFolder {
+            path,
+            name,
+            file_count: files.len() + folders.iter().map(|f| f.file_count).sum::<usize>(),
+            folders,
+            files,
+            additions,
+            deletions,
+            counted,
+        }
+    }
+
+    let mut root = Node::default();
+    for (ix, path) in paths.iter().enumerate() {
+        let mut node = &mut root;
+        let mut parts = path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            node = node.folders.entry(part).or_default();
+        }
+        node.files.push((ix, path));
+    }
+    build(String::new(), String::new(), root, stats)
+}
+
 /// Markdown at most `ui::READING_WIDTH` wide, so prose keeps a readable
 /// line length while the cards and diff snippets around it fill the tab.
 fn prose(id: impl Into<ElementId>, text: impl Into<SharedString>) -> AnyElement {
@@ -2413,7 +2956,7 @@ mod tests {
         RemovedTest, ReviewGuide, SCHEMA_VERSION, SnippetSide, StepKind, StoredGuide,
     };
 
-    use super::{GuideTab, GuideViewState};
+    use super::{GuideTab, GuideViewState, group_by_folder};
     use crate::github::pull_request::tab::{PrTabContext, PrTabEvent};
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
@@ -2837,6 +3380,173 @@ mod tests {
             })
         );
         assert_eq!(tab.read_with(&cx, |tab, _| tab.step_count()), Some(3));
+    }
+
+    #[test]
+    fn groups_uncovered_files_by_folder_biggest_change_first() {
+        let paths: Vec<String> = [
+            "Cargo.toml",
+            "web/src/components/RecipeCard.tsx",
+            "web/src/components/IngredientList.tsx",
+            "web/src/api/client.ts",
+            "src/units.rs",
+            "src/pantry/expiry.rs",
+            "docs/guides/planning.md",
+            "assets/icon.png",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let stats: HashMap<String, (u32, u32)> = [
+            ("Cargo.toml", (1, 1)),
+            ("web/src/components/RecipeCard.tsx", (1, 1)),
+            ("web/src/components/IngredientList.tsx", (20, 0)),
+            ("web/src/api/client.ts", (8, 5)),
+            ("src/units.rs", (5, 5)),
+            ("src/pantry/expiry.rs", (15, 0)),
+            ("docs/guides/planning.md", (8, 0)),
+        ]
+        .into_iter()
+        .map(|(path, stat)| (path.to_owned(), stat))
+        .collect();
+
+        let root = group_by_folder(&paths, &stats);
+
+        assert_eq!(root.file_count, 8);
+        assert_eq!((root.additions, root.deletions), (58, 12));
+        let names: Vec<&str> = root.folders.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["web/src", "src", "docs/guides", "assets"],
+            "single-child folders fold into one group, biggest change first"
+        );
+        let web = &root.folders[0];
+        assert_eq!(web.path, "web/src");
+        assert_eq!((web.file_count, web.additions, web.deletions), (3, 29, 6));
+        let web_names: Vec<&str> = web.folders.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(web_names, ["components", "api"]);
+        let components = &web.folders[0];
+        assert_eq!(components.path, "web/src/components");
+        let files: Vec<&str> = components.files.iter().map(|f| f.name()).collect();
+        assert_eq!(files, ["IngredientList.tsx", "RecipeCard.tsx"]);
+        assert_eq!(
+            components.files[0].ix, 2,
+            "a file keeps its place in the list"
+        );
+        let src = &root.folders[1];
+        assert_eq!(src.folders[0].name, "pantry");
+        assert_eq!(src.files[0].name(), "units.rs");
+        let assets = &root.folders[3];
+        assert!(
+            !assets.counted,
+            "a folder of files with no line count says none"
+        );
+        assert_eq!(assets.files[0].stat, None);
+        assert_eq!(root.files.len(), 1);
+        assert_eq!(root.files[0].path, "Cargo.toml");
+    }
+
+    #[gpui_kit::test]
+    fn uncovered_files_start_folded_then_open_by_folder_and_open_a_file(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_guide(cx);
+        let emitted = record_events(&mut cx, &tab);
+        let stored = Box::new(StoredGuide {
+            schema_version: SCHEMA_VERSION,
+            repo: "acme/app".into(),
+            pr_number: 42,
+            head_oid: "abc1234567890".into(),
+            base_oid: "0000000".into(),
+            model: "claude-sonnet-5-5".into(),
+            effort: "medium".into(),
+            generated_at: Utc::now(),
+            changed_files: vec![
+                "src/auth.rs".into(),
+                "web/src/app.ts".into(),
+                "web/src/main.ts".into(),
+                "docs/notes.md".into(),
+            ],
+            language: loupe_guide::GuideLanguage::portuguese_brazil(),
+            guide: fixture_guide(),
+        });
+        tab.update(&mut cx, |tab, cx| {
+            tab.set_state(
+                GuideViewState::Ready {
+                    stored,
+                    changed_steps: HashMap::new(),
+                },
+                cx,
+            );
+        });
+        paint(&mut cx);
+
+        assert!(cx.debug_bounds("guide-uncovered-toggle").is_some());
+        assert!(
+            cx.debug_bounds("guide-uncovered-folder-web/src").is_none()
+                && cx.debug_bounds("guide-uncovered-file-0").is_none(),
+            "the list starts folded to its summary"
+        );
+
+        click(&mut cx, "guide-uncovered-toggle");
+        assert!(cx.debug_bounds("guide-uncovered-folder-web/src").is_some());
+        assert!(cx.debug_bounds("guide-uncovered-folder-docs").is_some());
+        assert!(
+            cx.debug_bounds("guide-uncovered-file-0").is_none(),
+            "folders start folded"
+        );
+
+        click(&mut cx, "guide-uncovered-folder-web/src");
+        click(&mut cx, "guide-uncovered-file-1");
+        assert_eq!(
+            *emitted.borrow(),
+            vec![PrTabEvent::OpenFile {
+                path: "web/src/main.ts".into(),
+                line: None,
+                side: Side::Right,
+            }]
+        );
+
+        click(&mut cx, "guide-uncovered-toggle");
+        assert!(cx.debug_bounds("guide-uncovered-folder-web/src").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn a_lone_uncovered_file_with_a_long_name_stays_inside_its_line(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_guide(cx);
+        let long = "db/migrations/20231125093012_add_review_state_columns_to_pull_requests_table_and_backfill_every_row_of_the_table_in_batches.sql";
+        let stored = Box::new(StoredGuide {
+            schema_version: SCHEMA_VERSION,
+            repo: "acme/app".into(),
+            pr_number: 42,
+            head_oid: "abc1234567890".into(),
+            base_oid: "0000000".into(),
+            model: "claude-sonnet-5-5".into(),
+            effort: "medium".into(),
+            generated_at: Utc::now(),
+            changed_files: vec!["src/auth.rs".into(), long.into()],
+            language: loupe_guide::GuideLanguage::portuguese_brazil(),
+            guide: fixture_guide(),
+        });
+        tab.update(&mut cx, |tab, cx| {
+            tab.set_state(
+                GuideViewState::Ready {
+                    stored,
+                    changed_steps: HashMap::new(),
+                },
+                cx,
+            );
+        });
+        paint(&mut cx);
+
+        let line = cx
+            .debug_bounds("guide-uncovered-files")
+            .expect("the summary line is shown");
+        let name = cx
+            .debug_bounds("guide-uncovered-file-name")
+            .expect("the lone file is named on the line");
+        assert!(
+            name.right() <= line.right(),
+            "the file's name is cut to fit instead of running past the line"
+        );
     }
 
     fn record_events(
