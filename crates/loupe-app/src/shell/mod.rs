@@ -122,6 +122,9 @@ pub struct Workspace {
     /// The sidebar's width while its edge is dragged, saved to `Settings`
     /// once, when the drag ends.
     sidebar_drag: Option<f32>,
+    /// The sidebar was opened from its rail while the window is narrow;
+    /// Settings keeps only the wide window's choice.
+    sidebar_opened_while_narrow: bool,
     /// The menu of a right-clicked link in prose, while it is open.
     link_menu: Option<links::FloatingMenu>,
     /// The Linear workspace switcher, while it is open.
@@ -506,6 +509,7 @@ impl Workspace {
             github: Services::get(cx).github.clone(),
             sidebar,
             sidebar_drag: None,
+            sidebar_opened_while_narrow: false,
             link_menu: None,
             workspace_menu: None,
             shown_pages: Vec::new(),
@@ -1062,7 +1066,7 @@ impl Workspace {
     fn scroll_page(&mut self, direction: f32, window: &mut Window, cx: &mut Context<Self>) {
         let size = window.viewport_size();
         let sidebar = sidebar::width(
-            Settings::get(cx).sidebar_collapsed,
+            self.sidebar_collapsed(window, cx),
             self.sidebar_expanded(cx),
         );
         // The active pane's page once it has been drawn, else the middle of
@@ -1083,10 +1087,24 @@ impl Workspace {
         window.dispatch_event(PlatformInput::Scroll(event), cx);
     }
 
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
+        if sidebar::is_narrow(window) {
+            self.sidebar_opened_while_narrow = !self.sidebar_opened_while_narrow;
+            cx.notify();
+            return;
+        }
         store::update_settings(cx, |settings| {
             settings.sidebar_collapsed = !settings.sidebar_collapsed;
         });
+    }
+
+    /// Whether the sidebar shows as its icon rail in `window`.
+    fn sidebar_collapsed(&self, window: &Window, cx: &App) -> bool {
+        sidebar::collapsed(
+            Settings::get(cx).sidebar_collapsed,
+            sidebar::is_narrow(window),
+            self.sidebar_opened_while_narrow,
+        )
     }
 
     /// The expanded sidebar's width in points: the one being dragged, else
@@ -1145,7 +1163,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let current = self.panes.active().active().current().route.clone();
-        let collapsed = Settings::get(cx).sidebar_collapsed;
+        let collapsed = self.sidebar_collapsed(window, cx);
         let top_bar = tab_bar::render(self, cx);
         let expanded = self.sidebar_expanded(cx);
         let sidebar = sidebar::render(&current, viewer, &self.sidebar, collapsed, expanded, cx);

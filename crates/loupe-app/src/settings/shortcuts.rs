@@ -143,7 +143,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut("Pull request", "Find in the diff", || {
         Box::new(crate::github::FindInDiff)
     }),
-    shortcut("Window", "Show the sidebar as icons", || {
+    shortcut("Window", "Collapse or expand the sidebar", || {
         Box::new(ToggleSidebar)
     }),
     shortcut("Window", "Zoom in", || Box::new(ZoomIn)),
