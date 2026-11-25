@@ -76,7 +76,7 @@ use crate::{assets, ui};
 /// The files tree's starting width and the range its edge drags within.
 const FILE_LIST_WIDTH: f32 = 340.;
 /// A diff line longer than this runs past the panel at its default width.
-const LONG_LINE: usize = 100;
+pub(super) const LONG_LINE: usize = 100;
 /// What the toolbar's note about long lines explains.
 const LONG_LINES_HINT: &str = "These files have lines longer than the view. Scroll sideways with Shift + wheel or ← →, or choose Wrap.";
 /// What the toolbar's note about diffs GitHub left out explains.
@@ -87,7 +87,7 @@ const COMMIT_OMITTED_HINT: &str = "GitHub leaves some diffs out of a commit this
 const FILE_LIST_MIN: f32 = 220.;
 const FILE_LIST_MAX: f32 = 640.;
 /// How wide the diff's trailing edge fades while long lines run past it.
-const FADE_WIDTH: f32 = 32.;
+pub(super) const FADE_WIDTH: f32 = 32.;
 
 /// What the find bar's note about diffs GitHub left out explains.
 const NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a pull request this large, so their lines are not searched. Choose Load all to search them too.";

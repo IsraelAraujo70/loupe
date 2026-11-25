@@ -566,7 +566,7 @@ pub(super) fn step_cursor(cursor: usize, count: usize, key: &str) -> Option<usiz
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use chrono::{DateTime, NaiveDate};
     use loupe_linear::{
         Cycle, EstimateScale, Estimation, Label, NewIssue, Priority, Project, StateType, Team,
@@ -611,7 +611,7 @@ mod tests {
         }
     }
 
-    fn team(id: &str) -> Team {
+    pub(in crate::linear::new_issue) fn team(id: &str) -> Team {
         Team {
             id: id.into(),
             key: id.to_uppercase(),

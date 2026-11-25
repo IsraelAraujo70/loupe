@@ -138,7 +138,7 @@ fn build(repo: RepoRef, window: &mut Window, cx: &mut App) -> Entity<RepoView> {
             more: None,
             scroll: ScrollHandle::new(),
             rows: ScrollHandle::new(),
-            focus: cx.focus_handle(),
+            focus: crate::shell::page_focus(cx),
             cursor: None,
             _load: None,
             _more: None,

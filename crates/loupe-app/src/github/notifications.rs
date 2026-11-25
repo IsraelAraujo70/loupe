@@ -378,7 +378,7 @@ fn build(window: &mut Window, cx: &mut App) -> Entity<NotificationsView> {
             _mark_all: None,
             query,
             _query_events: query_events,
-            focus: cx.focus_handle(),
+            focus: crate::shell::page_focus(cx),
             cursor: None,
         };
         view.reload(cx);

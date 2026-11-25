@@ -39,7 +39,7 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
 use gpui_kit::component::resizable::{self, HandleEdge};
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -183,6 +183,14 @@ pub fn page_may_take_focus(window: &Window, cx: &App) -> bool {
             .try_global::<WorkspaceHandle>()
             .is_some_and(|handle| handle.1 == focused),
     }
+}
+
+/// The focus handle of a page's own content, its list: a stop in the Tab
+/// order after the controls of the page's header (tab index 1 inside its
+/// pane's tab group). The page takes the focus with it when it comes on
+/// screen ([`page_may_take_focus`]).
+pub fn page_focus(cx: &mut App) -> FocusHandle {
+    cx.focus_handle().tab_index(1).tab_stop(true)
 }
 
 /// Whether `view` is a page on screen: the current page of a pane's open
@@ -676,17 +684,32 @@ impl Workspace {
         self.tab_rows.get(&pane).cloned().unwrap_or_default()
     }
 
-    /// Forgets the row under the pointer when a pane shows another page.
-    fn track_shown_pages(&mut self, cx: &mut Context<Self>) {
+    /// Forgets the row under the pointer when a pane shows another page,
+    /// and hands the keyboard focus to the page that came on screen in the
+    /// active pane (a link, back or forward, another tab, the palette).
+    ///
+    /// The focus goes to the workspace root, where the page takes it as it
+    /// renders, right after this ([`page_may_take_focus`]). Whatever held it
+    /// before belongs to the page that left, or to an overlay that closed
+    /// and gave it back there; left alone, it would fall to the first stop
+    /// of the window, the sidebar toggle. A page that only became the active
+    /// one (a press in another pane) was on screen already and keeps the
+    /// focus the press gave, and an open dialog keeps its own.
+    fn track_shown_pages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let shown: Vec<EntityId> = self
             .panes
             .panes()
             .iter()
             .map(|pane| pane.tabs.active().current().view.entity_id())
             .collect();
-        if shown != self.shown_pages {
-            self.shown_pages = shown;
-            item_menu::forget_hovered(cx);
+        if shown == self.shown_pages {
+            return;
+        }
+        let arrived = !self.shown_pages.contains(&self.active_page());
+        self.shown_pages = shown;
+        item_menu::forget_hovered(cx);
+        if arrived && !window.has_active_dialog(cx) {
+            self.focus.focus(window, cx);
         }
     }
 
@@ -1164,14 +1187,22 @@ impl Workspace {
     fn frame(
         &self,
         viewer: &loupe_github::Viewer,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let current = self.panes.active().active().current().route.clone();
         let collapsed = self.sidebar_collapsed(window, cx);
         let top_bar = tab_bar::render(self, cx);
         let expanded = self.sidebar_expanded(cx);
-        let sidebar = sidebar::render(&current, viewer, &self.sidebar, collapsed, expanded, cx);
+        let sidebar = sidebar::render(
+            &current,
+            viewer,
+            &self.sidebar,
+            collapsed,
+            expanded,
+            window,
+            cx,
+        );
         let sidebar = div()
             .relative()
             .h_full()
@@ -1326,7 +1357,10 @@ impl Workspace {
             .child(view)
             .child(record_bounds)
             .children(overlay);
+        // Each pane's stops stay together in the Tab order: its row of
+        // tabs, its page's header, then the page's own content.
         v_flex()
+            .tab_group()
             .size_full()
             .min_w_0()
             .overflow_hidden()
@@ -1450,7 +1484,7 @@ fn splash(cx: &App) -> impl IntoElement {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.track_shown_pages(cx);
+        self.track_shown_pages(window, cx);
         self.track_tab_rows();
         let github = Accounts::get(cx).github.clone();
         let body = match &github {
@@ -2893,6 +2927,150 @@ mod tests {
         assert_eq!(after.1, 1, "Enter shows the first match, in the left pane");
         assert_eq!(after.2, Route::Notifications);
         assert_ne!(after.0, before.0, "its pane becomes the active one");
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    /// Whether the keyboard focus is on the element with key context
+    /// `context` itself, not on a control inside it.
+    fn focus_on(cx: &mut VisualTestContext, context: &str) -> bool {
+        redraw(cx);
+        cx.update(|window, _| {
+            window
+                .context_stack()
+                .last()
+                .is_some_and(|key_context| key_context.contains(context))
+        })
+    }
+
+    /// Whether the keyboard focus ring (`ui::ListRowFocus`'s accent line)
+    /// is drawn on the element with `selector`.
+    fn ring_on(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+        let Some(row) = cx.debug_bounds(selector) else {
+            return false;
+        };
+        cx.update(|window, _| {
+            let scale = window.scale_factor();
+            let near =
+                |painted: f32, laid_out: Pixels| (painted - f32::from(laid_out) * scale).abs() < 1.;
+            let accent = crate::theme::tokens::accent();
+            window.painted_quads().iter().any(|quad| {
+                quad.border_color == accent
+                    && quad.border_widths.top.0 > 0.
+                    && near(quad.bounds.origin.x.0, row.origin.x)
+                    && near(quad.bounds.origin.y.0, row.origin.y)
+                    && near(quad.bounds.size.width.0, row.size.width)
+            })
+        })
+    }
+
+    /// A page opened from the palette, and the one Back returns to, take
+    /// the keyboard focus. The palette gives the focus back to the page it
+    /// opened on, which then leaves the screen; the focus used to fall to
+    /// the window's first stop, the sidebar toggle.
+    #[gpui_kit::test]
+    fn a_page_opened_from_the_palette_takes_the_keyboard_focus(cx: &mut TestAppContext) {
+        use gpui_kit::base::actions::Confirm;
+
+        use crate::shell::actions::{GoBack, OpenPalette};
+
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        // The palette leaves with its exit transition, as in the app, once
+        // its entrance has played.
+        cx.update(|_, cx| cx.set_reduce_motion(false));
+        assert!(
+            focus_on(cx, "InboxView"),
+            "Reviews has the focus at the start"
+        );
+
+        cx.dispatch_action(OpenPalette);
+        redraw(cx);
+        for _ in 0..10 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            redraw(cx);
+        }
+        cx.simulate_input("Settings");
+        redraw(cx);
+        cx.dispatch_action(Confirm { secondary: false });
+        redraw(cx);
+        assert_eq!(tabs(&workspace, cx).0, [Route::Settings]);
+        assert!(
+            focus_on(cx, "SettingsView"),
+            "the page the palette opened has the focus"
+        );
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        assert!(
+            focus_on(cx, "SettingsView"),
+            "and keeps it once the palette is gone"
+        );
+
+        cx.dispatch_action(GoBack);
+        redraw(cx);
+        assert_eq!(tabs(&workspace, cx).0, [Route::Inbox]);
+        assert!(focus_on(cx, "InboxView"), "and so does the page Back shows");
+    }
+
+    /// Tab walks the window in the order it reads: the top bar, the
+    /// sidebar's rows (Inbox before My issues), the page's header, and back
+    /// to the page's list. Shift+Tab walks back, and Enter on a row opens
+    /// its page.
+    #[gpui_kit::test]
+    fn tab_reaches_the_sidebar_rows_and_comes_back_to_the_list(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        assert!(focus_on(cx, "InboxView"));
+
+        let mut rows = Vec::new();
+        let mut presses = 0;
+        loop {
+            presses += 1;
+            assert!(presses < 60, "Tab never came back to the list");
+            cx.simulate_keystrokes("tab");
+            if focus_on(cx, "InboxView") {
+                break;
+            }
+            for row in ["sidebar-inbox", "sidebar-my-issues"] {
+                if ring_on(cx, row) {
+                    rows.push(row);
+                }
+            }
+        }
+        assert_eq!(
+            rows,
+            ["sidebar-inbox", "sidebar-my-issues"],
+            "each sidebar row is a stop, in the sidebar's order"
+        );
+
+        for _ in 0..presses {
+            cx.simulate_keystrokes("shift-tab");
+            redraw(cx);
+            if ring_on(cx, "sidebar-my-issues") {
+                break;
+            }
+        }
+        assert!(
+            ring_on(cx, "sidebar-my-issues"),
+            "Shift+Tab walks back to the row"
+        );
+        // A keyboard click is the press and the release of the key.
+        let enter = gpui_kit::Keystroke::parse("enter").expect("a key");
+        cx.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: enter.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui_kit::KeyUpEvent { keystroke: enter });
+        redraw(cx);
+        assert_eq!(tabs(&workspace, cx).0, [Route::LinearMyIssues]);
     }
 
     /// Two Reviews tabs on different views are told apart: the tab whose
