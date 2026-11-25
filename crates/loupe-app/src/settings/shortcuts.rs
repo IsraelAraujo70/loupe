@@ -140,6 +140,9 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut("Issue", "Set the due date of a new issue", || {
         Box::new(crate::linear::SetDueDate)
     }),
+    shortcut("Pull request", "Find in the diff", || {
+        Box::new(crate::github::FindInDiff)
+    }),
     shortcut("Window", "Show the sidebar as icons", || {
         Box::new(ToggleSidebar)
     }),
