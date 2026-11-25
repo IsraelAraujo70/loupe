@@ -42,17 +42,19 @@ impl ChecksSummary {
             match run.status {
                 CheckStatus::Passed | CheckStatus::Neutral => summary.passing += 1,
                 CheckStatus::Skipped => summary.skipped += 1,
-                CheckStatus::Failed | CheckStatus::Cancelled => summary.failing += 1,
-                CheckStatus::Queued | CheckStatus::Running | CheckStatus::ActionRequired => {
-                    summary.pending += 1
+                CheckStatus::Failed | CheckStatus::Cancelled | CheckStatus::ActionRequired => {
+                    summary.failing += 1
                 }
+                CheckStatus::Queued | CheckStatus::Running => summary.pending += 1,
             }
             summary
         })
     }
 
     /// `3 passing / 1 failing / 2 pending / 1 skipped`, leaving out the
-    /// zero counts.
+    /// zero counts. The one wording of a pull request's checks: the header,
+    /// the merge box, and the Checks tab all show it. A check waiting for
+    /// an action counts as failing, as in the merge box's check list.
     pub(super) fn label(&self) -> String {
         let parts: Vec<String> = [
             (self.passing, "passing"),
@@ -860,14 +862,14 @@ mod tests {
             summary,
             ChecksSummary {
                 passing: 3,
-                failing: 2,
-                pending: 3,
+                failing: 3,
+                pending: 2,
                 skipped: 1
             }
         );
         assert_eq!(
             summary.label(),
-            "3 passing / 2 failing / 3 pending / 1 skipped"
+            "3 passing / 3 failing / 2 pending / 1 skipped"
         );
     }
 

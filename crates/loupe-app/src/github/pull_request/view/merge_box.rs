@@ -1,7 +1,9 @@
 //! The merge box at the top of the conversation, after GitHub's Overview:
 //! what stands between the pull request and a merge, the merge button,
 //! progress bars for checks, resolved conversations, and approvals, and
-//! under the checks' bar the list of checks it opens.
+//! under the checks' bar the list of checks it opens. Someone who did not
+//! open the pull request is there to read it, so for them the box is one
+//! line of state, and the check list stays behind that line's checks.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
@@ -10,20 +12,53 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{CheckRun, CheckStatus, PrState, PullRequestDetail};
+use loupe_github::{CheckRun, PrState, PullRequestDetail};
 
 use super::model::{
-    DraftAction, MergeAction, MergeTone, Panel, Progress, approvals, available_actions,
-    check_groups, check_outcome, check_tally, checks_open_at_first, merge_status, resolved_threads,
+    DraftAction, MergeAction, MergeStatus, MergeTone, Panel, Progress, approvals,
+    available_actions, check_groups, check_outcome, check_tally, checks_open_at_first,
+    merge_status, resolved_threads,
 };
 use super::{PullRequestView, Write};
 use crate::github::common::Submit;
-use crate::github::pull_request::checks::{check_route, status_style};
+use crate::github::pull_request::checks::{ChecksSummary, check_route, status_style};
+use crate::github::widgets;
 use crate::route::Route;
 use crate::shell::OpenOnClick as _;
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
 use crate::ui;
+
+/// Who the merge box is laid out for. The author drives the pull request
+/// to a merge and gets the whole box; anyone else, a reviewer above all,
+/// gets one line of state so the description is what they read first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MergeBoxLayout {
+    Author,
+    Reviewer,
+}
+
+impl MergeBoxLayout {
+    pub(super) fn of(detail: &PullRequestDetail) -> Self {
+        let authored = !detail.viewer_login.is_empty()
+            && detail
+                .author
+                .as_ref()
+                .is_some_and(|author| author.login.eq_ignore_ascii_case(&detail.viewer_login));
+        if authored {
+            Self::Author
+        } else {
+            Self::Reviewer
+        }
+    }
+
+    /// The author's check list opens while a check fails or runs, as on
+    /// GitHub. A reviewer's stays closed: the line already says how the
+    /// checks went, and the list is one click away.
+    pub(super) fn checks_open_at_first(self, detail: &PullRequestDetail) -> bool {
+        self == Self::Author && checks_open_at_first(detail)
+    }
+}
 
 fn tone_look(tone: MergeTone, cx: &App) -> (IconName, Hsla) {
     match tone {
@@ -157,6 +192,37 @@ fn progress_count(progress: Progress, verb: &str, empty: &str) -> String {
     }
 }
 
+/// A count in the reviewer's line: an icon that turns into a green check
+/// once every item is done, and the count, or `action` in its place.
+fn progress_fact(
+    id: &'static str,
+    icon: IconName,
+    title: &'static str,
+    count: String,
+    progress: Progress,
+    action: Option<AnyElement>,
+    muted: Hsla,
+) -> Stateful<Div> {
+    let done = progress.total > 0 && progress.done == progress.total;
+    let (icon, color) = if done {
+        (IconName::CircleCheck, tokens::open())
+    } else {
+        (icon, muted)
+    };
+    h_flex()
+        .id(id)
+        .role(Role::ProgressIndicator)
+        .aria_label(format!("{title}: {count}"))
+        .aria_min_numeric_value(0.)
+        .aria_max_numeric_value(100.)
+        .aria_numeric_value(f64::from(share(progress.done, progress.total) * 100.).round())
+        .flex_none()
+        .gap_1p5()
+        .items_center()
+        .child(Icon::new(icon).with_size(dp(14.)).text_color(color))
+        .child(action.unwrap_or_else(|| div().child(count).into_any_element()))
+}
+
 impl PullRequestView {
     pub(super) fn render_merge_box(
         &self,
@@ -180,7 +246,12 @@ impl PullRequestView {
                 // Keep at most one filled green button in the merge box: when
                 // the whole stack is ready, Merge stack takes the primary fill
                 // and single-PR merge steps back to outline.
-                Some(self.render_merge_controls(&methods, busy, !stack_ready, cx))
+                Some(
+                    div()
+                        .flex_none()
+                        .debug_selector(|| "merge-box-merge".to_owned())
+                        .child(self.render_merge_controls(&methods, busy, !stack_ready, cx)),
+                )
             }
             MergeAction::Hidden | MergeAction::Unavailable(_) => None,
         };
@@ -218,20 +289,11 @@ impl PullRequestView {
         )
         .then(|| self.render_panel(detail, cx));
 
+        let layout = MergeBoxLayout::of(detail);
         let checks = check_tally(detail);
         let threads = resolved_threads(detail);
         let approved = approvals(detail);
-        let skipped = detail
-            .checks
-            .runs
-            .iter()
-            .filter(|run| matches!(run.status, CheckStatus::Skipped))
-            .count();
-        let checks_count = match (checks.total, skipped) {
-            (0, _) => "No checks".to_owned(),
-            (total, 0) => format!("{} of {total} passed", checks.passed),
-            (_, skipped) => format!("{} passed, {skipped} skipped", checks.passed - skipped),
-        };
+        let checks_count = ChecksSummary::of(&detail.checks.runs).label();
         // Nobody is asked yet: where the viewer may ask, the cell offers to,
         // on GitHub, where reviewers are picked.
         let request_review =
@@ -260,7 +322,14 @@ impl PullRequestView {
         let has_runs = !detail.checks.runs.is_empty();
         let checks_open = self
             .checks_open
-            .unwrap_or_else(|| checks_open_at_first(detail));
+            .unwrap_or_else(|| layout.checks_open_at_first(detail));
+        let (line, request_review) = match layout {
+            MergeBoxLayout::Author => (None, request_review),
+            MergeBoxLayout::Reviewer => (
+                Some(self.render_state_line(detail, &status, checks_open, request_review, cx)),
+                None,
+            ),
+        };
         let theme = cx.theme();
         let (muted, foreground, border) = (theme.muted_foreground, theme.foreground, theme.border);
         let divider = || div().w_px().bg(border);
@@ -294,7 +363,7 @@ impl PullRequestView {
                             .bg(color.opacity(0.16))
                             .child(Icon::new(icon).small().text_color(color)),
                     )
-                    .child(
+                    .child(line.unwrap_or_else(|| {
                         v_flex()
                             .flex_1()
                             .min_w_0()
@@ -311,9 +380,10 @@ impl PullRequestView {
                                     .truncate()
                                     .text_size(scale::meta())
                                     .text_color(muted)
-                                    .child(status.detail),
-                            ),
-                    )
+                                    .child(status.detail.clone()),
+                            )
+                            .into_any_element()
+                    }))
                     .children(merge)
                     .children(merge_stack)
                     .children(ready),
@@ -344,64 +414,196 @@ impl PullRequestView {
                     .border_color(border)
                     .child(confirm)
             }))
-            .child(
-                h_flex()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        bar_cell(
-                            "merge-box-checks",
-                            IconName::CircleCheck,
-                            "Checks",
-                            checks_count,
-                            share(checks.passed, checks.total),
-                            checks.total,
-                            vec![
-                                (share(checks.passed, checks.total), tokens::open()),
-                                (share(checks.pending, checks.total), tokens::pending()),
-                                (share(checks.failed, checks.total), tokens::closed()),
-                            ],
-                            has_runs.then_some(checks_open),
+            .when(layout == MergeBoxLayout::Author, |merge_box| {
+                merge_box.child(
+                    h_flex()
+                        .debug_selector(|| "merge-box-bars".to_owned())
+                        .border_t_1()
+                        .border_color(border)
+                        .child(
+                            bar_cell(
+                                "merge-box-checks",
+                                IconName::CircleCheck,
+                                "Checks",
+                                checks_count,
+                                share(checks.passed, checks.total),
+                                checks.total,
+                                vec![
+                                    (share(checks.passed, checks.total), tokens::open()),
+                                    (share(checks.pending, checks.total), tokens::pending()),
+                                    (share(checks.failed, checks.total), tokens::closed()),
+                                ],
+                                has_runs.then_some(checks_open),
+                                None,
+                                cx,
+                            )
+                            .when(has_runs, |cell| {
+                                cell.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.checks_open = Some(!checks_open);
+                                    cx.notify();
+                                }))
+                            }),
+                        )
+                        .child(divider())
+                        .child(bar_cell(
+                            "merge-box-comments",
+                            IconName::MessageSquare,
+                            "Comments",
+                            progress_count(threads, "resolved", "No review threads"),
+                            share(threads.done, threads.total),
+                            threads.total,
+                            vec![(share(threads.done, threads.total), tokens::open())],
+                            None,
                             None,
                             cx,
-                        )
-                        .when(has_runs, |cell| {
-                            cell.on_click(cx.listener(move |this, _, _, cx| {
-                                this.checks_open = Some(!checks_open);
-                                cx.notify();
-                            }))
-                        }),
-                    )
-                    .child(divider())
-                    .child(bar_cell(
-                        "merge-box-comments",
-                        IconName::MessageSquare,
-                        "Comments",
-                        progress_count(threads, "resolved", "No review threads"),
-                        share(threads.done, threads.total),
-                        threads.total,
-                        vec![(share(threads.done, threads.total), tokens::open())],
-                        None,
-                        None,
-                        cx,
-                    ))
-                    .child(divider())
-                    .child(bar_cell(
-                        "merge-box-approvals",
-                        IconName::UserCheck,
-                        "Approvals",
-                        progress_count(approved, "approved", "No reviewers"),
-                        share(approved.done, approved.total),
-                        approved.total,
-                        vec![(share(approved.done, approved.total), tokens::open())],
-                        None,
-                        request_review,
-                        cx,
-                    )),
-            )
+                        ))
+                        .child(divider())
+                        .child(bar_cell(
+                            "merge-box-approvals",
+                            IconName::UserCheck,
+                            "Approvals",
+                            progress_count(approved, "approved", "No reviewers"),
+                            share(approved.done, approved.total),
+                            approved.total,
+                            vec![(share(approved.done, approved.total), tokens::open())],
+                            None,
+                            request_review,
+                            cx,
+                        )),
+                )
+            })
             .when(has_runs && checks_open, |merge_box| {
                 merge_box.child(self.render_check_list(detail, cx))
             })
+            .into_any_element()
+    }
+
+    /// The merge box for someone reading the pull request rather than
+    /// driving it: the state, then the checks, the review threads, and the
+    /// approvals as one line. The checks fact opens and closes the check
+    /// list under the line; the state's sentence is its tooltip.
+    fn render_state_line(
+        &self,
+        detail: &PullRequestDetail,
+        status: &MergeStatus,
+        checks_open: bool,
+        request_review: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let has_runs = !detail.checks.runs.is_empty();
+        let checks_label = ChecksSummary::of(&detail.checks.runs).label();
+        let divider = ui::vertical_divider(cx);
+        let theme = cx.theme();
+        let (muted, foreground, hover, radius) = (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.list_hover,
+            theme.radius,
+        );
+        let (checks_icon, checks_color) = match detail.checks.state {
+            Some(state) => (
+                widgets::checks_icon_name(state),
+                widgets::checks_color(state),
+            ),
+            None => (IconName::CircleCheck, muted),
+        };
+        let checks = h_flex()
+            .id("merge-box-line-checks")
+            .debug_selector(|| "merge-box-line-checks".to_owned())
+            .aria_label(format!("Checks: {checks_label}"))
+            .flex_none()
+            .h_6()
+            .px_1p5()
+            .gap_1p5()
+            .items_center()
+            .rounded(radius)
+            .child(
+                Icon::new(checks_icon)
+                    .with_size(dp(14.))
+                    .text_color(checks_color),
+            )
+            .child(div().text_color(foreground).child(checks_label))
+            .map(|fact| {
+                if !has_runs {
+                    return fact.role(Role::Status);
+                }
+                fact.role(Role::Button)
+                    .aria_expanded(checks_open)
+                    .hover(move |fact| fact.bg(hover))
+                    .tooltip(move |window, cx| {
+                        let tip = if checks_open {
+                            "Hide the checks"
+                        } else {
+                            "Show the checks"
+                        };
+                        Tooltip::new(tip).build(window, cx)
+                    })
+                    .child(
+                        Icon::new(if checks_open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .with_size(dp(14.))
+                        .text_color(muted),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.checks_open = Some(!checks_open);
+                        cx.notify();
+                    }))
+            });
+        let sentence = status.detail.clone();
+        h_flex()
+            .id("merge-box-line")
+            .debug_selector(|| "merge-box-line".to_owned())
+            .flex_1()
+            .min_w_0()
+            .gap_3()
+            .items_center()
+            .child(
+                div()
+                    .id("merge-box-state")
+                    .flex_none()
+                    .text_size(scale::body())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(foreground)
+                    .tooltip(move |window, cx| Tooltip::new(sentence.clone()).build(window, cx))
+                    .child(status.title),
+            )
+            .child(divider)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_3()
+                    .items_center()
+                    .overflow_hidden()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(checks)
+                    .child(progress_fact(
+                        "merge-box-line-threads",
+                        IconName::MessageSquare,
+                        "Review threads",
+                        progress_count(
+                            resolved_threads(detail),
+                            "threads resolved",
+                            "No review threads",
+                        ),
+                        resolved_threads(detail),
+                        None,
+                        muted,
+                    ))
+                    .child(progress_fact(
+                        "merge-box-line-approvals",
+                        IconName::UserCheck,
+                        "Approvals",
+                        progress_count(approvals(detail), "approved", "No reviewers"),
+                        approvals(detail),
+                        request_review,
+                        muted,
+                    )),
+            )
             .into_any_element()
     }
 
@@ -414,6 +616,7 @@ impl PullRequestView {
         let (muted, hover) = (theme.muted_foreground, theme.list_hover);
         let mut list = v_flex()
             .id("merge-box-check-list")
+            .debug_selector(|| "merge-box-check-list".to_owned())
             .role(Role::List)
             .aria_label("Checks")
             .max_h(dp(360.))
@@ -581,12 +784,15 @@ mod tests {
     use std::sync::Arc;
 
     use gpui_kit::{
-        AppContext as _, Bounds, TestAppContext, VisualTestContext, WindowBounds, WindowOptions,
-        px, size,
+        AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, WindowBounds,
+        WindowOptions, px, size,
     };
-    use loupe_github::{PrState, PullRequestDetail};
+    use loupe_github::{
+        Actor, CheckRun, CheckStatus, Checks, ChecksState, PrState, PullRequestDetail,
+    };
 
     use super::super::{PullRequestView, model};
+    use super::MergeBoxLayout;
     use crate::github::common::{Loadable, Submit};
     use crate::services::{Accounts, Services};
     use crate::store::Settings;
@@ -712,6 +918,117 @@ mod tests {
             ..model::tests::detail()
         };
         assert!(!offers_request_review(detail, cx));
+    }
+
+    fn run(name: &str, status: CheckStatus) -> CheckRun {
+        CheckRun {
+            name: name.into(),
+            workflow: None,
+            event: None,
+            description: None,
+            status,
+            started_at: None,
+            completed_at: None,
+            details_url: None,
+            is_required: false,
+            actions: None,
+        }
+    }
+
+    /// An open pull request by `ana` with a failing check, seen by
+    /// `viewer`.
+    fn failing_checks(viewer: &str) -> PullRequestDetail {
+        PullRequestDetail {
+            viewer_login: viewer.into(),
+            checks: Checks {
+                state: Some(ChecksState::Failing),
+                runs: vec![
+                    run("build", CheckStatus::Passed),
+                    run("test", CheckStatus::Failed),
+                    run("lint", CheckStatus::Skipped),
+                ],
+            },
+            ..model::tests::detail()
+        }
+    }
+
+    #[test]
+    fn the_author_gets_the_whole_box_and_anyone_else_the_line() {
+        let detail = model::tests::detail();
+        assert_eq!(MergeBoxLayout::of(&detail), MergeBoxLayout::Reviewer);
+        let own = PullRequestDetail {
+            viewer_login: "ANA".into(),
+            ..model::tests::detail()
+        };
+        assert_eq!(MergeBoxLayout::of(&own), MergeBoxLayout::Author);
+        let ghost = PullRequestDetail {
+            author: None,
+            ..model::tests::detail()
+        };
+        assert_eq!(MergeBoxLayout::of(&ghost), MergeBoxLayout::Reviewer);
+        let signed_out = PullRequestDetail {
+            author: Some(Actor {
+                login: String::new(),
+                avatar_url: String::new(),
+            }),
+            viewer_login: String::new(),
+            ..model::tests::detail()
+        };
+        assert_eq!(MergeBoxLayout::of(&signed_out), MergeBoxLayout::Reviewer);
+    }
+
+    #[test]
+    fn only_the_authors_check_list_opens_on_a_failing_check() {
+        assert!(MergeBoxLayout::Author.checks_open_at_first(&failing_checks("ana")));
+        assert!(!MergeBoxLayout::Reviewer.checks_open_at_first(&failing_checks("bruno")));
+    }
+
+    #[gpui_kit::test]
+    fn a_reviewer_reads_one_line_with_the_checks_closed(cx: &mut TestAppContext) {
+        let mut cx = open(failing_checks("bruno"), Submit::Idle, cx);
+        assert!(cx.debug_bounds("merge-box-line").is_some());
+        assert!(cx.debug_bounds("merge-box-bars").is_none());
+        assert!(
+            cx.debug_bounds("merge-box-check-list").is_none(),
+            "a failing check does not open the list for a reviewer"
+        );
+        let line = cx.debug_bounds("merge-box-line").expect("the line");
+        assert!(line.size.height < px(48.), "one line, not a box: {line:?}");
+    }
+
+    #[gpui_kit::test]
+    fn the_reviewers_checks_open_and_close_the_list(cx: &mut TestAppContext) {
+        let mut cx = open(failing_checks("bruno"), Submit::Idle, cx);
+        let checks = cx
+            .debug_bounds("merge-box-line-checks")
+            .expect("checks fact");
+        cx.simulate_click(checks.center(), Modifiers::none());
+        assert!(cx.debug_bounds("merge-box-check-list").is_some());
+        let checks = cx
+            .debug_bounds("merge-box-line-checks")
+            .expect("checks fact");
+        cx.simulate_click(checks.center(), Modifiers::none());
+        assert!(cx.debug_bounds("merge-box-check-list").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn the_author_keeps_the_box_its_merge_action_and_the_open_list(cx: &mut TestAppContext) {
+        let detail = PullRequestDetail {
+            merge_state: loupe_github::MergeStateStatus::Unstable,
+            ..failing_checks("ana")
+        };
+        let mut cx = open(detail, Submit::Idle, cx);
+        assert!(cx.debug_bounds("merge-box-bars").is_some());
+        assert!(cx.debug_bounds("merge-box-line").is_none());
+        assert!(cx.debug_bounds("merge-box-merge").is_some());
+        assert!(cx.debug_bounds("merge-box-check-list").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn a_reviewer_who_may_merge_still_has_the_merge_action(cx: &mut TestAppContext) {
+        let mut cx = open(model::tests::detail(), Submit::Idle, cx);
+        assert!(cx.debug_bounds("merge-box-line").is_some());
+        assert!(cx.debug_bounds("merge-box-merge").is_some());
     }
 
     fn stack_node(number: u64, base: &str, head: &str) -> loupe_github::StackNode {
