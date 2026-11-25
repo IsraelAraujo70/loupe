@@ -135,6 +135,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f", crate::linear::OpenFilter, Some("TeamView")),
         KeyBinding::new("f", crate::github::OpenReviewsFilter, Some("InboxView")),
         KeyBinding::new(primary!("f"), crate::github::FindInDiff, Some("FilesTab")),
+        KeyBinding::new(
+            "n",
+            crate::github::NextUnviewedFile,
+            Some(crate::github::NEXT_UNVIEWED_KEYS),
+        ),
         // An issue's properties, on Linear's own keys, and its comment box.
         KeyBinding::new("s", crate::linear::ChangeState, Some(ISSUE_KEYS)),
         KeyBinding::new("p", crate::linear::ChangePriority, Some(ISSUE_KEYS)),

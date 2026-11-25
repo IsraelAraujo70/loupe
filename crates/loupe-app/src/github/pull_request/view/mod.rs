@@ -5,6 +5,7 @@ mod header;
 mod merge_box;
 mod model;
 mod poll;
+mod progress;
 mod side;
 mod stack_panel;
 mod toolbar;
@@ -44,6 +45,7 @@ use model::{Panel, PrTab, review_blocker};
 pub(in crate::github::pull_request) use model::{
     ReviewButton, can_approve, pending_comments_label, review_button,
 };
+pub use progress::{NEXT_UNVIEWED_KEYS, NextUnviewedFile};
 
 /// What exists only after the first successful load.
 #[derive(Clone)]
@@ -269,6 +271,9 @@ pub struct PullRequestView {
     /// Last `(head_oid, guide_service::revision, language, stack)` synchronized
     /// into `GuideTab`.
     guide_sync: Option<(String, u64, loupe_guide::GuideLanguage, Option<StackGraph>)>,
+    /// Each file's Viewed mark when the Files tab last changed, to tell
+    /// when one changes.
+    viewed_marks: Vec<bool>,
     _ticker: Task<()>,
 }
 
@@ -363,6 +368,7 @@ impl PullRequestView {
             pr_polled_at: None,
             pr_poll_task: None,
             guide_sync: None,
+            viewed_marks: Vec::new(),
             _ticker: ticker,
         };
         let page = cx.entity_id();
@@ -616,6 +622,11 @@ impl PullRequestView {
             window,
             Self::reload_on_tab_event::<ChecksTab>,
         ));
+        self.subscriptions
+            .push(cx.observe(&files, |this, _, cx| this.files_changed(cx)));
+        // The header counts the Guide's viewed steps.
+        self.subscriptions
+            .push(cx.observe(&guide, |_, _, cx| cx.notify()));
         let linear = crate::linear::pr_linked_issues(link_context.clone(), window, cx);
         let t3 = crate::t3::pr_linked_threads(link_context.clone(), window, cx);
         self.loaded = Some(Loaded {
@@ -656,6 +667,9 @@ impl PullRequestView {
             }
             PrTabEvent::SubmitReview { pr, event, body } => {
                 self.submit_guide_review(pr.clone(), *event, body.clone(), cx);
+            }
+            PrTabEvent::StepViewed { pr, paths, viewed } => {
+                self.step_viewed(pr, paths, *viewed, cx);
             }
         }
     }
@@ -1614,6 +1628,7 @@ impl Render for PullRequestView {
             self.reveal_file(&path, line, side, window, cx);
         }
         self.maybe_open_requested_stack_confirm(window, cx);
+        let mut guide_changed = false;
         if let Some(loaded) = &self.loaded {
             let freshness = self.freshness();
             loaded
@@ -1636,8 +1651,12 @@ impl Render for PullRequestView {
                         .guide
                         .update(cx, |tab, cx| tab.set_state(guide_state, cx));
                     self.guide_sync = Some(sync_key);
+                    guide_changed = true;
                 }
             }
+        }
+        if guide_changed {
+            self.sync_guide_with_files(cx);
         }
         if std::mem::take(&mut self.focus_review_body) {
             let summary = self.review_body.read(cx).focus_handle(cx);
@@ -1662,7 +1681,10 @@ impl Render for PullRequestView {
             .aria_label(self.pr.to_string())
             .size_full()
             .key_context("PullRequestView")
-            .track_focus(&self.focus);
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &NextUnviewedFile, window, cx| {
+                this.next_unviewed_file(window, cx)
+            }));
         let wide = window.viewport_size().width
             >= scale::side_column_breakpoint().to_pixels(window.rem_size());
         let details_open = crate::store::Settings::get(cx).pr_details.is_open(wide);
