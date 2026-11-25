@@ -6,10 +6,10 @@ use std::rc::Rc;
 use chrono::Utc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{Commit, PullRequestDetail};
+use loupe_github::{Commit, PR_COMMITS_LIMIT, PullRequestDetail};
 
 use crate::github::pr_row::hint;
 use crate::github::widgets;
@@ -21,6 +21,38 @@ const SHA_LENGTH: usize = 7;
 /// Shows one commit's changes in the Files tab, or with `None` the whole
 /// pull request's.
 pub type OnShow = Rc<dyn Fn(Option<&str>, &mut Window, &mut App)>;
+
+/// Loads the commits after the first page again.
+pub type OnRetry = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+/// Where the commits after the ones in the detail stand.
+pub enum Rest {
+    /// Nothing is loading: the list is whole, or cut at the limit.
+    Settled,
+    Loading,
+    /// They did not load, for this reason.
+    Failed(SharedString),
+}
+
+/// What the Commits tab says over a list shorter than the pull request:
+/// `None` for a whole list.
+fn shortfall(shown: usize, total: usize, rest: &Rest) -> Option<String> {
+    if shown >= total {
+        return None;
+    }
+    match rest {
+        Rest::Loading => None,
+        Rest::Failed(reason) => Some(format!(
+            "Showing {shown} of {total} commits. The rest did not load: {reason}"
+        )),
+        Rest::Settled if shown >= PR_COMMITS_LIMIT => Some(format!(
+            "Showing the first {shown} of {total} commits. Loupe lists at most {PR_COMMITS_LIMIT}; the rest are on GitHub."
+        )),
+        Rest::Settled => Some(format!(
+            "Showing {shown} of {total} commits. GitHub listed no more; the rest are on GitHub."
+        )),
+    }
+}
 
 /// Where commit `oid` stands in `commits`, and the ones before and after it.
 fn neighbors<'a>(
@@ -44,9 +76,17 @@ fn author_name(commit: &Commit) -> &str {
 }
 
 /// One 36 px row per commit: glyph, headline, author, age, checks, SHA, and
-/// Open on GitHub. A click on the row shows the commit's changes.
-pub fn render(detail: &PullRequestDetail, on_show: OnShow, cx: &App) -> AnyElement {
-    if detail.commits.is_empty() {
+/// Open on GitHub. A click on the row shows the commit's changes. Skeleton
+/// rows follow while the rest of the commits load; a list that stays
+/// shorter than the pull request says over it how far it goes and why.
+pub fn render(
+    detail: &PullRequestDetail,
+    rest: Rest,
+    on_show: OnShow,
+    on_retry: OnRetry,
+    cx: &App,
+) -> AnyElement {
+    if detail.commits.is_empty() && detail.commit_count() == 0 {
         return ui::empty_state(
             IconName::GitCommitHorizontal,
             "No commits",
@@ -59,7 +99,43 @@ pub fn render(detail: &PullRequestDetail, on_show: OnShow, cx: &App) -> AnyEleme
     let mono = theme.mono_font_family.clone();
     let now = Utc::now();
     let repo_url = detail.pr.repo.url();
-    ui::list_container()
+    let shown = detail.commits.len();
+    let total = detail.commit_count();
+    let loading = matches!(rest, Rest::Loading) && shown < total;
+    let notice = shortfall(shown, total, &rest).map(|text| match rest {
+        Rest::Failed(_) => {
+            ui::load_error(text, move |event, window, cx| on_retry(event, window, cx))
+                .into_any_element()
+        }
+        Rest::Settled | Rest::Loading => {
+            let url = format!("{}/commits", detail.url);
+            h_flex()
+                .id("commits-cut")
+                .role(Role::Note)
+                .aria_label(SharedString::from(text.clone()))
+                .w_full()
+                .px(scale::content_inset())
+                .py_2()
+                .gap_2()
+                .items_center()
+                .text_size(scale::meta())
+                .text_color(muted)
+                .child(Icon::new(IconName::Info).small().text_color(muted))
+                .child(div().flex_1().min_w_0().child(text))
+                .child(
+                    Button::new("commits-on-github")
+                        .ghost()
+                        .control()
+                        .icon(IconName::ExternalLink)
+                        .label("Open on GitHub")
+                        .tooltip("See every commit in the browser")
+                        .accessibility_label("Open the commits on GitHub")
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+                .into_any_element()
+        }
+    });
+    let list = ui::list_container()
         .children(detail.commits.iter().enumerate().map(|(ix, commit)| {
             let url = format!("{repo_url}/commit/{}", commit.oid);
             let oid = commit.oid.clone();
@@ -144,6 +220,19 @@ pub fn render(detail: &PullRequestDetail, on_show: OnShow, cx: &App) -> AnyEleme
                     }),
                 )
         }))
+        .when(loading, |list| {
+            list.child(
+                div()
+                    .id("commits-loading")
+                    .role(Role::Status)
+                    .aria_label(format!("Loading {} more commits", total - shown))
+                    .child(ui::skeleton_rows(3)),
+            )
+        });
+    v_flex()
+        .w_full()
+        .children(notice)
+        .child(list)
         .into_any_element()
 }
 
@@ -176,7 +265,7 @@ pub fn commit_bar(
             short_sha(oid),
             commit.headline,
             ix + 1,
-            detail.commits.len()
+            detail.commit_count()
         ),
         _ => format!("Commit {}", short_sha(oid)),
     };
@@ -232,7 +321,7 @@ pub fn commit_bar(
                 .flex_none()
                 .text_size(scale::meta())
                 .text_color(muted)
-                .child(format!("{} of {}", ix + 1, detail.commits.len()))
+                .child(format!("{} of {}", ix + 1, detail.commit_count()))
         }))
         .child(step(
             "commit-previous",
@@ -263,7 +352,7 @@ mod tests {
     use chrono::DateTime;
     use loupe_github::{Actor, Commit};
 
-    use super::{author_name, neighbors, short_sha};
+    use super::{Rest, author_name, neighbors, short_sha, shortfall};
 
     fn commit(author: Option<&str>) -> Commit {
         Commit {
@@ -278,6 +367,30 @@ mod tests {
             committed_at: DateTime::from_timestamp(0, 0).unwrap(),
             checks: None,
         }
+    }
+
+    #[test]
+    fn a_short_list_says_how_far_it_goes_and_why() {
+        assert_eq!(shortfall(769, 769, &Rest::Settled), None);
+        assert_eq!(
+            shortfall(100, 769, &Rest::Loading),
+            None,
+            "skeleton rows stand for the commits on their way"
+        );
+        assert_eq!(
+            shortfall(100, 769, &Rest::Failed("HTTP 502".into())).as_deref(),
+            Some("Showing 100 of 769 commits. The rest did not load: HTTP 502")
+        );
+        assert_eq!(
+            shortfall(760, 769, &Rest::Settled).as_deref(),
+            Some("Showing 760 of 769 commits. GitHub listed no more; the rest are on GitHub.")
+        );
+        assert_eq!(
+            shortfall(3000, 5000, &Rest::Settled).as_deref(),
+            Some(
+                "Showing the first 3000 of 5000 commits. Loupe lists at most 3000; the rest are on GitHub."
+            )
+        );
     }
 
     #[test]

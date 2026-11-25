@@ -2019,6 +2019,8 @@ mod tests {
             labels: Vec::new(),
             assignees: Vec::new(),
             commits: Vec::new(),
+            commits_total: 0,
+            commits_cursor: None,
             checks: Checks {
                 state: None,
                 runs: Vec::new(),

@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 use ureq::RequestBuilder;
 
 use crate::{
-    BranchCi, BranchPullRequest, ChangedFile, CommitFiles, Error, FailedRun, FileStatus, GitHub,
-    Notification, NotificationSubject, PrRef, PrState, RepoRef, Result, Timestamp, ViewedState,
+    Actor, BranchCi, BranchPullRequest, ChangedFile, Commit, CommitFiles, Error, FailedRun,
+    FileStatus, GitHub, Notification, NotificationSubject, PrRef, PrState, RepoRef, Result,
+    Timestamp, ViewedState,
 };
 
 pub(crate) const REST_URL: &str = "https://api.github.com";
@@ -20,6 +21,12 @@ const API_VERSION: &str = "2022-11-28";
 const MAX_BODY_BYTES: u64 = 128 * 1024 * 1024;
 
 const FILES_PER_PAGE: usize = 100;
+const COMMITS_PER_PAGE: usize = 100;
+/// The most commits [`GitHub::pull_request_commits`] lists of a pull
+/// request; a list this long may have been cut.
+pub const PR_COMMITS_LIMIT: usize = 3000;
+/// Compare pages read at the same time.
+const PARALLEL_PAGES: usize = 4;
 /// GitHub lists at most 3000 files of a pull request.
 const MAX_FILE_PAGES: usize = 30;
 const NOTIFICATIONS_PER_PAGE: usize = 50;
@@ -46,13 +53,25 @@ pub(crate) enum RestMethod<'a> {
 
 impl GitHub {
     /// Every changed file with its patch (REST, all pages), with the viewer's
-    /// viewed state merged in from GraphQL.
+    /// viewed state merged in from GraphQL. The two lists are read side by
+    /// side.
     ///
     /// When a pull request's diff passes GitHub's size limit, REST leaves the
     /// patch out of some files and counts them as +0 −0. Their line counts
     /// come from GraphQL, which reports them all; the patch itself is
     /// [`GitHub::omitted_patch`].
     pub fn pull_request_files(&self, pr: &PrRef) -> Result<Vec<ChangedFile>> {
+        let (files, facts) = std::thread::scope(|scope| {
+            let facts = scope.spawn(|| self.file_facts(pr));
+            let files = self.rest_files(pr);
+            (files, joined(facts))
+        });
+        let mut files = files?;
+        merge_file_facts(&mut files, &facts?);
+        Ok(files)
+    }
+
+    fn rest_files(&self, pr: &PrRef) -> Result<Vec<ChangedFile>> {
         let mut files = Vec::new();
         for page in 1..=MAX_FILE_PAGES {
             let path = format!(
@@ -67,8 +86,47 @@ impl GitHub {
                 break;
             }
         }
-        self.refresh_viewed_states(pr, &mut files)?;
         Ok(files)
+    }
+
+    /// The `total` commits between `base_oid` and `head_oid` (their merge
+    /// base, as a pull request counts them), oldest first, up to
+    /// [`PR_COMMITS_LIMIT`]. The pages are numbered, so they are read
+    /// [`PARALLEL_PAGES`] at a time.
+    pub(crate) fn compared_commits(
+        &self,
+        repo: &RepoRef,
+        base_oid: &str,
+        head_oid: &str,
+        total: u32,
+    ) -> Result<Vec<Commit>> {
+        for oid in [base_oid, head_oid] {
+            if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(Error::Decode(format!("invalid commit sha {oid:?}")));
+            }
+        }
+        let pages = compare_pages(total);
+        let mut commits = Vec::new();
+        for batch in pages.chunks(PARALLEL_PAGES) {
+            let bodies: Vec<Result<String>> = std::thread::scope(|scope| {
+                let reads: Vec<_> = batch
+                    .iter()
+                    .map(|page| {
+                        let path = format!(
+                            "/repos/{}/{}/compare/{base_oid}...{head_oid}?per_page={COMMITS_PER_PAGE}&page={page}",
+                            repo.owner, repo.name
+                        );
+                        scope.spawn(move || self.rest(RestMethod::Get, &path))
+                    })
+                    .collect();
+                reads.into_iter().map(joined).collect()
+            });
+            for body in bodies {
+                commits.extend(parse_compare_commits(&body?)?);
+            }
+        }
+        commits.truncate(PR_COMMITS_LIMIT);
+        Ok(commits)
     }
 
     /// Sets each file's viewed state from GraphQL, and the line counts of a
@@ -669,6 +727,91 @@ struct WireFile {
     patch: Option<String>,
 }
 
+/// The result of a scoped thread, its panic passed on.
+fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// The compare pages that hold `total` commits, up to [`PR_COMMITS_LIMIT`].
+fn compare_pages(total: u32) -> Vec<usize> {
+    let commits = (total as usize).clamp(1, PR_COMMITS_LIMIT);
+    (1..=commits.div_ceil(COMMITS_PER_PAGE)).collect()
+}
+
+#[derive(Deserialize)]
+struct WireComparison {
+    commits: Vec<WireRestCommit>,
+}
+
+#[derive(Deserialize)]
+struct WireRestCommit {
+    sha: String,
+    commit: WireRestCommitData,
+    author: Option<WireRestUser>,
+}
+
+#[derive(Deserialize)]
+struct WireRestCommitData {
+    message: String,
+    author: Option<WireGitPerson>,
+    committer: Option<WireGitPerson>,
+}
+
+#[derive(Deserialize)]
+struct WireGitPerson {
+    name: Option<String>,
+    date: Option<Timestamp>,
+}
+
+#[derive(Deserialize)]
+struct WireRestUser {
+    login: String,
+    avatar_url: String,
+}
+
+/// A compare page's commits as GraphQL would give them: the message's first
+/// line as the headline and the rest, past the blank line, as the body.
+fn parse_compare_commits(body: &str) -> Result<Vec<Commit>> {
+    let comparison: WireComparison =
+        serde_json::from_str(body).map_err(|error| Error::Decode(error.to_string()))?;
+    Ok(comparison
+        .commits
+        .into_iter()
+        .map(|wire| {
+            let (headline, rest) = wire
+                .commit
+                .message
+                .split_once('\n')
+                .unwrap_or((wire.commit.message.as_str(), ""));
+            Commit {
+                headline: headline.trim_end().to_owned(),
+                body: rest.trim().to_owned(),
+                author_name: wire
+                    .commit
+                    .author
+                    .as_ref()
+                    .and_then(|person| person.name.clone())
+                    .unwrap_or_default(),
+                author: wire.author.map(|user| Actor {
+                    login: user.login,
+                    avatar_url: user.avatar_url,
+                }),
+                committed_at: wire
+                    .commit
+                    .committer
+                    .as_ref()
+                    .or(wire.commit.author.as_ref())
+                    .and_then(|person| person.date)
+                    .unwrap_or_default(),
+                checks: None,
+                oid: wire.sha,
+            }
+        })
+        .collect())
+}
+
 fn file_status(status: &str) -> FileStatus {
     match status {
         "added" => FileStatus::Added,
@@ -1070,6 +1213,65 @@ mod tests {
         let body = r#"{"merge_base_commit":{"sha":"abc123","commit":{}},"files":[]}"#;
         assert_eq!(parse_merge_base(body).expect("parses"), "abc123");
         assert!(parse_merge_base("{}").is_err());
+    }
+
+    #[test]
+    fn a_comparison_page_reads_its_commits_like_graphql() {
+        let body = r#"{"total_commits":769,"files":[{"filename":"a.rs"}],"commits":[
+            {"sha":"c1","author":{"login":"eve","avatar_url":"https://avatars.example/eve"},
+             "commit":{"message":"Fix the tab\n\nIt was cut.\r\nTwice.",
+                       "author":{"name":"Eve","date":"2026-01-02T03:00:00Z"},
+                       "committer":{"name":"GitHub","date":"2026-01-02T04:00:00Z"}}},
+            {"sha":"c2","author":null,
+             "commit":{"message":"One line","author":{"name":"Frank","date":"2026-01-03T03:00:00Z"},
+                       "committer":null}}
+        ]}"#;
+        let commits = parse_compare_commits(body).expect("parses");
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].oid, "c1");
+        assert_eq!(commits[0].headline, "Fix the tab");
+        assert_eq!(commits[0].body, "It was cut.\r\nTwice.");
+        assert_eq!(commits[0].author_name, "Eve");
+        assert_eq!(commits[0].author.as_ref().unwrap().login, "eve");
+        assert_eq!(
+            commits[0].committed_at,
+            Utc.with_ymd_and_hms(2026, 1, 2, 4, 0, 0).unwrap(),
+            "the committer's date, as GraphQL's committedDate"
+        );
+        assert_eq!(commits[0].checks, None, "REST has no checks per commit");
+        assert_eq!(commits[1].headline, "One line");
+        assert_eq!(commits[1].body, "");
+        assert_eq!(commits[1].author, None);
+        assert_eq!(
+            commits[1].committed_at,
+            Utc.with_ymd_and_hms(2026, 1, 3, 3, 0, 0).unwrap(),
+            "without a committer, the author's date"
+        );
+        assert!(parse_compare_commits(r#"{"commits":[{"sha":"c1"}]}"#).is_err());
+    }
+
+    #[test]
+    fn comparison_pages_cover_the_total_up_to_the_limit() {
+        assert_eq!(compare_pages(769), (1..=8).collect::<Vec<_>>());
+        assert_eq!(compare_pages(800), (1..=8).collect::<Vec<_>>());
+        assert_eq!(compare_pages(251), vec![1, 2, 3]);
+        assert_eq!(compare_pages(0), vec![1]);
+        assert_eq!(
+            compare_pages(u32::MAX).len(),
+            PR_COMMITS_LIMIT / COMMITS_PER_PAGE
+        );
+    }
+
+    #[test]
+    fn comparing_rejects_a_sha_that_would_change_the_path() {
+        let github = GitHub::new("token");
+        let repo = RepoRef::new("acme", "web");
+        for (base, head) in [("abc", "../x"), ("", "abc"), ("abc?page=9", "def")] {
+            assert!(matches!(
+                github.compared_commits(&repo, base, head, 300),
+                Err(Error::Decode(_))
+            ));
+        }
     }
 
     #[test]

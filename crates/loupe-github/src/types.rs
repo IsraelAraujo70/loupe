@@ -373,6 +373,14 @@ pub struct ReviewThread {
     pub comments: Vec<ReviewComment>,
 }
 
+/// The commits a pull request's changes run between, and its base branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestHead {
+    pub head_oid: String,
+    pub base_oid: String,
+    pub base_ref: String,
+}
+
 /// The viewer's review in progress on this pull request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
@@ -415,7 +423,17 @@ pub struct PullRequestDetail {
     pub reviewers: Vec<Reviewer>,
     pub labels: Vec<Label>,
     pub assignees: Vec<Actor>,
+    /// The first page of commits, oldest first, until the view swaps in
+    /// the whole list from [`crate::GitHub::pull_request_commits`].
     pub commits: Vec<Commit>,
+    /// How many commits the pull request has, `commits` loaded or not.
+    /// Defaulted so details cached before this field still load.
+    #[serde(default)]
+    pub commits_total: u32,
+    /// Where GitHub's list goes on after the first page of `commits`;
+    /// `None` when that page is all of them.
+    #[serde(default)]
+    pub commits_cursor: Option<String>,
     pub checks: Checks,
     pub timeline: Vec<TimelineItem>,
     pub threads: Vec<ReviewThread>,
@@ -433,6 +451,17 @@ pub struct PullRequestDetail {
 }
 
 impl PullRequestDetail {
+    /// How many commits the pull request has: its total, or the list when
+    /// a detail cached before the total says nothing.
+    pub fn commit_count(&self) -> usize {
+        (self.commits_total as usize).max(self.commits.len())
+    }
+
+    /// Whether `commits` is the whole list.
+    pub fn has_every_commit(&self) -> bool {
+        self.commits.len() >= self.commit_count()
+    }
+
     /// The viewer's approval or change request while it still covers the
     /// pull request: `None` once a commit lands after it, since that code is
     /// not reviewed yet.
