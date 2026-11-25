@@ -8,3 +8,4 @@ Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) first: crates, fixed contracts
 - Comments only for a non-obvious why. JSDoc-style `///` on public items whose behavior is not obvious.
 - No hardcoded product data or fixtures in the app. Tests may use fixtures.
 - Never print, log, or commit a token.
+- Live tests that read or write a real pull request use the test fixture in [docs/TEST_FIXTURE.md](docs/TEST_FIXTURE.md): write only to the pull request it names, and reset it with `scripts/loupe-fixture-reset.sh` afterwards.

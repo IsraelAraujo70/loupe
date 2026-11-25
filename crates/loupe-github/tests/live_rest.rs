@@ -2,7 +2,10 @@
 //! `cargo test -p loupe-github --test live_rest -- --ignored --nocapture`.
 //! Nothing here changes real notifications.
 
+use loupe_github::diff::{LineKind, parse_patch};
 use loupe_github::{Error, GitHub, PrRef, RepoRef};
+
+mod fixture;
 
 fn client() -> GitHub {
     let token = std::env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN is set");
@@ -81,12 +84,11 @@ fn branch_ci_finds_the_pull_request_and_the_failed_run_of_a_branch() {
 #[test]
 #[ignore = "needs GITHUB_TOKEN and network"]
 fn polling_the_checks_of_an_unchanged_commit_answers_unchanged() {
-    // The fixture pull request #1's head carries the failing `fixture` check.
+    // The fixture's head carries a passing, a failing, and a skipped check.
     let github = client();
-    let repo = RepoRef::new("IsraelAraujo70", "loupe");
-    let pr = github
-        .pull_request(&PrRef::new(repo.clone(), 1))
-        .expect("fixture loads");
+    let fixture = fixture::pr(fixture::STACK_1);
+    let repo = fixture.repo.clone();
+    let pr = github.pull_request(&fixture).expect("fixture loads");
     let first = github
         .poll_checks(&repo, &pr.head_oid, None)
         .expect("first poll");
@@ -180,4 +182,34 @@ fn a_pull_request_poll_answers_304_until_it_changes() {
         .poll_pull_request(&pr, Some(&etag))
         .expect("second poll");
     assert_eq!(second, loupe_github::PullRequestPoll::Unchanged);
+}
+
+#[test]
+#[ignore = "needs GITHUB_TOKEN and network"]
+fn loads_the_diffs_github_leaves_out_of_the_large_fixture() {
+    let github = client();
+    let pr = fixture::pr(fixture::LARGE_DIFF);
+    let detail = github.pull_request(&pr).expect("detail");
+    let files = github.pull_request_files(&pr).expect("files");
+    let omitted: Vec<_> = files.iter().filter(|file| file.patch.is_none()).collect();
+    println!("{} of {} diffs left out", omitted.len(), files.len());
+    assert!(omitted.len() >= 10, "GitHub leaves most diffs out");
+    assert!(files.iter().any(|file| file.patch.is_some()));
+    let part = files
+        .iter()
+        .find(|file| file.path == "data/nutrition/part-24.csv")
+        .expect("part-24.csv");
+    assert!(part.patch.is_none());
+    assert_eq!(part.additions, 2001, "GraphQL counts what REST leaves out");
+    let patch = github
+        .omitted_patch(&pr, &detail.base_oid, &detail.head_oid, part)
+        .expect("loads")
+        .expect("a text file");
+    let added = parse_patch(&patch)
+        .expect("hunks")
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter(|line| line.kind == LineKind::Added)
+        .count();
+    assert_eq!(added, 2001);
 }
