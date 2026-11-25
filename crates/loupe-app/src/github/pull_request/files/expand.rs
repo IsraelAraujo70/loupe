@@ -301,7 +301,7 @@ fn close(lines: Vec<(DiffLine, Option<usize>)>, hunks: &[Hunk]) -> Hunk {
 }
 
 /// What follows the closing `@@` of a hunk header: the scope Git names.
-fn scope(header: &str) -> &str {
+pub(super) fn scope(header: &str) -> &str {
     header
         .strip_prefix("@@")
         .and_then(|rest| rest.find("@@").map(|ix| &rest[ix + 2..]))
