@@ -10,6 +10,7 @@ mod stack_panel;
 mod toolbar;
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,14 @@ struct Loaded {
     link_context: PrLinkContext,
     linear: AnyView,
     t3: AnyView,
+}
+
+/// A commit opened from the Commits tab: the Files tab shows its changes
+/// in place of the whole pull request's until All changes.
+struct CommitDiff {
+    oid: String,
+    files: Entity<FilesTab>,
+    _events: Subscription,
 }
 
 /// What the pull request poll compares GitHub's answer with.
@@ -157,6 +166,7 @@ pub struct PullRequestView {
     stack_merge_task: Option<Task<()>>,
     tab: PrTab,
     loaded: Option<Loaded>,
+    commit: Option<CommitDiff>,
     /// A detail that arrived without a window to hand it to the tabs; the
     /// next render installs it.
     incoming: Option<Arc<PullRequestDetail>>,
@@ -275,6 +285,7 @@ impl PullRequestView {
             stack_merge_task: None,
             tab: PrTab::Conversation,
             loaded: None,
+            commit: None,
             incoming: None,
             panel: Panel::Closed,
             merge_method: None,
@@ -427,6 +438,11 @@ impl PullRequestView {
             pr: self.pr.clone(),
             ..PrLinkContext::from_detail(&detail)
         };
+        if let Some(commit) = &self.commit {
+            commit
+                .files
+                .update(cx, |tab, cx| tab.set_detail(detail.clone(), window, cx));
+        }
         if let Some(loaded) = &mut self.loaded {
             loaded
                 .conversation
@@ -542,6 +558,39 @@ impl PullRequestView {
         }
     }
 
+    /// Shows commit `oid`'s changes in the Files tab, or with `None` the
+    /// whole pull request's again.
+    fn show_commit(&mut self, oid: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = PrTab::Files;
+        if self.commit.as_ref().map(|commit| commit.oid.as_str()) == oid {
+            cx.notify();
+            return;
+        }
+        if let Some(closed) = self.commit.take()
+            && closed.files.read(cx).wrote_viewed()
+            && let Some(loaded) = &self.loaded
+        {
+            loaded
+                .files
+                .update(cx, |files, cx| files.refresh_viewed(cx));
+        }
+        if let (Some(oid), Some(detail)) = (oid, self.detail.value()) {
+            let context = PrTabContext {
+                pr: self.pr.clone(),
+                detail: detail.clone(),
+            };
+            let oid = oid.to_owned();
+            let files = cx.new(|cx| FilesTab::for_commit(context, oid.clone(), window, cx));
+            let events = cx.subscribe_in(&files, window, Self::reload_on_tab_event::<FilesTab>);
+            self.commit = Some(CommitDiff {
+                oid,
+                files,
+                _events: events,
+            });
+        }
+        cx.notify();
+    }
+
     /// Shows the Files tab at `path` (and `line` on `side` when given).
     fn reveal_file(
         &mut self,
@@ -551,7 +600,7 @@ impl PullRequestView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.tab = PrTab::Files;
+        self.show_commit(None, window, cx);
         if let Some(loaded) = &self.loaded {
             loaded.files.update(cx, |files, cx| {
                 files.reveal_line(path, line, side, window, cx)
@@ -1297,6 +1346,11 @@ impl PullRequestView {
                 .child(content)
                 .into_any_element()
         };
+        let view = cx.entity().downgrade();
+        let show_commit: commits::OnShow = Rc::new(move |oid, window, cx| {
+            view.update(cx, |view, cx| view.show_commit(oid, window, cx))
+                .ok();
+        });
         match self.tab {
             PrTab::Conversation => scrolling(
                 "pr-conversation",
@@ -1317,15 +1371,23 @@ impl PullRequestView {
                 &self.guide_scroll,
                 loaded.guide.clone().into_any_element(),
             ),
-            PrTab::Files => div()
-                .flex_1()
-                .min_h_0()
-                .child(loaded.files.clone())
-                .into_any_element(),
+            PrTab::Files => match &self.commit {
+                Some(commit) => v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(commits::commit_bar(detail, &commit.oid, show_commit, cx))
+                    .child(div().flex_1().min_h_0().child(commit.files.clone()))
+                    .into_any_element(),
+                None => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(loaded.files.clone())
+                    .into_any_element(),
+            },
             PrTab::Commits => scrolling(
                 "pr-commits",
                 &self.commits_scroll,
-                commits::render(detail, cx),
+                commits::render(detail, show_commit, cx),
             ),
             PrTab::Checks => scrolling(
                 "pr-checks",
