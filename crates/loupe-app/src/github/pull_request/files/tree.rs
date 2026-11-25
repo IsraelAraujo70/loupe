@@ -2,13 +2,25 @@
 //! plus the pure rules of a Zed-style project panel: keyboard moves, pinned
 //! ("sticky") folders, and the indent guide that holds the selection.
 //!
-//! Folders come before files at each level, both sorted by name ignoring
-//! case, and a chain of folders with a single child folder and no files
-//! shows as one compact row (`src/lib/http`).
+//! The tree reads in review order: at each level code comes first, then
+//! tests, then docs (a folder sorts by the first kind it holds), and within
+//! a kind folders come before files, both sorted by name ignoring case. The
+//! low-signal files (`signal::Signal::Low`) leave their folders for one
+//! group at the end, [`LOW_SIGNAL`], with a tree of their own inside. A
+//! chain of folders with a single child folder and no files shows as one
+//! compact row (`src/lib/http`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use loupe_github::{ChangedFile, FileStatus};
+
+use super::signal::Signal;
+
+/// The low-signal group: its row's label and the key the tree opens and
+/// closes it by, and the path of the divider over its files in the diff.
+/// The folders inside it are keyed under it (`Low signal/data`), so closing
+/// one never closes the folder of the same name among the code.
+pub const LOW_SIGNAL: &str = "Low signal";
 
 /// One visible row of the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,50 +67,75 @@ impl TreeRow {
     }
 }
 
-#[derive(Default)]
 struct Dir {
     dirs: BTreeMap<String, Dir>,
-    files: Vec<(String, usize)>,
+    /// Each file's name, index, and rank (`Signal::rank`).
+    files: Vec<(String, usize, u8)>,
+    /// The first rank of a file under the folder, which the folder sorts by.
+    rank: u8,
+}
+
+impl Default for Dir {
+    fn default() -> Self {
+        Dir {
+            dirs: BTreeMap::new(),
+            files: Vec::new(),
+            rank: u8::MAX,
+        }
+    }
 }
 
 impl Dir {
-    fn insert(&mut self, path: &str, index: usize) {
+    fn insert(&mut self, path: &str, index: usize, rank: u8) {
+        self.rank = self.rank.min(rank);
         match path.split_once('/') {
             Some((head, rest)) => self
                 .dirs
                 .entry(head.to_owned())
                 .or_default()
-                .insert(rest, index),
-            None => self.files.push((path.to_owned(), index)),
+                .insert(rest, index, rank),
+            None => self.files.push((path.to_owned(), index, rank)),
         }
     }
 
-    fn collect_files(&self, out: &mut Vec<usize>) {
-        for (_, dir) in sorted_dirs(self) {
-            dir.collect_files(out);
-        }
-        out.extend(sorted_files(self).into_iter().map(|(_, index)| index));
+    fn is_empty(&self) -> bool {
+        self.dirs.is_empty() && self.files.is_empty()
     }
+
+    fn collect_files(&self, out: &mut Vec<usize>) {
+        for entry in entries(self) {
+            match entry {
+                Entry::Dir(_, dir) => dir.collect_files(out),
+                Entry::File(index) => out.push(index),
+            }
+        }
+    }
+}
+
+enum Entry<'a> {
+    Dir(&'a String, &'a Dir),
+    File(usize),
 }
 
 fn sort_key(name: &str) -> (String, &str) {
     (name.to_lowercase(), name)
 }
 
-fn sorted_dirs(dir: &Dir) -> Vec<(&String, &Dir)> {
-    let mut dirs: Vec<_> = dir.dirs.iter().collect();
-    dirs.sort_by(|a, b| sort_key(a.0).cmp(&sort_key(b.0)));
-    dirs
-}
-
-fn sorted_files(dir: &Dir) -> Vec<(&str, usize)> {
-    let mut files: Vec<_> = dir
-        .files
+/// A folder's folders and files in reading order: by rank, then folders
+/// before files, then by name ignoring case.
+fn entries(dir: &Dir) -> Vec<Entry<'_>> {
+    let mut entries: Vec<(u8, bool, (String, &str), Entry)> = dir
+        .dirs
         .iter()
-        .map(|(name, index)| (name.as_str(), *index))
+        .map(|(name, child)| (child.rank, false, sort_key(name), Entry::Dir(name, child)))
+        .chain(
+            dir.files
+                .iter()
+                .map(|(name, index, rank)| (*rank, true, sort_key(name), Entry::File(*index))),
+        )
         .collect();
-    files.sort_by(|a, b| sort_key(a.0).cmp(&sort_key(b.0)));
-    files
+    entries.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+    entries.into_iter().map(|(.., entry)| entry).collect()
 }
 
 /// Whether the files filter keeps `path`: a case-insensitive substring of
@@ -108,26 +145,45 @@ pub fn filter_keeps(path: &str, filter: &str) -> bool {
     filter.is_empty() || path.to_lowercase().contains(&filter)
 }
 
-fn build(files: &[ChangedFile], filter: &str) -> Dir {
-    let mut root = Dir::default();
+/// The tree of the code, tests, and docs, and the tree of the low-signal
+/// files. `signals` holds each file's kind, in file order.
+fn build(files: &[ChangedFile], signals: &[Signal], filter: &str) -> (Dir, Dir) {
+    let (mut main, mut low) = (Dir::default(), Dir::default());
     for (index, file) in files.iter().enumerate() {
-        if filter_keeps(&file.path, filter) {
-            root.insert(&file.path, index);
+        if !filter_keeps(&file.path, filter) {
+            continue;
         }
+        let signal = signals.get(index).copied().unwrap_or(Signal::Code);
+        let tree = if signal.is_low() { &mut low } else { &mut main };
+        tree.insert(&file.path, index, signal.rank());
     }
-    root
+    (main, low)
 }
 
-/// The rows to draw for `files`. A folder in `collapsed` hides its children,
-/// except while a filter is set: then every folder opens so each match shows.
-pub fn tree_rows(files: &[ChangedFile], filter: &str, collapsed: &HashSet<String>) -> Vec<TreeRow> {
+/// The rows to draw for `files`, whose kinds `signals` holds in file order:
+/// the code, tests, and docs, then the low-signal group. A folder in
+/// `collapsed` hides its children, except while a filter is set: then every
+/// folder opens so each match shows.
+pub fn tree_rows(
+    files: &[ChangedFile],
+    signals: &[Signal],
+    filter: &str,
+    collapsed: &HashSet<String>,
+) -> Vec<TreeRow> {
     let mut emitter = Emitter {
         files,
         collapsed,
         force_open: !filter.trim().is_empty(),
         rows: Vec::new(),
     };
-    emitter.emit(&build(files, filter), "", 0, None);
+    let (main, low) = build(files, signals, filter);
+    emitter.emit(&main, "", 0, None);
+    if !low.is_empty() {
+        let row = emitter.push_dir(&low, LOW_SIGNAL.to_owned(), LOW_SIGNAL.to_owned(), 0, None);
+        if let Some(row) = row {
+            emitter.emit(&low, LOW_SIGNAL, 1, Some(row));
+        }
+    }
     emitter.rows
 }
 
@@ -140,49 +196,63 @@ struct Emitter<'a> {
 
 impl Emitter<'_> {
     fn emit(&mut self, dir: &Dir, parent_path: &str, depth: usize, parent: Option<usize>) {
-        for (name, mut child) in sorted_dirs(dir) {
-            let mut label = name.clone();
-            while child.files.is_empty() && child.dirs.len() == 1 {
-                let (next_name, next) = child.dirs.iter().next().expect("one child folder");
-                label = format!("{label}/{next_name}");
-                child = next;
-            }
-            let path = if parent_path.is_empty() {
-                label.clone()
-            } else {
-                format!("{parent_path}/{label}")
-            };
-            let mut indices = Vec::new();
-            child.collect_files(&mut indices);
-            let (additions, deletions) = indices.iter().fold((0, 0), |(a, d), &ix| {
-                (a + self.files[ix].additions, d + self.files[ix].deletions)
-            });
-            let expanded = self.force_open || !self.collapsed.contains(&path);
-            let row = self.rows.len();
-            self.rows.push(TreeRow {
-                depth,
-                path: path.clone(),
-                parent,
-                kind: RowKind::Dir(DirRow {
-                    label,
-                    files: indices,
-                    additions,
-                    deletions,
-                    expanded,
+        for entry in entries(dir) {
+            match entry {
+                Entry::Dir(name, mut child) => {
+                    let mut label = name.clone();
+                    while child.files.is_empty() && child.dirs.len() == 1 {
+                        let (next_name, next) = child.dirs.iter().next().expect("one child folder");
+                        label = format!("{label}/{next_name}");
+                        child = next;
+                    }
+                    let path = if parent_path.is_empty() {
+                        label.clone()
+                    } else {
+                        format!("{parent_path}/{label}")
+                    };
+                    if let Some(row) = self.push_dir(child, path.clone(), label, depth, parent) {
+                        self.emit(child, &path, depth + 1, Some(row));
+                    }
+                }
+                Entry::File(index) => self.rows.push(TreeRow {
+                    depth,
+                    path: self.files[index].path.clone(),
+                    parent,
+                    kind: RowKind::File { index },
                 }),
-            });
-            if expanded {
-                self.emit(child, &path, depth + 1, Some(row));
             }
         }
-        for (_, index) in sorted_files(dir) {
-            self.rows.push(TreeRow {
-                depth,
-                path: self.files[index].path.clone(),
-                parent,
-                kind: RowKind::File { index },
-            });
-        }
+    }
+
+    /// Adds the row of folder `dir`, and returns it when it is open.
+    fn push_dir(
+        &mut self,
+        dir: &Dir,
+        path: String,
+        label: String,
+        depth: usize,
+        parent: Option<usize>,
+    ) -> Option<usize> {
+        let mut indices = Vec::new();
+        dir.collect_files(&mut indices);
+        let (additions, deletions) = indices.iter().fold((0, 0), |(a, d), &ix| {
+            (a + self.files[ix].additions, d + self.files[ix].deletions)
+        });
+        let expanded = self.force_open || !self.collapsed.contains(&path);
+        let row = self.rows.len();
+        self.rows.push(TreeRow {
+            depth,
+            path,
+            parent,
+            kind: RowKind::Dir(DirRow {
+                label,
+                files: indices,
+                additions,
+                deletions,
+                expanded,
+            }),
+        });
+        expanded.then_some(row)
     }
 }
 
@@ -197,11 +267,23 @@ const OVERVIEW_ROWS: usize = 40;
 /// opens the folder holding most of the files (`crates/` in a Rust
 /// monorepo), so the first screen lists the folders that split the work,
 /// each with its count, instead of the first few hundred files.
-pub fn initial_collapsed(files: &[ChangedFile]) -> HashSet<String> {
+///
+/// The low-signal group opens closed whenever there is code beside it, so
+/// the tree starts on what needs reading.
+pub fn initial_collapsed(files: &[ChangedFile], signals: &[Signal]) -> HashSet<String> {
+    let mut collapsed = overview_collapsed(files, signals);
+    let low = signals.iter().filter(|signal| signal.is_low()).count();
+    if low > 0 && low < files.len() {
+        collapsed.insert(LOW_SIGNAL.to_owned());
+    }
+    collapsed
+}
+
+fn overview_collapsed(files: &[ChangedFile], signals: &[Signal]) -> HashSet<String> {
     if files.len() <= LARGE_TREE {
         return HashSet::new();
     }
-    let rows = tree_rows(files, "", &HashSet::new());
+    let rows = tree_rows(files, signals, "", &HashSet::new());
     let mut children: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
     for (ix, row) in rows.iter().enumerate() {
         children.entry(row.parent).or_default().push(ix);
@@ -249,16 +331,23 @@ pub fn initial_collapsed(files: &[ChangedFile]) -> HashSet<String> {
         .collect()
 }
 
-/// Reorders `files` into the tree's order, so the diff below reads in the
-/// same order as the list beside it.
-pub fn into_tree_order(files: Vec<ChangedFile>) -> Vec<ChangedFile> {
+/// Reorders `files` and their kinds into the tree's order (the code, tests,
+/// and docs, then the low-signal files), so the diff below reads in the same
+/// order as the list beside it.
+pub fn into_tree_order(
+    files: Vec<ChangedFile>,
+    signals: Vec<Signal>,
+) -> (Vec<ChangedFile>, Vec<Signal>) {
     let mut order = Vec::with_capacity(files.len());
-    build(&files, "").collect_files(&mut order);
-    let mut slots: Vec<Option<ChangedFile>> = files.into_iter().map(Some).collect();
+    let (main, low) = build(&files, &signals, "");
+    main.collect_files(&mut order);
+    low.collect_files(&mut order);
+    let mut slots: Vec<Option<(ChangedFile, Signal)>> =
+        files.into_iter().zip(signals).map(Some).collect();
     order
         .into_iter()
-        .filter_map(|index| slots[index].take())
-        .collect()
+        .filter_map(|index| slots.get_mut(index).and_then(Option::take))
+        .unzip()
 }
 
 /// What a key press does to the tree, decided before any state changes.
@@ -360,21 +449,36 @@ pub fn sticky_folders(rows: &[TreeRow], top: usize) -> Option<Sticky> {
 
 /// The row that stands for `path`: its own, or while a closed folder hides
 /// it, the innermost folder on screen that holds it, so the tree still
-/// shows where the diff is.
-pub fn shown_row(rows: &[TreeRow], path: &str) -> Option<usize> {
+/// shows where the diff is. `low` says whether the file is low signal, and
+/// so in the low-signal group.
+pub fn shown_row(rows: &[TreeRow], path: &str, low: bool) -> Option<usize> {
     if let Some(ix) = rows.iter().position(|row| row.path == path) {
         return Some(ix);
     }
     rows.iter()
         .enumerate()
-        .filter(|(_, row)| {
-            row.dir().is_some()
-                && path
-                    .strip_prefix(row.path.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
-        .max_by_key(|(_, row)| row.path.len())
+        .filter(|(_, row)| row.dir().is_some() && holds(&row.path, path, low))
+        .max_by_key(|(_, row)| row.depth)
         .map(|(ix, _)| ix)
+}
+
+/// Whether the folder keyed `folder` holds the file at `path`. The
+/// low-signal group holds every low-signal file, and a folder inside it
+/// (`Low signal/data`) the low-signal files of the folder it names.
+pub fn holds(folder: &str, path: &str, low: bool) -> bool {
+    if folder == LOW_SIGNAL {
+        return low;
+    }
+    let real = match folder
+        .strip_prefix(LOW_SIGNAL)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        Some(inner) if low => inner,
+        None if !low => folder,
+        _ => return false,
+    };
+    path.strip_prefix(real)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The folders holding `ix`, outermost first.
@@ -524,11 +628,17 @@ mod tests {
 
     use loupe_github::{ChangedFile, FileStatus, ViewedState};
 
+    use super::super::signal::{Attributes, Signal, classify_all};
     use super::{
-        GitTint, LARGE_TREE, Move, RowKind, Sticky, TreeRow, ViewedMark, active_folder,
-        distinct_starts, folder_tint, initial_collapsed, into_tree_order, move_down, move_left,
-        move_right, move_up, shown_row, sticky_folders, tree_rows, viewed_mark,
+        GitTint, LARGE_TREE, LOW_SIGNAL, Move, RowKind, Sticky, TreeRow, ViewedMark, active_folder,
+        distinct_starts, folder_tint, holds, initial_collapsed, into_tree_order, move_down,
+        move_left, move_right, move_up, shown_row, sticky_folders, tree_rows, viewed_mark,
     };
+
+    /// Every file as code, so a tree sorts by name alone.
+    fn code(files: &[ChangedFile]) -> Vec<Signal> {
+        vec![Signal::Code; files.len()]
+    }
 
     fn file(path: &str, additions: u32, deletions: u32) -> ChangedFile {
         ChangedFile {
@@ -584,7 +694,7 @@ mod tests {
     #[test]
     fn folders_nest_before_files_and_single_child_chains_compact() {
         let files = sample();
-        let rows = tree_rows(&files, "", &HashSet::new());
+        let rows = tree_rows(&files, &code(&files), "", &HashSet::new());
         assert_eq!(
             outline(&files, &rows),
             [
@@ -616,7 +726,7 @@ mod tests {
             file("crates/ai2/src/prompts/base.rs", 1, 0),
             file("crates/call/src/room/mod.rs", 1, 0),
         ];
-        let rows = tree_rows(&files, "", &HashSet::new());
+        let rows = tree_rows(&files, &code(&files), "", &HashSet::new());
         assert_eq!(
             outline(&files, &rows),
             [
@@ -653,15 +763,15 @@ mod tests {
     fn a_small_tree_opens_whole() {
         let files = monorepo(10, 10);
         assert!(files.len() <= LARGE_TREE);
-        assert!(initial_collapsed(&files).is_empty());
+        assert!(initial_collapsed(&files, &code(&files)).is_empty());
     }
 
     #[test]
     fn a_large_tree_opens_as_an_overview_of_its_folders() {
         let files = monorepo(36, 10);
         assert!(files.len() > LARGE_TREE);
-        let collapsed = initial_collapsed(&files);
-        let rows = tree_rows(&files, "", &collapsed);
+        let collapsed = initial_collapsed(&files, &code(&files));
+        let rows = tree_rows(&files, &code(&files), "", &collapsed);
         let shown = outline(&files, &rows);
         // The top level and its crates do not fit a screen together, but
         // `crates/` holds most of the files, so it opens on its crates,
@@ -685,7 +795,12 @@ mod tests {
             .iter()
             .flat_map(|dir| (0..70).map(move |ix| file(&format!("{dir}/f{ix}.rs"), 1, 0)))
             .collect();
-        let rows = tree_rows(&files, "", &initial_collapsed(&files));
+        let rows = tree_rows(
+            &files,
+            &code(&files),
+            "",
+            &initial_collapsed(&files, &code(&files)),
+        );
         assert_eq!(
             outline(&files, &rows),
             [
@@ -702,7 +817,12 @@ mod tests {
                 })
             })
             .collect();
-        let rows = tree_rows(&files, "", &initial_collapsed(&files));
+        let rows = tree_rows(
+            &files,
+            &code(&files),
+            "",
+            &initial_collapsed(&files, &code(&files)),
+        );
         assert_eq!(rows.len(), 30);
         assert_eq!(outline(&files, &rows)[1], "  > s0/ [11] +11 -0");
     }
@@ -711,7 +831,7 @@ mod tests {
     fn a_collapsed_folder_hides_its_children_but_keeps_its_totals() {
         let files = sample();
         let collapsed = HashSet::from(["src".to_owned()]);
-        let rows = tree_rows(&files, "", &collapsed);
+        let rows = tree_rows(&files, &code(&files), "", &collapsed);
         assert_eq!(
             outline(&files, &rows),
             [
@@ -728,17 +848,20 @@ mod tests {
     fn the_filter_keeps_matching_paths_and_opens_their_folders() {
         let files = sample();
         let collapsed = HashSet::from(["src".to_owned(), "src/lib/http".to_owned()]);
-        let rows = tree_rows(&files, "  HTTP/R ", &collapsed);
+        let rows = tree_rows(&files, &code(&files), "  HTTP/R ", &collapsed);
         assert_eq!(
             outline(&files, &rows),
             ["src/lib/http/ [1] +3 -1", "  src/lib/http/retry.rs"]
         );
-        assert!(tree_rows(&files, "nothing-matches", &collapsed).is_empty());
+        assert!(tree_rows(&files, &code(&files), "nothing-matches", &collapsed).is_empty());
     }
 
     #[test]
     fn tree_order_matches_the_rows_without_a_filter() {
-        let ordered: Vec<String> = into_tree_order(sample())
+        let files = sample();
+        let signals = code(&files);
+        let ordered: Vec<String> = into_tree_order(files, signals)
+            .0
             .into_iter()
             .map(|file| file.path)
             .collect();
@@ -759,7 +882,7 @@ mod tests {
     #[test]
     fn arrows_move_open_and_close_like_zed() {
         let files = sample();
-        let rows = tree_rows(&files, "", &HashSet::new());
+        let rows = tree_rows(&files, &code(&files), "", &HashSet::new());
         let src = find(&rows, "src");
         let http = find(&rows, "src/lib/http");
         let client = find(&rows, "src/lib/http/client.rs");
@@ -777,7 +900,7 @@ mod tests {
         assert_eq!(move_left(&rows, find(&rows, "README.md")), None);
 
         let collapsed = HashSet::from(["src/lib/http".to_owned()]);
-        let rows = tree_rows(&files, "", &collapsed);
+        let rows = tree_rows(&files, &code(&files), "", &collapsed);
         let http = find(&rows, "src/lib/http");
         // → opens a closed folder; ← on a closed folder closes its parent.
         assert_eq!(move_right(&rows, http), Some(Move::Expand(http)));
@@ -790,7 +913,7 @@ mod tests {
     #[test]
     fn folders_pin_while_their_rows_scroll_past() {
         let files = sample();
-        let rows = tree_rows(&files, "", &HashSet::new());
+        let rows = tree_rows(&files, &code(&files), "", &HashSet::new());
         let src = find(&rows, "src");
         let http = find(&rows, "src/lib/http");
         // The top of the list pins nothing: `docs/guide` is still in view.
@@ -832,21 +955,29 @@ mod tests {
     fn a_hidden_file_shows_as_the_innermost_folder_on_screen() {
         let files = sample();
         let client = "src/lib/http/client.rs";
-        let rows = tree_rows(&files, "", &HashSet::new());
-        assert_eq!(shown_row(&rows, client), Some(find(&rows, client)));
-        let rows = tree_rows(&files, "", &HashSet::from(["src/lib/http".to_owned()]));
-        assert_eq!(shown_row(&rows, client), Some(find(&rows, "src/lib/http")));
+        let rows = tree_rows(&files, &code(&files), "", &HashSet::new());
+        assert_eq!(shown_row(&rows, client, false), Some(find(&rows, client)));
+        let rows = tree_rows(
+            &files,
+            &code(&files),
+            "",
+            &HashSet::from(["src/lib/http".to_owned()]),
+        );
+        assert_eq!(
+            shown_row(&rows, client, false),
+            Some(find(&rows, "src/lib/http"))
+        );
         let collapsed = HashSet::from(["src".to_owned(), "src/lib/http".to_owned()]);
-        let rows = tree_rows(&files, "", &collapsed);
-        assert_eq!(shown_row(&rows, client), Some(find(&rows, "src")));
+        let rows = tree_rows(&files, &code(&files), "", &collapsed);
+        assert_eq!(shown_row(&rows, client, false), Some(find(&rows, "src")));
         // `src` is not a folder of `srcs/a.rs`.
-        assert_eq!(shown_row(&rows, "srcs/a.rs"), None);
+        assert_eq!(shown_row(&rows, "srcs/a.rs", false), None);
     }
 
     #[test]
     fn the_active_guide_belongs_to_the_open_folder_holding_the_selection() {
         let files = sample();
-        let rows = tree_rows(&files, "", &HashSet::new());
+        let rows = tree_rows(&files, &code(&files), "", &HashSet::new());
         let http = find(&rows, "src/lib/http");
         assert_eq!(
             active_folder(&rows, find(&rows, "src/lib/http/retry.rs")),
@@ -872,7 +1003,7 @@ mod tests {
             file("themes/atelier_cave_light.rs", 1, 0),
             file("themes/atelier_dune_dark.rs", 1, 0),
         ];
-        let rows = tree_rows(&files, "", &HashSet::new());
+        let rows = tree_rows(&files, &code(&files), "", &HashSet::new());
         let starts = distinct_starts(&rows);
         let start = |path: &str| {
             let ix = find(&rows, path);
@@ -930,5 +1061,132 @@ mod tests {
             GitTint::Modified
         );
         assert_eq!(folder_tint([FileStatus::Renamed]), GitTint::Modified);
+    }
+
+    /// The kinds of a pull request like the review fixture's, read as the
+    /// files tab reads them.
+    fn fixture() -> (Vec<ChangedFile>, Vec<Signal>) {
+        let files = vec![
+            file("assets/badge.png", 0, 0),
+            file("assets/icon.png", 0, 0),
+            file("docs/guide/quickstart.md", 5, 4),
+            file("README.md", 2, 1),
+            file("scripts/seed.sh", 0, 0),
+            file("src/generated/units_table.rs", 7, 7),
+            file("src/units.rs", 5, 5),
+            file("web/src/components/IngredientList.test.tsx", 10, 0),
+            file("web/src/components/IngredientList.tsx", 20, 0),
+            file("web/pnpm-lock.yaml", 40, 12),
+            file("Cargo.toml", 1, 1),
+        ];
+        let attributes = Attributes::parse("src/generated/** linguist-generated\n");
+        let signals = classify_all(&files, &attributes);
+        into_tree_order(files, signals)
+    }
+
+    #[test]
+    fn code_reads_first_then_tests_then_docs_and_low_signal_last() {
+        let (files, signals) = fixture();
+        let rows = tree_rows(&files, &signals, "", &HashSet::new());
+        assert_eq!(
+            outline(&files, &rows),
+            [
+                "src/ [1] +5 -5",
+                "  src/units.rs",
+                "web/src/components/ [2] +30 -0",
+                "  web/src/components/IngredientList.tsx",
+                "  web/src/components/IngredientList.test.tsx",
+                "Cargo.toml",
+                "docs/guide/ [1] +5 -4",
+                "  docs/guide/quickstart.md",
+                "README.md",
+                "Low signal/ [5] +47 -19",
+                "  assets/ [2] +0 -0",
+                "    assets/badge.png",
+                "    assets/icon.png",
+                "  scripts/ [1] +0 -0",
+                "    scripts/seed.sh",
+                "  src/generated/ [1] +7 -7",
+                "    src/generated/units_table.rs",
+                "  web/ [1] +40 -12",
+                "    web/pnpm-lock.yaml",
+            ]
+        );
+        // The diff reads in the same order.
+        let tree_files: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row.kind {
+                RowKind::File { index } => Some(files[index].path.as_str()),
+                RowKind::Dir(_) => None,
+            })
+            .collect();
+        let diff_files: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(tree_files, diff_files);
+        assert!(signals[..6].iter().all(|signal| !signal.is_low()));
+        assert!(signals[6..].iter().all(|signal| signal.is_low()));
+    }
+
+    #[test]
+    fn the_low_signal_group_opens_closed_beside_code_and_keeps_its_own_folders() {
+        let (files, signals) = fixture();
+        let collapsed = initial_collapsed(&files, &signals);
+        assert_eq!(collapsed, HashSet::from([LOW_SIGNAL.to_owned()]));
+        let rows = tree_rows(&files, &signals, "", &collapsed);
+        assert_eq!(
+            outline(&files, &rows).last().map(String::as_str),
+            Some("> Low signal/ [5] +47 -19")
+        );
+        let group = find(&rows, LOW_SIGNAL);
+        // A low-signal file hidden in the group shows as the group, and a
+        // code file never does.
+        assert_eq!(shown_row(&rows, "assets/badge.png", true), Some(group));
+        assert_eq!(shown_row(&rows, "web/pnpm-lock.yaml", true), Some(group));
+        // Closing `Low signal/web` closes the lockfile's folder only.
+        let closed = HashSet::from(["Low signal/web".to_owned()]);
+        let rows = tree_rows(&files, &signals, "", &closed);
+        assert!(
+            rows.iter()
+                .any(|row| row.path == "web/src/components/IngredientList.tsx")
+        );
+        assert!(!rows.iter().any(|row| row.path == "web/pnpm-lock.yaml"));
+        assert_eq!(
+            shown_row(&rows, "web/pnpm-lock.yaml", true),
+            Some(find(&rows, "Low signal/web"))
+        );
+        // A pull request of low-signal files alone opens the group.
+        let lock = vec![file("Cargo.lock", 3, 3)];
+        let lock_signals = classify_all(&lock, &Attributes::default());
+        assert!(initial_collapsed(&lock, &lock_signals).is_empty());
+    }
+
+    #[test]
+    fn a_folder_holds_the_files_of_its_own_section() {
+        assert!(holds(LOW_SIGNAL, "assets/badge.png", true));
+        assert!(!holds(LOW_SIGNAL, "src/units.rs", false));
+        assert!(holds("Low signal/assets", "assets/badge.png", true));
+        assert!(!holds("Low signal/assets", "assets/badge.png", false));
+        assert!(holds("web", "web/src/a.ts", false));
+        assert!(!holds("web", "web/pnpm-lock.yaml", true));
+        assert!(!holds("Low signal/web", "website/a.csv", true));
+        // A real folder whose name starts like the group is an ordinary one.
+        assert!(holds("Low signals", "Low signals/a.rs", false));
+    }
+
+    #[test]
+    fn the_filter_keeps_the_group_while_one_of_its_files_matches() {
+        let (files, signals) = fixture();
+        let collapsed = HashSet::from([LOW_SIGNAL.to_owned()]);
+        let rows = tree_rows(&files, &signals, "png", &collapsed);
+        assert_eq!(
+            outline(&files, &rows),
+            [
+                "Low signal/ [2] +0 -0",
+                "  assets/ [2] +0 -0",
+                "    assets/badge.png",
+                "    assets/icon.png",
+            ]
+        );
+        let rows = tree_rows(&files, &signals, "units.rs", &collapsed);
+        assert!(!rows.iter().any(|row| row.path == LOW_SIGNAL));
     }
 }
