@@ -7,6 +7,11 @@ pub enum Error {
     /// A non-success HTTP status other than 401.
     #[error("GitHub returned HTTP {status}: {message}")]
     Http { status: u16, message: String },
+    /// GitHub refused the call because a rate limit is used up (a primary
+    /// one, or a secondary one with `retry-after`). `reset` is when calls
+    /// work again, when GitHub said.
+    #[error("GitHub's rate limit is used up")]
+    RateLimited { reset: Option<crate::Timestamp> },
     /// The GraphQL response carried `errors`.
     #[error("GitHub GraphQL error: {}", .0.join("; "))]
     GraphQl(Vec<String>),
