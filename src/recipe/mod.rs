@@ -1,5 +1,6 @@
 //! Recipes: a name, the servings it feeds, and its amounts.
 
+pub mod convert;
 mod parser;
 pub mod scale;
 

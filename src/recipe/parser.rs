@@ -15,6 +15,7 @@ pub fn parse_line(line: &str) -> Option<Amount> {
         "cup" | "cups" => Unit::Cup,
         "tbsp" => Unit::Tablespoon,
         "tsp" => Unit::Teaspoon,
+        "pinch" | "pinches" => Unit::Pinch,
         "oz" => Unit::Ounce,
         _ => return None,
     };
