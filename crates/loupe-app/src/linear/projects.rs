@@ -242,7 +242,7 @@ impl Render for ProjectsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_client(cx);
         if self.client.is_none() {
-            return widgets::not_connected(IconName::Box, "Projects");
+            return widgets::not_connected(IconName::Box, "Projects", cx);
         }
         if crate::shell::page_may_take_focus(window, cx) {
             self.focus.focus(window, cx);

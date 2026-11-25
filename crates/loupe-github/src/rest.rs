@@ -193,17 +193,38 @@ impl GitHub {
         head_oid: &str,
         file: &ChangedFile,
     ) -> Result<Option<String>> {
+        let merge_base = self.merge_base(&pr.repo, base_oid, head_oid)?;
+        self.patch_since(&pr.repo, &merge_base, head_oid, file)
+    }
+
+    /// The commit GitHub diffs `head_oid` against: the merge base of
+    /// `base_oid` and `head_oid`. One call, so loading many left-out diffs
+    /// asks for it once.
+    pub fn merge_base(&self, repo: &RepoRef, base_oid: &str, head_oid: &str) -> Result<String> {
         let compare = self.rest(
             RestMethod::Get,
             &format!(
                 "/repos/{}/{}/compare/{}...{}?per_page=1",
-                pr.repo.owner,
-                pr.repo.name,
+                repo.owner,
+                repo.name,
                 query_value(base_oid),
                 query_value(head_oid)
             ),
         )?;
-        let merge_base = parse_merge_base(&compare)?;
+        parse_merge_base(&compare)
+    }
+
+    /// The diff of `file` from `merge_base` (see [`GitHub::merge_base`]) to
+    /// `head_oid`, read from the two versions of the file: one call for an
+    /// added or removed file, two otherwise. `None` when either version is
+    /// binary.
+    pub fn patch_since(
+        &self,
+        repo: &RepoRef,
+        merge_base: &str,
+        head_oid: &str,
+        file: &ChangedFile,
+    ) -> Result<Option<String>> {
         let old_path = match file.status {
             FileStatus::Renamed | FileStatus::Copied => {
                 file.previous_path.as_deref().unwrap_or(&file.path)
@@ -212,11 +233,11 @@ impl GitHub {
         };
         let old = match file.status {
             FileStatus::Added => Vec::new(),
-            _ => self.raw_contents(&pr.repo, old_path, &merge_base)?,
+            _ => self.raw_contents(repo, old_path, merge_base)?,
         };
         let new = match file.status {
             FileStatus::Removed => Vec::new(),
-            _ => self.raw_contents(&pr.repo, &file.path, head_oid)?,
+            _ => self.raw_contents(repo, &file.path, head_oid)?,
         };
         Ok(crate::diff::text_patch(&old, &new))
     }
