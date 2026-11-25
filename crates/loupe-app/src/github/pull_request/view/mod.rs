@@ -9,7 +9,6 @@ mod side;
 mod stack_panel;
 mod toolbar;
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -219,9 +218,9 @@ pub struct PullRequestView {
     /// tab without a focus of its own (Conversation, Guide, Commits).
     focus: FocusHandle,
     conversation_scroll: ScrollHandle,
-    /// The width of the header's title line on the last frame, which
-    /// decides which of its actions fit.
-    header_line: Rc<Cell<Pixels>>,
+    /// The widths of the header's title line and its actions on the last
+    /// frame, which decide what fits.
+    header_measure: Rc<header::HeaderMeasure>,
     guide_scroll: ScrollHandle,
     commits_scroll: ScrollHandle,
     checks_scroll: ScrollHandle,
@@ -333,7 +332,7 @@ impl PullRequestView {
             focus_review_body: false,
             focus: cx.focus_handle(),
             conversation_scroll: ScrollHandle::new(),
-            header_line: Rc::new(Cell::new(px(0.))),
+            header_measure: Rc::default(),
             guide_scroll: ScrollHandle::new(),
             commits_scroll: ScrollHandle::new(),
             checks_scroll: ScrollHandle::new(),
@@ -1677,7 +1676,7 @@ impl Render for PullRequestView {
                 .into_any_element();
         };
         let side = self.tab.has_side_column() && details_open;
-        page.child(self.render_header(&detail, cx))
+        page.child(self.render_header(&detail, window, cx))
             .children(self.render_title_edit(cx))
             .child(self.render_panel_band(&detail, cx))
             .child(self.render_tabs(&detail, wide, details_open, cx))

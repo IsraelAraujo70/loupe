@@ -1,7 +1,7 @@
 //! The header: one line with the title, the repository and number, and the
 //! pull request actions, and under it the meta line (state, author,
-//! branches, size, checks). Neither wraps: the title is cut, and labeled
-//! actions that would cut it too short move into "More actions".
+//! branches, size, checks). Neither wraps: labeled actions move into "More
+//! actions" before the title is cut, and the reference gives way first.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
@@ -12,11 +12,11 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::PullRequestDetail;
+use std::cell::Cell;
+use std::rc::Rc;
 
 use super::PullRequestView;
-use super::model::{
-    ReviewButton, available_actions, head_label, pending_comments_label, review_button,
-};
+use super::model::{ReviewButton, available_actions, head_label, review_button};
 use crate::github::guide_service;
 use crate::github::pull_request::checks::ChecksSummary;
 use crate::github::widgets;
@@ -37,26 +37,48 @@ fn branch_label(branch: &str) -> String {
     format!("…{tail}")
 }
 
-/// The least of the title the header keeps in sight, in px at 100% zoom,
-/// before it moves a labeled action into "More actions".
-const TITLE_MIN: f32 = 400.;
-
-/// Space between two actions, and between the title and the actions, in px.
+/// Space between two actions, between the title and the actions, and
+/// between the repository and the number, in px at 100% zoom.
 const ACTION_GAP: f32 = 8.;
 const TITLE_GAP: f32 = 12.;
+const NUMBER_GAP: f32 = 4.;
+
+/// The least of the repository's name worth showing cut, in px.
+const REPO_MIN: f32 = 48.;
 
 /// The widths the header's line weighs, in px at 100% zoom.
 struct LineWidths {
     /// The line's width on the last frame; zero before the first.
     room: f32,
-    /// The title, whole.
+    /// The title, the repository, and the number, whole.
     title: f32,
-    /// The repository and number after the title, with the gap before them.
-    reference: f32,
+    repo: f32,
+    number: f32,
     open_on_github: f32,
     summarize: f32,
     /// The actions that never move: the review button and "More actions".
     fixed: f32,
+}
+
+impl LineWidths {
+    /// The title and its reference, whole, with the gaps between them.
+    fn heading(&self) -> f32 {
+        self.title + ACTION_GAP + self.repo + NUMBER_GAP + self.number
+    }
+
+    /// What the actions in sight leave the title and its reference.
+    fn left_by(&self, overflow: Overflow) -> f32 {
+        let moving = [
+            (!overflow.open_on_github).then_some(self.open_on_github),
+            (!overflow.summarize).then_some(self.summarize),
+        ];
+        let actions: f32 = moving
+            .iter()
+            .flatten()
+            .map(|width| width + ACTION_GAP)
+            .sum();
+        self.room - TITLE_GAP - self.fixed - actions
+    }
 }
 
 /// The labeled actions that moved into "More actions".
@@ -66,28 +88,118 @@ pub(super) struct Overflow {
     pub summarize: bool,
 }
 
-/// Which actions leave the line so the title keeps [`TITLE_MIN`] (all of
-/// itself when shorter) beside its reference: Open on GitHub first, then
-/// Summarize. The review button and "More actions" always stay.
+/// Which actions leave the line before the title or its reference is cut:
+/// Open on GitHub first, then Summarize. The review button and "More
+/// actions" always stay. Before the line is measured nothing moves.
 fn overflow(widths: &LineWidths) -> Overflow {
-    let title = widths.title.min(TITLE_MIN) + widths.reference;
-    let fits = |actions: &[f32]| {
-        let gaps = ACTION_GAP * actions.len() as f32;
-        widths.room - TITLE_GAP - widths.fixed - gaps - actions.iter().sum::<f32>() >= title
-    };
-    if widths.room <= 0. || fits(&[widths.open_on_github, widths.summarize]) {
-        return Overflow::default();
-    }
-    Overflow {
+    let open_moved = Overflow {
         open_on_github: true,
-        summarize: !fits(&[widths.summarize]),
+        summarize: false,
+    };
+    if widths.room <= 0. || widths.left_by(Overflow::default()) >= widths.heading() {
+        Overflow::default()
+    } else if widths.left_by(open_moved) >= widths.heading() {
+        open_moved
+    } else {
+        Overflow {
+            open_on_github: true,
+            summarize: true,
+        }
+    }
+}
+
+/// How the title and its reference share what the actions leave. The
+/// reference gives way first: the repository is cut, then hidden, and only
+/// then the title is cut. The number always stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TitleFit {
+    Whole,
+    RepoCut,
+    RepoHidden,
+    TitleCut,
+}
+
+fn title_fit(widths: &LineWidths, room: f32) -> TitleFit {
+    let title = widths.title + ACTION_GAP + widths.number;
+    if widths.room <= 0. || room >= widths.heading() {
+        TitleFit::Whole
+    } else if room >= title + REPO_MIN + NUMBER_GAP {
+        TitleFit::RepoCut
+    } else if room >= title {
+        TitleFit::RepoHidden
+    } else {
+        TitleFit::TitleCut
     }
 }
 
 /// The width of a labeled 28 px button, in px at 100% zoom: its side
 /// padding, the 16 px icon and its gap, the 14 px label, and the border.
+/// Stands in until the button has been drawn and measured.
 fn button_width(label: &str, family: &SharedString, cx: &App) -> f32 {
     20. + 16. + 4. + ui::text_width(label, 14., family, cx) + 2.
+}
+
+/// How wide `text` is set at `size` and `weight`, in px at 100% zoom.
+fn shaped_width(
+    text: &str,
+    size: Rems,
+    weight: FontWeight,
+    family: &SharedString,
+    window: &Window,
+) -> f32 {
+    let run = TextRun {
+        len: text.len(),
+        font: Font {
+            weight,
+            ..font(family.clone())
+        },
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let width = window
+        .text_system()
+        .shape_line(
+            text.to_owned().into(),
+            size.to_pixels(window.rem_size()),
+            &[run],
+            None,
+        )
+        .width;
+    f32::from(width) / f32::from(dp(1.))
+}
+
+/// The widths of the header's line and of its actions on the last frame
+/// they were drawn, in window pixels; zero until then.
+#[derive(Default)]
+pub(super) struct HeaderMeasure {
+    line: Cell<Pixels>,
+    open_on_github: Cell<Pixels>,
+    summarize: Cell<Pixels>,
+    fixed: Cell<Pixels>,
+}
+
+/// An invisible layer over its parent that keeps the parent's width in
+/// `slot` and renders the header again when it changes.
+fn measure(
+    measured: &Rc<HeaderMeasure>,
+    slot: fn(&HeaderMeasure) -> &Cell<Pixels>,
+    view: WeakEntity<PullRequestView>,
+) -> impl IntoElement {
+    let measured = measured.clone();
+    canvas(
+        move |bounds, _, cx| {
+            let cell = slot(&measured);
+            if (f32::from(cell.get()) - f32::from(bounds.size.width)).abs() >= 1. {
+                cell.set(bounds.size.width);
+                view.update(cx, |_, cx| cx.notify()).ok();
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
 }
 
 /// The header's labeled actions "More actions" holds while they are out of
@@ -144,41 +256,50 @@ impl PullRequestView {
     pub(super) fn render_header(
         &self,
         detail: &PullRequestDetail,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let url = detail.url.clone();
         let can_edit = detail.viewer_can_update && self.title_edit.is_none();
         let muted = cx.theme().muted_foreground;
         let ui_font = cx.theme().font_family.clone();
-        let reference = format!("{} #{}", detail.pr.repo, detail.pr.number);
+        let repo = detail.pr.repo.to_string();
+        let number = format!("#{}", detail.pr.number);
         let pr_actions = available_actions(detail);
         let review = review_button(detail);
-        let review_width = match (review, detail.pending_review.as_ref()) {
-            (ReviewButton::Hidden, _) => 0.,
-            (_, None) => button_width("Review changes", &ui_font, cx) + ACTION_GAP,
-            // The pending count's chip and the discard button come with it.
-            (_, Some(pending)) => {
-                let chip = 18.
-                    + ui::text_width(
-                        &pending_comments_label(pending.comment_count),
-                        12.,
-                        &ui_font,
-                        cx,
-                    );
-                button_width("Finish review", &ui_font, cx) + chip + 24. + 3. * ACTION_GAP
+        let measured = &self.header_measure;
+        let drawn = |cell: &Cell<Pixels>, fallback: f32| {
+            let width = f32::from(cell.get());
+            if width > 0. {
+                width / f32::from(dp(1.))
+            } else {
+                fallback
             }
         };
-        let overflow = overflow(&LineWidths {
-            room: f32::from(self.header_line.get()) / f32::from(dp(1.)),
-            // The semibold face runs about 4% wider than the regular one
-            // `text_width` measures.
-            title: ui::text_width(&detail.title, 18., &ui_font, cx) * 1.04,
-            reference: ACTION_GAP + ui::text_width(&reference, 13., &ui_font, cx),
-            open_on_github: button_width("Open on GitHub", &ui_font, cx),
+        let widths = LineWidths {
+            room: drawn(&measured.line, 0.),
+            title: shaped_width(
+                &detail.title,
+                scale::heading(),
+                FontWeight::SEMIBOLD,
+                &ui_font,
+                window,
+            ),
+            repo: shaped_width(&repo, scale::body(), FontWeight::NORMAL, &ui_font, window),
+            number: shaped_width(&number, scale::body(), FontWeight::NORMAL, &ui_font, window),
+            open_on_github: drawn(
+                &measured.open_on_github,
+                button_width("Open on GitHub", &ui_font, cx),
+            ),
             // The split button's caret half is a 28 px square.
-            summarize: button_width("Summarize", &ui_font, cx) + 28.,
-            fixed: review_width + 28.,
-        });
+            summarize: drawn(
+                &measured.summarize,
+                button_width("Summarize", &ui_font, cx) + 28.,
+            ),
+            fixed: drawn(&measured.fixed, 0.),
+        };
+        let overflow = overflow(&widths);
+        let fit = title_fit(&widths, widths.left_by(overflow));
         let view = cx.entity().downgrade();
         let items = OverflowItems {
             overflow,
@@ -186,50 +307,54 @@ impl PullRequestView {
             summarizing: guide_service::is_generating(cx, &detail.pr),
             view: view.clone(),
         };
-        // The actions with a label are in sight while the title keeps its
-        // room; Copy link and the ones that were icons alone (edit the
-        // title, the repository's list, refresh) are items of the "More
-        // actions" menu, with the state changes.
+        // The actions with a label are in sight while the title fits whole;
+        // Copy link and the ones that were icons alone (edit the title, the
+        // repository's list, refresh) are items of the "More actions" menu,
+        // with the state changes.
         let actions = h_flex()
             .flex_none()
             .gap_2()
             .items_center()
             .when(!overflow.open_on_github, |actions| {
                 actions.child(
-                    Button::new("pr-open-in-browser")
-                        .ghost()
-                        .control()
-                        .icon(IconName::ExternalLink)
-                        .label("Open on GitHub")
-                        .tooltip("Open this pull request in the browser")
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(
+                            Button::new("pr-open-in-browser")
+                                .ghost()
+                                .control()
+                                .icon(IconName::ExternalLink)
+                                .label("Open on GitHub")
+                                .tooltip("Open this pull request in the browser")
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        )
+                        .child(measure(measured, |m| &m.open_on_github, view.clone())),
                 )
             })
             .when(!overflow.summarize, |actions| {
-                actions.child(self.render_summarize_button(detail, cx))
+                actions.child(
+                    self.render_summarize_button(detail, cx)
+                        .relative()
+                        .child(measure(measured, |m| &m.summarize, view.clone())),
+                )
             })
-            .when(review != ReviewButton::Hidden, |actions| {
-                actions.child(self.render_review_controls(
-                    detail,
-                    review == ReviewButton::Primary,
-                    cx,
-                ))
-            })
-            .child(self.render_action_controls(&pr_actions, detail, can_edit, items, cx));
-        // The line's width decides what fits on the next frame; a change
-        // renders the header again.
-        let line = self.header_line.clone();
-        let measure = canvas(
-            move |bounds, _, cx| {
-                if (f32::from(line.get()) - f32::from(bounds.size.width)).abs() >= 1. {
-                    line.set(bounds.size.width);
-                    view.update(cx, |_, cx| cx.notify()).ok();
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full();
+            .child(
+                h_flex()
+                    .relative()
+                    .flex_none()
+                    .gap_2()
+                    .items_center()
+                    .when(review != ReviewButton::Hidden, |actions| {
+                        actions.child(self.render_review_controls(
+                            detail,
+                            review == ReviewButton::Primary,
+                            cx,
+                        ))
+                    })
+                    .child(self.render_action_controls(&pr_actions, detail, can_edit, items, cx))
+                    .child(measure(measured, |m| &m.fixed, view.clone())),
+            );
         let title = SharedString::from(detail.title.clone());
         v_flex()
             .id("page-header")
@@ -246,11 +371,14 @@ impl PullRequestView {
                     .h(scale::control_height())
                     .gap_3()
                     .items_center()
-                    .child(measure)
+                    .child(measure(measured, |m| &m.line, view))
                     .child(
                         h_flex()
                             .flex_1()
                             .min_w_0()
+                            // The last guard: what the measures missed is cut
+                            // here, never drawn over the actions.
+                            .overflow_hidden()
                             .gap_2()
                             .items_baseline()
                             .child(
@@ -258,7 +386,10 @@ impl PullRequestView {
                                     .id("pr-title")
                                     .role(Role::Heading)
                                     .aria_label(title.clone())
-                                    .min_w_0()
+                                    .map(|title| match fit {
+                                        TitleFit::TitleCut => title.min_w_0(),
+                                        _ => title.flex_none(),
+                                    })
                                     .truncate()
                                     .text_size(scale::heading())
                                     .line_height(rems(1.625))
@@ -272,11 +403,30 @@ impl PullRequestView {
                                     .child(title),
                             )
                             .child(
-                                div()
-                                    .flex_none()
+                                h_flex()
+                                    .id("pr-reference")
+                                    .role(Role::Group)
+                                    .aria_label(format!("{repo} {number}"))
+                                    .min_w_0()
+                                    .gap_1()
                                     .text_size(scale::body())
                                     .text_color(muted)
-                                    .child(reference),
+                                    .when(
+                                        matches!(fit, TitleFit::Whole | TitleFit::RepoCut),
+                                        |row| {
+                                            row.child(
+                                                div()
+                                                    .min_w_0()
+                                                    .map(|repo| match fit {
+                                                        TitleFit::Whole => repo.flex_none(),
+                                                        _ => repo.flex_shrink_1(),
+                                                    })
+                                                    .truncate()
+                                                    .child(repo.clone()),
+                                            )
+                                        },
+                                    )
+                                    .child(div().flex_none().child(number)),
                             ),
                     )
                     .child(actions),
@@ -526,53 +676,68 @@ impl PullRequestView {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineWidths, Overflow, branch_label, overflow};
+    use super::{LineWidths, Overflow, TitleFit, branch_label, overflow, title_fit};
 
+    /// A 600 px title, "owner/repo" of 140 px, "#123" of 30 px: 782 px with
+    /// the gaps. Actions: 130 + 140 movable, 180 fixed.
     fn widths(room: f32) -> LineWidths {
         LineWidths {
             room,
-            title: 700.,
-            reference: 100.,
+            title: 600.,
+            repo: 140.,
+            number: 30.,
             open_on_github: 130.,
             summarize: 140.,
             fixed: 180.,
         }
     }
 
+    fn fit(room: f32) -> (Overflow, TitleFit) {
+        let widths = widths(room);
+        let overflow = overflow(&widths);
+        (overflow, title_fit(&widths, widths.left_by(overflow)))
+    }
+
+    const NONE: Overflow = Overflow {
+        open_on_github: false,
+        summarize: false,
+    };
+    const OPEN: Overflow = Overflow {
+        open_on_github: true,
+        summarize: false,
+    };
+    const BOTH: Overflow = Overflow {
+        open_on_github: true,
+        summarize: true,
+    };
+
     #[test]
-    fn the_title_keeps_its_room_and_the_labeled_actions_give_way_in_order() {
-        let open_moved = Overflow {
-            open_on_github: true,
-            summarize: false,
-        };
-        // Everything: 12 + 180 + 8 + 130 + 8 + 140, 400 of the title, and
-        // the reference.
-        assert_eq!(overflow(&widths(978.)), Overflow::default());
-        assert_eq!(overflow(&widths(977.)), open_moved);
-        // Without Open on GitHub: 12 + 180 + 8 + 140 + 400 + 100.
-        assert_eq!(overflow(&widths(840.)), open_moved);
-        assert_eq!(
-            overflow(&widths(839.)),
-            Overflow {
-                open_on_github: true,
-                summarize: true,
-            }
-        );
+    fn the_labeled_actions_leave_before_the_title_or_its_reference_is_cut() {
+        // Everything: 12 + 180 + 138 + 148 + 782.
+        assert_eq!(fit(1260.), (NONE, TitleFit::Whole));
+        assert_eq!(fit(1259.), (OPEN, TitleFit::Whole));
+        // Without Open on GitHub: 12 + 180 + 148 + 782.
+        assert_eq!(fit(1122.), (OPEN, TitleFit::Whole));
+        assert_eq!(fit(1121.).0, BOTH);
     }
 
     #[test]
-    fn a_short_title_asks_only_for_itself() {
-        let short = |room| LineWidths {
-            title: 200.,
-            ..widths(room)
-        };
-        assert_eq!(overflow(&short(778.)), Overflow::default());
-        assert!(overflow(&short(777.)).open_on_github);
+    fn then_the_repository_gives_way_and_the_title_is_cut_last() {
+        // With both actions in the menu the title and reference get
+        // room - 192: whole down to 782.
+        assert_eq!(fit(974.), (BOTH, TitleFit::Whole));
+        assert_eq!(fit(973.), (BOTH, TitleFit::RepoCut));
+        // The repository is cut down to 48 px: 600 + 8 + 30 + 48 + 4.
+        assert_eq!(fit(882.), (BOTH, TitleFit::RepoCut));
+        assert_eq!(fit(881.), (BOTH, TitleFit::RepoHidden));
+        // Then only the number stays beside the whole title: 638.
+        assert_eq!(fit(830.), (BOTH, TitleFit::RepoHidden));
+        assert_eq!(fit(829.), (BOTH, TitleFit::TitleCut));
     }
 
     #[test]
     fn nothing_moves_before_the_line_is_measured() {
-        assert_eq!(overflow(&widths(0.)), Overflow::default());
+        assert_eq!(fit(0.), (NONE, TitleFit::Whole));
     }
 
     #[test]
