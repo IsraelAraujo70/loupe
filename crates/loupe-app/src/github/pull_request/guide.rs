@@ -2401,8 +2401,8 @@ mod tests {
 
     use chrono::Utc;
     use gpui_kit::{
-        AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, WindowBounds,
-        WindowOptions, px, size,
+        AppContext as _, Bounds, Focusable as _, Modifiers, TestAppContext, VisualTestContext,
+        WindowBounds, WindowOptions, px, size,
     };
     use loupe_github::{
         Actor, Checks, MergeMethod, MergeStateStatus, Mergeable, PrRef, PrState, PullRequestDetail,
@@ -2967,16 +2967,18 @@ mod tests {
         let (mut cx, tab) = open_guide_with_height(cx, 2400.);
         let emitted = record_events(&mut cx, &tab);
         load_fixture_guide(&mut cx, &tab);
-        type_review(&mut cx, &tab, "One question inline");
         cx.update(|window, cx| {
             let field = tab.read(cx).review_body.read(cx).focus_handle(cx);
             field.focus(window, cx);
         });
+        paint(&mut cx);
+        cx.simulate_input("One question inline");
         cx.simulate_keystrokes(if cfg!(target_os = "macos") {
             "cmd-enter"
         } else {
             "ctrl-enter"
         });
+        cx.run_until_parked();
         assert_eq!(
             *emitted.borrow(),
             vec![submitted(42, ReviewEvent::Comment, "One question inline")]
