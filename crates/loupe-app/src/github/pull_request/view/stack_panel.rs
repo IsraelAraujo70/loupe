@@ -15,6 +15,10 @@ use crate::theme::scale::{self, dp};
 use crate::theme::tokens;
 use crate::ui;
 
+/// Tree levels indented at most: deeper levels line up with the last one, so
+/// the rows of a stack many levels deep stay on screen.
+const MAX_INDENT_LEVELS: usize = 8;
+
 /// Renders the vertical Graphite-style stack rail dot and connecting segments
 /// for row `ix` out of `total` (above the base branch footer).
 fn rail_node(ix: usize, is_current: bool, cx: &App) -> Div {
@@ -103,7 +107,7 @@ fn render_entry_row(
     );
     let route = Route::PullRequest(node.pr.clone());
     let indent = if is_tree && entry.depth > 0 {
-        Some(dp(entry.depth as f32 * 16.))
+        Some(dp(entry.depth.min(MAX_INDENT_LEVELS) as f32 * 16.))
     } else {
         None
     };
