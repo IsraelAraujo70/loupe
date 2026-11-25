@@ -1666,7 +1666,7 @@ impl PaletteView {
             .footer(|_, _, cx| {
                 let muted = cx.theme().muted_foreground;
                 footer(cx)
-                    .child(hint("up", "Move", muted))
+                    .child(hint("↑↓", "Move", muted))
                     .child(hint("enter", "Select", muted))
                     .child(hint("escape", "Close", muted))
             })
@@ -1805,7 +1805,7 @@ impl PaletteView {
             .footer(|_, _, cx| {
                 let muted = cx.theme().muted_foreground;
                 footer(cx)
-                    .child(hint("up", "Move", muted))
+                    .child(hint("↑↓", "Move", muted))
                     .child(hint("enter", "Open", muted))
                     .child(hint("cmd-enter", "New tab", muted))
                     .child(hint("escape", "Close", muted))
