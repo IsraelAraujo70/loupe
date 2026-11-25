@@ -300,13 +300,10 @@ impl Render for RepoView {
             Loadable::Loaded(page) | Loadable::Refreshing(page) => {
                 let page = page.clone();
                 let loading_more = matches!(self.more, Some(Ok(())));
-                let lanes = Lanes {
-                    repo: false,
-                    author: true,
-                    age_from: AgeFrom::Updated,
-                };
+                let rows: Vec<&PrSummary> = page.items.iter().collect();
+                let lanes = Lanes::for_rows(&rows, true, AgeFrom::Updated);
                 ui::list_container()
-                    .child(column_header(false, false, true, None, None, cx))
+                    .child(column_header(false, lanes, None, None, cx))
                     .children(
                         page.items
                             .iter()
