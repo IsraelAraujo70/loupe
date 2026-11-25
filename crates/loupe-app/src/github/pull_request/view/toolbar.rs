@@ -16,6 +16,7 @@ use loupe_github::{
     StackMergePlan, StackMergeStep, StepStatus,
 };
 
+use super::header::OverflowItems;
 use super::model::{
     DraftAction, Panel, PrActions, PrTab, StackMerge, StateAction, can_approve,
     discard_confirm_text, merge_button_label, merge_confirm_text, pending_comments_label,
@@ -174,14 +175,16 @@ impl PullRequestView {
             })
     }
 
-    /// The "More actions" menu: edit the title, the repository's pull
-    /// requests, refresh, and the less used state changes (draft, close,
-    /// reopen). Close is the one item in the danger color, and only here.
+    /// The "More actions" menu: the header's labeled actions that left its
+    /// line (`overflow`), edit the title, the repository's pull requests,
+    /// refresh, and the less used state changes (draft, close, reopen).
+    /// Close is the one item in the danger color, and only here.
     pub(super) fn render_action_controls(
         &self,
         actions: &PrActions,
         detail: &PullRequestDetail,
         can_edit: bool,
+        overflow: OverflowItems,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (draft, state) = (actions.draft, actions.state);
@@ -197,6 +200,7 @@ impl PullRequestView {
             // The button is at the header's trailing edge: the menu's
             // trailing edge sits under it.
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let menu = overflow.add_to(menu);
                 let menu = if can_edit {
                     let (this, title) = (this.clone(), title.clone());
                     menu.item(

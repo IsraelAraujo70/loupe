@@ -495,10 +495,11 @@ pub mod scale {
     pub fn side_width() -> Rems {
         rems(296. / BASE)
     }
-    /// A window narrower than this, 1200 px, folds a page's side column
-    /// behind a Details toggle so the main column keeps room to read.
+    /// A window narrower than this, 1600 px, starts a pull request's side
+    /// column hidden behind its Details toggle, so the main column keeps
+    /// room to read.
     pub fn side_column_breakpoint() -> Rems {
-        rems(1200. / BASE)
+        rems(1600. / BASE)
     }
     /// A window narrower than this, 1100 px, shows the sidebar as its icon
     /// rail until the user opens it there.
