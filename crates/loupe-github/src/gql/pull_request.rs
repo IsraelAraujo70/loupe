@@ -188,6 +188,7 @@ query PullRequestDetail($owner: String!, $name: String!, $number: Int!) {
                   ... on StatusContext {
                     context
                     state
+                    description
                     targetUrl
                     createdAt
                     isRequired(pullRequestNumber: $number)
@@ -778,6 +779,7 @@ struct WireWorkflow {
 struct WireStatusContext {
     context: String,
     state: WireRollupState,
+    description: Option<String>,
     target_url: Option<String>,
     created_at: Option<Timestamp>,
     is_required: bool,
@@ -1165,6 +1167,7 @@ fn check_run(context: WireContext) -> Option<CheckRun> {
                 workflow: workflow_run
                     .and_then(|workflow_run| workflow_run.workflow)
                     .map(|workflow| workflow.name),
+                description: None,
                 status: check_run_status(run.status, run.conclusion),
                 started_at: run.started_at,
                 completed_at: run.completed_at,
@@ -1176,6 +1179,7 @@ fn check_run(context: WireContext) -> Option<CheckRun> {
         WireContext::StatusContext(status) => Some(CheckRun {
             name: status.context,
             workflow: None,
+            description: status.description.filter(|text| !text.is_empty()),
             status: match status.state {
                 WireRollupState::Success => CheckStatus::Passed,
                 WireRollupState::Failure | WireRollupState::Error => CheckStatus::Failed,
@@ -1403,6 +1407,7 @@ mod tests {
                         "__typename": "StatusContext",
                         "context": "ci/legacy",
                         "state": "PENDING",
+                        "description": "Add the reviewed label",
                         "targetUrl": "https://ci.example/1",
                         "createdAt": "2026-01-02T05:02:00Z",
                         "isRequired": true
@@ -1795,6 +1800,10 @@ mod tests {
         let legacy = &checks.runs[2];
         assert_eq!(legacy.name, "ci/legacy");
         assert_eq!(legacy.workflow, None);
+        assert_eq!(
+            legacy.description.as_deref(),
+            Some("Add the reviewed label")
+        );
         assert_eq!(legacy.status, CheckStatus::Running);
         assert_eq!(legacy.details_url.as_deref(), Some("https://ci.example/1"));
         assert!(legacy.completed_at.is_none());
