@@ -243,3 +243,4 @@
 - Entry 243: a one-line change, so the pull request has more than 250 commits.
 - Entry 244: a one-line change, so the pull request has more than 250 commits.
 - Entry 245: a one-line change, so the pull request has more than 250 commits.
+- Entry 246: a one-line change, so the pull request has more than 250 commits.
