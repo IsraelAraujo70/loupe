@@ -122,6 +122,9 @@ pub fn row(
                 .role(Role::TreeItem)
                 .aria_label(view.accessible_name.clone())
                 .aria_selected(view.selected)
+                .when(view.selected && view.focused, |item| {
+                    item.aria_active_descendant()
+                })
                 .when_some(view.folder, |item, expanded| item.aria_expanded(expanded))
                 .flex_1()
                 .min_w_0()

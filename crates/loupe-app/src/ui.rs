@@ -30,7 +30,8 @@ mod segmented;
 mod side;
 mod tabs;
 pub use list::{
-    list_column_header, list_container, list_group_header, list_row, list_row_divider, nav_row,
+    ListRowFocus, list_column_header, list_container, list_group_header, list_row,
+    list_row_divider, nav_row,
 };
 pub use menu::{MenuRow, menu_row};
 pub use reading::{READING_WIDTH, markdown};

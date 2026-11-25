@@ -20,8 +20,8 @@ use crate::store::{Settings, update_settings};
 use crate::theme::{self, Zoom};
 
 /// Where the list keys (J, K, the arrows, Enter, O) act: a screen with a
-/// row cursor, while no text field has the focus.
-const LIST_KEYS: &str = "InboxView && !Input";
+/// row cursor (Reviews, the Inbox), while no text field has the focus.
+const LIST_KEYS: &str = "(InboxView || NotificationsView) && !Input";
 
 /// Where an issue's single-letter keys act: its screen, while no text field
 /// has the focus.
