@@ -225,8 +225,8 @@ LIGHT_STATES = {
     "merge_fill": "#1f883d",
     "merge_fill_hover": "#1a7f37",
     "merge_fill_active": "#116329",
-    "diff_added_bg": "#2da44e26",
-    "diff_removed_bg": "#ff818233",
+    "diff_added_bg": "#2da44e1a",
+    "diff_removed_bg": "#ff818224",
     "diff_added_text": "#116329",
     "diff_removed_text": "#a40e26",
 }
