@@ -3057,6 +3057,7 @@ mod tests {
             mergeable: loupe_github::Mergeable::Unknown,
             review_requests: Vec::new(),
             reviewed_by: Vec::new(),
+            viewer_review: None,
         }
     }
 

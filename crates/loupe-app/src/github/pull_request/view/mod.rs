@@ -561,7 +561,10 @@ impl PullRequestView {
             pr: self.pr.clone(),
             detail: detail.clone(),
         };
-        let conversation = cx.new(|cx| ConversationTab::new(context.clone(), window, cx));
+        let conversation = cx.new(|cx| {
+            ConversationTab::new(context.clone(), window, cx)
+                .follow_scroll(self.conversation_scroll.clone())
+        });
         let guide =
             cx.new(|cx| GuideTab::new(context.clone(), self.guide_scroll.clone(), window, cx));
         {
