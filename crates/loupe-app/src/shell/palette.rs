@@ -183,24 +183,43 @@ pub fn direct_items(query: &str) -> Vec<PaletteItem> {
         route,
         comments: 0,
     };
-    if let Some(pr) = PrRef::parse(query) {
-        return vec![item(
-            pr.to_string(),
-            "Open pull request",
-            Route::PullRequest(pr),
-        )];
-    }
-    if let Some(identifier) = linear_identifier(query) {
-        return vec![item(
-            identifier.clone(),
-            "Open Linear issue",
-            Route::LinearIssue { identifier },
-        )];
+    match reference(query) {
+        Some(Reference::PullRequest(pr)) => {
+            return vec![item(
+                pr.to_string(),
+                "Open pull request",
+                Route::PullRequest(pr),
+            )];
+        }
+        Some(Reference::Issue(identifier)) => {
+            return vec![item(
+                identifier.clone(),
+                "Open Linear issue",
+                Route::LinearIssue { identifier },
+            )];
+        }
+        None => {}
     }
     if let Some(repo) = repo_slug(query) {
         return vec![item(repo.to_string(), "Open repository", Route::Repo(repo))];
     }
     Vec::new()
+}
+
+/// What a query that is one pull request or one Linear issue names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Reference {
+    PullRequest(PrRef),
+    Issue(String),
+}
+
+/// The pull request or the Linear issue the whole query names: `owner/repo#123`,
+/// a pull request URL, or `ENG-123`.
+fn reference(query: &str) -> Option<Reference> {
+    let query = query.trim();
+    PrRef::parse(query)
+        .map(Reference::PullRequest)
+        .or_else(|| linear_identifier(query).map(Reference::Issue))
 }
 
 /// `^[A-Za-z][A-Za-z0-9]{0,9}-\d+$`, uppercased.
@@ -310,11 +329,17 @@ struct ParsedQuery {
     team_key: Option<String>,
     /// The free words, and what follows `pr:`, `issue:`, and `tab:`.
     words: Vec<String>,
+    /// The pull request or issue the whole query names. The words then name
+    /// one item, not a topic, so no search runs for them.
+    reference: Option<Reference>,
 }
 
 impl ParsedQuery {
     fn parse(query: &str) -> Self {
-        let mut parsed = Self::default();
+        let mut parsed = Self {
+            reference: reference(query),
+            ..Self::default()
+        };
         for word in query.split_whitespace() {
             if let Some((prefix, len)) = word_prefix(word) {
                 if !parsed.prefixes.contains(&prefix) {
@@ -368,16 +393,19 @@ impl ParsedQuery {
     }
 
     fn shows_github(&self) -> bool {
-        self.narrows_to_github() || !(self.narrows_to_linear() || self.narrows_to_tabs())
+        self.reference.is_none()
+            && (self.narrows_to_github() || !(self.narrows_to_linear() || self.narrows_to_tabs()))
     }
 
     fn shows_linear(&self) -> bool {
-        self.narrows_to_linear() || !(self.narrows_to_github() || self.narrows_to_tabs())
+        self.reference.is_none()
+            && (self.narrows_to_linear() || !(self.narrows_to_github() || self.narrows_to_tabs()))
     }
 
-    /// Whether the query runs a search over the network.
+    /// Whether the query goes over the network: a search, or the read of the
+    /// one item it names.
     fn searches_remotely(&self) -> bool {
-        self.shows_github() || self.shows_linear()
+        self.reference.is_some() || self.shows_github() || self.shows_linear()
     }
 }
 
@@ -762,6 +790,8 @@ fn text_rank(query: &str, haystack: &str) -> Option<u8> {
 enum Source {
     GitHub(PrTarget),
     Linear,
+    /// The read of the item a query names exactly.
+    Reference,
 }
 
 /// Results of the remote searches for the latest query. Every new query bumps
@@ -773,6 +803,8 @@ struct RemoteResults {
     /// One entry per `repo:` search, in the order they started.
     repo_pull_requests: Vec<(RepoRef, Vec<PaletteItem>)>,
     linear: Vec<PaletteItem>,
+    /// The item a query names exactly, with its title.
+    reference: Vec<PaletteItem>,
     awaiting: usize,
 }
 
@@ -783,6 +815,7 @@ impl RemoteResults {
         self.pull_requests.clear();
         self.repo_pull_requests.clear();
         self.linear.clear();
+        self.reference.clear();
         self.awaiting = 0;
         self.generation
     }
@@ -819,6 +852,7 @@ impl RemoteResults {
                 }
             }
             Source::Linear => self.linear = items,
+            Source::Reference => self.reference = items,
         }
         self.awaiting = self.awaiting.saturating_sub(1);
         true
@@ -939,7 +973,12 @@ fn build_sections(
     catalog: &RepoCatalog,
     remote: &RemoteResults,
 ) -> Vec<(Group, Vec<PaletteItem>)> {
-    let mut candidates: Vec<(Group, PaletteItem)> = direct
+    let jump = if remote.reference.is_empty() {
+        direct
+    } else {
+        &remote.reference
+    };
+    let mut candidates: Vec<(Group, PaletteItem)> = jump
         .iter()
         .map(|item| (Group::JumpTo, item.clone()))
         .collect();
@@ -1237,6 +1276,7 @@ impl PaletteView {
             executor.timer(SEARCH_DEBOUNCE).await;
             this.update_in(cx, |this, window, cx| {
                 this.debouncing = false;
+                this.start_reference(generation, window, cx);
                 this.start_linear(generation, window, cx);
                 if this.catalog_ready {
                     this.start_github(generation, window, cx);
@@ -1249,6 +1289,20 @@ impl PaletteView {
             .ok();
         });
         self.pending.push(debounce);
+    }
+
+    fn start_reference(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(reference) = self.parsed.reference.clone() else {
+            return;
+        };
+        if !self.remote.expect(generation, &[Source::Reference]) {
+            return;
+        }
+        let lookup = match reference {
+            Reference::PullRequest(pr) => crate::github::palette_pull_request(pr, cx),
+            Reference::Issue(identifier) => crate::linear::palette_issue(&identifier, cx),
+        };
+        self.track(Source::Reference, lookup, generation, window, cx);
     }
 
     fn start_linear(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -2416,6 +2470,57 @@ mod tests {
         )];
         let sections = build_sections(&parsed, &[], &local, &catalog(), &remote);
         assert_eq!(groups(&sections), [Group::LinearIssues]);
+    }
+
+    /// A query that is one pull request or one issue goes to Jump to alone,
+    /// with the title read by its id; the free-text searches stay off, since
+    /// they only bring other items that mention the same words.
+    #[test]
+    fn an_exact_reference_runs_no_text_search() {
+        for query in ["acme/web#3174", "BACK-293", "back-293"] {
+            let parsed = ParsedQuery::parse(query);
+            assert!(parsed.reference.is_some(), "{query}");
+            assert!(pr_searches(&parsed, &catalog()).is_empty(), "{query}");
+            assert_eq!(linear_search(&parsed), None, "{query}");
+            assert!(parsed.searches_remotely(), "{query}: the lookup runs");
+        }
+        for query in [
+            "web",
+            "pr:acme/web#1",
+            "BACK-",
+            "acme/web",
+            "BACK-293 proxy",
+        ] {
+            assert_eq!(ParsedQuery::parse(query).reference, None, "{query}");
+        }
+
+        let parsed = ParsedQuery::parse("BACK-293");
+        let direct = direct_items("BACK-293");
+        let mut remote = RemoteResults::default();
+        let generation = remote.reset();
+        assert!(remote.expect(generation, &[Source::Reference]));
+        let titles = |remote: &RemoteResults| -> Vec<String> {
+            build_sections(&parsed, &direct, &[], &catalog(), remote)
+                .into_iter()
+                .flat_map(|(_, items)| items)
+                .map(|item| item.title.to_string())
+                .collect()
+        };
+        assert_eq!(
+            titles(&remote),
+            ["BACK-293"],
+            "the bare jump while it loads"
+        );
+
+        let route = Route::LinearIssue {
+            identifier: "BACK-293".into(),
+        };
+        let found = item("BACK-293 Loupe test", "Todo · Back", route);
+        assert!(remote.accept(&Source::Reference, vec![found], generation));
+        remote.pull_requests = vec![pr_item("acme", "web", 1)];
+        let sections = build_sections(&parsed, &direct, &[], &catalog(), &remote);
+        assert_eq!(groups(&sections), [Group::JumpTo]);
+        assert_eq!(titles(&remote), ["BACK-293 Loupe test"]);
     }
 
     #[test]
