@@ -4,8 +4,12 @@
 //! components: decision points at the top, narrative summary and before/after
 //! flow, removed tests without replacement, and ordered walkthrough steps with
 //! syntax-highlighted diff snippets that jump straight to the Files tab.
+//!
+//! A stack guide shows the stack's overview, its decision points, and the map
+//! of its pull requests above one chapter at a time, opening on the chapter of
+//! the pull request on screen.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -16,10 +20,11 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{PullRequestDetail, Side};
+use loupe_github::{PrRef, PullRequestDetail, Side, StackNode};
 use loupe_guide::{
-    DecisionCategory, DecisionPoint, DiffSnippet, FlowComparison, GuideReadState, GuideStep,
-    RemovedTest, ReviewGuide, SnippetSide, StepChange, StoredGuide,
+    ChapterChange, DecisionCategory, DecisionPoint, DiffSnippet, FlowComparison, GuideLanguage,
+    GuideReadState, GuideStep, RemovedTest, ReviewGuide, SnippetSide, StepChange, StoredGuide,
+    StoredStackGuide,
 };
 
 use super::tab::{PrTabContext, PrTabEvent};
@@ -48,6 +53,23 @@ pub enum GuideViewState {
         stored: Box<StoredGuide>,
         changed_steps: HashMap<String, StepChange>,
     },
+    /// A validated guide across the stack this pull request belongs to.
+    StackReady {
+        stored: Box<StoredStackGuide>,
+        /// Chapters that no longer match the stack (empty when up to date).
+        changes: BTreeMap<u64, ChapterChange>,
+        /// The stack's pull requests now, in chapter (merge) order.
+        nodes: Vec<StackNode>,
+    },
+}
+
+/// Whose viewed marks the tab shows: a pull request's own guide at one
+/// commit, or one chapter of a stack guide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadTarget {
+    pr: PrRef,
+    head_oid: String,
+    chapter: bool,
 }
 
 /// Optional callback invoked when the user clicks Summarize / Regenerate / Cancel / Check again.
@@ -70,8 +92,10 @@ pub struct GuideTab {
     expanded_override: HashMap<String, bool>,
     /// Step most recently jumped to from a decision point, highlighted briefly.
     focused_step: Option<String>,
-    /// Steps whose IDs have been marked viewed on disk for the active guide commit.
-    read_state_commit: Option<String>,
+    /// The guide or chapter `read_state` belongs to.
+    read_target: Option<ReadTarget>,
+    /// The stack guide chapter on screen, by pull request number.
+    selected_chapter: Option<u64>,
     /// Optional action handler registered by the owning pull request view (wired in stage 4).
     on_action: Option<GuideActionHandler>,
 }
@@ -86,7 +110,8 @@ impl GuideTab {
             read_state: GuideReadState::default(),
             expanded_override: HashMap::new(),
             focused_step: None,
-            read_state_commit: None,
+            read_target: None,
+            selected_chapter: None,
             on_action: None,
         }
     }
@@ -112,15 +137,67 @@ impl GuideTab {
         if self.state == state {
             return;
         }
-        if let GuideViewState::Ready { stored, .. } = &state
-            && self.read_state_commit.as_deref() != Some(stored.head_oid.as_str())
-        {
-            self.read_state = load_read_state(cx, &self.context.pr, &stored.head_oid);
-            self.read_state_commit = Some(stored.head_oid.clone());
-            self.expanded_override.clear();
-            self.focused_step = None;
+        match &state {
+            GuideViewState::Ready { stored, .. } => {
+                let target = ReadTarget {
+                    pr: self.context.pr.clone(),
+                    head_oid: stored.head_oid.clone(),
+                    chapter: false,
+                };
+                self.set_read_target(target, cx);
+            }
+            GuideViewState::StackReady { stored, .. } => {
+                let selected = self
+                    .selected_chapter
+                    .filter(|number| stored.chapter(*number).is_some())
+                    .or_else(|| {
+                        stored
+                            .chapter(self.context.pr.number)
+                            .map(|(_, chapter)| chapter.pr_number)
+                    })
+                    .or_else(|| stored.chapters.first().map(|chapter| chapter.pr_number));
+                if let Some((_, chapter)) = selected.and_then(|number| stored.chapter(number)) {
+                    let target = ReadTarget {
+                        pr: PrRef::new(self.context.pr.repo.clone(), chapter.pr_number),
+                        head_oid: chapter.head_oid.clone(),
+                        chapter: true,
+                    };
+                    self.set_read_target(target, cx);
+                }
+                self.selected_chapter = selected;
+            }
+            _ => {}
         }
         self.state = state;
+        cx.notify();
+    }
+
+    /// Shows the viewed marks of `target`, resetting what was expanded.
+    fn set_read_target(&mut self, target: ReadTarget, cx: &mut Context<Self>) {
+        if self.read_target.as_ref() == Some(&target) {
+            return;
+        }
+        self.read_state = load_read_state(cx, &target);
+        self.read_target = Some(target);
+        self.expanded_override.clear();
+        self.focused_step = None;
+    }
+
+    /// Shows the stack guide's chapter for pull request `number`.
+    fn select_chapter(&mut self, number: u64, cx: &mut Context<Self>) {
+        let GuideViewState::StackReady { stored, .. } = &self.state else {
+            return;
+        };
+        let Some((_, chapter)) = stored.chapter(number) else {
+            return;
+        };
+        let target = ReadTarget {
+            pr: PrRef::new(self.context.pr.repo.clone(), number),
+            head_oid: chapter.head_oid.clone(),
+            chapter: true,
+        };
+        self.selected_chapter = Some(number);
+        self.set_read_target(target, cx);
         cx.notify();
     }
 
@@ -128,8 +205,16 @@ impl GuideTab {
     pub fn step_count(&self) -> Option<usize> {
         match &self.state {
             GuideViewState::Ready { stored, .. } => Some(stored.guide.steps.len()),
+            GuideViewState::StackReady { stored, .. } => Some(stored.step_count()),
             _ => None,
         }
+    }
+
+    /// The pull request whose guide or chapter is on screen.
+    fn shown_pr_number(&self) -> u64 {
+        self.read_target
+            .as_ref()
+            .map_or(self.context.pr.number, |target| target.pr.number)
     }
 
     /// Validates raw JSON at the boundary and transitions to `Ready` or `Invalid`.
@@ -202,8 +287,8 @@ impl GuideTab {
         // unmarking expands it again.
         self.expanded_override
             .insert(step_id.to_owned(), !now_viewed);
-        if let Some(commit) = &self.read_state_commit {
-            save_read_state(cx, &self.context.pr, commit, &self.read_state);
+        if let Some(target) = &self.read_target {
+            save_read_state(cx, target, &self.read_state);
         }
         cx.notify();
     }
@@ -214,8 +299,32 @@ impl GuideTab {
         cx.notify();
     }
 
+    /// Opens `path` in the Files tab of the pull request on screen.
     fn open_file(&mut self, path: String, line: Option<u32>, side: Side, cx: &mut Context<Self>) {
-        cx.emit(PrTabEvent::OpenFile { path, line, side });
+        let number = self.shown_pr_number();
+        self.open_file_in(number, path, line, side, cx);
+    }
+
+    /// Opens `path` in the Files tab of pull request `number`: this one's, or
+    /// another pull request of its stack.
+    fn open_file_in(
+        &mut self,
+        number: u64,
+        path: String,
+        line: Option<u32>,
+        side: Side,
+        cx: &mut Context<Self>,
+    ) {
+        if number == self.context.pr.number {
+            cx.emit(PrTabEvent::OpenFile { path, line, side });
+        } else {
+            cx.emit(PrTabEvent::OpenFileIn {
+                pr: PrRef::new(self.context.pr.repo.clone(), number),
+                path,
+                line,
+                side,
+            });
+        }
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -482,7 +591,24 @@ impl GuideTab {
             .px(scale::content_inset())
             .py_4()
             .gap_5()
-            .child(self.render_meta_bar(stored, viewed, total, now, cx))
+            .child(
+                self.render_meta_bar(
+                    &stored.model,
+                    &stored.language,
+                    ui::chip()
+                        .child(
+                            div()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(scale::code())
+                                .child(stored.short_sha().to_owned()),
+                        )
+                        .into_any_element(),
+                    stored.generated_at,
+                    (viewed, total),
+                    now,
+                    cx,
+                ),
+            )
             .when(stale, |col| col.child(self.render_stale_banner(stored, cx)))
             .when(!guide.decisions.is_empty(), |col| {
                 col.child(self.render_decisions(guide, cx))
@@ -498,17 +624,18 @@ impl GuideTab {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_meta_bar(
         &self,
-        stored: &StoredGuide,
-        viewed: usize,
-        total: usize,
+        model: &str,
+        language: &GuideLanguage,
+        tag: AnyElement,
+        generated_at: DateTime<Utc>,
+        (viewed, total): (usize, usize),
         now: DateTime<Utc>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let mono = theme.mono_font_family.clone();
+        let muted = cx.theme().muted_foreground;
         h_flex()
             .debug_selector(|| "guide-meta-bar".into())
             .w_full()
@@ -518,12 +645,12 @@ impl GuideTab {
             .pb_3()
             .border_b_1()
             .border_color(tokens::border_subtle())
-            .child(ui::chip().child(stored.model.clone()))
+            .child(ui::chip().child(model.to_owned()))
             .child(
                 div()
                     .id("guide-language")
                     .debug_selector(|| "guide-language".into())
-                    .child(ui::chip().child(stored.language.name().to_owned()))
+                    .child(ui::chip().child(language.name().to_owned()))
                     .tooltip(|window, cx| {
                         gpui_kit::component::tooltip::Tooltip::new(
                             "Language this guide was written in",
@@ -531,21 +658,14 @@ impl GuideTab {
                         .build(window, cx)
                     }),
             )
-            .child(
-                ui::chip().child(
-                    div()
-                        .font_family(mono)
-                        .text_size(scale::code())
-                        .child(stored.short_sha().to_owned()),
-                ),
-            )
+            .child(tag)
             .child(
                 div()
                     .text_size(scale::meta())
                     .text_color(muted)
                     .child(format!(
                         "Generated {}",
-                        ui::relative_time(stored.generated_at, now)
+                        ui::relative_time(generated_at, now)
                     )),
             )
             .child(
@@ -632,10 +752,16 @@ impl GuideTab {
                     ix,
                     decision,
                     step_lookup.get(decision.step_id.as_str()).copied(),
+                    None,
                     cx,
                 )
             })
             .collect();
+        self.render_decision_list(rows, cx)
+    }
+
+    fn render_decision_list(&self, rows: Vec<AnyElement>, cx: &mut Context<Self>) -> AnyElement {
+        let count = rows.len();
         v_flex()
             .debug_selector(|| "guide-decisions".into())
             .w_full()
@@ -655,7 +781,7 @@ impl GuideTab {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Decision points"),
                     )
-                    .child(ui::count_badge(guide.decisions.len(), cx)),
+                    .child(ui::count_badge(count, cx)),
             )
             .child(
                 ui::card(cx)
@@ -678,8 +804,10 @@ impl GuideTab {
         ix: usize,
         decision: &DecisionPoint,
         step_info: Option<(usize, &GuideStep)>,
+        chapter: Option<u64>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let target_pr = chapter.unwrap_or_else(|| self.shown_pr_number());
         let muted = cx.theme().muted_foreground;
         let mono = cx.theme().mono_font_family.clone();
         let chip_color = decision_color(decision.category);
@@ -701,6 +829,9 @@ impl GuideTab {
                     .flex_wrap()
                     .gap_2()
                     .items_center()
+                    .when_some(chapter, |row, number| {
+                        row.child(ui::chip().child(format!("#{number}")))
+                    })
                     .child(widgets::tinted_tag(chip_color).child(decision.category.label()))
                     .child(
                         div()
@@ -732,6 +863,9 @@ impl GuideTab {
                                 .icon(IconName::ArrowDown)
                                 .label(format!("Step {}: {}", step_ix + 1, step.title))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(number) = chapter {
+                                        this.select_chapter(number, cx);
+                                    }
                                     this.focus_step(&step_id, cx);
                                 })),
                         )
@@ -754,7 +888,13 @@ impl GuideTab {
                                         .child(label),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_file(path.clone(), Some(line), side, cx);
+                                    this.open_file_in(
+                                        target_pr,
+                                        path.clone(),
+                                        Some(line),
+                                        side,
+                                        cx,
+                                    );
                                 })),
                         )
                     }),
@@ -1228,6 +1368,469 @@ impl GuideTab {
     }
 }
 
+/// The stack guide.
+impl GuideTab {
+    fn render_stack_ready(
+        &self,
+        stored: &StoredStackGuide,
+        changes: &BTreeMap<u64, ChapterChange>,
+        nodes: &[StackNode],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((chapter_ix, chapter)) = self
+            .selected_chapter
+            .and_then(|number| stored.chapter(number))
+        else {
+            return self.render_invalid("This stack guide has no chapters.", cx);
+        };
+        let guide = &chapter.guide;
+        let viewed = self.read_state.viewed_count(guide);
+        let total = guide.steps.len();
+        let uncovered = loupe_guide::uncovered_files(&chapter.changed_files, guide);
+        let stack_tag = ui::chip()
+            .child(format!("Stack · {} PRs", stored.chapters.len()))
+            .into_any_element();
+
+        v_flex()
+            .w_full()
+            .max_w(dp(ui::READING_WIDTH + 32.))
+            .px(scale::content_inset())
+            .py_4()
+            .gap_5()
+            .child(self.render_meta_bar(
+                &stored.model,
+                &stored.language,
+                stack_tag,
+                stored.generated_at,
+                (viewed, total),
+                Utc::now(),
+                cx,
+            ))
+            .when(!changes.is_empty(), |col| {
+                col.child(self.render_stack_stale_banner(changes, cx))
+            })
+            .child(self.render_stack_overview(stored, cx))
+            .when(
+                stored
+                    .chapters
+                    .iter()
+                    .any(|c| !c.guide.decisions.is_empty()),
+                |col| col.child(self.render_stack_decisions(stored, cx)),
+            )
+            .child(self.render_stack_map(stored, changes, nodes, cx))
+            .child(self.render_chapter_header(stored, chapter_ix, changes, cx))
+            .child(self.render_summary(guide, cx))
+            .when(!guide.removed_tests.is_empty(), |col| {
+                col.child(self.render_removed_tests(&guide.removed_tests, cx))
+            })
+            .when(!uncovered.is_empty(), |col| {
+                col.child(self.render_uncovered_files(&uncovered, cx))
+            })
+            .child(self.render_steps(guide, &HashMap::new(), viewed, total, cx))
+            .child(self.render_chapter_nav(stored, chapter_ix, cx))
+            .into_any_element()
+    }
+
+    fn render_stack_stale_banner(
+        &self,
+        changes: &BTreeMap<u64, ChapterChange>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let warning = tokens::pending();
+        let what = changes
+            .iter()
+            .map(|(number, change)| format!("#{number} {}", change.label().to_lowercase()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        h_flex()
+            .debug_selector(|| "guide-stale-banner".into())
+            .w_full()
+            .px_3()
+            .py_2p5()
+            .gap_2p5()
+            .items_center()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(warning.opacity(0.4))
+            .bg(warning.opacity(0.08))
+            .child(
+                Icon::new(IconName::CircleAlert)
+                    .with_size(scale::icon_md())
+                    .text_color(warning),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(scale::body())
+                    .child(format!("Outdated stack guide: {what}.")),
+            )
+            .child(
+                Button::new("guide-stale-regenerate")
+                    .outline()
+                    .small()
+                    .icon(IconName::RefreshCw)
+                    .label("Update guide")
+                    .tooltip("Writes again only the chapters that changed, then the overview")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(GuideAction::Generate, window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_stack_overview(
+        &self,
+        stored: &StoredStackGuide,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        ui::card(cx)
+            .debug_selector(|| "guide-stack-overview".into())
+            .p_4()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(Icon::new(IconName::Layers).with_size(scale::icon_sm()))
+                    .child(format!(
+                        "Stack of {} pull requests into",
+                        stored.chapters.len()
+                    ))
+                    .child(ui::branch_chip(stored.base_ref.clone(), cx)),
+            )
+            .child(
+                div()
+                    .text_size(scale::title())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(stored.overview.headline.clone()),
+            )
+            .child(ui::markdown("guide-stack-why", stored.overview.why.clone()))
+            .into_any_element()
+    }
+
+    /// Every chapter's decision points, each naming its pull request.
+    fn render_stack_decisions(
+        &self,
+        stored: &StoredStackGuide,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut rows = Vec::new();
+        for chapter in &stored.chapters {
+            let steps: HashMap<&str, (usize, &GuideStep)> = chapter
+                .guide
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(ix, step)| (step.id.as_str(), (ix, step)))
+                .collect();
+            for decision in &chapter.guide.decisions {
+                let ix = rows.len();
+                rows.push(self.render_decision_row(
+                    ix,
+                    decision,
+                    steps.get(decision.step_id.as_str()).copied(),
+                    Some(chapter.pr_number),
+                    cx,
+                ));
+            }
+        }
+        self.render_decision_list(rows, cx)
+    }
+
+    /// The stack's pull requests in chapter order, with each one's base,
+    /// approval, and checks as GitHub reports them now. A row opens its chapter.
+    fn render_stack_map(
+        &self,
+        stored: &StoredStackGuide,
+        changes: &BTreeMap<u64, ChapterChange>,
+        nodes: &[StackNode],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let live: HashMap<u64, &StackNode> = nodes.iter().map(|n| (n.pr.number, n)).collect();
+        let joined: Vec<&StackNode> = nodes
+            .iter()
+            .filter(|node| stored.chapter(node.pr.number).is_none())
+            .collect();
+        let mut rows: Vec<AnyElement> = stored
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(ix, chapter)| {
+                self.render_map_row(
+                    Some(ix),
+                    MapRow {
+                        number: chapter.pr_number,
+                        title: chapter.title.clone(),
+                        base_ref: chapter.base_ref.clone(),
+                        live: live.get(&chapter.pr_number).copied(),
+                    },
+                    changes.get(&chapter.pr_number).copied(),
+                    cx,
+                )
+            })
+            .collect();
+        rows.extend(joined.into_iter().map(|node| {
+            self.render_map_row(
+                None,
+                MapRow {
+                    number: node.pr.number,
+                    title: node.title.clone(),
+                    base_ref: node.base_ref.clone(),
+                    live: Some(node),
+                },
+                Some(ChapterChange::NotInGuide),
+                cx,
+            )
+        }));
+        let count = rows.len();
+        v_flex()
+            .debug_selector(|| "guide-stack-map".into())
+            .w_full()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(scale::title())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Pull requests in merge order"),
+                    )
+                    .child(ui::count_badge(count, cx)),
+            )
+            .child(
+                ui::card(cx)
+                    .p_0()
+                    .py_1()
+                    .overflow_hidden()
+                    .id("guide-stack-map-list")
+                    .role(Role::List)
+                    .aria_label("Chapters of this stack guide")
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_map_row(
+        &self,
+        chapter_ix: Option<usize>,
+        row: MapRow<'_>,
+        change: Option<ChapterChange>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, foreground, hover, active) = (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.list_hover,
+            theme.list_active,
+        );
+        let number = row.number;
+        let selected = self.selected_chapter == Some(number);
+        let is_current = number == self.context.pr.number;
+        h_flex()
+            .id(("guide-stack-map-row", number))
+            .debug_selector(move || format!("guide-stack-map-row-{number}"))
+            .role(Role::ListItem)
+            .aria_label(format!("Chapter for #{number} {}", row.title))
+            .h(scale::row_height())
+            .px_3()
+            .gap_2()
+            .items_center()
+            .when(selected, |el| el.bg(active))
+            .when(!selected && chapter_ix.is_some(), |el| {
+                el.hover(move |el| el.bg(hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_chapter(number, cx)))
+            })
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w_5()
+                    .justify_end()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(chapter_ix.map_or_else(|| "–".to_owned(), |ix| (ix + 1).to_string())),
+            )
+            .children(
+                row.live
+                    .map(|node| widgets::state_icon(node.state, node.is_draft)),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w_10()
+                    .justify_end()
+                    .text_size(scale::meta())
+                    .text_color(if selected { foreground } else { muted })
+                    .child(format!("#{number}")),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(scale::body())
+                            .text_color(foreground)
+                            .child(row.title.clone()),
+                    )
+                    .when(is_current, |el| el.child(ui::chip().child("Current")))
+                    .when_some(change, |el, change| {
+                        el.child(widgets::tinted_tag(tokens::pending()).child(change.label()))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .items_center()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child("into")
+                    .child(ui::branch_chip(row.base_ref.clone(), cx)),
+            )
+            .children(
+                row.live
+                    .and_then(|node| node.review_decision)
+                    .map(widgets::approval_chip),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w_32()
+                    .gap_1()
+                    .items_center()
+                    .text_size(scale::meta())
+                    .map(|lane| match row.live.and_then(|node| node.checks) {
+                        Some(state) => lane.child(widgets::checks_icon(state)).child(
+                            div()
+                                .text_color(if state == loupe_github::ChecksState::Failing {
+                                    widgets::checks_color(state)
+                                } else {
+                                    muted
+                                })
+                                .child(widgets::checks_label(state)),
+                        ),
+                        None => lane.text_color(muted).child("No checks"),
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_chapter_header(
+        &self,
+        stored: &StoredStackGuide,
+        chapter_ix: usize,
+        changes: &BTreeMap<u64, ChapterChange>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chapter = &stored.chapters[chapter_ix];
+        let muted = cx.theme().muted_foreground;
+        let builds_on = chapter_ix
+            .checked_sub(1)
+            .and_then(|ix| stored.chapters.get(ix))
+            .map(|previous| previous.pr_number);
+        v_flex()
+            .debug_selector(|| "guide-chapter-header".into())
+            .w_full()
+            .gap_1()
+            .pt_2()
+            .border_t_1()
+            .border_color(tokens::border_subtle())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(format!(
+                        "Chapter {} of {}",
+                        chapter_ix + 1,
+                        stored.chapters.len()
+                    ))
+                    .when_some(builds_on, |el, number| {
+                        el.child(format!("· adds on top of #{number}"))
+                    })
+                    .when(chapter.pr_number == self.context.pr.number, |el| {
+                        el.child(ui::chip().child("This pull request"))
+                    })
+                    .when_some(changes.get(&chapter.pr_number), |el, change| {
+                        el.child(widgets::tinted_tag(tokens::pending()).child(change.label()))
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(scale::heading())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("#{} {}", chapter.pr_number, chapter.title)),
+            )
+            .into_any_element()
+    }
+
+    fn render_chapter_nav(
+        &self,
+        stored: &StoredStackGuide,
+        chapter_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let previous = chapter_ix
+            .checked_sub(1)
+            .and_then(|ix| stored.chapters.get(ix))
+            .map(|c| c.pr_number);
+        let next = stored.chapters.get(chapter_ix + 1).map(|c| c.pr_number);
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .when_some(previous, |row, number| {
+                row.child(
+                    Button::new("guide-chapter-previous")
+                        .debug_selector(|| "guide-chapter-previous".into())
+                        .outline()
+                        .control()
+                        .icon(IconName::ArrowLeft)
+                        .label(format!("Previous chapter: #{number}"))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.select_chapter(number, cx)),
+                        ),
+                )
+            })
+            .child(div().flex_1())
+            .when_some(next, |row, number| {
+                row.child(
+                    Button::new("guide-chapter-next")
+                        .debug_selector(|| "guide-chapter-next".into())
+                        .outline()
+                        .control()
+                        .icon(IconName::ArrowRight)
+                        .label(format!("Next chapter: #{number}"))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.select_chapter(number, cx)),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+/// One row of the stack map: a chapter, or a pull request that joined later.
+struct MapRow<'a> {
+    number: u64,
+    title: String,
+    base_ref: String,
+    /// The pull request as GitHub reports it now; `None` once it left the stack.
+    live: Option<&'a StackNode>,
+}
+
 impl Render for GuideTab {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.state {
@@ -1241,6 +1844,11 @@ impl Render for GuideTab {
                 stored,
                 changed_steps,
             } => self.render_ready(stored, changed_steps, cx),
+            GuideViewState::StackReady {
+                stored,
+                changes,
+                nodes,
+            } => self.render_stack_ready(stored, changes, nodes, cx),
         }
     }
 }
@@ -1333,28 +1941,24 @@ fn render_diff_line(
         .into_any_element()
 }
 
-fn read_state_key(cx: &App, pr: &loupe_github::PrRef, head_oid: &str) -> String {
-    let resource = format!("guide-read/{}/{head_oid}", pr.url());
+/// Where `target`'s viewed marks are kept. A stack chapter's are apart from
+/// the pull request's own guide: the two guides choose their step IDs apart.
+fn read_state_key(cx: &App, target: &ReadTarget) -> String {
+    let kind = if target.chapter {
+        "guide-stack-read"
+    } else {
+        "guide-read"
+    };
+    let resource = format!("{kind}/{}/{}", target.pr.url(), target.head_oid);
     crate::cache::github_key(cx, &resource).unwrap_or_else(|| format!("local/{resource}"))
 }
 
-fn load_read_state(cx: &App, pr: &loupe_github::PrRef, head_oid: &str) -> GuideReadState {
-    let key = read_state_key(cx, pr, head_oid);
-    crate::cache::get::<GuideReadState>(&key).unwrap_or_default()
+fn load_read_state(cx: &App, target: &ReadTarget) -> GuideReadState {
+    crate::cache::get::<GuideReadState>(&read_state_key(cx, target)).unwrap_or_default()
 }
 
-fn save_read_state(cx: &App, pr: &loupe_github::PrRef, head_oid: &str, state: &GuideReadState) {
-    let key = read_state_key(cx, pr, head_oid);
-    crate::cache::put(&key, state);
-}
-
-/// Returns the set of viewed step IDs currently persisted for `(pr, head_oid)`.
-#[allow(dead_code)]
-pub fn viewed_steps_for(cx: &App, pr: &loupe_github::PrRef, head_oid: &str) -> HashSet<String> {
-    load_read_state(cx, pr, head_oid)
-        .viewed_steps
-        .into_iter()
-        .collect()
+fn save_read_state(cx: &App, target: &ReadTarget, state: &GuideReadState) {
+    crate::cache::put(&read_state_key(cx, target), state);
 }
 
 #[cfg(test)]
@@ -1474,6 +2078,13 @@ mod tests {
     }
 
     fn open_guide(cx: &mut TestAppContext) -> (VisualTestContext, gpui_kit::Entity<GuideTab>) {
+        open_guide_with_height(cx, 900.)
+    }
+
+    fn open_guide_with_height(
+        cx: &mut TestAppContext,
+        height: f32,
+    ) -> (VisualTestContext, gpui_kit::Entity<GuideTab>) {
         let d = Arc::new(detail());
         let (handle, tab) = cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1485,7 +2096,7 @@ mod tests {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                         Default::default(),
-                        size(px(1000.), px(900.)),
+                        size(px(1000.), px(height)),
                     ))),
                     ..Default::default()
                 },
@@ -1649,5 +2260,141 @@ mod tests {
         });
         paint(&mut cx);
         assert!(cx.debug_bounds("guide-unavailable").is_some());
+    }
+
+    fn stack_guide() -> loupe_guide::StoredStackGuide {
+        let chapter = |number: u64| {
+            let mut guide = fixture_guide();
+            guide.steps[0].snippets[0].path = format!("src/pr{number}.rs");
+            guide.decisions[0].title = format!("Decision of #{number}");
+            loupe_guide::StackChapter {
+                pr_number: number,
+                title: format!("Part {number}"),
+                base_ref: if number == 41 {
+                    "main".into()
+                } else {
+                    format!("feat/{}", number - 1)
+                },
+                head_oid: format!("head{number}"),
+                base_oid: "0000000".into(),
+                changed_files: Vec::new(),
+                guide,
+            }
+        };
+        loupe_guide::StoredStackGuide {
+            schema_version: loupe_guide::STACK_SCHEMA_VERSION,
+            repo: "acme/app".into(),
+            base_ref: "main".into(),
+            model: "claude-sonnet-5-5".into(),
+            effort: "medium".into(),
+            generated_at: Utc::now(),
+            language: loupe_guide::GuideLanguage::english(),
+            overview: loupe_guide::StackOverview {
+                headline: "Ships auth in three parts".into(),
+                why: "Each part builds on the last.".into(),
+            },
+            chapters: vec![chapter(41), chapter(42), chapter(43)],
+        }
+    }
+
+    /// #144: the stack guide opens on the chapter of the pull request on
+    /// screen, a map row switches chapters, and a snippet of another pull
+    /// request opens that pull request's Files tab.
+    #[gpui_kit::test]
+    fn stack_guide_opens_on_this_chapter_and_snippets_open_their_own_pull_request(
+        cx: &mut TestAppContext,
+    ) {
+        // Tall enough that the whole chapter is on screen without scrolling.
+        let (mut cx, tab) = open_guide_with_height(cx, 2400.);
+        let emitted: Rc<RefCell<Vec<PrTabEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = emitted.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&tab, move |_, event: &PrTabEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        let mut changes = std::collections::BTreeMap::new();
+        changes.insert(43, loupe_guide::ChapterChange::NewCommits);
+        tab.update(&mut cx, |tab, cx| {
+            tab.set_state(
+                GuideViewState::StackReady {
+                    stored: Box::new(stack_guide()),
+                    changes,
+                    nodes: Vec::new(),
+                },
+                cx,
+            );
+        });
+        paint(&mut cx);
+        for selector in [
+            "guide-stack-overview",
+            "guide-stack-map",
+            "guide-decisions",
+            "guide-chapter-header",
+            "guide-stale-banner",
+            "guide-stack-map-row-41",
+            "guide-stack-map-row-43",
+            "guide-chapter-previous",
+            "guide-chapter-next",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
+        }
+
+        // The chapter on screen is #42's, this pull request's.
+        let snippet = cx.debug_bounds("guide-snippet-0-0").expect("snippet");
+        cx.simulate_click(snippet.center(), Modifiers::none());
+        assert_eq!(
+            emitted.borrow().last(),
+            Some(&PrTabEvent::OpenFile {
+                path: "src/pr42.rs".into(),
+                line: Some(12),
+                side: Side::Right,
+            })
+        );
+
+        // A decision of #41 opens #41's file.
+        let decision = cx
+            .debug_bounds("guide-decision-snippet-0")
+            .expect("first decision snippet");
+        cx.simulate_click(decision.center(), Modifiers::none());
+        assert_eq!(
+            emitted.borrow().last(),
+            Some(&PrTabEvent::OpenFileIn {
+                pr: PrRef::new(RepoRef::new("acme", "app"), 41),
+                path: "src/pr41.rs".into(),
+                line: Some(12),
+                side: Side::Right,
+            })
+        );
+
+        // Mark #42's step viewed, then switch to #43 from the map.
+        let viewed = cx
+            .debug_bounds("guide-step-viewed-0")
+            .expect("viewed button");
+        cx.simulate_click(viewed.center(), Modifiers::none());
+        paint(&mut cx);
+        assert!(cx.debug_bounds("guide-snippet-0-0").is_none());
+        let row = cx.debug_bounds("guide-stack-map-row-43").expect("map row");
+        cx.simulate_click(row.center(), Modifiers::none());
+        paint(&mut cx);
+        assert!(
+            cx.debug_bounds("guide-chapter-next").is_none(),
+            "#43 is the last chapter"
+        );
+        let snippet = cx
+            .debug_bounds("guide-snippet-0-0")
+            .expect("#43's step is not viewed: viewed marks are per chapter");
+        cx.simulate_click(snippet.center(), Modifiers::none());
+        assert_eq!(
+            emitted.borrow().last(),
+            Some(&PrTabEvent::OpenFileIn {
+                pr: PrRef::new(RepoRef::new("acme", "app"), 43),
+                path: "src/pr43.rs".into(),
+                line: Some(12),
+                side: Side::Right,
+            })
+        );
+        assert_eq!(tab.read_with(&cx, |tab, _| tab.step_count()), Some(3));
     }
 }

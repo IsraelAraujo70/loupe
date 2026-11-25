@@ -413,6 +413,20 @@ impl StackGraph {
         out
     }
 
+    /// The stack's pull requests in the order a stack merge lands them: a
+    /// chain from the base up (closest to `base_ref` first), a tree deepest
+    /// children first, siblings by number, and the root last.
+    pub fn merge_order(&self) -> Vec<&StackGraphNode> {
+        let mut ordered: Vec<&StackGraphNode> = self.nodes.iter().collect();
+        match self.shape {
+            StackShape::Chain => ordered.sort_by_key(|item| (item.depth, item.node.pr.number)),
+            StackShape::Tree => {
+                ordered.sort_by_key(|item| (Reverse(item.depth), item.node.pr.number));
+            }
+        }
+        ordered
+    }
+
     /// Computes the exact merge plan (order, target branch per PR, retargeting
     /// flags, parent head updates, and readiness blockers).
     pub fn merge_plan(&self) -> StackMergePlan {
@@ -432,19 +446,8 @@ impl StackGraph {
         };
         let member_numbers: HashSet<u64> = self.nodes.iter().map(|n| n.node.pr.number).collect();
 
-        let mut ordered: Vec<&StackGraphNode> = self.nodes.iter().collect();
-        match self.shape {
-            StackShape::Chain => {
-                // Closest to base branch first (depth 0, 1, 2, ...).
-                ordered.sort_by_key(|item| (item.depth, item.node.pr.number));
-            }
-            StackShape::Tree => {
-                // Deepest children first, siblings by PR number ascending, root last.
-                ordered.sort_by_key(|item| (Reverse(item.depth), item.node.pr.number));
-            }
-        }
-
-        let steps = ordered
+        let steps = self
+            .merge_order()
             .into_iter()
             .map(|item| {
                 let (target_base, needs_retarget, updates_parent_head) = match self.shape {
