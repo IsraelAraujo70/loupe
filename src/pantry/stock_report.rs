@@ -2,11 +2,11 @@
 
 use crate::pantry::stock::Stock;
 
-/// One line per ingredient: name and amount.
+/// One line per ingredient: name and amount, in the order given.
 pub fn report(stock: &Stock, names: &[&str]) -> String {
     let mut out = String::new();
     for name in names {
-        out.push_str(&format!("{name}: {}\n", stock.amount(name)));
+        out.push_str(&format!("{name}: {:.1}\n", stock.amount(name)));
     }
     out
 }

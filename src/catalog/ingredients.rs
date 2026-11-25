@@ -61,7 +61,7 @@ pub const CATALOG: &[Ingredient] = &[
         name: "Basil, smoked",
         category: Category::Herb,
         unit: Unit::Gram,
-        shelf_days: 550,
+        shelf_days: 3,
     },
     Ingredient {
         name: "Basil, pickled",
@@ -1120,7 +1120,7 @@ pub const CATALOG: &[Ingredient] = &[
         shelf_days: 469,
     },
     Ingredient {
-        name: "Saffron, whole",
+        name: "Saffron, whole threads",
         category: Category::Spice,
         unit: Unit::Teaspoon,
         shelf_days: 698,
@@ -2904,7 +2904,7 @@ pub const CATALOG: &[Ingredient] = &[
     Ingredient {
         name: "Cherry, fresh",
         category: Category::Fruit,
-        unit: Unit::Piece,
+        unit: Unit::Gram,
         shelf_days: 280,
     },
     Ingredient {
@@ -3026,4 +3026,9 @@ pub const CATALOG: &[Ingredient] = &[
 /// The ingredient named `name`, ignoring case.
 pub fn find(name: &str) -> Option<&'static Ingredient> {
     CATALOG.iter().find(|item| item.name.eq_ignore_ascii_case(name))
+}
+
+/// Every ingredient of `category`, in catalog order.
+pub fn in_category(category: Category) -> impl Iterator<Item = &'static Ingredient> {
+    CATALOG.iter().filter(move |item| item.category == category)
 }
