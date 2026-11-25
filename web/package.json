@@ -1,0 +1,8 @@
+{
+  "name": "pantry-web",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "test": "vitest run"
+  }
+}

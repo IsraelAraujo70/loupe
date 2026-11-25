@@ -1,0 +1,56 @@
+name: Loupe fixture checks
+# Runs only on the Loupe test fixture's pull requests (see docs/TEST_FIXTURE.md
+# on main). It gives the fixture one passing, one failing, and one skipped
+# check plus a commit status with a description. Never merge these branches.
+on:
+  pull_request:
+    branches: ['loupe-fixture/**']
+permissions:
+  contents: read
+concurrency:
+  group: loupe-fixture-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  passes:
+    name: passes
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Pass with annotations
+        run: |
+          echo "::notice file=README.md,line=1::The fixture's passing check leaves a notice."
+          echo "::warning file=src/units.rs,line=3::The fixture's passing check leaves a warning."
+          echo "passes"
+  fails:
+    name: fails
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Fail on purpose
+        run: |
+          echo "::error file=src/recipe/scale.rs,line=1::The fixture's failing check fails on purpose."
+          exit 1
+  skipped:
+    name: skipped
+    needs: passes
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "never runs"
+  status:
+    name: status
+    needs: passes
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      statuses: write
+    steps:
+      - name: Post a commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          gh api "repos/${{ github.repository }}/statuses/$SHA"
+          -f state=success
+          -f context=loupe-fixture/status
+          -f description="Commit status with a description, posted by the fixture workflow"
