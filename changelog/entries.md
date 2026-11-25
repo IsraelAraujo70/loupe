@@ -103,3 +103,4 @@
 - Entry 103: a one-line change, so the pull request has more than 250 commits.
 - Entry 104: a one-line change, so the pull request has more than 250 commits.
 - Entry 105: a one-line change, so the pull request has more than 250 commits.
+- Entry 106: a one-line change, so the pull request has more than 250 commits.
