@@ -147,6 +147,7 @@ mod tests {
                     .map(|status| CheckRun {
                         name: "ci".into(),
                         workflow: None,
+                        description: None,
                         status: *status,
                         started_at: None,
                         completed_at: None,

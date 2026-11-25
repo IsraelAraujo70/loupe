@@ -6,6 +6,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -457,14 +458,18 @@ impl PullRequestView {
             None => run.name.clone(),
         };
         let outcome = check_outcome(run);
+        let label = match &run.description {
+            Some(description) => format!("{name}: {outcome}. {description}"),
+            None => format!("{name}: {outcome}"),
+        };
         let actions = check_route(&self.pr.repo, head_ref, run);
         h_flex()
             .id(("merge-box-check", ix))
             .role(Role::ListItem)
-            .aria_label(format!("{name}: {outcome}"))
+            .aria_label(label.clone())
             .when_some(actions.clone(), |row, route| {
                 row.role(Role::Button)
-                    .aria_label(format!("{name}: {outcome}, open its run"))
+                    .aria_label(format!("{label}, open its run"))
                     .opens(route)
             })
             .h(scale::row_height())
@@ -483,7 +488,7 @@ impl PullRequestView {
                     .text_size(scale::body())
                     .child(
                         div()
-                            .flex_shrink(1.)
+                            .flex_shrink(0.1)
                             .min_w_0()
                             .truncate()
                             .text_color(foreground)
@@ -495,7 +500,23 @@ impl PullRequestView {
                             .text_size(scale::meta())
                             .text_color(muted)
                             .child(outcome),
-                    ),
+                    )
+                    .when_some(run.description.clone(), |row, description| {
+                        let tip = description.clone();
+                        row.child(
+                            div()
+                                .id(("merge-box-check-description", ix))
+                                .flex_shrink(1.)
+                                .min_w_0()
+                                .truncate()
+                                .text_size(scale::meta())
+                                .text_color(muted)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tip.clone()).build(window, cx)
+                                })
+                                .child(description),
+                        )
+                    }),
             )
             .when(run.is_required, |row| {
                 row.child(ui::chip().small().child("Required"))
