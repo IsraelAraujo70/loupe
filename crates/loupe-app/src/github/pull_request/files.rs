@@ -7,6 +7,7 @@ mod emphasis;
 mod expand;
 mod header;
 mod model;
+mod on_screen;
 mod search;
 mod sticky;
 mod tree;
@@ -50,6 +51,7 @@ use self::model::{
     file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
     to_diff_side, to_side, viewed_counts,
 };
+use self::on_screen::{CardWidth, on_screen};
 use self::search::Match;
 use self::sticky::HeaderWatch;
 use self::tree::{
@@ -186,6 +188,8 @@ pub struct FilesTab {
     _theme_changes: Subscription,
     /// Where the diff drew its file headers, to tell the file at its top.
     headers: Rc<RefCell<HeaderWatch>>,
+    /// How wide the threads and the composer are in the diff on screen.
+    card_width: CardWidth,
     layout: DiffLayout,
     viewed_error: Option<String>,
     viewed_pending: HashSet<String>,
@@ -268,6 +272,7 @@ impl FilesTab {
             syntax_theme: cx.theme().highlight_theme.clone(),
             _theme_changes: cx.observe_global::<Theme>(Self::theme_changed),
             headers: Rc::default(),
+            card_width: CardWidth::default(),
             layout: Settings::get(cx).diff_layout,
             viewed_error: None,
             viewed_pending: HashSet::new(),
@@ -2071,9 +2076,10 @@ impl FilesTab {
         // keeps the scroll offset to itself (`DiffState::horizontal_scroll`
         // is crate-private), so a bar of Loupe's own could not be true.
         let runs_on = !wrap && self.long_files().next().is_some();
+        let fade = if runs_on { dp(FADE_WIDTH) } else { px(0.) };
+        let card_width = self.card_width.clone();
         let content: HeaderFor = {
             let (viewed, sizes, weak) = (viewed.clone(), sizes.clone(), weak.clone());
-            let fade = if runs_on { dp(FADE_WIDTH) } else { px(0.) };
             Rc::new(move |file: &DiffFile| {
                 let path = file.path().clone();
                 let title = match (file.original_path(), file.modified_path()) {
@@ -2140,8 +2146,9 @@ impl FilesTab {
                 // Long lines scroll sideways by default, so a line keeps its
                 // indentation (the component has no hanging indent for a
                 // wrapped line); the toolbar's Wrap option wraps them. Threads and the composer anchor under a
-                // line in a card at most 760 px wide from the leading edge,
-                // so their buttons stay in reach however wide the file is.
+                // line in a card at most 760 px wide that stays on the part
+                // of the diff on screen, so their buttons stay in reach
+                // however wide the file or narrow the window is.
                 Diff::new(state)
                     .size_full()
                     .soft_wrap(wrap)
@@ -2155,6 +2162,7 @@ impl FilesTab {
                         // Threads and the composer sit in a card under their
                         // line, inset from the gutter like a review comment.
                         let card = div()
+                            .debug_selector(|| "diff-card".into())
                             .mx_3()
                             .my_2()
                             .p(scale::card_padding())
@@ -2165,7 +2173,8 @@ impl FilesTab {
                             .bg(surface);
                         if let Some((_, view)) = views.iter().find(|(id, _)| id == annotation.id())
                         {
-                            return card.child(view.clone()).into_any_element();
+                            return on_screen(card.child(view.clone()), card_width.clone(), fade)
+                                .into_any_element();
                         }
                         let (note, load) = notes
                             .iter()
@@ -2941,6 +2950,68 @@ pub(super) mod tests {
 
         cx.update(|_, cx| update_settings(cx, |settings| settings.diff_wrap = true));
         assert_viewed_on_screen(cx, "lines wrap");
+    }
+
+    fn assert_card_on_screen(cx: &mut VisualTestContext, case: &str) -> Bounds<Pixels> {
+        let (_, diff) = panes(cx);
+        let card = cx
+            .debug_bounds("diff-card")
+            .expect("the composer's card is drawn");
+        assert!(
+            card.left() >= diff.left() && card.right() <= diff.right(),
+            "{case}: the card {card:?} is outside the diff {diff:?}"
+        );
+        card
+    }
+
+    #[gpui_kit::test]
+    fn a_card_under_a_line_stays_on_screen_while_lines_scroll(cx: &mut TestAppContext) {
+        let line = "x".repeat(400);
+        let (mut cx, tab) = open_files_tab_with(
+            cx,
+            ChangedFile {
+                path: "src/main.rs".into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 1,
+                patch: Some(format!("@@ -1 +1 @@\n-old\n+{line}")),
+                viewed: ViewedState::Unviewed,
+            },
+        );
+        let cx = &mut cx;
+        cx.update(|window, cx| {
+            tab.update(cx, |tab, cx| {
+                let range = DiffLineRange::new("src/main.rs", DiffSide::Modified, 1, 1);
+                tab.open_composer(&range, window, cx);
+            })
+        });
+
+        let before = assert_card_on_screen(cx, "lines scroll");
+        let (_, diff) = panes(cx);
+        dispatch(
+            cx,
+            ScrollEvent {
+                position: point(diff.left() + px(200.), diff.top() + px(60.)),
+                delta: ScrollDelta::Pixels(point(px(-300.), px(0.))),
+                ..ScrollEvent::default()
+            }
+            .to_platform_input(),
+        );
+        let after = assert_card_on_screen(cx, "scrolled sideways");
+        assert_eq!(
+            after.left(),
+            before.left(),
+            "the card stays put while the lines scroll"
+        );
+
+        // The diff beside the tree is narrower than a card at its widest.
+        cx.simulate_resize(size(px(960.), px(800.)));
+        let narrow = assert_card_on_screen(cx, "narrow window");
+        assert!(narrow.size.width < before.size.width, "the card narrows");
+
+        cx.update(|_, cx| update_settings(cx, |settings| settings.diff_wrap = true));
+        assert_card_on_screen(cx, "lines wrap");
     }
 
     fn added(path: &str, lines: usize) -> ChangedFile {
