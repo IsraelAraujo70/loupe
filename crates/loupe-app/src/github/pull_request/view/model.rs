@@ -4,7 +4,6 @@
 use loupe_github::{
     CheckRun, CheckStatus, ChecksState, MergeMethod, MergeStateStatus, Mergeable, PrState,
     PullRequestDetail, ReviewDecision, ReviewEvent, ReviewerState, StackEntry, StackMergePlan,
-    TimelineItem,
 };
 
 use crate::github::pull_request::checks::format_duration;
@@ -484,21 +483,6 @@ pub(super) fn approvals(detail: &PullRequestDetail) -> Progress {
             .count(),
         total: detail.reviewers.len(),
     }
-}
-
-/// Conversation comments, review summaries with a body, and inline review
-/// comments: everything someone wrote on the pull request.
-pub(super) fn comment_count(detail: &PullRequestDetail) -> usize {
-    let timeline = detail
-        .timeline
-        .iter()
-        .filter(|item| match item {
-            TimelineItem::Comment(_) => true,
-            TimelineItem::Review(review) => !review.body.trim().is_empty(),
-        })
-        .count();
-    let inline: usize = detail.threads.iter().map(|t| t.comments.len()).sum();
-    timeline + inline
 }
 
 /// The selected method when the repository still allows it, else the first
