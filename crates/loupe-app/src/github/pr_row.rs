@@ -42,11 +42,12 @@ const REPO_LANE: f32 = 150.;
 
 /// Widths of the trailing lanes. From the repository on they are the same
 /// in every section, so those columns hold their place down the list; the
-/// author lane comes before them and exists only where authors differ.
+/// author lane (avatar and login) comes before them and exists only where
+/// authors differ.
 const CHANGES_LANE: f32 = 90.;
 const COMMENTS_LANE: f32 = 72.;
 const CHECKS_LANE: f32 = 48.;
-const AUTHOR_LANE: f32 = 48.;
+const AUTHOR_LANE: f32 = 140.;
 const AGE_LANE: f32 = 40.;
 /// The checkbox lane at the leading edge of a list whose rows can be picked.
 const CHECKBOX_LANE: f32 = 16.;
@@ -117,15 +118,14 @@ pub const ROW_GROUP: &str = "pr-row";
 pub type OnSort = Rc<dyn Fn(SortKey, &mut Window, &mut App)>;
 
 /// The 24 px heading over a list of [`pr_row`]s: a 12 px label over each
-/// lane, aligned to the rows' own leading edge (after the 16 px checkbox lane
-/// when `checkbox_lane` is true). With `on_sort`, every lane but the title's
-/// sorts the list when clicked, and the column `sort` names shows its
-/// direction with an arrow. The age lane sorts by the date its rows show:
-/// created when `sort` is by creation, else updated.
+/// lane `lanes` shows, aligned to the rows' own leading edge (after the
+/// 16 px checkbox lane when `checkbox_lane` is true). With `on_sort`, every
+/// lane but the title's sorts the list when clicked, and the column `sort`
+/// names shows its direction with an arrow. The age lane sorts by the date
+/// its rows show: created when `sort` is by creation, else updated.
 pub fn column_header(
     checkbox_lane: bool,
-    show_repo: bool,
-    show_author: bool,
+    lanes: Lanes,
     sort: Option<Sort>,
     on_sort: Option<OnSort>,
     cx: &App,
@@ -154,10 +154,14 @@ pub fn column_header(
             row.child(div().flex_none().w(dp(CHECKBOX_LANE)))
         })
         .child(div().flex_1().min_w_0().child("Pull request"))
-        .when(show_author, |row| {
-            row.child(heading(SortKey::Author, "Author", AUTHOR_LANE, true))
+        .when(lanes.author, |row| {
+            row.child(
+                sort_heading(SortKey::Author, "Author", sort, on_sort.clone(), cx)
+                    .flex_none()
+                    .w(dp(AUTHOR_LANE)),
+            )
         })
-        .when(show_repo, |row| {
+        .when(lanes.repo, |row| {
             row.child(
                 sort_heading(SortKey::Repository, "Repository", sort, on_sort.clone(), cx)
                     .flex_none()
@@ -165,7 +169,9 @@ pub fn column_header(
             )
         })
         .child(heading(SortKey::Changes, "Changes", CHANGES_LANE, false))
-        .child(heading(SortKey::Comments, "Comments", COMMENTS_LANE, false))
+        .when(lanes.comments, |row| {
+            row.child(heading(SortKey::Comments, "Comments", COMMENTS_LANE, false))
+        })
         .child(heading(SortKey::Checks, "Checks", CHECKS_LANE, true))
         .child(heading(age_key, "Age", AGE_LANE, false))
 }
@@ -241,12 +247,53 @@ impl AgeFrom {
 }
 
 /// The lanes a list's rows show besides those every list has: the
-/// repository, the author, and which date the age counts from.
+/// repository, the author, the comments, and which date the age counts
+/// from. A list drops the repository when every row shares one, and the
+/// comments when no row has any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lanes {
     pub repo: bool,
     pub author: bool,
+    pub comments: bool,
     pub age_from: AgeFrom,
+}
+
+impl Lanes {
+    /// The lanes `rows` need: the repository only when they come from more
+    /// than one, the comments only when one of them has any.
+    pub fn for_rows(rows: &[&PrSummary], author: bool, age_from: AgeFrom) -> Self {
+        let repo = rows
+            .first()
+            .is_some_and(|first| rows.iter().any(|row| row.pr.repo != first.pr.repo));
+        Lanes {
+            repo,
+            author,
+            comments: rows.iter().any(|row| row.comment_count > 0),
+            age_from,
+        }
+    }
+}
+
+/// The author lane: the avatar, then the login, cut at the lane's end.
+fn author_lane(avatar_url: impl Into<SharedString>, login: SharedString, cx: &App) -> Div {
+    h_flex()
+        .flex_none()
+        .w(dp(AUTHOR_LANE))
+        .gap_2()
+        .items_center()
+        .child(ui::avatar_named(
+            avatar_url,
+            login.clone(),
+            scale::avatar_md(),
+        ))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(scale::meta())
+                .text_color(cx.theme().muted_foreground)
+                .child(login),
+        )
 }
 
 /// A row inside an open stack: its place from the stack's base, and whether
@@ -303,6 +350,7 @@ pub fn pr_row(
     let Lanes {
         repo: show_repo,
         author: show_author,
+        comments: show_comments,
         age_from,
     } = lanes;
     let theme = cx.theme();
@@ -322,11 +370,16 @@ pub fn pr_row(
     );
     let id = summary.id.clone();
     // The accessible name: what the row shows, so assistive technology and UI
-    // agents can find a pull request by number, title, or repository.
+    // agents can find a pull request by number, title, repository, or author.
+    let by = if show_author {
+        format!(", by {login}")
+    } else {
+        String::new()
+    };
     let name = match marked {
-        Some(Change::Entered) => format!("{reference} {}, new", summary.title),
-        Some(Change::Updated) => format!("{reference} {}, updated", summary.title),
-        None => format!("{reference} {}", summary.title),
+        Some(Change::Entered) => format!("{reference} {}{by}, new", summary.title),
+        Some(Change::Updated) => format!("{reference} {}{by}, updated", summary.title),
+        None => format!("{reference} {}{by}", summary.title),
     };
     let item = Item::pull_request(summary);
     let pr = summary.pr.clone();
@@ -449,11 +502,7 @@ pub fn pr_row(
         // where authors differ: on the viewer's own pull requests its width
         // goes to the title.
         .when(show_author, |row| {
-            row.child(lane(AUTHOR_LANE).justify_center().child(ui::avatar_named(
-                avatar_url,
-                login,
-                scale::avatar_md(),
-            )))
+            row.child(author_lane(avatar_url, login.into(), cx))
         })
         // The lane shows the repository's name; the tooltip keeps the full
         // reference so repositories with one name stay distinguishable.
@@ -471,17 +520,19 @@ pub fn pr_row(
             )
         })
         .child(lane(CHANGES_LANE).child(widgets::diff_stat(summary.additions, summary.deletions)))
-        .child(
-            lane(COMMENTS_LANE)
-                .gap_1()
-                .text_size(scale::meta())
-                .text_color(muted)
-                .when(summary.comment_count > 0, |lane| {
-                    lane.child(Icon::new(IconName::MessageSquare).xsmall())
-                        .child(summary.comment_count.to_string())
-                })
-                .when(summary.comment_count == 0, |lane| lane.child(none(cx))),
-        )
+        .when(show_comments, |row| {
+            row.child(
+                lane(COMMENTS_LANE)
+                    .gap_1()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .when(summary.comment_count > 0, |lane| {
+                        lane.child(Icon::new(IconName::MessageSquare).xsmall())
+                            .child(summary.comment_count.to_string())
+                    })
+                    .when(summary.comment_count == 0, |lane| lane.child(none(cx))),
+            )
+        })
         // The checks: one state icon, with its name in a tooltip.
         .child(
             lane(CHECKS_LANE)
@@ -682,12 +733,8 @@ pub fn stack_row(
         )
         .when(lanes.author, |row| {
             row.child(match author {
-                Some(author) => lane(AUTHOR_LANE).justify_center().child(ui::avatar_named(
-                    author.avatar_url,
-                    author.login,
-                    dp(20.),
-                )),
-                None => lane(AUTHOR_LANE).justify_center().child(none(cx)),
+                Some(author) => author_lane(author.avatar_url, author.login.into(), cx),
+                None => h_flex().flex_none().w(dp(AUTHOR_LANE)).child(none(cx)),
             })
         })
         .when(lanes.repo, |row| {
@@ -702,17 +749,19 @@ pub fn stack_row(
             )
         })
         .child(lane(CHANGES_LANE).child(widgets::diff_stat(additions, deletions)))
-        .child(
-            lane(COMMENTS_LANE)
-                .gap_1()
-                .text_size(scale::meta())
-                .text_color(muted)
-                .when(comments > 0, |lane| {
-                    lane.child(Icon::new(IconName::MessageSquare).xsmall())
-                        .child(comments.to_string())
-                })
-                .when(comments == 0, |lane| lane.child(none(cx))),
-        )
+        .when(lanes.comments, |row| {
+            row.child(
+                lane(COMMENTS_LANE)
+                    .gap_1()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .when(comments > 0, |lane| {
+                        lane.child(Icon::new(IconName::MessageSquare).xsmall())
+                            .child(comments.to_string())
+                    })
+                    .when(comments == 0, |lane| lane.child(none(cx))),
+            )
+        })
         .child(
             lane(CHECKS_LANE)
                 .justify_center()
@@ -747,6 +796,60 @@ mod tests {
     use loupe_github::{PrRef, PrState, PrSummary, RepoRef};
 
     use super::{AgeFrom, Lanes, RowSelect, SelectGesture, pr_row};
+
+    fn summary(repo: &str, number: u64, comments: u32) -> PrSummary {
+        let at = Utc::now();
+        PrSummary {
+            id: format!("PR_{number}"),
+            pr: PrRef::new(RepoRef::new("a", repo), number),
+            title: String::new(),
+            url: String::new(),
+            state: PrState::Open,
+            is_draft: false,
+            author: None,
+            created_at: at,
+            updated_at: at,
+            comment_count: comments,
+            additions: 0,
+            deletions: 0,
+            checks: None,
+            review_decision: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
+            cross_repository: false,
+            stack: None,
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            reviewers: Vec::new(),
+            mergeable: loupe_github::Mergeable::Unknown,
+            review_requests: Vec::new(),
+            reviewed_by: Vec::new(),
+        }
+    }
+
+    /// A lane that would say the same on every row is dropped: the
+    /// repository when all rows share one, the comments when none has any.
+    #[test]
+    fn lanes_drop_what_every_row_shares() {
+        let lanes = |rows: &[PrSummary]| {
+            let rows: Vec<&PrSummary> = rows.iter().collect();
+            let lanes = Lanes::for_rows(&rows, true, AgeFrom::Updated);
+            (lanes.repo, lanes.comments)
+        };
+        assert_eq!(
+            lanes(&[summary("x", 1, 0), summary("x", 2, 0)]),
+            (false, false)
+        );
+        assert_eq!(
+            lanes(&[summary("x", 1, 0), summary("y", 2, 0)]),
+            (true, false)
+        );
+        assert_eq!(
+            lanes(&[summary("x", 1, 0), summary("x", 2, 3)]),
+            (false, true)
+        );
+        assert_eq!(lanes(&[]), (false, false));
+    }
     use crate::store::Settings;
 
     type Picks = Rc<RefCell<Vec<SelectGesture>>>;
@@ -797,6 +900,7 @@ mod tests {
                     Lanes {
                         repo: true,
                         author: true,
+                        comments: true,
                         age_from: AgeFrom::Updated,
                     },
                     false,

@@ -391,7 +391,7 @@ fn grouped<'a>(
     let group_of_row = |pr: &PrSummary| {
         stacked(pr).map_or_else(|| group_of(tab, pr, inbox), |stack| in_stack[&stack.key].1)
     };
-    tab_groups(tab)
+    let mut groups: Vec<Group<'a>> = tab_groups(tab)
         .into_iter()
         .filter_map(|step| {
             let mut rows: Vec<&PrSummary> = items
@@ -431,7 +431,13 @@ fn grouped<'a>(
                 rows,
             })
         })
-        .collect()
+        .collect();
+    // One group sets nothing apart: the list shows its rows without a
+    // heading, so nothing can fold it.
+    if let [only] = groups.as_mut_slice() {
+        only.collapsed = false;
+    }
+    groups
 }
 
 /// A line the keyboard cursor can stand on: a pull request's row or a
@@ -2157,19 +2163,23 @@ impl InboxView {
             .and_then(|id| views.views.iter().position(|saved| saved.id == id))
             .map_or(0, |ix| ix + 1);
         self.views_row.follow(open_tab, open_tab);
-        let tab_row = h_flex()
-            .on_children_prepainted(self.views_row.watch_width(cx.entity_id()))
-            .id("reviews-views")
-            .debug_selector(|| "reviews-views".into())
-            .role(Role::TabList)
-            .aria_label("Views")
-            .min_w_0()
-            .overflow_x_scroll()
-            .track_scroll(self.views_row.handle())
-            .gap_1()
-            .items_center()
-            .child(all)
-            .children(tabs);
+        // With no saved view, "All" would be the only tab, and it would
+        // repeat the All tab under the header.
+        let tab_row = (!views.views.is_empty()).then(|| {
+            h_flex()
+                .on_children_prepainted(self.views_row.watch_width(cx.entity_id()))
+                .id("reviews-views")
+                .debug_selector(|| "reviews-views".into())
+                .role(Role::TabList)
+                .aria_label("Views")
+                .min_w_0()
+                .overflow_x_scroll()
+                .track_scroll(self.views_row.handle())
+                .gap_1()
+                .items_center()
+                .child(all)
+                .children(tabs)
+        });
         // In the header's own row, after the title: one view needs no row
         // of its own.
         h_flex()
@@ -2181,7 +2191,7 @@ impl InboxView {
             .ml_2()
             .gap_1()
             .items_center()
-            .child(tab_row)
+            .children(tab_row)
             .child(
                 h_flex()
                     .flex_none()
@@ -2577,12 +2587,15 @@ impl InboxView {
     }
 
     /// One group of the open tab: its heading, which folds it, and its rows
-    /// unless it is folded. `focused` says whether the list has the focus,
-    /// and so whether the row under the keyboard cursor shows it.
+    /// unless it is folded; the tab's only group has no heading (`headed`
+    /// is false). `focused` says whether the list has the focus, and so
+    /// whether the row under the keyboard cursor shows it.
+    #[allow(clippy::too_many_arguments)]
     fn group(
         &self,
-        tab: ReviewTab,
         group: Group<'_>,
+        lanes: Lanes,
+        headed: bool,
         on_select: OnSelect,
         showing: bool,
         focused: bool,
@@ -2610,13 +2623,10 @@ impl InboxView {
                 },
             )
         });
-        let heading = group_heading(step, group.collapsed, group.rows.len(), lead, cx)
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(step, cx)));
-        let lanes = Lanes {
-            repo: true,
-            author: shows_author(tab),
-            age_from: AgeFrom::for_sort(self.page.sort),
-        };
+        let heading = headed.then(|| {
+            group_heading(step, group.collapsed, group.rows.len(), lead, cx)
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(step, cx)))
+        });
         let row = |summary: &PrSummary, place: Option<StackPlace>, cx: &mut Context<Self>| {
             pr_row(
                 summary,
@@ -2658,7 +2668,7 @@ impl InboxView {
         });
         v_flex()
             .w_full()
-            .child(heading)
+            .children(heading)
             .children(rows)
             .into_any_element()
     }
@@ -2857,6 +2867,11 @@ impl Render for InboxView {
                         .iter()
                         .any(|summary| self.selection.contains(&summary.pr))
                 });
+                let lanes = Lanes::for_rows(
+                    &items,
+                    shows_author(active),
+                    AgeFrom::for_sort(self.page.sort),
+                );
                 // One column heading for the whole tab, outside the scroll,
                 // so its labels stay over the rows' lanes.
                 let columns = (!items.is_empty()).then(|| {
@@ -2865,8 +2880,7 @@ impl Render for InboxView {
                         .px_2()
                         .child(super::pr_row::column_header(
                             true,
-                            true,
-                            shows_author(active),
+                            lanes,
                             self.page.sort,
                             Some(self.on_sort(cx)),
                             cx,
@@ -2885,9 +2899,20 @@ impl Render for InboxView {
                     ui::empty_line(icon, text, cx).px_2().h_8()
                 });
                 let on_select = self.on_select(cx);
+                let headed = groups.len() > 1;
                 let groups: Vec<AnyElement> = groups
                     .into_iter()
-                    .map(|group| self.group(active, group, on_select.clone(), showing, focused, cx))
+                    .map(|group| {
+                        self.group(
+                            group,
+                            lanes,
+                            headed,
+                            on_select.clone(),
+                            showing,
+                            focused,
+                            cx,
+                        )
+                    })
                     .collect();
                 let body = v_flex()
                     .gap_3()
@@ -3290,16 +3315,26 @@ mod tests {
         let (mut cx, view) = open(cx);
         let cx = &mut cx;
 
+        // With no saved view there is no row: "All" alone would repeat the
+        // All tab under the header.
+        assert_eq!(bounds(cx, "reviews-views"), None);
+        assert_eq!(bounds(cx, "reviews-view-all"), None);
+
         // While the views fit, the row is as wide as its tabs and does not
         // scroll.
+        view.update(cx, |view, cx| {
+            view.edit_draft(|draft| *draft = org("org-0"), cx);
+            view.save_as_new("Review queue 0", cx);
+        });
         let row = settled(cx, "reviews-views");
         let all = settled(cx, "reviews-view-all");
         assert_eq!(all.left(), row.left(), "nothing is scrolled");
-        let first_view = view.update(cx, |_, cx| super::views_store::snapshot(cx).views.len());
-        if first_view > 0 {
-            let last = settled(cx, &format!("reviews-view-tab-{}", first_view - 1));
-            assert_eq!(last.right(), row.right(), "the row ends at its last tab");
-        }
+        let last = settled(cx, "reviews-view-bell-0");
+        assert_eq!(
+            last.right(),
+            row.right(),
+            "the row ends at its last tab's bell"
+        );
 
         // Eight more views, the last one open with an unsaved change, in a
         // narrow window.
@@ -3763,10 +3798,10 @@ mod tests {
 
         // With no view, a second click on "All" keeps the tab and the folds.
         view.update(cx, |view, cx| view.switch_view(None, cx));
-        click(cx, "reviews-tab-Involved");
+        click(cx, "reviews-tab-All");
         click(cx, "reviews-group-Waiting for review");
         click(cx, "reviews-view-all");
-        assert_eq!(active(&view, cx), Some(ReviewTab::Involved));
+        assert_eq!(active(&view, cx), Some(ReviewTab::All));
         let folded = view.read_with(cx, |view, _| view.page.collapsed.clone());
         assert_eq!(folded, [ReviewGroup::Step(NextStep::WaitingForReview)]);
         click(cx, "reviews-group-Waiting for review");
@@ -4363,6 +4398,43 @@ mod tests {
                 Spot::Stack(key) => key.element_id(),
             })
         })
+    }
+
+    /// A tab whose rows all fall in one group shows them without its
+    /// heading, so a fold made in another tab cannot hide them; a lane every
+    /// row would show the same way is dropped.
+    #[gpui_kit::test]
+    fn a_lone_group_has_no_heading_and_shared_lanes_drop(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        load(&view, inbox(), cx);
+
+        // All: ready to merge (1, 6) and waiting for review (2 to 5), from
+        // a/repo and b/repo, none with a comment.
+        click(cx, "reviews-tab-All");
+        assert!(bounds(cx, "reviews-group-Ready to merge").is_some());
+        assert!(
+            bounds(cx, "reviews-sort-repository").is_some(),
+            "two repositories"
+        );
+        assert!(
+            bounds(cx, "reviews-sort-comments").is_none(),
+            "no comment anywhere"
+        );
+        click(cx, "reviews-group-Waiting for review");
+        assert!(bounds(cx, "pr-row-PR_4").is_none(), "folded in All");
+
+        // Involved: 4 and 5, both waiting for review, both from b/repo.
+        click(cx, "reviews-tab-Involved");
+        assert!(bounds(cx, "reviews-group-Waiting for review").is_none());
+        assert!(
+            bounds(cx, "pr-row-PR_4").is_some(),
+            "the lone group is open"
+        );
+        assert!(
+            bounds(cx, "reviews-sort-repository").is_none(),
+            "one repository"
+        );
     }
 
     #[gpui_kit::test]

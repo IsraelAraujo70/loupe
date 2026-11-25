@@ -58,8 +58,6 @@ fn group(notifications: &[Notification]) -> Vec<(RepoRef, Vec<&Notification>)> {
     groups
 }
 
-/// Width of the trailing reason lane ("Review requested").
-const REASON_LANE: f32 = 120.;
 /// Width of the lane for a row's age ("3mo").
 const AGE_LANE: f32 = 40.;
 
@@ -558,6 +556,50 @@ impl NotificationsView {
         cx.notify();
     }
 
+    /// Shows every notification (`all`) or only the unread ones.
+    fn set_all(&mut self, all: bool, cx: &mut Context<Self>) {
+        if self.all != all {
+            self.all = all;
+            self.list = Loadable::Loading;
+            self.reload(cx);
+        }
+    }
+
+    /// Drops every filter term, the one being typed included.
+    fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.query
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.set_filter(Vec::new(), cx);
+    }
+
+    /// The actions of an empty Inbox: Show read while it shows only the
+    /// unread, Clear filter while a filter is set.
+    fn empty_actions(&self, filtered: bool, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .gap_2()
+            .when(!self.all, |row| {
+                row.child(
+                    Button::new("inbox-show-read")
+                        .debug_selector(|| "inbox-show-read".into())
+                        .outline()
+                        .small()
+                        .label("Show read")
+                        .accessibility_label("Show read notifications")
+                        .on_click(cx.listener(|view, _, _, cx| view.set_all(true, cx))),
+                )
+            })
+            .when(filtered, |row| {
+                row.child(
+                    Button::new("inbox-filter-clear-empty")
+                        .debug_selector(|| "inbox-filter-clear-empty".into())
+                        .outline()
+                        .small()
+                        .label("Clear filter")
+                        .on_click(cx.listener(|view, _, window, cx| view.clear_filter(window, cx))),
+                )
+            })
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         let key = crate::cache::github_key(cx, &format!("notifications/{}", self.all));
         if self.list.value().is_none()
@@ -804,15 +846,8 @@ impl NotificationsView {
                 ],
                 usize::from(self.all),
                 move |index, _, cx| {
-                    let all = index == 1;
-                    this.update(cx, |view, cx| {
-                        if view.all != all {
-                            view.all = all;
-                            view.list = Loadable::Loading;
-                            view.reload(cx);
-                        }
-                    })
-                    .ok();
+                    this.update(cx, |view, cx| view.set_all(index == 1, cx))
+                        .ok();
                 },
             ))
             .child(
@@ -829,11 +864,11 @@ impl NotificationsView {
                                 .xsmall()
                                 .label("Clear")
                                 .accessibility_label("Clear filters")
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.query
-                                        .update(cx, |state, cx| state.set_value("", window, cx));
-                                    view.set_filter(Vec::new(), cx);
-                                })),
+                                .on_click(
+                                    cx.listener(|view, _, window, cx| {
+                                        view.clear_filter(window, cx)
+                                    }),
+                                ),
                         )
                     }),
             )
@@ -981,11 +1016,11 @@ impl NotificationsView {
         rows
     }
 
-    /// One 32 px row: the subject, then what happened, with the age at its
-    /// end. With `fold`, the row stands for a stack of notifications that
-    /// read the same: it says in words what happened and where, how many
-    /// they are, and when the latest came; a click opens or closes the list
-    /// of them instead of opening one.
+    /// One 32 px row: the subject, then why GitHub sent it as a chip right
+    /// after it, with the age at its end. With `fold`, the row stands for a
+    /// stack of notifications that read the same: it says in words what
+    /// happened and where, how many they are, and when the latest came; a
+    /// click opens or closes the list of them instead of opening one.
     ///
     /// A failed workflow run says which pull request it belongs to (its
     /// number and title, once GitHub answered), "CI failed" beside a red
@@ -1045,14 +1080,21 @@ impl NotificationsView {
             .as_ref()
             .map(|pull| format!(", pull request #{}", pull.pr.number))
             .unwrap_or_default();
+        // Why GitHub sent it, beside the subject. A run says it in its own
+        // words ("CI failed"), and a row inside a stack shares its stack's.
+        let reason = (run.is_none() && !nested).then(|| reason_label(&notification.reason));
+        let reason_name = reason
+            .as_ref()
+            .map(|reason| format!(", {reason}"))
+            .unwrap_or_default();
         let name = match open {
             Some(open) => format!(
-                "{} {}{pull_name}, {count} notifications{}",
+                "{} {}{pull_name}{reason_name}, {count} notifications{}",
                 if open { "Collapse" } else { "Expand" },
                 notification.title,
                 if unread { ", unread" } else { "" }
             ),
-            None => format!("{}{pull_name}", notification.title),
+            None => format!("{}{pull_name}{reason_name}", notification.title),
         };
         let row = ui::list_row(
             SharedString::from(match &fold {
@@ -1107,19 +1149,19 @@ impl NotificationsView {
         let ink = if unread { foreground } else { muted };
 
         // What the line says. A stack and a row on its own name the
-        // subject: for a failed run, the pull request (or the branch while
-        // GitHub has not answered), then "CI failed" with its red mark and
-        // the jobs that failed. A row inside a stack says what is its own:
-        // which run, which jobs, and exactly when.
+        // subject: for a failed run, the pull request when GitHub named one,
+        // then "CI failed" with its red mark, the jobs that failed, and the
+        // branch, which gives way first when the row is narrow. A row inside
+        // a stack says what is its own: which run, which jobs, and exactly
+        // when.
         let mut line = h_flex().flex_1().min_w_0().gap_2().items_center();
         match (&run, nested) {
             (Some(run), false) => {
-                line = match &pull {
-                    Some(pull) => line
+                if let Some(pull) = &pull {
+                    line = line
                         .child(faint(format!("#{}", pull.pr.number).into()))
-                        .child(text(ink, pull.title.clone().into())),
-                    None => line.child(text(ink, run.branch.to_owned().into())),
-                };
+                        .child(text(ink, pull.title.clone().into()));
+                }
                 line = line.child(
                     h_flex()
                         .flex_none()
@@ -1142,9 +1184,14 @@ impl NotificationsView {
                 if let Some(jobs) = jobs.clone() {
                     line = line.child(faint(format!("· {jobs}").into()));
                 }
-                if pull.is_some() {
-                    line = line.child(faint(format!("· {}", run.branch).into()));
-                }
+                line = line.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .child(format!("· {}", run.branch)),
+                );
             }
             (Some(run), true) => {
                 let which = match failed_run {
@@ -1160,20 +1207,21 @@ impl NotificationsView {
                 if let Some(jobs) = jobs.clone() {
                     line = line.child(faint(format!("· {jobs}").into()));
                 }
+                line = line.child(faint(exact.clone().into()));
             }
-            (None, _) => {
+            (None, nested) => {
                 line = line.child(text(ink, notification.title.clone().into()));
+                if nested {
+                    line = line.child(faint(exact.clone().into()));
+                }
             }
         }
         if open.is_some() {
             line = line.child(ui::count_badge(count, cx));
         }
-        let trailing_meta: SharedString = match (open, nested, &run) {
-            (Some(_), _, _) => format!("Latest {exact}").into(),
-            (None, true, _) => exact.clone().into(),
-            (None, false, Some(_)) => "Workflow".into(),
-            (None, false, None) => reason_label(&notification.reason).into(),
-        };
+        if let Some(reason) = reason {
+            line = line.child(ui::chip().child(reason));
+        }
 
         // The pull request of a failed run, one click away from the row
         // that reports it. Opening it marks what the row stands for as read.
@@ -1204,7 +1252,7 @@ impl NotificationsView {
             .child(
                 slot().w_2().child(
                     div()
-                        .size_1p5()
+                        .size_2()
                         .rounded_full()
                         .when(unread, |dot| dot.bg(tokens::accent())),
                 ),
@@ -1228,16 +1276,6 @@ impl NotificationsView {
             }))
             .child(line)
             .children(open_pr)
-            .child(
-                div()
-                    .flex_none()
-                    .w(dp(REASON_LANE))
-                    .truncate()
-                    .text_right()
-                    .text_size(scale::meta())
-                    .text_color(muted)
-                    .child(trailing_meta),
-            )
             .child(
                 // A shortcut: opening a notification also marks it read.
                 slot().w_6().invisible().when(unread, |lane| {
@@ -1295,58 +1333,40 @@ impl Render for NotificationsView {
                     .into_any_element()
             }
             Loadable::Loading => ui::loading_rows(10).into_any_element(),
+            // GitHub sent nothing at all, so the filter hides nothing: the
+            // line says so, and the actions show the read ones or drop the
+            // filter.
             Loadable::Loaded(list) | Loadable::Refreshing(list) if list.is_empty() => {
-                let state = ui::empty_state(
-                    IconName::BellCheck,
-                    "You're all caught up",
-                    if self.all {
-                        "No notifications."
-                    } else {
-                        "No unread notifications."
-                    },
-                );
-                if self.all {
+                let filtered = !terms.is_empty();
+                let detail = match (self.all, filtered) {
+                    (false, false) => "No unread notifications.",
+                    (false, true) => "No unread notifications, with or without the filter.",
+                    (true, false) => "No notifications.",
+                    (true, true) => "No notifications, with or without the filter.",
+                };
+                let state = ui::empty_state(IconName::BellCheck, "You're all caught up", detail);
+                if self.all && !filtered {
                     state.into_any_element()
                 } else {
                     state
-                        .action(
-                            Button::new("show-all")
-                                .outline()
-                                .small()
-                                .label("Show all")
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    view.all = true;
-                                    view.list = Loadable::Loading;
-                                    view.reload(cx);
-                                })),
-                        )
+                        .action(self.empty_actions(filtered, cx))
                         .into_any_element()
                 }
             }
             Loadable::Loaded(list) | Loadable::Refreshing(list)
                 if filter::apply(&terms, list).is_empty() =>
             {
-                ui::empty_state(
-                    IconName::ListFilter,
-                    "Nothing matches the filter",
-                    if self.all {
-                        "No notification matches it."
-                    } else {
-                        "No unread notification matches it."
-                    },
-                )
-                .action(
-                    Button::new("inbox-filter-clear-empty")
-                        .outline()
-                        .small()
-                        .label("Clear filter")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.query
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                            view.set_filter(Vec::new(), cx);
-                        })),
-                )
-                .into_any_element()
+                let unread = list.iter().filter(|item| item.unread).count();
+                let detail = match (self.all, unread) {
+                    (false, 1) => "Your one unread notification does not match it.".to_owned(),
+                    (false, unread) if unread > 1 => {
+                        format!("None of your {unread} unread notifications matches it.")
+                    }
+                    _ => "No notification matches it.".to_owned(),
+                };
+                ui::empty_state(IconName::ListFilter, "Nothing matches the filter", detail)
+                    .action(self.empty_actions(true, cx))
+                    .into_any_element()
             }
             Loadable::Loaded(list) | Loadable::Refreshing(list) => {
                 let list: Vec<Notification> =
@@ -1699,5 +1719,47 @@ mod tests {
         // Enter on the stack's row opens it too.
         view.update_in(cx, |view, window, cx| view.open_cursor(window, cx));
         assert!(view.read_with(cx, |view, _| view.expanded.contains(&key)));
+    }
+
+    /// An empty Inbox offers the read notifications while it shows only the
+    /// unread, and a way out of the filter while one is set, whether GitHub
+    /// sent nothing or the filter hides what it sent.
+    #[gpui_kit::test]
+    fn an_empty_inbox_offers_show_read_and_clear_filter(cx: &mut TestAppContext) {
+        let (mut cx, view) = open(cx);
+        let cx = &mut cx;
+        cx.run_until_parked();
+        let shown = |list: Vec<Notification>, filter: &[&str], cx: &mut VisualTestContext| {
+            let filter: Vec<String> = filter.iter().map(|term| (*term).to_owned()).collect();
+            cx.update(|_, cx| cx.global_mut::<Settings>().notification_filter = filter);
+            view.update(cx, |view, cx| {
+                view.list = Loadable::Loaded(list);
+                cx.notify();
+            });
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            (
+                cx.debug_bounds("inbox-show-read").is_some(),
+                cx.debug_bounds("inbox-filter-clear-empty").is_some(),
+            )
+        };
+
+        assert_eq!(shown(Vec::new(), &[], cx), (true, false), "nothing unread");
+        assert_eq!(
+            shown(Vec::new(), &["repo:o/r"], cx),
+            (true, true),
+            "nothing unread, with a filter"
+        );
+        let elsewhere = vec![notification("a", "x/y", true, 0)];
+        assert_eq!(
+            shown(elsewhere, &["repo:o/r"], cx),
+            (true, true),
+            "unread only outside the filter"
+        );
+
+        view.update(cx, |view, _| view.all = true);
+        assert_eq!(shown(Vec::new(), &["repo:o/r"], cx), (false, true));
     }
 }
