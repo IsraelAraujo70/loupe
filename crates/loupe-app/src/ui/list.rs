@@ -101,10 +101,7 @@ impl TabStopRow for Stateful<Div> {
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
-        let focus = window
-            .use_keyed_state(key, cx, |_, cx| cx.focus_handle().tab_stop(true))
-            .read(cx)
-            .clone();
+        let focus = tab_stop_focus(key, window, cx);
         let focused = focus.is_focused(window);
         self.track_focus(&focus)
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
@@ -112,6 +109,14 @@ impl TabStopRow for Stateful<Div> {
                 row.relative().bg(fill).child(focus_ring(radius))
             })
     }
+}
+
+/// The focus of the [`TabStopRow`] drawn with `key`.
+pub fn tab_stop_focus(key: impl Into<ElementId>, window: &mut Window, cx: &mut App) -> FocusHandle {
+    window
+        .use_keyed_state(key, cx, |_, cx| cx.focus_handle().tab_stop(true))
+        .read(cx)
+        .clone()
 }
 
 /// Where a list's keyboard cursor goes next among `rows`, the lines on

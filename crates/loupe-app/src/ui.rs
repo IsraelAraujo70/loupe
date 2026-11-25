@@ -33,7 +33,7 @@ mod tabs;
 pub(crate) use list::test_support::open_list;
 pub use list::{
     ListRowFocus, TabStopRow, list_column_header, list_container, list_group_header, list_row,
-    list_row_divider, nav_row, scroll_to_rows, step_cursor,
+    list_row_divider, nav_row, scroll_to_rows, step_cursor, tab_stop_focus,
 };
 pub use menu::{MenuRow, menu_row};
 pub use reading::{READING_WIDTH, markdown};

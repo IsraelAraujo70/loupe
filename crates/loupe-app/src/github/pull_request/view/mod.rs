@@ -214,6 +214,9 @@ pub struct PullRequestView {
     /// Put the caret in the review summary on the next render: the review
     /// panel just opened, and what the user types next belongs there.
     focus_review_body: bool,
+    /// The page's own focus, which it takes when it comes on screen on a
+    /// tab without a focus of its own (Conversation, Guide, Commits).
+    focus: FocusHandle,
     conversation_scroll: ScrollHandle,
     /// Details opened in a window too narrow to show the side column on
     /// its own.
@@ -327,6 +330,7 @@ impl PullRequestView {
             review_body,
             clear_review_body: false,
             focus_review_body: false,
+            focus: cx.focus_handle(),
             conversation_scroll: ScrollHandle::new(),
             details_open: false,
             guide_scroll: ScrollHandle::new(),
@@ -1616,20 +1620,35 @@ impl Render for PullRequestView {
             self.review_body
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
+        // Files and Checks focus their own list as they render, when nothing
+        // else holds the focus: the page lets go of it for them.
+        let tab_takes_focus =
+            self.loaded.is_some() && matches!(self.tab, PrTab::Files | PrTab::Checks);
+        if tab_takes_focus && self.focus.is_focused(window) {
+            window.blur(cx);
+        } else if !tab_takes_focus && crate::shell::page_may_take_focus(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        let page = v_flex()
+            .id("pr-page")
+            .role(Role::Group)
+            .aria_label(self.pr.to_string())
+            .size_full()
+            .key_context("PullRequestView")
+            .track_focus(&self.focus);
         let (Some(detail), Some(loaded)) = (self.detail.value().cloned(), self.loaded.clone())
         else {
-            return match &self.detail {
-                Loadable::Failed(error) => self.render_failed(error, cx),
-                _ => self.render_loading(cx),
-            }
-            .into_any_element();
+            return page
+                .child(match &self.detail {
+                    Loadable::Failed(error) => self.render_failed(error, cx),
+                    _ => self.render_loading(cx),
+                })
+                .into_any_element();
         };
         let narrow = window.viewport_size().width
             < scale::side_column_breakpoint().to_pixels(window.rem_size());
         let side = self.tab.has_side_column() && (!narrow || self.details_open);
-        v_flex()
-            .size_full()
-            .child(self.render_header(&detail, cx))
+        page.child(self.render_header(&detail, cx))
             .children(self.render_title_edit(cx))
             .child(self.render_panel_band(&detail, cx))
             .child(self.render_tabs(&detail, narrow, cx))

@@ -110,6 +110,10 @@ pub(super) struct SidebarData {
     github: Option<Arc<GitHub>>,
     linear: Option<Arc<Linear>>,
     loaded: Loaded,
+    /// The scroll of the rows under the workspace's, and the row it last
+    /// scrolled into view because Tab or Shift+Tab gave it the focus.
+    nav_scroll: ScrollHandle,
+    revealed: Option<SharedString>,
     _counts: Option<Task<()>>,
     _teams: Option<Task<()>>,
     _services: Subscription,
@@ -122,6 +126,8 @@ impl SidebarData {
             github: None,
             linear: None,
             loaded: Loaded::default(),
+            nav_scroll: ScrollHandle::new(),
+            revealed: None,
             _counts: None,
             _teams: None,
             _services: cx.observe_global::<Services>(Self::sync),
@@ -782,7 +788,29 @@ pub(super) fn render(
     };
 
     let listed = repos::listed(cx);
-    let rows: Vec<AnyElement> = entries(Settings::get(cx), &loaded, &views, &listed, current)
+    let entries = entries(Settings::get(cx), &loaded, &views, &listed, current);
+    // A row that takes the focus below or above the rows in view scrolls
+    // into view, once: the wheel moves the list freely while it keeps it.
+    let focused = entries.iter().enumerate().find_map(|(ix, entry)| {
+        let key = match entry {
+            Entry::Section { key, .. } => section_focus_key(key),
+            Entry::Row(row) => row_focus_key(row)?,
+        };
+        ui::tab_stop_focus(key.clone(), window, cx)
+            .is_focused(window)
+            .then_some((ix, key))
+    });
+    let nav_scroll = data.update(cx, |data, _| {
+        let key = focused.as_ref().map(|(_, key)| key.clone());
+        if data.revealed != key {
+            if let Some((ix, _)) = &focused {
+                data.nav_scroll.scroll_to_item(*ix);
+            }
+            data.revealed = key;
+        }
+        data.nav_scroll.clone()
+    });
+    let rows: Vec<AnyElement> = entries
         .into_iter()
         .map(|entry| match entry {
             Entry::Section { key, label, open } => {
@@ -814,9 +842,11 @@ pub(super) fn render(
         .child(
             v_flex()
                 .id("sidebar-nav")
+                .debug_selector(|| "sidebar-nav".into())
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
+                .track_scroll(&nav_scroll)
                 .px_2()
                 .pb_2()
                 .when(collapsed, |nav| nav.items_center())
@@ -1007,7 +1037,7 @@ fn section_header(
         .on_click(move |_, _, cx| {
             store::update_settings(cx, |settings| settings.toggle_collapsed(key));
         })
-        .tab_stop_row(format!("section-{key}"), colors.hover, dp(6.), window, cx);
+        .tab_stop_row(section_focus_key(key), colors.hover, dp(6.), window, cx);
     if collapsed {
         return header
             .w(scale::nav_row_height())
@@ -1040,6 +1070,16 @@ fn section_header(
         ))
 }
 
+/// The key of a section heading's focus in the Tab order.
+fn section_focus_key(key: &str) -> SharedString {
+    format!("section-{key}").into()
+}
+
+/// The key of a row's focus in the Tab order; a label is not a stop.
+fn row_focus_key(row: &Row) -> Option<SharedString> {
+    (!matches!(row.target, Target::Label)).then(|| format!("sidebar-{}", row.id).into())
+}
+
 fn nav_row(
     row: Row,
     current: &Route,
@@ -1050,6 +1090,7 @@ fn nav_row(
     cx: &mut App,
 ) -> AnyElement {
     let is_selected = matches!(&row.target, Target::Route(route) if same_page(route, current));
+    let focus_key = row_focus_key(&row);
     let fold = match &row.target {
         Target::FoldTeam { open, .. } | Target::FoldRepo { open, .. } => Some(*open),
         _ => None,
@@ -1074,8 +1115,6 @@ fn nav_row(
     };
     let data = data.downgrade();
     let selector = format!("sidebar-{}", row.id);
-    let focus_key = SharedString::from(selector.clone());
-    let clickable = !matches!(target, Target::Label);
     let focus_fill = if is_selected {
         colors.selected
     } else {
@@ -1134,8 +1173,8 @@ fn nav_row(
         .when_some(route, |item, route| {
             item.on_middle_click(move |event, window, cx| open(route.clone(), event, window, cx))
         })
-        .when(clickable, |item| {
-            item.tab_stop_row(focus_key, focus_fill, dp(6.), window, cx)
+        .when_some(focus_key, |item, key| {
+            item.tab_stop_row(key, focus_fill, dp(6.), window, cx)
         })
         // The open page's icon takes the accent, so the selection is not
         // one more grey fill beside the open tab and the open view.
