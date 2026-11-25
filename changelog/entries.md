@@ -70,3 +70,4 @@
 - Entry 070: a one-line change, so the pull request has more than 250 commits.
 - Entry 071: a one-line change, so the pull request has more than 250 commits.
 - Entry 072: a one-line change, so the pull request has more than 250 commits.
+- Entry 073: a one-line change, so the pull request has more than 250 commits.
