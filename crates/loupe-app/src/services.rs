@@ -95,8 +95,8 @@ pub struct Accounts {
     pub github_saved_token_rejected: bool,
     /// The active Linear workspace.
     pub linear: Connection<loupe_linear::Viewer>,
-    /// Why each stored Linear key that did not connect failed, safe to show.
-    pub linear_failed: Vec<String>,
+    /// Why each stored Linear key that did not connect failed.
+    pub linear_failed: Vec<loupe_linear::ErrorKind>,
 }
 
 impl Global for Accounts {}

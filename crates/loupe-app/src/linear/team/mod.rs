@@ -1125,6 +1125,7 @@ impl Render for TeamView {
             return widgets::not_connected(
                 gpui_kit::component::IconName::LayoutDashboard,
                 self.name.clone(),
+                cx,
             );
         }
         if let Some(id) = self
