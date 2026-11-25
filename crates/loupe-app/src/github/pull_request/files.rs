@@ -1338,7 +1338,10 @@ impl FilesTab {
         }
         parts.push(
             ui::icon_button("files-find-open", IconName::Search, "Find in diff")
-                .tooltip(format!("Find in diff ({})", ui::shortcut("cmd-f")))
+                .tooltip(format!(
+                    "Find in diff ({})",
+                    ui::bound_shortcut(&FindInDiff, cx)
+                ))
                 .selected(self.find.open)
                 .on_click(cx.listener(|this, _, window, cx| this.open_find(window, cx)))
                 .into_any_element(),
