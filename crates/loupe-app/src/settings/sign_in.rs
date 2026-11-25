@@ -216,11 +216,12 @@ async fn validate(token: String, cx: &mut AsyncApp) -> Result<(), String> {
 impl Render for SignIn {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, border, surface, danger) = (
+        let (muted, border, surface, danger, warning) = (
             theme.muted_foreground,
             theme.border,
             theme.secondary,
             theme.danger,
+            theme.warning,
         );
         let mono = theme.mono_font_family.clone();
 
@@ -340,6 +341,7 @@ impl Render for SignIn {
             }
         };
 
+        let saved_rejected = Accounts::get(cx).github_saved_token_rejected;
         let unreachable = match &Accounts::get(cx).github {
             Connection::Failed(message) => Some(message.clone()),
             _ => None,
@@ -352,8 +354,10 @@ impl Render for SignIn {
                         .ghost()
                         .compact()
                         .label("Paste a token instead")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
                             this.paste = PasteToken::Open;
+                            this.token_input
+                                .update(cx, |input, cx| input.focus(window, cx));
                             cx.notify();
                         })),
                 )
@@ -437,6 +441,18 @@ impl Render for SignIn {
                                 column.child(ui::error_banner(message, |_, _, cx| {
                                     session::discover_github(cx)
                                 }))
+                            })
+                            .when(saved_rejected, |column| {
+                                column.child(
+                                    div()
+                                        .id("saved-token-rejected")
+                                        .text_size(scale::body())
+                                        .text_color(warning)
+                                        .text_center()
+                                        .child(
+                                            "Your saved GitHub token stopped working. Sign in again.",
+                                        ),
+                                )
                             })
                             .child(device)
                             .child(div().h(px(1.)).bg(border))
