@@ -55,6 +55,26 @@ fragment TimelinePage on PullRequestTimelineItemsConnection {
     };
 }
 
+macro_rules! commits_page_fragment {
+    () => {
+        r#"
+fragment CommitsPage on PullRequestCommitConnection {
+  pageInfo { hasNextPage endCursor }
+  nodes {
+    commit {
+      oid
+      messageHeadline
+      messageBody
+      committedDate
+      author { name user { login avatarUrl } }
+      statusCheckRollup { state }
+    }
+  }
+}
+"#
+    };
+}
+
 macro_rules! threads_page_fragment {
     () => {
         r#"
@@ -143,17 +163,8 @@ query PullRequestDetail($owner: String!, $name: String!, $number: Int!) {
       }
       labels(first: 50) { nodes { id name color } }
       assignees(first: 50) { nodes { login avatarUrl } }
-      commits(last: 100) {
-        nodes {
-          commit {
-            oid
-            messageHeadline
-            messageBody
-            committedDate
-            author { name user { login avatarUrl } }
-            statusCheckRollup { state }
-          }
-        }
+      commits(first: 100) {
+        ...CommitsPage
       }
       headCommit: commits(last: 1) {
         nodes {
@@ -203,6 +214,7 @@ query PullRequestDetail($owner: String!, $name: String!, $number: Int!) {
 "#,
     timeline_page_fragment!(),
     threads_page_fragment!(),
+    commits_page_fragment!(),
     stack_fragment!()
 );
 
@@ -219,6 +231,21 @@ query PullRequestTimelinePage($owner: String!, $name: String!, $number: Int!, $c
 }
 "#,
     timeline_page_fragment!()
+);
+
+const COMMITS_PAGE_QUERY: &str = concat!(
+    r#"
+query PullRequestCommitsPage($owner: String!, $name: String!, $number: Int!, $cursor: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(first: 100, after: $cursor) {
+        ...CommitsPage
+      }
+    }
+  }
+}
+"#,
+    commits_page_fragment!()
 );
 
 const THREADS_PAGE_QUERY: &str = concat!(
@@ -239,6 +266,7 @@ query PullRequestThreadsPage($owner: String!, $name: String!, $number: Int!, $cu
 pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("pull_request_detail", DETAIL_QUERY),
     ("pull_request_timeline_page", TIMELINE_PAGE_QUERY),
+    ("pull_request_commits_page", COMMITS_PAGE_QUERY),
     ("pull_request_threads_page", THREADS_PAGE_QUERY),
 ];
 
@@ -246,9 +274,9 @@ impl GitHub {
     /// Header, body, reviewers, labels, assignees, commits, checks, timeline,
     /// review threads, and the viewer's pending review of one pull request.
     ///
-    /// The timeline and the review threads are paged (up to ten pages each)
-    /// with small first pages, because GitHub times out (HTTP 502) on one
-    /// large query for busy pull requests. A thread keeps its first 30
+    /// The commits, the timeline and the review threads are paged (up to ten
+    /// pages each) with small first pages, because GitHub times out (HTTP
+    /// 502) on one large query for busy pull requests. A thread keeps its first 30
     /// comments, and the head commit's checks are capped at 100.
     pub fn pull_request(&self, pr: &PrRef) -> Result<PullRequestDetail> {
         let data: Data = self.graphql(
@@ -263,7 +291,12 @@ impl GitHub {
             mut detail,
             mut timeline_cursor,
             mut threads_cursor,
+            commits_cursor,
         } = parse_detail(pr, data)?;
+
+        drain_commits(&mut detail.commits, commits_cursor, |cursor| {
+            self.connection_page(COMMITS_PAGE_QUERY, pr, cursor, "commits")
+        })?;
 
         for _ in 1..MAX_PAGES {
             let Some(cursor) = timeline_cursor.take() else {
@@ -310,6 +343,24 @@ impl GitHub {
             .ok_or_else(not_found)?;
         Connection::deserialize(node).map_err(|error| Error::Decode(error.to_string()))
     }
+}
+
+/// Appends the commit pages after the first one, `fetch` returning the page
+/// that follows a cursor.
+fn drain_commits(
+    commits: &mut Vec<Commit>,
+    mut cursor: Option<String>,
+    mut fetch: impl FnMut(&str) -> Result<Connection<WireCommitNode>>,
+) -> Result<()> {
+    for _ in 1..MAX_PAGES {
+        let Some(after) = cursor.take() else {
+            break;
+        };
+        let (page, next) = parse_commits(fetch(&after)?);
+        commits.extend(page);
+        cursor = next;
+    }
+    Ok(())
 }
 
 fn not_found() -> Error {
@@ -818,6 +869,7 @@ struct FirstPage {
     detail: PullRequestDetail,
     timeline_cursor: Option<String>,
     threads_cursor: Option<String>,
+    commits_cursor: Option<String>,
 }
 
 fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
@@ -874,6 +926,7 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
 
     let (timeline, timeline_cursor) = parse_timeline(wire.timeline_items);
     let (threads, threads_cursor) = parse_threads(wire.review_threads);
+    let (commits, commits_cursor) = parse_commits(wire.commits);
 
     let pending_review = wire
         .pending_reviews
@@ -954,12 +1007,7 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
             .into_iter()
             .map(Actor::from)
             .collect(),
-        commits: wire
-            .commits
-            .into_nodes()
-            .into_iter()
-            .map(|node| commit(node.commit))
-            .collect(),
+        commits,
         checks,
         timeline,
         threads,
@@ -973,6 +1021,7 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
         detail,
         timeline_cursor,
         threads_cursor,
+        commits_cursor,
     })
 }
 
@@ -1068,6 +1117,14 @@ fn checks_state(state: WireRollupState) -> ChecksState {
             ChecksState::Pending
         }
     }
+}
+
+fn parse_commits(connection: Connection<WireCommitNode>) -> (Vec<Commit>, Option<String>) {
+    let (nodes, cursor) = connection.into_page();
+    (
+        nodes.into_iter().map(|node| commit(node.commit)).collect(),
+        cursor,
+    )
 }
 
 fn commit(wire: WireCommit) -> Commit {
@@ -1631,6 +1688,82 @@ mod tests {
         assert_eq!(commits[1].author_name, "Frank");
         assert_eq!(commits[1].author, None);
         assert_eq!(commits[1].checks, None);
+    }
+
+    fn commits_page(
+        range: std::ops::Range<usize>,
+        next: Option<&str>,
+    ) -> Connection<WireCommitNode> {
+        let nodes: Vec<Value> = range
+            .map(|ix| {
+                json!({ "commit": {
+                    "oid": format!("oid{ix}"),
+                    "messageHeadline": format!("commit {ix}"),
+                    "messageBody": "",
+                    "committedDate": "2026-01-02T04:00:00Z",
+                    "author": null,
+                    "statusCheckRollup": null
+                } })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+            "nodes": nodes
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn first_page_reports_the_commits_cursor() {
+        let mut json = pull_request_json();
+        json["commits"]["pageInfo"] = json!({ "hasNextPage": true, "endCursor": "cursor-c" });
+        let first = parse_detail(&pr_ref(), data(json)).unwrap();
+        assert_eq!(first.commits_cursor.as_deref(), Some("cursor-c"));
+        assert_eq!(first.detail.commits.len(), 2);
+        assert_eq!(parsed().commits_cursor, None);
+    }
+
+    #[test]
+    fn every_commit_of_a_pull_request_with_more_than_100_is_listed() {
+        let (mut commits, cursor) = parse_commits(commits_page(0..100, Some("after-100")));
+        let mut asked = Vec::new();
+        drain_commits(&mut commits, cursor, |after| {
+            asked.push(after.to_owned());
+            Ok(match after {
+                "after-100" => commits_page(100..200, Some("after-200")),
+                "after-200" => commits_page(200..250, None),
+                other => panic!("unexpected cursor {other}"),
+            })
+        })
+        .unwrap();
+        assert_eq!(asked, ["after-100", "after-200"]);
+        assert_eq!(commits.len(), 250);
+        assert!(
+            commits
+                .iter()
+                .enumerate()
+                .all(|(ix, c)| c.oid == format!("oid{ix}"))
+        );
+    }
+
+    #[test]
+    fn commit_paging_stops_at_the_page_cap_and_surfaces_errors() {
+        let mut commits = Vec::new();
+        let mut calls = 0;
+        drain_commits(&mut commits, Some("c".to_owned()), |_| {
+            calls += 1;
+            Ok(commits_page(0..1, Some("c")))
+        })
+        .unwrap();
+        assert_eq!(calls, MAX_PAGES - 1);
+
+        let failure = drain_commits(&mut commits, Some("c".to_owned()), |_| {
+            Err(Error::Http {
+                status: 502,
+                message: String::new(),
+            })
+        });
+        assert!(matches!(failure, Err(Error::Http { status: 502, .. })));
     }
 
     #[test]
