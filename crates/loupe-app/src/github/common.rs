@@ -10,8 +10,8 @@ use crate::services::{Services, background};
 use crate::ui;
 
 /// Why a screen could not load. `NotConnected` and `Unauthorized` point the
-/// user to Settings; `NotFound` and `Offline` say what happened in plain
-/// words; everything else shows GitHub's message.
+/// user to Settings; `NotFound`, `Offline` and `RateLimited` say what happened
+/// in plain words; everything else shows GitHub's message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadError {
     NotConnected,
@@ -20,6 +20,11 @@ pub enum LoadError {
     /// GitHub answers both the same way.
     NotFound,
     Offline,
+    /// A rate limit is used up; `reset` is when GitHub lets calls through
+    /// again, when it said.
+    RateLimited {
+        reset: Option<loupe_github::Timestamp>,
+    },
     Other(String),
 }
 
@@ -36,6 +41,7 @@ impl From<loupe_github::Error> for LoadError {
                 LoadError::NotFound
             }
             loupe_github::Error::Transport(_) => LoadError::Offline,
+            loupe_github::Error::RateLimited { reset } => LoadError::RateLimited { reset },
             other => LoadError::Other(other.to_string()),
         }
     }
@@ -48,6 +54,7 @@ impl LoadError {
             LoadError::Unauthorized => "GitHub rejected the token",
             LoadError::NotFound => "Not found on GitHub",
             LoadError::Offline => "Can't reach GitHub",
+            LoadError::RateLimited { .. } => "GitHub's rate limit is used up",
             LoadError::Other(_) => "Could not load from GitHub",
         }
     }
@@ -67,6 +74,13 @@ impl LoadError {
                 "It doesn't exist, or this account doesn't have access to it.".into()
             }
             LoadError::Offline => "Check your connection, then try again.".into(),
+            LoadError::RateLimited { reset: Some(reset) } => format!(
+                "GitHub lets calls through again at {}. Try again then.",
+                reset.with_timezone(&chrono::Local).format("%H:%M")
+            ),
+            LoadError::RateLimited { reset: None } => {
+                "GitHub did not say when it resets. Try again in a few minutes.".into()
+            }
             LoadError::Other(message) => message.clone(),
         }
     }
@@ -209,6 +223,7 @@ pub fn load_failed_page(
         LoadError::NotFound => IconName::FileX,
         LoadError::Offline => IconName::Unplug,
         LoadError::NotConnected | LoadError::Unauthorized => IconName::Key,
+        LoadError::RateLimited { .. } => IconName::Clock,
         LoadError::Other(_) => IconName::TriangleAlert,
     };
     let title = match error {
@@ -241,4 +256,30 @@ pub fn load_failed_page(
                     .on_click(move |_, _, cx| cx.open_url(&url)),
             ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Local};
+
+    use super::LoadError;
+
+    #[test]
+    fn a_rate_limit_names_the_local_hour_it_resets() {
+        let reset = DateTime::from_timestamp(1_794_415_931, 0).unwrap();
+        let error = LoadError::from(loupe_github::Error::RateLimited { reset: Some(reset) });
+        let hour = reset.with_timezone(&Local).format("%H:%M").to_string();
+        assert_eq!(error.title(), "GitHub's rate limit is used up");
+        assert_eq!(
+            error.detail(),
+            format!("GitHub lets calls through again at {hour}. Try again then.")
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_without_a_reset_still_says_what_happened() {
+        let error = LoadError::from(loupe_github::Error::RateLimited { reset: None });
+        assert_eq!(error.title(), "GitHub's rate limit is used up");
+        assert!(error.detail().contains("did not say when"));
+    }
 }

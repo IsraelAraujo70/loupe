@@ -13,10 +13,13 @@ mod tree;
 mod tree_view;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, PoisonError};
+use std::time::Instant;
+
+use chrono::{Local, Utc};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
@@ -43,14 +46,14 @@ use loupe_github::{
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
-use self::emphasis::{Emphasis, SharedEmphasis};
+use self::emphasis::{Emphasis, SharedEmphasis, SyntaxCache};
 use self::expand::{Direction, Gap, Source};
 use self::model::{
     LoadedFiles, Missing, PlacedThread, Placement, anchor_error_message, build_files, diff_mode,
     file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
     to_diff_side, to_side, viewed_counts,
 };
-use self::search::Match;
+use self::search::{Match, Needle};
 use self::sticky::HeaderWatch;
 use self::tree::{
     GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
@@ -63,10 +66,11 @@ use super::thread::{HeadRef, ThreadEvent, ThreadView};
 
 pub(super) use self::model::resolved_summary;
 use crate::github::common::{self, LoadError, Loadable};
-use crate::github::widgets;
+use crate::github::{live, widgets};
 use crate::store::{DiffLayout, FileTreePosition, Settings, update_settings};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
+use crate::ui::ControlSize as _;
 use crate::{assets, ui};
 
 /// The files tree's starting width and the range its edge drags within.
@@ -76,18 +80,21 @@ pub(super) const LONG_LINE: usize = 100;
 /// What the toolbar's note about long lines explains.
 const LONG_LINES_HINT: &str = "These files have lines longer than the view. Scroll sideways with Shift + wheel or ← →, or choose Wrap.";
 /// What the toolbar's note about diffs GitHub left out explains.
-const OMITTED_HINT: &str = "GitHub leaves some diffs out of a pull request this large. Their line counts are included; choose Load diff on a file to see it.";
+const OMITTED_HINT: &str = "GitHub leaves some diffs out of a pull request this large. Their line counts are included; choose Load diff on a file, or Load all, to see them.";
 /// The same note and hint for one commit.
 const COMMIT_OMITTED_NOTE: &str = "GitHub left this diff out because the commit is too large.";
-const COMMIT_OMITTED_HINT: &str = "GitHub leaves some diffs out of a commit this large. Their line counts are included; choose Load diff on a file to see it.";
+const COMMIT_OMITTED_HINT: &str = "GitHub leaves some diffs out of a commit this large. Their line counts are included; choose Load diff on a file, or Load all, to see them.";
 const FILE_LIST_MIN: f32 = 220.;
 const FILE_LIST_MAX: f32 = 640.;
 /// How wide the diff's trailing edge fades while long lines run past it.
 pub(super) const FADE_WIDTH: f32 = 32.;
 
 /// What the find bar's note about diffs GitHub left out explains.
-const NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a pull request this large, so their lines are not searched. Choose Load diff on a file to search it too.";
-const COMMIT_NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a commit this large, so their lines are not searched. Choose Load diff on a file to search it too.";
+const NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a pull request this large, so their lines are not searched. Choose Load all to search them too.";
+const COMMIT_NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a commit this large, so their lines are not searched. Choose Load all to search them too.";
+/// How many left-out diffs Load all reads at once, so a large pull request
+/// does not send GitHub a burst of calls.
+const LOAD_ALL_AT_ONCE: usize = 4;
 
 gpui_kit::actions!(
     github,
@@ -101,6 +108,11 @@ gpui_kit::actions!(
 /// The note under a file with no diff, and for a diff GitHub left out, the
 /// path to load and whether it is loading.
 type NoDiffNote = (ElementId, SharedString, Option<(String, bool)>);
+
+/// Why Load all stopped: a short line for the toolbar and the whole reason.
+fn stopped_by(error: &LoadError) -> (SharedString, SharedString) {
+    (error.title().into(), error.message().into())
+}
 
 /// What a file's header in the diff shows.
 type HeaderFor = Rc<dyn Fn(&DiffFile) -> header::HeaderContent>;
@@ -145,6 +157,9 @@ struct Find {
     open: bool,
     /// The text the matches are for.
     query: SharedString,
+    /// The text the diff's highlighter marks: the query while the bar is
+    /// open, else nothing.
+    marked: SharedString,
     matches: Vec<Match>,
     current: Option<usize>,
 }
@@ -154,6 +169,30 @@ struct CommitSource {
     oid: String,
     /// Its first parent, once its files load.
     parent: Option<String>,
+}
+
+/// Load all: every diff GitHub left out, read a few at a time and put in the
+/// viewer together once the last one arrives, so the diff moves only once.
+struct LoadAll {
+    /// Every path the run loads, to show their Load diff as busy.
+    paths: HashSet<String>,
+    /// Paths not asked for yet, in the tree's order.
+    queue: VecDeque<String>,
+    /// The reads under way, by path.
+    reading: HashMap<String, Task<()>>,
+    /// The diffs read so far (`None` for a binary file).
+    read: Vec<(String, Option<String>)>,
+    /// The commit the diffs are read against, once GitHub said which.
+    merge_base: Option<String>,
+    _merge_base: Task<()>,
+    started: Instant,
+}
+
+impl LoadAll {
+    /// How many diffs the run has read or given up on.
+    fn done(&self) -> usize {
+        self.paths.len() - self.queue.len() - self.reading.len()
+    }
 }
 
 pub struct FilesTab {
@@ -176,11 +215,17 @@ pub struct FilesTab {
     patch_loads: HashMap<String, Task<()>>,
     /// Why loading a left-out diff failed, by path.
     patch_errors: HashMap<String, String>,
+    /// Load all, while it runs.
+    load_all: Option<LoadAll>,
+    /// Why the last Load all stopped early: a short line and the whole reason.
+    load_all_error: Option<(SharedString, SharedString)>,
     /// The lines revealed between hunks, by path.
     expansions: HashMap<String, Expansion>,
     diff: Option<Entity<DiffState>>,
     /// The changed words the diff marks, read by its highlighter.
     emphasis: SharedEmphasis,
+    /// The syntax colors the highlighter worked out, kept for the next one.
+    syntax: SyntaxCache,
     /// The syntax colors the diff's highlighter was made with.
     syntax_theme: Arc<HighlightTheme>,
     _theme_changes: Subscription,
@@ -203,26 +248,29 @@ pub struct FilesTab {
 
 impl FilesTab {
     pub fn new(context: PrTabContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::build(context, None, window, cx)
+        Self::build(context, None, None, window, cx)
     }
 
     /// The tab for what commit `oid` of the pull request changes against its
     /// first parent. Its Viewed marks are the pull request's, as on GitHub;
     /// it takes no threads or new comments, which belong to the pull
-    /// request's whole diff.
+    /// request's whole diff. `find`, the text of the find bar open in the
+    /// commit shown before, opens the bar with it.
     pub fn for_commit(
         context: PrTabContext,
         oid: String,
+        find: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let commit = CommitSource { oid, parent: None };
-        Self::build(context, Some(commit), window, cx)
+        Self::build(context, Some(commit), find, window, cx)
     }
 
     fn build(
         context: PrTabContext,
         commit: Option<CommitSource>,
+        find: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -232,7 +280,13 @@ impl FilesTab {
                 cx.notify();
             }
         });
-        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in diff"));
+        let find_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Find in diff");
+            if let Some(text) = &find {
+                input.set_value(text.clone(), window, cx);
+            }
+            input
+        });
         let find_events =
             cx.subscribe(&find_input, |this, _, event: &InputEvent, cx| match event {
                 // Enter also reports a change; only a new text starts over.
@@ -262,9 +316,12 @@ impl FilesTab {
             missing: HashMap::new(),
             patch_loads: HashMap::new(),
             patch_errors: HashMap::new(),
+            load_all: None,
+            load_all_error: None,
             expansions: HashMap::new(),
             diff: None,
             emphasis: SharedEmphasis::default(),
+            syntax: SyntaxCache::default(),
             syntax_theme: cx.theme().highlight_theme.clone(),
             _theme_changes: cx.observe_global::<Theme>(Self::theme_changed),
             headers: Rc::default(),
@@ -282,8 +339,9 @@ impl FilesTab {
             find: Find {
                 input: find_input,
                 _events: find_events,
-                open: false,
+                open: find.is_some(),
                 query: SharedString::default(),
+                marked: find.unwrap_or_default(),
                 matches: Vec::new(),
                 current: None,
             },
@@ -323,6 +381,8 @@ impl FilesTab {
             self.hunks.clear();
             self.patch_loads.clear();
             self.patch_errors.clear();
+            self.load_all = None;
+            self.load_all_error = None;
             self.expansions.clear();
             self.diff = None;
         }
@@ -476,6 +536,7 @@ impl FilesTab {
             }
         };
         self.load.finish(Ok(()));
+        let first_load = self.diff.is_none();
         self.files = loaded.files;
         eprintln!(
             "review-files-ready pr={} files={} timestamp={}",
@@ -486,6 +547,10 @@ impl FilesTab {
         self.hunks = loaded.hunks;
         self.missing = loaded.missing;
         self.expansions.clear();
+        self.syntax
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         self.refresh_emphasis();
         let mode = diff_mode(self.layout);
         match &self.diff {
@@ -503,10 +568,22 @@ impl FilesTab {
                 }));
             }
         }
-        // The diff starts over on its first file, which can open past that
-        // file's header, so no header tells it.
-        self.headers.borrow_mut().jumped_to(0);
+        self.load_all = None;
+        self.load_all_error = None;
         self.collapse_viewed(cx);
+        // Collapsing a file keeps the line at the top of the diff in place,
+        // and at the very top that is the first file's first line, under its
+        // header and its hunk's: open on the header instead.
+        if let Some(state) = &self.diff {
+            state.update(cx, |state, cx| {
+                if let Some(first) = state.files().first().map(|file| file.path().clone()) {
+                    state.scroll_to_file(&first, cx);
+                }
+            });
+        }
+        // The diff starts over on its first file before any header is drawn
+        // to tell it.
+        self.headers.borrow_mut().jumped_to(0);
         if let Some(slot) = &self.composer
             && !self
                 .files
@@ -516,10 +593,13 @@ impl FilesTab {
             self.composer = None;
         }
         self.threads_dirty = true;
-        if let Some((path, line, side)) = self.pending_reveal.take() {
+        let reveal = self.pending_reveal.take();
+        // A find carried from the commit shown before goes to its first match.
+        let jump = first_load && reveal.is_none();
+        if let Some((path, line, side)) = reveal {
             self.apply_reveal(&path, line, side, cx);
         }
-        self.run_find(false, cx);
+        self.run_find(jump, cx);
     }
 
     /// Collapses viewed files, and files whose diff GitHub left out so the
@@ -582,7 +662,7 @@ impl FilesTab {
     /// Loads the diff GitHub left out of `path` and puts it in the viewer in
     /// place of the file's placeholder.
     fn load_omitted_patch(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.patch_loads.contains_key(path) {
+        if self.loading_patch(path) {
             return;
         }
         let Some(file) = self.files.iter().find(|file| file.path == path).cloned() else {
@@ -590,18 +670,7 @@ impl FilesTab {
         };
         self.patch_errors.remove(path);
         let pr = self.context.pr.clone();
-        // A commit's diff is against its first parent; a root commit only
-        // adds files, so it needs no older side.
-        let (base, head) = match &self.commit {
-            Some(commit) => (
-                commit.parent.clone().unwrap_or_else(|| commit.oid.clone()),
-                commit.oid.clone(),
-            ),
-            None => (
-                self.context.detail.base_oid.clone(),
-                self.context.detail.head_oid.clone(),
-            ),
-        };
+        let (base, head) = self.diff_ends();
         let follows_head = self.commit.is_none();
         let expected_head = self.context.detail.head_oid.clone();
         let owned_path = path.to_owned();
@@ -625,13 +694,251 @@ impl FilesTab {
         cx.notify();
     }
 
+    /// The commits the diff runs between. A commit's diff is against its
+    /// first parent; a root commit only adds files, so it needs no older side.
+    fn diff_ends(&self) -> (String, String) {
+        match &self.commit {
+            Some(commit) => (
+                commit.parent.clone().unwrap_or_else(|| commit.oid.clone()),
+                commit.oid.clone(),
+            ),
+            None => (
+                self.context.detail.base_oid.clone(),
+                self.context.detail.head_oid.clone(),
+            ),
+        }
+    }
+
+    /// Whether the diff GitHub left out of `path` is being loaded, on its
+    /// own or by Load all.
+    fn loading_patch(&self, path: &str) -> bool {
+        self.patch_loads.contains_key(path)
+            || self
+                .load_all
+                .as_ref()
+                .is_some_and(|run| run.paths.contains(path))
+    }
+
+    /// The diffs GitHub left out that nothing is loading yet, in the tree's
+    /// order.
+    fn unloaded_patches(&self) -> VecDeque<String> {
+        self.files
+            .iter()
+            .filter(|file| {
+                self.missing.get(&file.path) == Some(&Missing::Omitted)
+                    && !self.loading_patch(&file.path)
+            })
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    /// Loads every diff GitHub left out: one call for the merge base they
+    /// share, then each file's versions, `LOAD_ALL_AT_ONCE` files at a time.
+    fn load_all_patches(&mut self, cx: &mut Context<Self>) {
+        if self.load_all.is_some() {
+            return;
+        }
+        let queue = self.unloaded_patches();
+        if queue.is_empty() {
+            return;
+        }
+        for path in &queue {
+            self.patch_errors.remove(path);
+        }
+        self.load_all_error = None;
+        eprintln!("diff-load-all start files={}", queue.len());
+        let repo = self.context.pr.repo.clone();
+        let (base, head) = self.diff_ends();
+        let merge_base = common::run(
+            cx,
+            move |gh| gh.merge_base(&repo, &base, &head),
+            |this, result, cx| match result {
+                Ok(merge_base) => {
+                    if let Some(run) = &mut this.load_all {
+                        run.merge_base = Some(merge_base);
+                    }
+                    this.next_patches(cx);
+                }
+                Err(error) => this.stop_load_all(Some(stopped_by(&error)), cx),
+            },
+        );
+        self.load_all = Some(LoadAll {
+            paths: queue.iter().cloned().collect(),
+            queue,
+            reading: HashMap::new(),
+            read: Vec::new(),
+            merge_base: None,
+            _merge_base: merge_base,
+            started: Instant::now(),
+        });
+        cx.notify();
+    }
+
+    /// Asks for the next diffs until `LOAD_ALL_AT_ONCE` are under way, and
+    /// puts them all in the viewer once none is left. Asks for no more while
+    /// GitHub's rate limit runs low, so the rest of the app keeps working.
+    fn next_patches(&mut self, cx: &mut Context<Self>) {
+        let paused = common::client(cx)
+            .and_then(|github| live::paused_until(github.rate_limits(), Utc::now()));
+        let (_, head) = self.diff_ends();
+        let Some(run) = &mut self.load_all else {
+            return;
+        };
+        let Some(merge_base) = run.merge_base.clone() else {
+            return;
+        };
+        if let Some(until) = paused
+            && !run.queue.is_empty()
+        {
+            run.queue.clear();
+            let at = until.with_timezone(&Local).format("%H:%M");
+            self.load_all_error = Some((
+                format!("Paused until {at}").into(),
+                format!(
+                    "GitHub's rate limit is running low, so Load all stopped to leave calls for the rest of the app. It fills up again at {at}."
+                )
+                .into(),
+            ));
+        }
+        while run.reading.len() < LOAD_ALL_AT_ONCE
+            && let Some(path) = run.queue.pop_front()
+        {
+            let Some(file) = self.files.iter().find(|file| file.path == path).cloned() else {
+                continue;
+            };
+            let repo = self.context.pr.repo.clone();
+            let (merge_base, head, read_path) = (merge_base.clone(), head.clone(), path.clone());
+            let task = common::run(
+                cx,
+                move |gh| gh.patch_since(&repo, &merge_base, &head, &file),
+                move |this, result, cx| this.patch_read(read_path, result, cx),
+            );
+            run.reading.insert(path, task);
+        }
+        if run.queue.is_empty() && run.reading.is_empty() {
+            self.finish_load_all(cx);
+        }
+        cx.notify();
+    }
+
+    /// One of Load all's diffs arrived, or failed. A file GitHub does not
+    /// have keeps its error and the rest go on; any other failure (offline,
+    /// the token, the rate limit) would fail the rest too, so the run stops.
+    fn patch_read(
+        &mut self,
+        path: String,
+        result: Result<Option<String>, LoadError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(run) = &mut self.load_all else {
+            return;
+        };
+        run.reading.remove(&path);
+        match result {
+            Ok(patch) => run.read.push((path, patch)),
+            Err(error) => {
+                if error != LoadError::NotFound {
+                    run.queue.clear();
+                    self.load_all_error = Some(stopped_by(&error));
+                }
+                self.patch_errors.insert(path, error.message());
+            }
+        }
+        self.next_patches(cx);
+    }
+
+    /// Stops Load all, keeping the diffs it read, and says why when `why`
+    /// is given.
+    fn stop_load_all(&mut self, why: Option<(SharedString, SharedString)>, cx: &mut Context<Self>) {
+        if why.is_some() {
+            self.load_all_error = why;
+        }
+        if let Some(run) = &mut self.load_all {
+            run.queue.clear();
+            run.reading.clear();
+        }
+        self.finish_load_all(cx);
+    }
+
+    /// Puts what Load all read in the viewer in one go, keeping the file at
+    /// the top of the diff where it is.
+    fn finish_load_all(&mut self, cx: &mut Context<Self>) {
+        let Some(run) = self.load_all.take() else {
+            return;
+        };
+        let top = self
+            .top_file(cx)
+            .or(Some(0))
+            .and_then(|ix| self.files.get(ix))
+            .map(|file| file.path.clone());
+        let (loaded, asked) = (run.read.len(), run.paths.len());
+        let applied = Instant::now();
+        self.apply_omitted_patches(run.read, top, cx);
+        eprintln!(
+            "diff-load-all done loaded={loaded} of={asked} ms={} apply_ms={}",
+            run.started.elapsed().as_millis(),
+            applied.elapsed().as_millis()
+        );
+        cx.notify();
+    }
+
     /// Puts a loaded diff (`None` for a binary file) in the viewer, opens the
     /// file, and keeps it on screen.
     fn apply_omitted_patch(&mut self, path: &str, patch: Option<String>, cx: &mut Context<Self>) {
+        self.apply_omitted_patches(vec![(path.to_owned(), patch)], Some(path.to_owned()), cx);
+    }
+
+    /// Puts loaded diffs (`None` for a binary file) in the viewer with one
+    /// change of its files, opens those not viewed, and shows the header of
+    /// `scroll_to`.
+    fn apply_omitted_patches(
+        &mut self,
+        patches: Vec<(String, Option<String>)>,
+        scroll_to: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut docs = HashMap::new();
+        for (path, patch) in patches {
+            if let Some(doc) = self.take_omitted_patch(&path, patch) {
+                docs.insert(path, doc);
+            }
+        }
+        self.refresh_emphasis();
+        if let Some(state) = &self.diff
+            && !docs.is_empty()
+        {
+            state.update(cx, |state, cx| {
+                let files = state
+                    .files()
+                    .iter()
+                    .map(|existing| match docs.get(existing.path().as_ref()) {
+                        Some((doc, _)) => doc.clone(),
+                        None => existing.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                state.set_files(files, cx);
+                for (path, (_, viewed)) in &docs {
+                    state.set_file_collapsed(path, *viewed, cx);
+                }
+                if let Some(path) = &scroll_to {
+                    state.scroll_to_file(path, cx);
+                }
+            });
+        }
+        self.threads_dirty = true;
+        self.run_find(false, cx);
+    }
+
+    /// Takes the diff loaded for `path` into the files, its hunks, and what
+    /// is missing, and returns the file for the viewer with whether it is
+    /// viewed.
+    fn take_omitted_patch(
+        &mut self,
+        path: &str,
+        patch: Option<String>,
+    ) -> Option<(DiffFile, bool)> {
         self.expansions.remove(path);
-        let Some(file) = self.files.iter_mut().find(|file| file.path == path) else {
-            return;
-        };
+        let file = self.files.iter_mut().find(|file| file.path == path)?;
         file.patch = patch;
         let viewed = is_viewed(file.viewed);
         let file = file.clone();
@@ -664,27 +971,7 @@ impl FilesTab {
         {
             self.hunks.insert(file.path.clone(), Arc::new(hunks));
         }
-        self.refresh_emphasis();
-        if let (Some(state), Some(doc)) = (&self.diff, doc) {
-            state.update(cx, |state, cx| {
-                let docs = state
-                    .files()
-                    .iter()
-                    .map(|existing| {
-                        if existing.path().as_ref() == path {
-                            doc.clone()
-                        } else {
-                            existing.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                state.set_files(docs, cx);
-                state.set_file_collapsed(path, viewed, cx);
-                state.scroll_to_file(path, cx);
-            });
-        }
-        self.threads_dirty = true;
-        self.run_find(false, cx);
+        doc.map(|doc| (doc, viewed))
     }
 
     /// Gives the diff's highlighter the hunks the diff is about to show.
@@ -700,19 +987,37 @@ impl FilesTab {
             .unwrap_or_else(PoisonError::into_inner) = Arc::new(shown);
     }
 
-    /// The diff's highlighter, in the current theme's syntax colors and the
-    /// component's own wash for changed words.
+    /// The diff's highlighter, in the current theme's syntax colors, the
+    /// component's own wash for changed words, and the find's mark over the
+    /// text found.
     fn highlighter(
         &self,
         cx: &App,
     ) -> impl Fn(&str, &str) -> Vec<(Range<usize>, HighlightStyle)> + Send + Sync + 'static {
         let theme = cx.theme();
-        emphasis::highlighter(
+        let words = emphasis::highlighter(
             self.emphasis.clone(),
+            self.syntax.clone(),
             theme.highlight_theme.clone(),
             theme.success.opacity(0.3),
             theme.danger.opacity(0.3),
-        )
+        );
+        let needle = Needle::new(&self.find.marked);
+        let found = HighlightStyle {
+            background_color: Some(theme.warning.opacity(0.4)),
+            ..Default::default()
+        };
+        move |language, text| {
+            let mut styles = words(language, text);
+            if let Some(needle) = &needle {
+                styles.extend(
+                    search::marks(needle, text)
+                        .into_iter()
+                        .map(|range| (range, found)),
+                );
+            }
+            styles
+        }
     }
 
     /// The highlighter keeps the styles it returned, so a new palette needs a
@@ -722,6 +1027,7 @@ impl FilesTab {
             return;
         }
         self.syntax_theme = cx.theme().highlight_theme.clone();
+        self.syntax = SyntaxCache::default();
         if let Some(state) = self.diff.clone() {
             let highlighter = self.highlighter(cx);
             state.update(cx, |state, cx| {
@@ -1039,8 +1345,35 @@ impl FilesTab {
         self.find.open = false;
         self.find.matches.clear();
         self.find.current = None;
+        self.mark_found(cx);
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// The find bar's text while it is open, for the commit shown next.
+    pub fn open_find_text(&self, cx: &App) -> Option<SharedString> {
+        self.find.open.then(|| self.find.input.read(cx).value())
+    }
+
+    /// Gives the diff a highlighter that marks the text to find, when that
+    /// text changed: the query while the bar is open, else none. A new
+    /// highlighter paints every file again.
+    fn mark_found(&mut self, cx: &mut Context<Self>) {
+        let marked = if self.find.open {
+            self.find.query.clone()
+        } else {
+            SharedString::default()
+        };
+        if marked == self.find.marked {
+            return;
+        }
+        self.find.marked = marked;
+        if let Some(state) = self.diff.clone() {
+            let highlighter = self.highlighter(cx);
+            state.update(cx, |state, cx| {
+                state.set_syntax_highlighter(highlighter, cx)
+            });
+        }
     }
 
     /// Finds the bar's text in the diffs loaded. A new text goes to its first
@@ -1066,6 +1399,7 @@ impl FilesTab {
         });
         self.find.matches = search::find(files, &query);
         self.find.query = query.clone();
+        self.mark_found(cx);
         if !query.is_empty() {
             let lines: usize = self
                 .files
@@ -1086,6 +1420,8 @@ impl FilesTab {
                 found.path == previous.path
                     && found.line == previous.line
                     && found.side == previous.side
+                    && found.range == previous.range
+                    && found.in_header == previous.in_header
             })
         });
         self.find.current =
@@ -1136,46 +1472,33 @@ impl FilesTab {
             .position(|file| file.path == path.as_ref())
     }
 
-    /// The marks of the lines found: a quiet one on each, a stronger one on
-    /// the current match. A split diff marks both halves of an unchanged line.
+    /// The mark of the current match's line, on both halves of an unchanged
+    /// line in a split diff; the highlighter marks the text found in every
+    /// line. A match in a hunk's header has no line to mark.
     fn find_decorations(&self, cx: &App) -> Vec<DiffDecoration> {
-        if !self.find.open {
-            return Vec::new();
-        }
-        let current = cx.theme().warning.opacity(0.5);
-        let marks = |found: &Match| {
-            let mut marks = vec![DiffDecoration::new(DiffLineRange::new(
-                found.path.clone(),
-                to_diff_side(found.side),
-                found.line as usize,
-                found.line as usize,
-            ))];
-            if let Some(old) = found.old_line {
-                marks.push(DiffDecoration::new(DiffLineRange::new(
-                    found.path.clone(),
-                    to_diff_side(loupe_github::Side::Left),
-                    old as usize,
-                    old as usize,
-                )));
-            }
-            marks
-        };
-        let mut decorations: Vec<DiffDecoration> = self
+        let Some(found) = self
             .find
-            .matches
-            .iter()
-            .enumerate()
-            .filter(|(ix, _)| Some(*ix) != self.find.current)
-            .flat_map(|(_, found)| marks(found))
-            .collect();
-        // The last decoration on a line is the one shown.
-        if let Some(found) = self.find.current.and_then(|ix| self.find.matches.get(ix)) {
-            decorations.extend(
-                marks(found)
-                    .into_iter()
-                    .map(|mark| mark.with_background(current)),
-            );
-        }
+            .current
+            .and_then(|ix| self.find.matches.get(ix))
+            .filter(|found| self.find.open && !found.in_header)
+        else {
+            return Vec::new();
+        };
+        let line = |side, line: u32| {
+            DiffDecoration::new(DiffLineRange::new(
+                found.path.clone(),
+                to_diff_side(side),
+                line as usize,
+                line as usize,
+            ))
+            .with_background(cx.theme().warning.opacity(0.2))
+        };
+        let mut decorations = vec![line(found.side, found.line)];
+        decorations.extend(
+            found
+                .old_line
+                .map(|old| line(loupe_github::Side::Left, old)),
+        );
         decorations
     }
 
@@ -1189,9 +1512,9 @@ impl FilesTab {
             _ if !searching => None,
             Some(ix) => Some((
                 format!("{} of {total}", ix + 1),
-                format!("Line {} of {total} with the text", ix + 1),
+                format!("Match {} of {total}", ix + 1),
             )),
-            None => Some(("No results".to_owned(), "No line has the text".to_owned())),
+            None => Some(("No results".to_owned(), "No match in the diff".to_owned())),
         };
         let not_searched = self
             .missing
@@ -1262,7 +1585,10 @@ impl FilesTab {
                             })),
                     ),
             )
-            .when(not_searched > 0, |bar| {
+            .when(self.load_all.is_some(), |bar| {
+                bar.child(self.load_all_progress("files-find-load-all-progress", cx))
+            })
+            .when(self.load_all.is_none() && not_searched > 0, |bar| {
                 let text = match not_searched {
                     1 => "1 file not searched".to_owned(),
                     count => format!("{count} files not searched"),
@@ -1278,6 +1604,7 @@ impl FilesTab {
                         .tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
                         .child(text),
                 )
+                .children(self.load_all_button("files-find-load-all", cx))
             })
             .child(div().flex_1())
             .child(
@@ -1498,6 +1825,53 @@ impl FilesTab {
         })
     }
 
+    /// Load all, and why the last run stopped early when it did.
+    fn load_all_button(&self, id: &'static str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let muted = cx.theme().muted_foreground;
+        let error = self.load_all_error.clone().map(|(short, reason)| {
+            div()
+                .id(SharedString::from(format!("{id}-stopped")))
+                .role(Role::Status)
+                .aria_label(reason.clone())
+                .flex_none()
+                .text_size(scale::meta())
+                .text_color(muted)
+                .tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx))
+                .child(short)
+                .into_any_element()
+        });
+        error
+            .into_iter()
+            .chain([Button::new(id)
+                .outline()
+                .control()
+                .label("Load all")
+                .accessibility_label("Load all diffs")
+                .on_click(cx.listener(|this, _, _, cx| this.load_all_patches(cx)))
+                .into_any_element()])
+            .collect()
+    }
+
+    /// How far Load all got: a spinner and "Loading diffs: 12 of 69".
+    fn load_all_progress(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let text = self.load_all.as_ref().map_or_else(String::new, |run| {
+            format!("Loading diffs: {} of {}", run.done(), run.paths.len())
+        });
+        h_flex()
+            .id(id)
+            .role(Role::Status)
+            .aria_label(text.clone())
+            .flex_none()
+            .gap_2()
+            .items_center()
+            .text_size(scale::meta())
+            .text_color(muted)
+            .child(Spinner::new().xsmall().color(muted))
+            .child(text)
+            .into_any_element()
+    }
+
     fn toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let wrap = Settings::get(cx).diff_wrap;
         let counts = viewed_counts(&self.files);
@@ -1555,7 +1929,18 @@ impl FilesTab {
         // past the edge. The edge's fade alone is dark on dark and says
         // nothing on a line with no tint, and the component shows its
         // own horizontal bar only while it scrolls.
-        if omitted > 0 {
+        if self.load_all.is_some() {
+            parts.push(self.load_all_progress("load-all-progress", cx));
+            parts.push(
+                Button::new("load-all-stop")
+                    .outline()
+                    .control()
+                    .label("Stop")
+                    .accessibility_label("Stop loading diffs")
+                    .on_click(cx.listener(|this, _, _, cx| this.stop_load_all(None, cx)))
+                    .into_any_element(),
+            );
+        } else if omitted > 0 {
             parts.push(
                 div()
                     .id("omitted-diffs-note")
@@ -1569,6 +1954,7 @@ impl FilesTab {
                     })
                     .into_any_element(),
             );
+            parts.extend(self.load_all_button("load-all-diffs", cx));
         }
         if long > 0 {
             parts.push(
@@ -1988,8 +2374,8 @@ impl FilesTab {
                 }
                 None => reason.note().into(),
             };
-            let load = (*reason == Missing::Omitted)
-                .then(|| (path.clone(), self.patch_loads.contains_key(path)));
+            let load =
+                (*reason == Missing::Omitted).then(|| (path.clone(), self.loading_patch(path)));
             notes.push((id, note, load));
         }
         // Each gap between hunks goes under the line above it, or under the
@@ -2569,11 +2955,12 @@ pub(super) mod tests {
     use std::sync::Arc;
 
     use chrono::{DateTime, Utc};
+    use gpui_kit::component::ActiveTheme as _;
     use gpui_kit::component::diff::{DiffLineRange, DiffSide};
     use gpui_kit::{
-        AppContext as _, Bounds, Entity, InputEvent as _, Modifiers, MouseButton, MouseDownEvent,
-        MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, TestAppContext,
-        VisualTestContext, WindowBounds, WindowOptions, point, px, size,
+        AppContext as _, Bounds, Context, Entity, InputEvent as _, Modifiers, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent,
+        TestAppContext, VisualTestContext, Window, WindowBounds, WindowOptions, point, px, size,
     };
     use loupe_github::diff::{git_patch, parse_patch};
     use loupe_github::{
@@ -2581,6 +2968,7 @@ pub(super) mod tests {
         PullRequestDetail, RepoRef, ViewedState,
     };
 
+    use super::emphasis::PLAIN;
     use super::expand::{Direction, Source};
     use super::model::build_files;
     use super::{FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_WIDTH, FilesTab, PrTabContext};
@@ -2664,6 +3052,15 @@ pub(super) mod tests {
         cx: &mut TestAppContext,
         files: Vec<ChangedFile>,
     ) -> (VisualTestContext, Entity<FilesTab>) {
+        open_tab(cx, files, FilesTab::new)
+    }
+
+    /// The tab `build` makes, alone in a window, with `files` loaded.
+    fn open_tab(
+        cx: &mut TestAppContext,
+        files: Vec<ChangedFile>,
+        build: impl FnOnce(PrTabContext, &mut Window, &mut Context<FilesTab>) -> FilesTab + 'static,
+    ) -> (VisualTestContext, Entity<FilesTab>) {
         let (handle, tab) = cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::init(cx);
@@ -2684,7 +3081,7 @@ pub(super) mod tests {
                         pr: PrRef::new(RepoRef::new("acme", "app"), 12),
                         detail: Arc::new(detail()),
                     };
-                    cx.new(|cx| FilesTab::new(context, window, cx))
+                    cx.new(|cx| build(context, window, cx))
                 },
             )
             .expect("open the window")
@@ -3121,6 +3518,191 @@ pub(super) mod tests {
             current_match(cx, &tab).map(|(_, path, line)| (path, line)),
             before,
             "the current match stays where it was"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn find_marks_the_text_found_and_only_the_current_line(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_files_tab_with_files(cx, vec![added("src/long.rs", 300)]);
+        let cx = &mut cx;
+        draw(cx);
+        let marked = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let found = cx.theme().warning.opacity(0.4);
+                let highlight = tab.read(cx).highlighter(cx);
+                highlight(PLAIN, "line 25\nline 250\nline 3\n")
+                    .into_iter()
+                    .filter(|(_, style)| style.background_color == Some(found))
+                    .map(|(range, _)| range)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(marked(cx).is_empty(), "nothing is marked before a find");
+
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.open_find(window, cx)));
+        cx.simulate_input("LINE 25");
+        draw(cx);
+        assert_eq!(
+            marked(cx),
+            [0..7, 8..15],
+            "the text found, not the whole line"
+        );
+        let lines: Vec<_> = cx.update(|_, cx| {
+            tab.read(cx)
+                .find_decorations(cx)
+                .iter()
+                .map(|mark| (mark.range().start(), mark.range().end()))
+                .collect()
+        });
+        assert_eq!(lines, [(25, 25)], "only the current match's line");
+        assert_eq!(
+            cx.update(|_, cx| tab.read(cx).open_find_text(cx))
+                .as_deref(),
+            Some("LINE 25")
+        );
+
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.close_find(window, cx)));
+        assert!(
+            marked(cx).is_empty(),
+            "closing the bar takes the marks away"
+        );
+        assert_eq!(cx.update(|_, cx| tab.read(cx).open_find_text(cx)), None);
+    }
+
+    #[gpui_kit::test]
+    fn the_next_commit_opens_with_the_find_on_its_first_match(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_tab(
+            cx,
+            vec![added("src/long.rs", 300)],
+            |context, window, cx| {
+                FilesTab::for_commit(context, "c0ffee".into(), Some("LINE 25".into()), window, cx)
+            },
+        );
+        let cx = &mut cx;
+        draw(cx);
+        assert!(cx.debug_bounds("files-find").is_some(), "the bar is open");
+        assert_eq!(
+            tab.read_with(cx, |tab, cx| tab.find.input.read(cx).value().to_string()),
+            "LINE 25"
+        );
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 11);
+        assert_eq!(
+            current_match(cx, &tab),
+            Some((0, "src/long.rs".into(), 25)),
+            "the first match"
+        );
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
+            Some("src/long.rs"),
+            "the diff went to it"
+        );
+    }
+
+    /// A file whose diff GitHub left out: lines changed, no patch.
+    fn left_out(path: &str) -> ChangedFile {
+        ChangedFile {
+            patch: None,
+            additions: 5000,
+            ..added(path, 1)
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_diff_with_collapsed_files_opens_on_the_first_header(cx: &mut TestAppContext) {
+        let seen = ChangedFile {
+            viewed: ViewedState::Viewed,
+            ..added("src/seen.rs", 20)
+        };
+        let (mut cx, tab) = open_files_tab_with_files(
+            cx,
+            vec![
+                added("src/first.rs", 40),
+                left_out("src/huge.rs"),
+                seen,
+                added("src/last.rs", 40),
+            ],
+        );
+        let cx = &mut cx;
+        panes(cx);
+        assert!(
+            cx.debug_bounds("pinned-header").is_none(),
+            "the first file's own header and its first lines are on screen"
+        );
+        assert_eq!(tab.read_with(cx, |tab, cx| tab.top_file(cx)), Some(0));
+    }
+
+    #[gpui_kit::test]
+    fn load_all_stops_with_the_reason_when_github_cannot_answer(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_files_tab_with_files(
+            cx,
+            vec![
+                added("src/first.rs", 40),
+                left_out("src/huge.rs"),
+                left_out("src/other.rs"),
+            ],
+        );
+        let cx = &mut cx;
+        tab.update(cx, |tab, cx| tab.load_all_patches(cx));
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert!(tab.load_all.is_none(), "the run ended");
+            assert_eq!(
+                tab.load_all_error
+                    .as_ref()
+                    .map(|(short, _)| short.to_string()),
+                Some("GitHub is not connected".into())
+            );
+            assert!(!tab.loading_patch("src/huge.rs"));
+            assert_eq!(tab.unloaded_patches().len(), 2, "both can be loaded again");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn diffs_loaded_together_are_searched_and_keep_the_top_in_place(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_files_tab_with_files(
+            cx,
+            vec![
+                added("src/first.rs", 40),
+                left_out("src/huge.rs"),
+                left_out("src/other.rs"),
+            ],
+        );
+        let cx = &mut cx;
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.open_find(window, cx)));
+        cx.simulate_input("needle");
+        panes(cx);
+        assert_eq!(tab.read_with(cx, |tab, _| tab.find.matches.len()), 0);
+
+        tab.update(cx, |tab, cx| {
+            tab.apply_omitted_patches(
+                vec![
+                    (
+                        "src/huge.rs".into(),
+                        Some("@@ -0,0 +1 @@\n+a needle".into()),
+                    ),
+                    (
+                        "src/other.rs".into(),
+                        Some("@@ -0,0 +1 @@\n+one more needle".into()),
+                    ),
+                ],
+                Some("src/first.rs".into()),
+                cx,
+            )
+        });
+        panes(cx);
+        tab.read_with(cx, |tab, cx| {
+            assert_eq!(tab.find.matches.len(), 2, "both diffs are searched");
+            assert!(tab.unloaded_patches().is_empty());
+            let state = tab.diff.as_ref().expect("diff").read(cx);
+            assert!(
+                !state.is_file_collapsed("src/huge.rs"),
+                "a loaded diff opens"
+            );
+            assert!(!state.is_file_collapsed("src/other.rs"));
+        });
+        assert!(
+            cx.debug_bounds("pinned-header").is_none(),
+            "the file at the top stays on its header"
         );
     }
 

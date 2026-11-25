@@ -15,7 +15,6 @@ use crate::links::PrLinkContext;
 use crate::route::Route;
 use crate::services::LinearWorkspace;
 use crate::shell::OpenOnClick as _;
-use crate::shell::navigate;
 use crate::theme::scale::dp;
 
 /// How a PR relates to an issue.
@@ -293,7 +292,13 @@ impl PrPanel {
                     .icon(IconName::Settings)
                     .label("Connect in Settings…")
                     .text_color(crate::theme::tokens::link())
-                    .on_click(|_, window, cx| navigate(Route::Settings, window, cx)),
+                    .on_click(|_, window, cx| {
+                        crate::settings::view::open_section(
+                            crate::settings::catalog::Section::Linear,
+                            window,
+                            cx,
+                        )
+                    }),
             )
     }
 

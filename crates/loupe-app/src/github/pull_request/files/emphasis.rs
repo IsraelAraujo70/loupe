@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::{HighlightStyle, Hsla};
@@ -38,6 +38,11 @@ pub const PLAIN: &str = "plain";
 
 /// The marks of the hunks the diff shows, replaced whenever they change.
 pub type SharedEmphasis = Arc<RwLock<Arc<Emphasis>>>;
+
+/// Syntax colors of one theme already worked out, by language and hunk side,
+/// so a new highlighter (one for a new text to find) paints every file again
+/// without parsing it again.
+pub type SyntaxCache = Arc<Mutex<HashMap<u64, Arc<[(Range<usize>, HighlightStyle)]>>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
@@ -132,10 +137,11 @@ impl Emphasis {
     }
 }
 
-/// The diff's highlighter: syntax colors from `theme`, and `added` or
-/// `removed` behind the words that changed in a paired line.
+/// The diff's highlighter: syntax colors from `theme`, kept in `syntax`,
+/// and `added` or `removed` behind the words that changed in a paired line.
 pub fn highlighter(
     emphasis: SharedEmphasis,
+    syntax: SyntaxCache,
     theme: Arc<HighlightTheme>,
     added: Hsla,
     removed: Hsla,
@@ -144,7 +150,23 @@ pub fn highlighter(
         let mut styles = if language == PLAIN {
             Vec::new()
         } else {
-            highlight_hunk(language, text, &theme)
+            let mut hasher = DefaultHasher::new();
+            (language, text).hash(&mut hasher);
+            let key = hasher.finish();
+            let cached = syntax
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&key)
+                .cloned();
+            let colors = cached.unwrap_or_else(|| {
+                let colors: Arc<[_]> = highlight_hunk(language, text, &theme).into();
+                syntax
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key, colors.clone());
+                colors
+            });
+            colors.to_vec()
         };
         let emphasis = emphasis
             .read()
@@ -334,7 +356,7 @@ mod tests {
     use gpui_kit::{Hsla, green, red};
     use loupe_github::diff::parse_patch;
 
-    use super::{Emphasis, PLAIN, changed_words, highlighter};
+    use super::{Emphasis, PLAIN, SyntaxCache, changed_words, highlighter};
 
     const EDIT: &str = "@@ -1,3 +1,4 @@\n fn f() {\n-    let busy = crate::github::guide_service::is_generating(cx, &detail.pr);\n+    use crate::github::guide_service::{self, GuideScope};\n+    let busy = guide_service::is_generating(cx, &detail.pr);\n }\n";
     const OLD: &str = "fn f() {\n    let busy = crate::github::guide_service::is_generating(cx, &detail.pr);\n}\n";
@@ -347,7 +369,13 @@ mod tests {
             .iter()
             .map(|patch| Arc::new(parse_patch(patch).unwrap()));
         let emphasis = Arc::new(RwLock::new(Arc::new(Emphasis::new(files))));
-        let highlight = highlighter(emphasis, HighlightTheme::default_dark(), green(), red());
+        let highlight = highlighter(
+            emphasis,
+            SyntaxCache::default(),
+            HighlightTheme::default_dark(),
+            green(),
+            red(),
+        );
         highlight(PLAIN, text)
             .into_iter()
             .map(|(range, style)| (range, style.background_color.unwrap()))
