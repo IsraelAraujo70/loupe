@@ -8,6 +8,7 @@
 //! key to another host.
 
 pub mod documents;
+mod error;
 pub mod filter;
 mod identifiers;
 mod types;
@@ -23,29 +24,13 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 pub use documents::Document;
+pub use error::{Error, ErrorKind, Result};
 pub use identifiers::extract_identifiers;
 pub use types::*;
 
 const GRAPHQL_URL: &str = "https://api.linear.app/graphql";
 const USER_AGENT: &str = concat!("Loupe/", env!("CARGO_PKG_VERSION"));
 const MY_ISSUES_MAX_PAGES: usize = 5;
-
-/// Every way a Linear call can fail, already classified at the boundary.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Linear rejected the API key")]
-    Unauthorized,
-    #[error("Linear returned HTTP {status}: {message}")]
-    Http { status: u16, message: String },
-    #[error("Linear GraphQL error: {}", .0.join("; "))]
-    GraphQl(Vec<String>),
-    #[error("network error: {0}")]
-    Transport(String),
-    #[error("unexpected Linear response: {0}")]
-    Decode(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
 
 /// An authenticated Linear API client. Cheap to clone; share it behind `Arc`.
 #[derive(Clone)]
@@ -485,35 +470,16 @@ impl Linear {
             }))
             .map_err(|error| Error::Transport(error.to_string()))?;
         let status = response.status().as_u16();
-        let body: Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|error| Error::Decode(error.to_string()))?;
-        if let Some(errors) = body["errors"]
-            .as_array()
-            .filter(|errors| !errors.is_empty())
-        {
-            let unauthenticated = errors
-                .iter()
-                .any(|error| error["extensions"]["code"] == "AUTHENTICATION_ERROR");
-            if unauthenticated || status == 401 {
-                return Err(Error::Unauthorized);
-            }
-            let messages = errors
-                .iter()
-                .map(|error| {
-                    error["message"]
-                        .as_str()
-                        .unwrap_or("unknown error")
-                        .to_owned()
-                })
-                .collect();
-            return Err(Error::GraphQl(messages));
+        let body: std::result::Result<Value, _> = response.body_mut().read_json();
+        let errors = body
+            .as_ref()
+            .ok()
+            .and_then(|body| body["errors"].as_array())
+            .map_or(&[][..], Vec::as_slice);
+        if !errors.is_empty() || !(200..300).contains(&status) {
+            return Err(Error::from_response(status, errors));
         }
-        if !(200..300).contains(&status) {
-            let message = body["message"].as_str().unwrap_or_default().to_owned();
-            return Err(Error::Http { status, message });
-        }
+        let body = body.map_err(|error| Error::Decode(error.to_string()))?;
         serde_json::from_value(body["data"].clone())
             .map_err(|error| Error::Decode(error.to_string()))
     }

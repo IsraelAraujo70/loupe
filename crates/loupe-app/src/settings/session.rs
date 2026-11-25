@@ -10,7 +10,7 @@ use loupe_linear::Linear;
 use loupe_t3::T3;
 
 use crate::services::{self, Accounts, Connection, LinearWorkspace, Services};
-use crate::settings::auth::{self, DiscoveredToken, TokenSource};
+use crate::settings::auth::{self, DiscoveredToken, Discovery, TokenSource};
 use crate::store::{self, Secret, Settings};
 
 /// Called once at startup, after the `Settings`, `Services` and `Accounts`
@@ -86,12 +86,12 @@ pub fn discover_github(cx: &mut App) {
 }
 
 /// Applies the discovery result unless the user signed in or out while it ran.
-fn finish_github_discovery(found: Result<Option<DiscoveredToken>, String>, cx: &mut App) {
+fn finish_github_discovery(found: Result<Discovery, String>, cx: &mut App) {
     if !matches!(Accounts::get(cx).github, Connection::Checking) {
         return;
     }
     match found {
-        Ok(Some(DiscoveredToken {
+        Ok(Discovery::Found(DiscoveredToken {
             token,
             source,
             viewer,
@@ -103,9 +103,12 @@ fn finish_github_discovery(found: Result<Option<DiscoveredToken>, String>, cx: &
             );
             connect_github(token, viewer, cx);
         }
-        Ok(None) => {
-            eprintln!("loupe: github not connected");
-            apply(cx, |_, accounts| accounts.github = Connection::Disconnected);
+        Ok(Discovery::NotFound { saved_rejected }) => {
+            eprintln!("loupe: github not connected (saved token rejected: {saved_rejected})");
+            apply(cx, |_, accounts| {
+                accounts.github = Connection::Disconnected;
+                accounts.github_saved_token_rejected = saved_rejected;
+            });
         }
         Err(message) => {
             eprintln!("loupe: github not reachable: {message}");
@@ -141,7 +144,7 @@ fn finish_linear_check(
             }
             Err(error) => {
                 eprintln!("loupe: a linear key did not connect: {error}");
-                keys.failed.push((key, error.to_string()));
+                keys.failed.push((key, error.kind()));
             }
         }
     }
@@ -278,8 +281,8 @@ struct LinearKeys {
     /// The keys Linear accepted, with whose they are, in connection order;
     /// one per workspace.
     connected: Vec<(String, loupe_linear::Viewer)>,
-    /// Stored keys that did not connect, with why (safe to show).
-    failed: Vec<(String, String)>,
+    /// Stored keys that did not connect, with why.
+    failed: Vec<(String, loupe_linear::ErrorKind)>,
     /// `LINEAR_API_KEY`, used while no key is stored and never stored.
     from_env: Option<String>,
 }
@@ -415,15 +418,11 @@ fn set_linear_keys(keys: LinearKeys, cx: &mut App) {
             .map(|index| keys.connected[index].0.clone())
             .filter(|key| !key.is_empty()),
     );
-    let failed: Vec<String> = keys
-        .failed
-        .iter()
-        .map(|(_, message)| message.clone())
-        .collect();
+    let failed: Vec<loupe_linear::ErrorKind> = keys.failed.iter().map(|(_, kind)| *kind).collect();
     let state = match active {
         Some(index) => Connection::Connected(keys.connected[index].1.clone()),
         None => match failed.first() {
-            Some(message) => Connection::Failed(message.clone()),
+            Some(kind) => Connection::Failed(kind.message()),
             None => Connection::Disconnected,
         },
     };
@@ -464,6 +463,7 @@ fn connect_github(token: String, viewer: Viewer, cx: &mut App) {
     apply(cx, |services, accounts| {
         services.github = Some(client);
         accounts.github = Connection::Connected(viewer);
+        accounts.github_saved_token_rejected = false;
     });
 }
 
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn failed_keys_are_kept_and_the_environment_key_is_not() {
         let mut keys = LinearKeys {
-            failed: vec![("lin_down".into(), "Could not reach Linear".into())],
+            failed: vec![("lin_down".into(), loupe_linear::ErrorKind::Offline)],
             from_env: Some("lin_env".into()),
             ..LinearKeys::default()
         };
