@@ -29,7 +29,7 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::diff::{Hunk, anchor_for_range, find_line, git_patch, parse_patch};
-use loupe_github::{ChangedFile, NodeId, PullRequestDetail};
+use loupe_github::{ChangedFile, NodeId, PullRequestDetail, ViewedFailure, ViewedState};
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
 use self::model::{
@@ -102,7 +102,9 @@ pub struct FilesTab {
     diff: Option<Entity<DiffState>>,
     layout: DiffLayout,
     viewed_error: Option<String>,
-    viewed_tasks: HashMap<String, Task<()>>,
+    viewed_pending: HashSet<String>,
+    viewed_tasks: HashMap<usize, Task<()>>,
+    viewed_writes: usize,
     placed: Vec<PlacedThread>,
     threads: HashMap<NodeId, ThreadSlot>,
     threads_dirty: bool,
@@ -136,7 +138,9 @@ impl FilesTab {
             diff: None,
             layout: Settings::get(cx).diff_layout,
             viewed_error: None,
+            viewed_pending: HashSet::new(),
             viewed_tasks: HashMap::new(),
+            viewed_writes: 0,
             placed: Vec::new(),
             threads: HashMap::new(),
             threads_dirty: false,
@@ -548,16 +552,38 @@ impl FilesTab {
     }
 
     /// Marks a file viewed or unviewed at once, collapses or expands it, and
-    /// reverts with an inline error when GitHub refuses. One write per file
-    /// at a time: dropping a task does not stop its request, so a second
-    /// toggle could reach GitHub first and leave it opposite to the screen.
+    /// reverts with an inline error when GitHub refuses.
     fn toggle_viewed(&mut self, path: &str, viewed: bool, cx: &mut Context<Self>) {
-        if self.viewed_tasks.contains_key(path) {
+        self.set_files_viewed(&[path.to_owned()], viewed, cx);
+    }
+
+    /// Marks `paths` viewed or unviewed on screen at once (a folder's files
+    /// go through here together), sends them to GitHub in one task, and reverts the files GitHub refuses with a single
+    /// inline error. Files already in that state, or with a write in flight,
+    /// are skipped: dropping a task does not stop its request, so a second
+    /// write could reach GitHub first and leave it opposite to the screen.
+    fn set_files_viewed(&mut self, paths: &[String], viewed: bool, cx: &mut Context<Self>) {
+        let mut previous: HashMap<String, ViewedState> = HashMap::new();
+        for path in paths {
+            if self.viewed_pending.contains(path) {
+                continue;
+            }
+            let differs = self
+                .files
+                .iter()
+                .any(|file| &file.path == path && is_viewed(file.viewed) != viewed);
+            if differs && let Some(state) = set_viewed(&mut self.files, path, viewed) {
+                previous.insert(path.clone(), state);
+            }
+        }
+        if previous.is_empty() {
             return;
         }
-        let Some(previous) = set_viewed(&mut self.files, path, viewed) else {
-            return;
-        };
+        let batch: Vec<String> = paths
+            .iter()
+            .filter(|path| previous.contains_key(*path))
+            .cloned()
+            .collect();
         // A pre-mutation viewed read must not undo the confirmed mutation.
         self._load = None;
         self.load.finish(Ok(()));
@@ -575,54 +601,75 @@ impl FilesTab {
             crate::cache::invalidate_reads(key);
         }
         self.viewed_error = None;
-        self.set_collapsed(path, viewed, cx);
+        for path in &batch {
+            self.set_collapsed(path, viewed, cx);
+        }
+        self.viewed_pending.extend(batch.iter().cloned());
+        let write = self.viewed_writes;
+        self.viewed_writes += 1;
         let pull_request_id = self.context.detail.id.clone();
         let expected_head = self.context.detail.head_oid.clone();
         let expected_base = self.context.detail.base_oid.clone();
-        let request_path = path.to_owned();
-        let owned_path = path.to_owned();
+        let request_paths = batch.clone();
         let task = common::run(
             cx,
-            move |gh| gh.set_file_viewed(&pull_request_id, &request_path, viewed),
+            move |gh| Ok(gh.set_files_viewed(&pull_request_id, &request_paths, viewed)),
             move |this, result, cx| {
-                this.viewed_tasks.remove(&owned_path);
+                this.viewed_tasks.remove(&write);
+                for path in &batch {
+                    this.viewed_pending.remove(path);
+                }
                 if this.context.detail.head_oid != expected_head
                     || this.context.detail.base_oid != expected_base
                 {
                     return;
                 }
-                let confirmed = result.is_ok();
-                if let Err(error) = result {
-                    restore_viewed(&mut this.files, &owned_path, previous);
-                    this.set_collapsed(&owned_path, is_viewed(previous), cx);
-                    this.viewed_error = Some(format!(
-                        "Could not update the viewed mark of {owned_path}: {}",
-                        error.detail()
-                    ));
+                let failures = result.unwrap_or_else(|error| {
+                    let message = error.detail();
+                    batch
+                        .iter()
+                        .map(|path| ViewedFailure {
+                            path: path.clone(),
+                            message: message.clone(),
+                        })
+                        .collect()
+                });
+                for failure in &failures {
+                    if let Some(state) = previous.get(&failure.path) {
+                        restore_viewed(&mut this.files, &failure.path, *state);
+                        this.set_collapsed(&failure.path, is_viewed(*state), cx);
+                    }
                 }
-                if confirmed && let Some(key) = &cache_key {
+                if let Some(first) = failures.first() {
+                    this.viewed_error = Some(if failures.len() == 1 {
+                        format!(
+                            "Could not update the viewed mark of {}: {}",
+                            first.path, first.message
+                        )
+                    } else {
+                        format!(
+                            "Could not update the viewed mark of {} of {} files: {}",
+                            failures.len(),
+                            batch.len(),
+                            first.message
+                        )
+                    });
+                }
+                if let Some(key) = &cache_key {
+                    let failed: HashSet<&str> = failures
+                        .iter()
+                        .map(|failure| failure.path.as_str())
+                        .collect();
                     crate::cache::update::<Vec<ChangedFile>>(key, |files| {
-                        set_viewed(files, &owned_path, viewed);
+                        for path in batch.iter().filter(|path| !failed.contains(path.as_str())) {
+                            set_viewed(files, path, viewed);
+                        }
                     });
                 }
             },
         );
-        self.viewed_tasks.insert(path.to_owned(), task);
+        self.viewed_tasks.insert(write, task);
         cx.notify();
-    }
-
-    /// Marks every file under a folder viewed or unviewed, one write per file
-    /// that is not in that state yet.
-    fn set_folder_viewed(&mut self, paths: &[String], viewed: bool, cx: &mut Context<Self>) {
-        for path in paths {
-            let current = self
-                .files
-                .iter()
-                .any(|file| &file.path == path && is_viewed(file.viewed));
-            if current != viewed {
-                self.toggle_viewed(path, viewed, cx);
-            }
-        }
     }
 
     fn toggle_folder(&mut self, path: &str, cx: &mut Context<Self>) {
@@ -899,7 +946,7 @@ impl FilesTab {
                     .iter()
                     .map(|&ix| self.files[ix].path.clone())
                     .collect();
-                self.set_folder_viewed(&paths, mark != ViewedMark::All, cx);
+                self.set_files_viewed(&paths, mark != ViewedMark::All, cx);
             }
         }
     }

@@ -98,6 +98,29 @@ impl GitHub {
 
     /// Runs one GraphQL document and decodes `data` into `T`.
     pub(crate) fn graphql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
+        let body = self.graphql_body(query, variables)?;
+        if let Some(errors) = body["errors"]
+            .as_array()
+            .filter(|errors| !errors.is_empty())
+        {
+            let messages = errors
+                .iter()
+                .map(|error| {
+                    error["message"]
+                        .as_str()
+                        .unwrap_or("unknown error")
+                        .to_owned()
+                })
+                .collect();
+            return Err(Error::GraphQl(messages));
+        }
+        serde_json::from_value(body["data"].clone())
+            .map_err(|error| Error::Decode(error.to_string()))
+    }
+
+    /// Sends one GraphQL document and returns the whole response body,
+    /// `errors` included, for callers that read errors per field.
+    pub(crate) fn graphql_body(&self, query: &str, variables: Value) -> Result<Value> {
         if std::env::var_os("LOUPE_OFFLINE").is_some() {
             return Err(Error::Transport("Offline mode".into()));
         }
@@ -132,24 +155,7 @@ impl GitHub {
                 .unwrap_or_default();
             return Err(Error::Http { status, message });
         }
-        let body = parsed.map_err(|error| Error::Decode(error.to_string()))?;
-        if let Some(errors) = body["errors"]
-            .as_array()
-            .filter(|errors| !errors.is_empty())
-        {
-            let messages = errors
-                .iter()
-                .map(|error| {
-                    error["message"]
-                        .as_str()
-                        .unwrap_or("unknown error")
-                        .to_owned()
-                })
-                .collect();
-            return Err(Error::GraphQl(messages));
-        }
-        serde_json::from_value(body["data"].clone())
-            .map_err(|error| Error::Decode(error.to_string()))
+        parsed.map_err(|error| Error::Decode(error.to_string()))
     }
 }
 

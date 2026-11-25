@@ -111,6 +111,71 @@ pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("remove_labels", REMOVE_LABELS),
 ];
 
+/// Files per `set_files_viewed` request: each is a separate write to GitHub,
+/// so a bigger document would only move the secondary rate limit closer.
+const VIEWED_BATCH: usize = 50;
+
+/// A file whose viewed mark GitHub did not accept, with GitHub's reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewedFailure {
+    pub path: String,
+    pub message: String,
+}
+
+/// One mutation for `count` files, aliased `m0`, `m1`, … with the paths as
+/// variables `p0`, `p1`, …, never spliced in.
+pub(crate) fn viewed_batch_document(count: usize, viewed: bool) -> String {
+    let (name, field) = if viewed {
+        ("MarkFilesViewed", "markFileAsViewed")
+    } else {
+        ("UnmarkFilesViewed", "unmarkFileAsViewed")
+    };
+    let variables: String = (0..count).map(|at| format!(", $p{at}: String!")).collect();
+    let fields: String = (0..count)
+        .map(|at| {
+            format!(
+                "  m{at}: {field}(input: {{pullRequestId: $pullRequestId, path: $p{at}}}) \
+                 {{ clientMutationId }}\n"
+            )
+        })
+        .collect();
+    format!("mutation {name}($pullRequestId: ID!{variables}) {{\n{fields}}}")
+}
+
+/// The files of `paths` whose alias carries an error in `body`. GitHub answers
+/// each alias on its own (`data.m3` is null and `errors` names `m3` in its
+/// `path`); an error that names no alias fails the whole request.
+fn viewed_failures(body: &Value, paths: &[String]) -> Vec<ViewedFailure> {
+    let Some(errors) = body["errors"].as_array() else {
+        return Vec::new();
+    };
+    let mut failures: Vec<ViewedFailure> = Vec::new();
+    for error in errors {
+        let message = error["message"].as_str().unwrap_or("unknown error");
+        let alias = error["path"][0]
+            .as_str()
+            .and_then(|alias| alias.strip_prefix('m'))
+            .and_then(|at| at.parse::<usize>().ok())
+            .filter(|at| *at < paths.len());
+        let Some(at) = alias else {
+            return paths
+                .iter()
+                .map(|path| ViewedFailure {
+                    path: path.clone(),
+                    message: message.to_owned(),
+                })
+                .collect();
+        };
+        if failures.iter().all(|failure| failure.path != paths[at]) {
+            failures.push(ViewedFailure {
+                path: paths[at].clone(),
+                message: message.to_owned(),
+            });
+        }
+    }
+    failures
+}
+
 fn side_name(side: Side) -> &'static str {
     match side {
         Side::Left => "LEFT",
@@ -250,6 +315,41 @@ impl GitHub {
         )
     }
 
+    /// Marks `paths` viewed or unviewed, up to 50 files per request, one
+    /// request after the other. Returns the files GitHub did not accept; a
+    /// request that fails as a whole (network, rate limit) fails its files
+    /// and the ones after it, which are not sent.
+    pub fn set_files_viewed(
+        &self,
+        pull_request_id: &str,
+        paths: &[String],
+        viewed: bool,
+    ) -> Vec<ViewedFailure> {
+        let mut failures = Vec::new();
+        for (batch, chunk) in paths.chunks(VIEWED_BATCH).enumerate() {
+            let mut variables = serde_json::Map::new();
+            variables.insert("pullRequestId".into(), json!(pull_request_id));
+            for (at, path) in chunk.iter().enumerate() {
+                variables.insert(format!("p{at}"), json!(path));
+            }
+            let document = viewed_batch_document(chunk.len(), viewed);
+            match self.graphql_body(&document, Value::Object(variables)) {
+                Ok(body) => failures.extend(viewed_failures(&body, chunk)),
+                Err(error) => {
+                    let message = error.to_string();
+                    failures.extend(paths[batch * VIEWED_BATCH..].iter().map(|path| {
+                        ViewedFailure {
+                            path: path.clone(),
+                            message: message.clone(),
+                        }
+                    }));
+                    break;
+                }
+            }
+        }
+        failures
+    }
+
     pub fn mark_ready_for_review(&self, pull_request_id: &str) -> Result<()> {
         self.mutate(MARK_READY, json!({ "pullRequestId": pull_request_id }))
     }
@@ -326,7 +426,10 @@ impl GitHub {
 mod tests {
     use serde_json::json;
 
-    use super::{review_event_name, review_thread_variables, side_name};
+    use super::{
+        ViewedFailure, review_event_name, review_thread_variables, side_name,
+        viewed_batch_document, viewed_failures,
+    };
     use crate::{LineAnchor, NewThread, ReviewEvent, Side};
 
     fn thread(anchor: LineAnchor) -> NewThread {
@@ -384,5 +487,63 @@ mod tests {
         assert_eq!(variables["side"], "RIGHT");
         assert_eq!(variables["startLine"], 4);
         assert_eq!(variables["startSide"], "LEFT");
+    }
+
+    fn paths(count: usize) -> Vec<String> {
+        (0..count).map(|at| format!("src/f{at}.rs")).collect()
+    }
+
+    #[test]
+    fn viewed_batch_is_one_document_with_a_field_per_file() {
+        let document = viewed_batch_document(3, true);
+        assert!(document.starts_with(
+            "mutation MarkFilesViewed($pullRequestId: ID!, $p0: String!, $p1: String!, $p2: String!)"
+        ));
+        assert_eq!(document.matches("markFileAsViewed(").count(), 3);
+        assert!(
+            document.contains(
+                "m2: markFileAsViewed(input: {pullRequestId: $pullRequestId, path: $p2})"
+            )
+        );
+        assert_eq!(document.matches("mutation ").count(), 1);
+        let undo = viewed_batch_document(2, false);
+        assert!(undo.starts_with("mutation UnmarkFilesViewed("));
+        assert_eq!(undo.matches("unmarkFileAsViewed(").count(), 2);
+    }
+
+    #[test]
+    fn a_clean_response_has_no_failures() {
+        let body = json!({ "data": { "m0": {}, "m1": {} } });
+        assert!(viewed_failures(&body, &paths(2)).is_empty());
+    }
+
+    #[test]
+    fn an_error_names_the_file_of_its_alias() {
+        let body = json!({
+            "data": { "m0": {}, "m1": null, "m2": {} },
+            "errors": [
+                { "message": "no such file", "path": ["m1"] },
+                { "message": "again", "path": ["m1", "clientMutationId"] },
+            ],
+        });
+        assert_eq!(
+            viewed_failures(&body, &paths(3)),
+            vec![ViewedFailure {
+                path: "src/f1.rs".into(),
+                message: "no such file".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_error_without_an_alias_fails_every_file() {
+        let body = json!({ "errors": [{ "message": "rate limited" }] });
+        let failures = viewed_failures(&body, &paths(2));
+        assert_eq!(failures.len(), 2);
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.message == "rate limited")
+        );
     }
 }

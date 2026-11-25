@@ -30,7 +30,16 @@ pub(crate) fn documents() -> Vec<(&'static str, &'static str)> {
         "changes_since",
         Box::leak(changes::changes_document(2).into_boxed_str()),
     ));
+    all.push((
+        "mark_files_viewed",
+        Box::leak(mutations::viewed_batch_document(2, true).into_boxed_str()),
+    ));
+    all.push((
+        "unmark_files_viewed",
+        Box::leak(mutations::viewed_batch_document(2, false).into_boxed_str()),
+    ));
     all
 }
 
 pub use changes::{Changes, ChangesQuery, PrStamp};
+pub use mutations::ViewedFailure;

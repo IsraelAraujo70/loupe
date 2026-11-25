@@ -23,7 +23,7 @@ mod workflow_file;
 
 pub use client::{GitHub, Viewer};
 pub use error::{Error, Result};
-pub use gql::{Changes, ChangesQuery, PrStamp};
+pub use gql::{Changes, ChangesQuery, PrStamp, ViewedFailure};
 pub use ids::{PrRef, RepoRef};
 pub use merge::{MergeOutcome, MergeResult};
 pub use rate::{RateLimit, RateLimits};
