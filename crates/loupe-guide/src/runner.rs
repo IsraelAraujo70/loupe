@@ -33,8 +33,8 @@ use crate::claude::{
 use crate::language::GuideLanguage;
 use crate::private_dir::PrivateDir;
 use crate::prompt::{
-    ChangeMap, ChangedFolder, GuidePromptInput, MUST_COVER_PERCENT, PromptFile, SYSTEM_PROMPT,
-    build_repair_prompt, build_user_prompt, truncate_utf8,
+    ChangeMap, ChangedFolder, CopyEvidence, GuidePromptInput, MUST_COVER_PERCENT, PromptFile,
+    SYSTEM_PROMPT, build_repair_prompt, build_user_prompt, copy_evidence, truncate_utf8,
 };
 use crate::schema::{
     DiffSnippet, GuideStep, GuideValidationError, ReviewGuide, SnippetSide, StepKind,
@@ -288,14 +288,21 @@ pub fn sort_by_changed_lines(paths: &mut [String], files: &[PromptFile]) {
 /// What Loupe's own check found wrong in a guide the agent returned.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct GuideCheck {
-    /// Step index, snippet index, and why, for each snippet that is not in
-    /// the pull request's diff.
-    invented: Vec<(usize, usize, String)>,
-    /// Indices of steps that explain a part of the change without citing
-    /// a single line of it (the overview and the mechanical step need none).
+    /// Step index, snippet index, and why, for each snippet that is not a
+    /// real excerpt of the diff or shows only imports and module lines.
+    rejected: Vec<(usize, usize, String)>,
+    /// Indices of steps that explain a part of the change without a single
+    /// accepted snippet (the overview and the mechanical step need none).
     uncited: Vec<usize>,
+    /// Decisions whose snippet link is missing or points at a rejected snippet.
+    unlinked: Vec<String>,
+    /// Bullets of the mechanical step Loupe does not accept, and why.
+    bad_bullets: Vec<(String, String)>,
+    /// Bullets of the mechanical step Loupe accepts: the line, its folder,
+    /// and the comparison that confirms the folder is a copy.
+    mechanical: Vec<(String, String, CopyEvidence)>,
     /// Folders over [`MUST_COVER_PERCENT`] of the changed lines that no step
-    /// explains, largest first.
+    /// cites a snippet from and no accepted bullet lists, largest first.
     unexplained: Vec<ChangedFolder>,
 }
 
@@ -305,12 +312,16 @@ impl GuideCheck {
     }
 
     fn problem_count(&self) -> usize {
-        self.invented.len() + self.uncited.len() + self.unexplained.len()
+        self.rejected.len()
+            + self.uncited.len()
+            + self.unlinked.len()
+            + self.bad_bullets.len()
+            + self.unexplained.len()
     }
 
     /// One line per problem, for the repair prompt.
     fn findings(&self, guide: &ReviewGuide, map: &ChangeMap) -> Vec<String> {
-        let snippets = self.invented.iter().map(|(step_ix, snip_ix, why)| {
+        let snippets = self.rejected.iter().map(|(step_ix, snip_ix, why)| {
             let step = &guide.steps[*step_ix];
             let snippet = &step.snippets[*snip_ix];
             format!(
@@ -320,27 +331,42 @@ impl GuideCheck {
         });
         let uncited = self.uncited.iter().map(|step_ix| {
             format!(
-                "Step `{}` cites no snippet: add the lines of the diff that best show what it explains.",
+                "Step `{}` cites no snippet: add the lines of the diff that carry what it explains, from the folders it explains.",
                 guide.steps[*step_ix].id
             )
         });
+        let unlinked = self.unlinked.iter().map(|id| {
+            format!(
+                "Decision `{id}` links no accepted snippet: set `snippet_index` to the snippet that shows it."
+            )
+        });
+        let bullets = self
+            .bad_bullets
+            .iter()
+            .map(|(line, why)| format!("Mechanical bullet \"{}\": {why}", line.trim()));
         let folders = self.unexplained.iter().map(|folder| {
             let share = folder.per_mille(map.total_lines);
             format!(
-                "Folder `{}` ({}.{}% of the changed lines, {} files) is not explained by any step and is not a bullet of the `mechanical` step.",
+                "Folder `{}` ({}.{}% of the changed lines, {} files) is not explained: no step cites a snippet from it and it is not an accepted bullet of the `mechanical` step.",
                 folder.label(),
                 share / 10,
                 share % 10,
                 folder.files.len()
             )
         });
-        snippets.chain(uncited).chain(folders).collect()
+        snippets
+            .chain(uncited)
+            .chain(unlinked)
+            .chain(bullets)
+            .chain(folders)
+            .collect()
     }
 }
 
 /// Checks every snippet of `guide` against the pull request's diff and the
-/// checkout at its head, then which large folders of `map` no step explains
-/// once the invented snippets are set aside.
+/// checkout at its head, every decision's snippet link, every bullet of the
+/// mechanical step against a comparison with the folder's origin, and which
+/// large folders of `map` are left unexplained.
 fn check_guide(
     guide: &ReviewGuide,
     files: &[PromptFile],
@@ -351,39 +377,224 @@ fn check_guide(
         .iter()
         .map(|file| (file.path.as_str(), file))
         .collect();
-    let mut invented = Vec::new();
-    let mut uncited = Vec::new();
-    let mut cited: HashSet<&str> = HashSet::new();
+    let folder_of: HashMap<&str, usize> = map
+        .folders
+        .iter()
+        .enumerate()
+        .flat_map(|(ix, folder)| folder.files.iter().map(move |file| (file.as_str(), ix)))
+        .collect();
+    let mut check = GuideCheck::default();
+    // Folders each step cites an accepted snippet from.
+    let mut cited_by: Vec<HashSet<usize>> = vec![HashSet::new(); guide.steps.len()];
     for (step_ix, step) in guide.steps.iter().enumerate() {
-        let mut real = 0;
         for (snip_ix, snippet) in step.snippets.iter().enumerate() {
-            match snippet_problem(snippet, &by_path, checkout) {
-                Some(why) => invented.push((step_ix, snip_ix, why)),
+            let problem = snippet_problem(snippet, &by_path, checkout).or_else(|| {
+                only_declarations(&snippet.diff).then(|| {
+                    "it shows only imports or module declarations; cite the lines that carry the behavior".to_owned()
+                })
+            });
+            match problem {
+                Some(why) => check.rejected.push((step_ix, snip_ix, why)),
                 None => {
-                    real += 1;
-                    cited.insert(snippet.path.as_str());
+                    if let Some(&folder) = folder_of.get(snippet.path.as_str()) {
+                        cited_by[step_ix].insert(folder);
+                    }
                 }
             }
         }
-        let needs_snippet = step.kind != StepKind::Overview && step.id != MECHANICAL_STEP_ID;
-        if real == 0 && step.snippets.is_empty() && needs_snippet {
-            uncited.push(step_ix);
+        let accepted = step.snippets.len()
+            - check
+                .rejected
+                .iter()
+                .filter(|(ix, _, _)| *ix == step_ix)
+                .count();
+        if accepted == 0 && step.kind != StepKind::Overview && step.id != MECHANICAL_STEP_ID {
+            check.uncited.push(step_ix);
+        }
+    }
+    for decision in &guide.decisions {
+        let step_ix = guide.steps.iter().position(|s| s.id == decision.step_id);
+        let linked = match (step_ix, decision.snippet_index) {
+            (Some(step_ix), Some(snip_ix)) => !check
+                .rejected
+                .iter()
+                .any(|(s, i, _)| *s == step_ix && *i == snip_ix),
+            _ => false,
+        };
+        if !linked {
+            check.unlinked.push(decision.id.clone());
+        }
+    }
+
+    let mut covered: HashSet<usize> = HashSet::new();
+    for (step_ix, step) in guide.steps.iter().enumerate() {
+        if step.id != MECHANICAL_STEP_ID {
+            covered.extend(cited_by[step_ix].iter().copied());
         }
     }
     for removed in &guide.removed_tests {
-        cited.insert(removed.path.as_str());
+        if let Some(&folder) = folder_of.get(removed.path.as_str()) {
+            covered.insert(folder);
+        }
     }
-    let unexplained = map
+
+    if let Some(step) = guide.steps.iter().find(|s| s.id == MECHANICAL_STEP_ID) {
+        let mut listed: HashSet<usize> = HashSet::new();
+        for line in step
+            .explanation
+            .lines()
+            .filter(|l| bullet_body(l).is_some())
+        {
+            match review_bullet(line, guide, map, &covered, &listed, checkout) {
+                Ok((folder_ix, evidence)) => {
+                    listed.insert(folder_ix);
+                    let path = map.folders[folder_ix].path.clone();
+                    check.mechanical.push((line.to_owned(), path, evidence));
+                }
+                Err(why) => check.bad_bullets.push((line.to_owned(), why)),
+            }
+        }
+        covered.extend(listed);
+    }
+
+    check.unexplained = map
         .folders
         .iter()
-        .filter(|folder| map.must_cover(folder) && !is_explained(folder, guide, &cited))
-        .cloned()
+        .enumerate()
+        .filter(|(ix, folder)| map.must_cover(folder) && !covered.contains(ix))
+        .map(|(_, folder)| folder.clone())
         .collect();
-    GuideCheck {
-        invented,
-        uncited,
-        unexplained,
+    check
+}
+
+/// The text of a Markdown bullet line, without its marker.
+fn bullet_body(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    line.strip_prefix("- ").or_else(|| line.strip_prefix("* "))
+}
+
+/// Accepts one bullet of the mechanical step when it names exactly one
+/// changed folder first, in backticks, that Loupe confirms is a copy of its
+/// origin, that no other step explains or names, and that no earlier bullet
+/// listed. Returns the folder's index in `map` and the comparison.
+fn review_bullet(
+    line: &str,
+    guide: &ReviewGuide,
+    map: &ChangeMap,
+    covered: &HashSet<usize>,
+    listed: &HashSet<usize>,
+    checkout: &Path,
+) -> Result<(usize, CopyEvidence), String> {
+    let body = bullet_body(line).unwrap_or(line);
+    let subject = body
+        .strip_prefix('`')
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(path, _)| path.trim_end_matches('/'))
+        .ok_or("it must start with one folder path in backticks")?;
+    let folder_ix = map
+        .folders
+        .iter()
+        .position(|f| !f.path.is_empty() && f.path == subject)
+        .ok_or_else(|| format!("`{subject}` is not a folder of the change map"))?;
+    if listed.contains(&folder_ix) {
+        return Err(format!("`{subject}` already has a bullet"));
     }
+    let folder = &map.folders[folder_ix];
+    let evidence = copy_evidence(folder, checkout);
+    let origin = evidence.as_ref().map(|e| e.origin.as_str());
+    let others: Vec<&str> = map
+        .folders
+        .iter()
+        .map(|f| f.path.as_str())
+        .filter(|path| {
+            !path.is_empty() && *path != subject && Some(*path) != origin && mentions(body, path)
+        })
+        .collect();
+    if !others.is_empty() {
+        return Err(format!(
+            "it names several changed folders ({}); give each folder its own bullet",
+            others.join(", ")
+        ));
+    }
+    let Some(evidence) = evidence.filter(CopyEvidence::is_copy) else {
+        let why = match copy_evidence(folder, checkout) {
+            Some(e) => format!(
+                "Loupe compared `{subject}` with `{}`: {} of {} files have a counterpart and {}% of their lines are identical, too different to call mechanical; explain it in a step with a snippet from it",
+                e.origin,
+                e.matched_files,
+                e.files,
+                e.identical_percent()
+            ),
+            None => format!(
+                "Loupe found no folder that `{subject}` copies, so it cannot be called mechanical; explain it in a step with a snippet from it"
+            ),
+        };
+        return Err(why);
+    };
+    if covered.contains(&folder_ix) {
+        return Err(format!(
+            "another step cites a snippet from `{subject}`; keep the folder in one place"
+        ));
+    }
+    if let Some(step) = guide.steps.iter().find(|step| {
+        step.id != MECHANICAL_STEP_ID
+            && (mentions(&step.title, subject) || mentions(&step.explanation, subject))
+    }) {
+        return Err(format!(
+            "step `{}` also explains `{subject}`; keep the folder in one place",
+            step.id
+        ));
+    }
+    Ok((folder_ix, evidence))
+}
+
+/// Whether every line of a snippet is an import, a module declaration, a
+/// re-export, or punctuation: lines that show where code lives, not what it
+/// does.
+fn only_declarations(diff: &str) -> bool {
+    const DECLARATIONS: [&str; 14] = [
+        "use ",
+        "pub use ",
+        "pub(crate) use ",
+        "mod ",
+        "pub mod ",
+        "pub(crate) mod ",
+        "extern crate ",
+        "import ",
+        "from ",
+        "export * from ",
+        "export {",
+        "#include ",
+        "package ",
+        "require(",
+    ];
+    let mut open_braces = false;
+    let mut code_lines = 0;
+    for raw in diff.lines().filter(|l| !l.starts_with("@@")) {
+        let code = match raw.chars().next() {
+            Some('+' | '-' | ' ') => raw[1..].trim(),
+            _ => raw.trim(),
+        };
+        if code.is_empty() {
+            continue;
+        }
+        code_lines += 1;
+        if open_braces {
+            open_braces = !code.contains('}');
+            continue;
+        }
+        if DECLARATIONS.iter().any(|d| code.starts_with(d)) {
+            open_braces = code.ends_with('{');
+            continue;
+        }
+        if !code
+            .chars()
+            .all(|c| matches!(c, '{' | '}' | '(' | ')' | ';' | ','))
+        {
+            return false;
+        }
+    }
+    code_lines > 0
 }
 
 /// Why `snippet` is not a real excerpt of the pull request, if it is not:
@@ -494,29 +705,6 @@ impl<'a> PatchLines<'a> {
     }
 }
 
-/// Whether a step cites one of `folder`'s files or names the folder (for the
-/// repository root, one of its files) in its title or explanation.
-fn is_explained(folder: &ChangedFolder, guide: &ReviewGuide, cited: &HashSet<&str>) -> bool {
-    if folder
-        .files
-        .iter()
-        .any(|file| cited.contains(file.as_str()))
-    {
-        return true;
-    }
-    let names = |text: &str| {
-        if folder.path.is_empty() {
-            folder.files.iter().any(|file| mentions(text, file))
-        } else {
-            mentions(text, &folder.path)
-        }
-    };
-    guide
-        .steps
-        .iter()
-        .any(|step| names(&step.title) || names(&step.explanation))
-}
-
 /// Whether `text` names `path` as a whole path: `crates/ai` is named by
 /// "`crates/ai`" and "crates/ai/src", not by "crates/ai2".
 fn mentions(text: &str, path: &str) -> bool {
@@ -529,22 +717,24 @@ fn mentions(text: &str, path: &str) -> bool {
     })
 }
 
-/// The guide the reviewer gets: invented snippets removed (a decision that
-/// pointed at one keeps its step but loses the snippet link), and the large
-/// folders no step explains listed in a last step that says so.
+/// The guide the reviewer gets: rejected snippets removed (a decision that
+/// pointed at one keeps its step but loses the snippet link), the mechanical
+/// step reduced to the bullets Loupe confirmed, each with its comparison,
+/// and the large folders nothing explains listed in a last step that says so.
 fn settle(
     mut guide: ReviewGuide,
     check: &GuideCheck,
     map: &ChangeMap,
     language: &GuideLanguage,
 ) -> ReviewGuide {
-    let mut invented: Vec<(usize, usize)> = check
-        .invented
+    let portuguese = *language == GuideLanguage::portuguese_brazil();
+    let mut rejected: Vec<(usize, usize)> = check
+        .rejected
         .iter()
         .map(|(step_ix, snip_ix, _)| (*step_ix, *snip_ix))
         .collect();
-    invented.sort_unstable_by(|a, b| b.cmp(a));
-    for (step_ix, snip_ix) in invented {
+    rejected.sort_unstable_by(|a, b| b.cmp(a));
+    for (step_ix, snip_ix) in rejected {
         let step = &mut guide.steps[step_ix];
         step.snippets.remove(snip_ix);
         let step_id = step.id.clone();
@@ -556,6 +746,58 @@ fn settle(
             };
         }
     }
+
+    if let Some(ix) = guide.steps.iter().position(|s| s.id == MECHANICAL_STEP_ID) {
+        let mut kept: Vec<String> = Vec::new();
+        for line in guide.steps[ix].explanation.lines() {
+            if bullet_body(line).is_none() {
+                kept.push(line.to_owned());
+                continue;
+            }
+            let Some((_, _, evidence)) =
+                check.mechanical.iter().find(|(l, _, _)| l.as_str() == line)
+            else {
+                continue;
+            };
+            let proof = if portuguese {
+                format!(
+                    " O Loupe conferiu: {} de {} arquivos têm par em `{}`, com {}% das linhas idênticas.",
+                    evidence.matched_files,
+                    evidence.files,
+                    evidence.origin,
+                    evidence.identical_percent()
+                )
+            } else {
+                format!(
+                    " Loupe checked: {} of {} files have a counterpart in `{}`, {}% of their lines identical.",
+                    evidence.matched_files,
+                    evidence.files,
+                    evidence.origin,
+                    evidence.identical_percent()
+                )
+            };
+            kept.push(format!("{}{proof}", line.trim_end()));
+        }
+        let explanation = kept.join("\n").trim().to_owned();
+        let referenced = guide
+            .decisions
+            .iter()
+            .any(|d| d.step_id == MECHANICAL_STEP_ID);
+        if check.mechanical.is_empty() && !referenced {
+            guide.steps.remove(ix);
+        } else {
+            guide.steps[ix].explanation = if explanation.is_empty() {
+                if portuguese {
+                    "O Loupe não confirmou nenhuma pasta como cópia.".to_owned()
+                } else {
+                    "Loupe confirmed no folder as a copy.".to_owned()
+                }
+            } else {
+                explanation
+            };
+        }
+    }
+
     if !check.unexplained.is_empty() {
         let step = unexplained_step(&check.unexplained, map.total_lines, language, &guide);
         guide.steps.push(step);
@@ -1211,13 +1453,14 @@ mod check_tests {
 
     /// A repository where `crates/ai2` copies `crates/ai` and
     /// `crates/core/src/auth.rs` gains a real function.
-    fn repo() -> (PathBuf, String) {
+    fn repo(extra: &[(&str, &str)]) -> (PathBuf, String) {
         let src = unique("repo");
-        for (path, text) in [
+        let base = [
             ("crates/ai/src/lib.rs", "pub fn complete() {}\n"),
             ("crates/ai2/src/lib.rs", "pub fn complete() {}\n"),
             ("crates/core/src/auth.rs", AUTH),
-        ] {
+        ];
+        for (path, text) in base.iter().chain(extra) {
             fs::create_dir_all(src.join(path).parent().unwrap()).unwrap();
             fs::write(src.join(path), text).unwrap();
         }
@@ -1374,14 +1617,24 @@ mod check_tests {
     }
 
     fn generate(answers: &[ReviewGuide]) -> (ReviewGuide, Vec<String>) {
-        let (src, sha) = repo();
+        generate_in(&[], files(), answers)
+    }
+
+    fn generate_in(
+        extra: &[(&str, &str)],
+        files: Vec<PromptFile>,
+        answers: &[ReviewGuide],
+    ) -> (ReviewGuide, Vec<String>) {
+        let (src, sha) = repo(extra);
         let dir = unique("stub");
         let exe = stub(&dir, answers);
         let checkout = TempCheckout::from_local_repo(&src, &sha).unwrap();
+        let mut input = input(&sha);
+        input.files = files;
         let generated = run_in_checkout(
             &exe,
             checkout.path(),
-            &input(&sha),
+            &input,
             &ClaudeConfig::default(),
             &CancelToken::new(),
             |_| {},
@@ -1394,6 +1647,121 @@ mod check_tests {
         (generated.guide, prompts)
     }
 
+    /// `guide` as Loupe saves it: the accepted mechanical bullet carries the
+    /// comparison that confirmed it.
+    fn with_proof(mut guide: ReviewGuide) -> ReviewGuide {
+        let step = guide
+            .steps
+            .iter_mut()
+            .find(|s| s.id == "mechanical")
+            .unwrap();
+        step.explanation = "- `crates/ai2`: copy of `crates/ai`. Loupe checked: 1 of 1 files have a counterpart in `crates/ai`, 100% of their lines identical.".into();
+        guide
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_mechanical_step_keeps_only_confirmed_copies_one_folder_per_bullet() {
+        let extra = [
+            ("crates/web/src/lib.rs", "pub fn serve() {}\n"),
+            (
+                "crates/web2/src/lib.rs",
+                "pub fn serve_two() -> u8 {\n    2\n}\n",
+            ),
+            ("crates/db/src/lib.rs", "pub fn open() {}\n"),
+            ("crates/db2/src/lib.rs", "pub fn open() {}\n"),
+        ];
+        let added = |path: &str| PromptFile {
+            path: path.into(),
+            status: "added".into(),
+            additions: 300,
+            deletions: 0,
+            patch: None,
+        };
+        let mut files = files();
+        files.push(added("crates/web2/src/lib.rs"));
+        files.push(added("crates/db2/src/lib.rs"));
+        let db = GuideStep {
+            id: "db".into(),
+            kind: StepKind::Subsystem,
+            title: "Database".into(),
+            explanation: "Ports `crates/db2` to the new API.".into(),
+            snippets: vec![snippet(5, 7, REAL)],
+        };
+        let mut mechanical = mechanical();
+        mechanical.explanation = [
+            "Copies of other crates:",
+            "- `crates/ai2`: copy of `crates/ai`.",
+            "- `crates/web2`: copy of `crates/web`.",
+            "- `crates/db2`: copy of `crates/db`.",
+            "- `crates/db2` together with `crates/web2`: copies.",
+            "- `crates/ai2`: listed twice.",
+        ]
+        .join("\n");
+        let mut draft = guide(vec![snippet(5, 7, REAL)], vec![db, mechanical]);
+        draft.decisions[0].snippet_index = Some(0);
+        let (generated, prompts) = generate_in(&extra, files, &[draft]);
+
+        assert_eq!(prompts.len(), 2);
+        let repair = &prompts[1];
+        assert!(repair.contains("- crates/web2: 29.8%, 300 lines in 1 files (1 added), must cover, resembles crates/web: 1 of 1 files have a counterpart there, 0% of their lines identical\n"), "{repair}");
+        for finding in [
+            "Mechanical bullet \"- `crates/web2`: copy of `crates/web`.\": Loupe compared `crates/web2` with `crates/web`: 1 of 1 files have a counterpart and 0% of their lines are identical, too different to call mechanical",
+            "Mechanical bullet \"- `crates/db2`: copy of `crates/db`.\": step `db` also explains `crates/db2`; keep the folder in one place",
+            "Mechanical bullet \"- `crates/db2` together with `crates/web2`: copies.\": it names several changed folders (crates/web2); give each folder its own bullet",
+            "Mechanical bullet \"- `crates/ai2`: listed twice.\": `crates/ai2` already has a bullet",
+            "Folder `crates/db2` (29.8% of the changed lines, 1 files) is not explained",
+            "Folder `crates/web2` (29.8% of the changed lines, 1 files) is not explained",
+        ] {
+            assert!(
+                repair.contains(finding),
+                "missing finding {finding:?} in {repair}"
+            );
+        }
+        assert!(
+            !repair.contains("Folder `crates/ai2`"),
+            "the confirmed copy is covered"
+        );
+
+        let mechanical = generated
+            .steps
+            .iter()
+            .find(|s| s.id == "mechanical")
+            .unwrap();
+        assert_eq!(
+            mechanical.explanation,
+            "Copies of other crates:\n- `crates/ai2`: copy of `crates/ai`. Loupe checked: 1 of 1 files have a counterpart in `crates/ai`, 100% of their lines identical."
+        );
+        let last = generated.steps.last().unwrap();
+        assert_eq!(last.id, "unexplained-folders");
+        assert!(
+            last.explanation.contains("- `crates/db2`: 29.8%"),
+            "a folder named in a step without a snippet from it is not explained"
+        );
+        assert!(last.explanation.contains("- `crates/web2`: 29.8%"));
+        assert!(!last.explanation.contains("crates/ai2"));
+    }
+
+    #[test]
+    fn imports_and_module_lines_alone_are_not_a_snippet() {
+        use super::only_declarations;
+        assert!(only_declarations("+pub use ui::Story;"));
+        assert!(only_declarations(
+            "+mod dispatcher;\n+mod platform;\n+\n+pub use dispatcher::*;"
+        ));
+        assert!(only_declarations(
+            "+use cli::{\n+    IpcSender, CliRequest,\n+};\n+use anyhow::anyhow;"
+        ));
+        assert!(only_declarations("+import { a } from \"b\";"));
+        assert!(!only_declarations(
+            "+use std::env;\n+if let Ok(key) = env::var(\"OPENAI_API_KEY\") {"
+        ));
+        assert!(!only_declarations(
+            "+[dependencies]\n+gpui = { path = \"../gpui\" }"
+        ));
+        assert!(!only_declarations(""));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_draft_that_passes_the_check_is_kept_after_one_run() {
@@ -1401,9 +1769,9 @@ mod check_tests {
         draft.decisions[0].snippet_index = Some(0);
         let (generated, prompts) = generate(std::slice::from_ref(&draft));
         assert_eq!(prompts.len(), 1, "no repair run for a clean draft");
-        assert_eq!(generated, draft);
+        assert_eq!(generated, with_proof(draft));
         assert!(
-            prompts[0].contains("- crates/ai2: 99.0%, 400 lines in 1 files (1 added), must cover, looks like a copy of crates/ai (1 of 1 files have a counterpart there)"),
+            prompts[0].contains("- crates/ai2: 99.0%, 400 lines in 1 files (1 added), must cover, copy of crates/ai: 1 of 1 files have a counterpart there, 100% of their lines identical\n"),
             "the change map names the copy: {}",
             prompts[0]
         );
@@ -1434,13 +1802,16 @@ mod check_tests {
             "Snippet 1 of step `auth` (crates/core/src/auth.rs lines 5-6): `token.len() > 0` is not an added line of the diff"
         ));
         assert!(repair.contains(
-            "Folder `crates/ai2` (99.0% of the changed lines, 1 files) is not explained by any step"
+            "Folder `crates/ai2` (99.0% of the changed lines, 1 files) is not explained: no step cites a snippet from it"
         ));
         assert!(repair.contains(
-            "Step `copy` cites no snippet: add the lines of the diff that best show what it explains."
+            "Step `copy` cites no snippet: add the lines of the diff that carry what it explains"
+        ));
+        assert!(repair.contains(
+            "Decision `empty-tokens` links no accepted snippet: set `snippet_index` to the snippet that shows it."
         ));
         assert!(repair.contains("## First draft"));
-        assert_eq!(generated, fixed);
+        assert_eq!(generated, with_proof(fixed));
     }
 
     #[cfg(unix)]
