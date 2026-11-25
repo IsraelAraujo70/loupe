@@ -9,7 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{CheckRun, PrState, PullRequestDetail};
+use loupe_github::{CheckRun, CheckStatus, PrState, PullRequestDetail};
 
 use super::model::{
     DraftAction, MergeAction, MergeTone, Panel, Progress, approvals, available_actions,
@@ -211,10 +211,16 @@ impl PullRequestView {
         let checks = check_tally(detail);
         let threads = resolved_threads(detail);
         let approved = approvals(detail);
-        let checks_count = if checks.total == 0 {
-            "No checks".to_owned()
-        } else {
-            format!("{} of {} passed", checks.passed, checks.total)
+        let skipped = detail
+            .checks
+            .runs
+            .iter()
+            .filter(|run| matches!(run.status, CheckStatus::Skipped))
+            .count();
+        let checks_count = match (checks.total, skipped) {
+            (0, _) => "No checks".to_owned(),
+            (total, 0) => format!("{} of {total} passed", checks.passed),
+            (_, skipped) => format!("{} passed, {skipped} skipped", checks.passed - skipped),
         };
         let has_runs = !detail.checks.runs.is_empty();
         let checks_open = self
