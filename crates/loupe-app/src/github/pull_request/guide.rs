@@ -1543,8 +1543,12 @@ impl GuideTab {
                         .min_w_0()
                         .when_some(path.rsplit_once('/'), |name, (folder, _)| {
                             name.child(
+                                // Shrinks a thousand times faster than the
+                                // name, so the folder is gone before the
+                                // name loses a character.
                                 div()
                                     .min_w_0()
+                                    .flex_shrink(1000.)
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis_start()
@@ -1554,7 +1558,9 @@ impl GuideTab {
                         })
                         .child(
                             div()
-                                .flex_none()
+                                .debug_selector(|| "guide-uncovered-file-name".into())
+                                .min_w_0()
+                                .truncate()
                                 .child(path.rsplit('/').next().unwrap_or(&path).to_owned()),
                         ),
                 )
@@ -3501,6 +3507,46 @@ mod tests {
 
         click(&mut cx, "guide-uncovered-toggle");
         assert!(cx.debug_bounds("guide-uncovered-folder-web/src").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn a_lone_uncovered_file_with_a_long_name_stays_inside_its_line(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_guide(cx);
+        let long = "db/migrations/20231125093012_add_review_state_columns_to_pull_requests_table_and_backfill_every_row_of_the_table_in_batches.sql";
+        let stored = Box::new(StoredGuide {
+            schema_version: SCHEMA_VERSION,
+            repo: "acme/app".into(),
+            pr_number: 42,
+            head_oid: "abc1234567890".into(),
+            base_oid: "0000000".into(),
+            model: "claude-sonnet-5-5".into(),
+            effort: "medium".into(),
+            generated_at: Utc::now(),
+            changed_files: vec!["src/auth.rs".into(), long.into()],
+            language: loupe_guide::GuideLanguage::portuguese_brazil(),
+            guide: fixture_guide(),
+        });
+        tab.update(&mut cx, |tab, cx| {
+            tab.set_state(
+                GuideViewState::Ready {
+                    stored,
+                    changed_steps: HashMap::new(),
+                },
+                cx,
+            );
+        });
+        paint(&mut cx);
+
+        let line = cx
+            .debug_bounds("guide-uncovered-files")
+            .expect("the summary line is shown");
+        let name = cx
+            .debug_bounds("guide-uncovered-file-name")
+            .expect("the lone file is named on the line");
+        assert!(
+            name.right() <= line.right(),
+            "the file's name is cut to fit instead of running past the line"
+        );
     }
 
     fn record_events(
