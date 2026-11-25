@@ -192,6 +192,6 @@ impl RenderOnce for SectionTabs {
                     })),
             )
             .child(div().flex_1())
-            .children(self.trailing)
+            .child(h_flex().items_center().gap_2().children(self.trailing))
     }
 }
