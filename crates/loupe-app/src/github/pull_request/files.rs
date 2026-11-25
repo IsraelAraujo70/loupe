@@ -3,6 +3,7 @@
 //! annotations.
 
 mod composer;
+mod emphasis;
 mod expand;
 mod header;
 mod model;
@@ -15,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
@@ -24,6 +25,7 @@ use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffDecoration, DiffFile, DiffFileStatus, DiffHoverHighlight,
     DiffLinePosition, DiffLineRange, DiffState,
 };
+use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Search};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
@@ -31,7 +33,7 @@ use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, Theme, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -41,6 +43,7 @@ use loupe_github::{
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
+use self::emphasis::{Emphasis, SharedEmphasis};
 use self::expand::{Direction, Gap, Source};
 use self::model::{
     LoadedFiles, Missing, PlacedThread, Placement, anchor_error_message, build_files, diff_mode,
@@ -176,6 +179,11 @@ pub struct FilesTab {
     /// The lines revealed between hunks, by path.
     expansions: HashMap<String, Expansion>,
     diff: Option<Entity<DiffState>>,
+    /// The changed words the diff marks, read by its highlighter.
+    emphasis: SharedEmphasis,
+    /// The syntax colors the diff's highlighter was made with.
+    syntax_theme: Arc<HighlightTheme>,
+    _theme_changes: Subscription,
     /// Where the diff drew its file headers, to tell the file at its top.
     headers: Rc<RefCell<HeaderWatch>>,
     layout: DiffLayout,
@@ -256,6 +264,9 @@ impl FilesTab {
             patch_errors: HashMap::new(),
             expansions: HashMap::new(),
             diff: None,
+            emphasis: SharedEmphasis::default(),
+            syntax_theme: cx.theme().highlight_theme.clone(),
+            _theme_changes: cx.observe_global::<Theme>(Self::theme_changed),
             headers: Rc::default(),
             layout: Settings::get(cx).diff_layout,
             viewed_error: None,
@@ -469,16 +480,20 @@ impl FilesTab {
         self.hunks = loaded.hunks;
         self.missing = loaded.missing;
         self.expansions.clear();
+        self.refresh_emphasis();
         let mode = diff_mode(self.layout);
         match &self.diff {
             Some(state) => state.update(cx, |state, cx| state.set_files(loaded.docs, cx)),
             None => {
+                let highlighter = self.highlighter(cx);
                 // Every line given is shown: the lines revealed between
                 // hunks are context the component would fold away again.
                 self.diff = Some(cx.new(|cx| {
                     DiffState::new(loaded.docs, cx)
                         .with_mode(mode)
                         .with_context_lines(None)
+                        .with_inline_unit(None)
+                        .with_syntax_highlighter(highlighter)
                 }));
             }
         }
@@ -643,6 +658,7 @@ impl FilesTab {
         {
             self.hunks.insert(file.path.clone(), Arc::new(hunks));
         }
+        self.refresh_emphasis();
         if let (Some(state), Some(doc)) = (&self.diff, doc) {
             state.update(cx, |state, cx| {
                 let docs = state
@@ -663,6 +679,49 @@ impl FilesTab {
         }
         self.threads_dirty = true;
         self.run_find(false, cx);
+    }
+
+    /// Gives the diff's highlighter the hunks the diff is about to show.
+    fn refresh_emphasis(&self) {
+        let shown = Emphasis::new(
+            self.files
+                .iter()
+                .filter_map(|file| self.shown_hunks(&file.path).cloned()),
+        );
+        *self
+            .emphasis
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(shown);
+    }
+
+    /// The diff's highlighter, in the current theme's syntax colors and the
+    /// component's own wash for changed words.
+    fn highlighter(
+        &self,
+        cx: &App,
+    ) -> impl Fn(&str, &str) -> Vec<(Range<usize>, HighlightStyle)> + Send + Sync + 'static {
+        let theme = cx.theme();
+        emphasis::highlighter(
+            self.emphasis.clone(),
+            theme.highlight_theme.clone(),
+            theme.success.opacity(0.3),
+            theme.danger.opacity(0.3),
+        )
+    }
+
+    /// The highlighter keeps the styles it returned, so a new palette needs a
+    /// new one; a change of zoom or font keeps the same syntax colors.
+    fn theme_changed(&mut self, cx: &mut Context<Self>) {
+        if Arc::ptr_eq(&self.syntax_theme, &cx.theme().highlight_theme) {
+            return;
+        }
+        self.syntax_theme = cx.theme().highlight_theme.clone();
+        if let Some(state) = self.diff.clone() {
+            let highlighter = self.highlighter(cx);
+            state.update(cx, |state, cx| {
+                state.set_syntax_highlighter(highlighter, cx)
+            });
+        }
     }
 
     /// The hunks the diff shows for `path`: its patch's, with any lines
@@ -763,6 +822,7 @@ impl FilesTab {
         let (Some(doc), None) = file_doc(&file, git_patch(&file)) else {
             return;
         };
+        self.refresh_emphasis();
         let lead = expand::lead(&shown, lines.start, search::LEAD);
         if let Some(state) = &self.diff {
             let headers = self.headers.clone();
