@@ -23,10 +23,6 @@ pub(crate) fn documents() -> Vec<(&'static str, &'static str)> {
         Box::leak(reads::open_by_base_query(2).into_boxed_str()),
     ));
     all.push((
-        "pull_request_stack_children",
-        Box::leak(stack_graph::stack_children_query(2).into_boxed_str()),
-    ));
-    all.push((
         "changes_since",
         Box::leak(changes::changes_document(2).into_boxed_str()),
     ));
