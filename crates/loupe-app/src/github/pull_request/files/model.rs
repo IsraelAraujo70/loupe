@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui_kit::component::diff::{DiffFile, DiffMode, DiffSide};
-use loupe_github::diff::{AnchorError, Hunk};
+use loupe_github::diff::{AnchorError, Hunk, git_patch};
 use loupe_github::{ChangedFile, FileStatus, LineAnchor, NodeId, ReviewThread, Side, ViewedState};
 
 use crate::github::highlight::language_for_path;
@@ -195,17 +195,35 @@ pub fn anchor_error_message(error: &AnchorError) -> String {
     }
 }
 
-/// A Git patch GitHub has no hunks for (binary or too large), so the viewer
-/// still lists the file in the diff and the tab can annotate it.
-pub fn placeholder_patch(path: &str) -> String {
-    format!("diff --git a/{path} b/{path}\nBinary files a/{path} and b/{path} differ\n")
+/// A Git patch with no hunks for a file GitHub sent no patch for, so the
+/// viewer still lists the file and the tab can annotate it. The line under
+/// the header is what the viewer's notice prints: a file that counts no
+/// changed lines is binary or only renamed, and one whose diff is missing
+/// says so instead of passing for binary.
+pub fn placeholder_patch(file: &ChangedFile, missing: Option<Missing>) -> String {
+    let path = &file.path;
+    match missing {
+        Some(Missing::Omitted) => format!("diff --git a/{path} b/{path}\nDiff not loaded\n"),
+        Some(Missing::Unreadable) => format!("diff --git a/{path} b/{path}\nDiff not shown\n"),
+        None => match file.status {
+            FileStatus::Renamed | FileStatus::Copied => git_patch(&ChangedFile {
+                patch: Some(String::new()),
+                ..file.clone()
+            })
+            .unwrap_or_default(),
+            _ => {
+                format!("diff --git a/{path} b/{path}\nBinary files a/{path} and b/{path} differ\n")
+            }
+        },
+    }
 }
 
 /// Why a file has no diff in the viewer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Missing {
-    /// GitHub sent no patch: a binary file or one too large to diff.
-    NoPatch,
+    /// GitHub left the patch out because the pull request's diff is too
+    /// large, though lines changed: the tab can load it.
+    Omitted,
     /// GitHub sent a patch the viewer could not read.
     Unreadable,
 }
@@ -213,12 +231,28 @@ pub enum Missing {
 impl Missing {
     pub fn note(self) -> &'static str {
         match self {
-            Missing::NoPatch => {
-                "Diff not shown: GitHub has no text diff for this file (binary or too large)."
-            }
+            Missing::Omitted => "GitHub left this diff out because the pull request is too large.",
             Missing::Unreadable => "Diff not shown: the patch could not be read.",
         }
     }
+}
+
+/// The viewer document for `file` from its full Git patch, or a placeholder
+/// and why the diff is missing. A file GitHub sent no patch for is missing
+/// only when it counts changed lines; otherwise there is nothing to show.
+pub fn file_doc(file: &ChangedFile, patch: Option<String>) -> (Option<DiffFile>, Option<Missing>) {
+    let parse = |patch: &str| {
+        DiffFile::parse(patch)
+            .ok()
+            .and_then(|parsed| parsed.into_iter().next())
+    };
+    let missing = match patch.as_deref().map(parse) {
+        Some(Some(doc)) => return (Some(doc.with_language(language_for_path(&file.path))), None),
+        Some(None) => Some(Missing::Unreadable),
+        None if file.additions + file.deletions > 0 => Some(Missing::Omitted),
+        None => None,
+    };
+    (parse(&placeholder_patch(file, missing)), missing)
 }
 
 /// The changed files with everything the tab derives from their patches.
@@ -244,26 +278,17 @@ pub fn build_files(
     let mut hunks = HashMap::new();
     let mut missing = HashMap::new();
     for file in &files {
-        let parsed = match patch_for(file) {
-            None => Err(Missing::NoPatch),
-            Some(patch) => DiffFile::parse(&patch)
-                .ok()
-                .and_then(|parsed| parsed.into_iter().next())
-                .map(|doc| doc.with_language(language_for_path(&file.path)))
-                .ok_or(Missing::Unreadable),
-        };
-        let doc = parsed.or_else(|reason| {
-            missing.insert(file.path.clone(), reason);
-            DiffFile::parse(&placeholder_patch(&file.path))
-                .ok()
-                .and_then(|parsed| parsed.into_iter().next())
-                .ok_or(reason)
-        });
-        docs.extend(doc.ok());
-        if !missing.contains_key(&file.path)
-            && let Some(parsed) = file.patch.as_deref().and_then(&parse_hunks)
-        {
-            hunks.insert(file.path.clone(), Arc::new(parsed));
+        let (doc, reason) = file_doc(file, patch_for(file));
+        docs.extend(doc);
+        match reason {
+            Some(reason) => {
+                missing.insert(file.path.clone(), reason);
+            }
+            None => {
+                if let Some(parsed) = file.patch.as_deref().and_then(&parse_hunks) {
+                    hunks.insert(file.path.clone(), Arc::new(parsed));
+                }
+            }
         }
     }
     LoadedFiles {
@@ -284,7 +309,7 @@ pub fn resolved_summary(thread: &ReviewThread) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Missing, Placement, anchor_error_message, build_files, composer_label, diff_mode,
+        Missing, Placement, anchor_error_message, build_files, composer_label, diff_mode, file_doc,
         is_viewed, outdated_label, place_threads, placeholder_patch, resolved_summary,
         restore_viewed, set_viewed, split_path, status_letter, to_diff_side, to_side,
         viewed_counts,
@@ -494,8 +519,10 @@ mod tests {
             file("a.txt", ViewedState::Unviewed),
             file("logo.png", ViewedState::Unviewed),
             file("broken.txt", ViewedState::Unviewed),
+            file("big.ts", ViewedState::Unviewed),
         ];
         files[0].patch = Some("@@ -1 +1 @@\n-old\n+new\n".into());
+        files[1].additions = 0;
         files[2].patch = Some("not a patch".into());
         let loaded = build_files(
             files,
@@ -507,22 +534,49 @@ mod tests {
             |_| Some(Vec::new()),
         );
         let paths: Vec<&str> = loaded.docs.iter().map(|doc| doc.path().as_str()).collect();
-        assert_eq!(paths, ["a.txt", "logo.png", "broken.txt"]);
-        assert_eq!(loaded.missing.get("logo.png"), Some(&Missing::NoPatch));
+        assert_eq!(paths, ["a.txt", "logo.png", "broken.txt", "big.ts"]);
+        assert_eq!(loaded.missing.get("logo.png"), None);
+        assert!(loaded.docs[1].is_binary());
         assert_eq!(loaded.missing.get("broken.txt"), Some(&Missing::Unreadable));
+        assert_eq!(loaded.missing.get("big.ts"), Some(&Missing::Omitted));
+        assert!(!loaded.docs[3].is_binary());
         assert!(!loaded.missing.contains_key("a.txt"));
         assert!(loaded.hunks.contains_key("a.txt"));
         assert!(!loaded.hunks.contains_key("broken.txt"));
     }
 
     #[test]
-    fn placeholder_patch_parses_as_one_binary_file_at_the_path() {
+    fn placeholder_patch_parses_as_one_file_at_the_path() {
         for path in ["logo.png", "assets/dir with space/logo.png"] {
-            let parsed = DiffFile::parse(&placeholder_patch(path));
+            let mut changed = file(path, ViewedState::Unviewed);
+            changed.additions = 0;
+            let parsed = DiffFile::parse(&placeholder_patch(&changed, None));
             let files = parsed.expect("placeholder patch parses");
             assert_eq!(files.len(), 1, "{path}");
             assert_eq!(files[0].path().as_str(), path);
             assert!(files[0].is_binary());
+
+            let parsed = DiffFile::parse(&placeholder_patch(&changed, Some(Missing::Omitted)));
+            let files = parsed.expect("placeholder patch parses");
+            assert_eq!(files[0].path().as_str(), path);
+            assert!(!files[0].is_binary());
+            assert_eq!(files[0].extended_headers(), ["Diff not loaded"]);
         }
+    }
+
+    #[test]
+    fn a_pure_rename_without_a_patch_is_not_called_binary() {
+        let mut renamed = file("src/new.rs", ViewedState::Unviewed);
+        renamed.status = FileStatus::Renamed;
+        renamed.previous_path = Some("src/old.rs".into());
+        renamed.additions = 0;
+        let (doc, missing) = file_doc(&renamed, None);
+        let doc = doc.expect("placeholder parses");
+        assert_eq!(missing, None);
+        assert!(!doc.is_binary());
+        assert_eq!(
+            doc.original_path().map(|path| path.as_str()),
+            Some("src/old.rs")
+        );
     }
 }

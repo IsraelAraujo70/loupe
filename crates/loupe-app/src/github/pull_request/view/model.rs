@@ -744,6 +744,7 @@ pub(super) mod tests {
         CheckRun {
             name: "ci".into(),
             workflow: None,
+            description: None,
             status,
             started_at: None,
             completed_at: None,

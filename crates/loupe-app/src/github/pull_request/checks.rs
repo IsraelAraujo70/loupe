@@ -8,6 +8,7 @@ use chrono::{DateTime, Local};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -508,6 +509,10 @@ impl ChecksTab {
         let log_open = job.is_some_and(|job| self.logs.contains_key(&job.job_id));
         let route = check_route(&self.context.pr.repo, &self.context.detail.head_ref, run);
         ui::list_row(("check", ix), cx)
+            .when_some(run.description.clone(), |row, description| {
+                row.role(Role::ListItem)
+                    .aria_label(format!("{}: {description}", run.name))
+            })
             .when_some(route.clone(), |row, route| {
                 row.role(Role::Button)
                     .aria_label(format!("{}, open its run", run.name))
@@ -520,7 +525,13 @@ impl ChecksTab {
                     .min_w_0()
                     .gap_2()
                     .items_center()
-                    .child(div().min_w_0().truncate().child(run.name.clone()))
+                    .child(
+                        div()
+                            .flex_shrink(0.1)
+                            .min_w_0()
+                            .truncate()
+                            .child(run.name.clone()),
+                    )
                     .when_some(run.workflow.clone(), |row, workflow| {
                         row.child(
                             div()
@@ -528,6 +539,21 @@ impl ChecksTab {
                                 .text_size(scale::meta())
                                 .text_color(muted)
                                 .child(workflow),
+                        )
+                    })
+                    .when_some(run.description.clone(), |row, description| {
+                        let tip = description.clone();
+                        row.child(
+                            div()
+                                .id(("check-description", ix))
+                                .min_w_0()
+                                .truncate()
+                                .text_size(scale::meta())
+                                .text_color(muted)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tip.clone()).build(window, cx)
+                                })
+                                .child(description),
                         )
                     }),
             )
@@ -638,6 +664,7 @@ mod tests {
         CheckRun {
             name: "build".into(),
             workflow: None,
+            description: None,
             status,
             started_at: None,
             completed_at: None,

@@ -1,7 +1,7 @@
 //! GraphQL queries for building and tracking a pull request's full stack
 //! graph (linear chains and container trees) from GitHub's open pull requests.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -12,13 +12,14 @@ use crate::{
     RepoRef, Result, ReviewDecision, StackMember, StackSummary,
 };
 
-/// Maximum open pull requests collected into one stack graph. Guards against
-/// runaway BFS on a shared integration branch with hundreds of PRs.
-const MAX_STACK_NODES: usize = 50;
-/// Maximum downward hops when walking from a child PR to its root PR.
-const MAX_ANCESTOR_HOPS: usize = 50;
-/// Base branches queried in one batched children request.
-const BRANCHES_PER_REQUEST: usize = 25;
+/// Maximum open pull requests collected into one stack graph.
+const MAX_STACK_NODES: usize = 500;
+/// Open pull requests listed per request while looking for a stack's
+/// members (GitHub's page maximum).
+const OPEN_BRANCHES_PAGE_SIZE: u32 = 100;
+/// Pages of open pull requests read at most: a repository with more open
+/// pull requests than that shows no stack graph.
+const MAX_OPEN_BRANCHES_PAGES: usize = 20;
 
 macro_rules! stack_node_fragment {
     () => {
@@ -108,18 +109,19 @@ query PullRequestStackNeighbors(
     stack_node_fragment!()
 );
 
-const STACK_PARENTS_QUERY: &str = concat!(
-    r#"
-query PullRequestStackParents($owner: String!, $name: String!, $headRef: String!) {
+/// The branches of every open pull request of a repository, a page at a
+/// time: all a stack walk needs, so a stack of any depth costs one request
+/// per hundred open pull requests instead of one per level.
+const OPEN_BRANCHES_QUERY: &str = r#"
+query OpenPullRequestBranches($owner: String!, $name: String!, $first: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(headRefName: $headRef, states: OPEN, first: 10) {
-      nodes { ...StackNodeFields }
+    pullRequests(states: OPEN, first: $first, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { id number baseRefName headRefName isCrossRepository }
     }
   }
 }
-"#,
-    stack_node_fragment!()
-);
+"#;
 
 const STACK_NODES_BY_IDS_QUERY: &str = concat!(
     r#"
@@ -143,32 +145,9 @@ query StackNodeStatus($owner: String!, $name: String!, $number: Int!) {
     stack_node_fragment!()
 );
 
-/// Batched children lookup for `count` base branch names on one repository.
-pub(crate) fn stack_children_query(count: usize) -> String {
-    let vars: Vec<String> = (0..count).map(|at| format!("$b{at}: String!")).collect();
-    let fields: Vec<String> = (0..count)
-        .map(|at| {
-            format!(
-                "    c{at}: pullRequests(baseRefName: $b{at}, states: OPEN, first: 50) {{ \
-                 pageInfo {{ hasNextPage }} nodes {{ ...StackNodeFields }} }}"
-            )
-        })
-        .collect();
-    format!(
-        "query PullRequestStackChildren($owner: String!, $name: String!, {}) {{\n\
-         \x20 repository(owner: $owner, name: $name) {{\n\
-         {}\n\
-         \x20 }}\n\
-         }}\n{}",
-        vars.join(", "),
-        fields.join("\n"),
-        stack_node_fragment!()
-    )
-}
-
 pub(crate) const DOCUMENTS: &[(&str, &str)] = &[
     ("pull_request_stack_neighbors", STACK_NEIGHBORS_QUERY),
-    ("pull_request_stack_parents", STACK_PARENTS_QUERY),
+    ("open_pull_request_branches", OPEN_BRANCHES_QUERY),
     ("stack_nodes_by_ids", STACK_NODES_BY_IDS_QUERY),
     ("stack_node_status", STACK_NODE_STATUS_QUERY),
 ];
@@ -177,7 +156,13 @@ impl GitHub {
     /// Builds the full open stack graph (chain or container tree) containing
     /// `pr`, rooted at the bottom open pull request of its branch hierarchy.
     /// Returns `Ok(None)` when `pr` is not open, is alone (no open parent or
-    /// children), or exceeds the safety cap.
+    /// children), sits on a loop of branches, or the stack or the
+    /// repository's open pull requests exceed the safety caps.
+    ///
+    /// A pull request alone costs one request. One in a stack also lists the
+    /// branches of the repository's open pull requests (one request per
+    /// hundred), walks the stack from them, and reads the members (one
+    /// request per hundred), whatever the stack's depth.
     pub fn pull_request_stack(
         &self,
         pr: &PrRef,
@@ -210,124 +195,52 @@ impl GitHub {
             repo.squash_merge_allowed,
             repo.rebase_merge_allowed,
         );
-        let mut nodes_by_num: HashMap<u64, StackNode> = HashMap::new();
-        nodes_by_num.insert(current.pr.number, current.clone());
-
-        let initial_parents: Vec<StackNode> = repo
+        let parents = repo
             .parents
             .into_vec()
             .into_iter()
             .map(|w| w.into_node(&pr.repo))
-            .collect();
-        let initial_children_truncated = repo
-            .children
-            .page_info
-            .as_ref()
-            .is_some_and(|p| p.has_next_page);
-        let initial_children: Vec<StackNode> = repo
+            .filter(|p| {
+                p.state == PrState::Open
+                    && !p.cross_repository
+                    && p.pr.number != current.pr.number
+                    && p.head_ref == current.base_ref
+            })
+            .count();
+        let has_children = repo
             .children
             .into_vec()
             .into_iter()
-            .map(|w| w.into_node(&pr.repo))
+            .any(|w| w.into_node(&pr.repo).state == PrState::Open);
+        if parents != 1 && !has_children {
+            return Ok(None);
+        }
+
+        let Some(mut open) = open_branches(|cursor| self.open_branches_page(&pr.repo, cursor))?
+        else {
+            return Ok(None);
+        };
+        if open.iter().all(|branch| branch.number != current.pr.number) {
+            open.push(OpenBranch {
+                id: current.id.clone(),
+                number: current.pr.number,
+                base_ref_name: current.base_ref.clone(),
+                head_ref_name: current.head_ref.clone(),
+                is_cross_repository: current.cross_repository,
+            });
+        }
+        let Some((root, members)) = stack_members(current.pr.number, &open) else {
+            return Ok(None);
+        };
+        let ids: Vec<NodeId> = members
+            .iter()
+            .filter(|member| member.number != current.pr.number)
+            .map(|member| member.id.clone())
             .collect();
-
-        // Walk downward to find the root PR (if `current` is stacked on another open PR).
-        let mut root = current.clone();
-        let mut visited_bases: HashSet<String> = HashSet::new();
-        visited_bases.insert(current.head_ref.clone());
-        let mut parents = initial_parents;
-        for _ in 0..MAX_ANCESTOR_HOPS {
-            let candidates: Vec<StackNode> = parents
-                .into_iter()
-                .filter(|p| {
-                    p.state == PrState::Open
-                        && !p.cross_repository
-                        && p.pr.number != root.pr.number
-                        && p.head_ref == root.base_ref
-                })
-                .collect();
-            if candidates.len() != 1 {
-                break;
-            }
-            let parent = candidates.into_iter().next().unwrap();
-            if !visited_bases.insert(parent.head_ref.clone()) {
-                // Cycle detected; stop walking.
-                return Ok(None);
-            }
-            nodes_by_num.insert(parent.pr.number, parent.clone());
-            root = parent;
-            parents = self.stack_parents(&pr.repo, &root.base_ref)?;
-        }
-
-        // Fast path: if `current` was already the root and has no children, it's not a stack.
-        if root.pr.number == current.pr.number {
-            if initial_children_truncated {
-                return Ok(None);
-            }
-            if initial_children.is_empty() {
-                return Ok(None);
-            }
-        }
-
-        // Walk upward (BFS) from `root.head_ref` to collect every descendant.
-        let mut queried_branches: HashSet<String> = HashSet::new();
-        let mut frontier: VecDeque<String> = VecDeque::new();
-        if root.pr.number == current.pr.number {
-            queried_branches.insert(root.head_ref.clone());
-            for child in initial_children {
-                if child.state == PrState::Open && !nodes_by_num.contains_key(&child.pr.number) {
-                    if !child.cross_repository && !child.head_ref.is_empty() {
-                        frontier.push_back(child.head_ref.clone());
-                    }
-                    nodes_by_num.insert(child.pr.number, child);
-                }
-            }
-        } else if !root.cross_repository && !root.head_ref.is_empty() {
-            frontier.push_back(root.head_ref.clone());
-        }
-
-        while !frontier.is_empty() {
-            if nodes_by_num.len() > MAX_STACK_NODES {
-                return Ok(None);
-            }
-            let mut batch: Vec<String> = Vec::new();
-            while batch.len() < BRANCHES_PER_REQUEST {
-                let Some(branch) = frontier.pop_front() else {
-                    break;
-                };
-                if queried_branches.insert(branch.clone()) {
-                    batch.push(branch);
-                }
-            }
-            if batch.is_empty() {
-                break;
-            }
-            let (found, truncated) = self.stack_children(&pr.repo, &batch)?;
-            if truncated {
-                return Ok(None);
-            }
-            for child in found {
-                if child.state != PrState::Open {
-                    continue;
-                }
-                // The pull request on screen is already known when it sits in
-                // the middle of the stack, but the ones built on it are not.
-                if !child.cross_repository && !child.head_ref.is_empty() {
-                    frontier.push_back(child.head_ref.clone());
-                }
-                if nodes_by_num.contains_key(&child.pr.number) {
-                    continue;
-                }
-                nodes_by_num.insert(child.pr.number, child);
-                if nodes_by_num.len() > MAX_STACK_NODES {
-                    return Ok(None);
-                }
-            }
-        }
-
-        let nodes: Vec<StackNode> = nodes_by_num.into_values().collect();
+        let mut nodes = self.stack_nodes_by_ids(&pr.repo, &ids)?;
+        nodes.push(current);
         Ok(StackGraph::build(
-            root.pr.number,
+            root,
             nodes,
             default_branch,
             merge_methods,
@@ -388,67 +301,119 @@ impl GitHub {
             })
     }
 
-    fn stack_parents(&self, repo: &RepoRef, head_ref: &str) -> Result<Vec<StackNode>> {
+    fn open_branches_page(
+        &self,
+        repo: &RepoRef,
+        cursor: Option<&str>,
+    ) -> Result<WireConnection<OpenBranch>> {
         #[derive(Deserialize)]
         struct Data {
-            repository: Option<RepoParents>,
+            repository: Option<Repo>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct RepoParents {
-            pull_requests: WireConnection<WireStackNode>,
+        struct Repo {
+            pull_requests: WireConnection<OpenBranch>,
         }
         let data: Data = self.graphql(
-            STACK_PARENTS_QUERY,
+            OPEN_BRANCHES_QUERY,
             json!({
                 "owner": repo.owner,
                 "name": repo.name,
-                "headRef": head_ref,
+                "first": OPEN_BRANCHES_PAGE_SIZE,
+                "cursor": cursor,
             }),
         )?;
-        Ok(data
-            .repository
-            .map(|r| {
-                r.pull_requests
-                    .into_vec()
-                    .into_iter()
-                    .map(|w| w.into_node(repo))
-                    .collect()
-            })
-            .unwrap_or_default())
+        data.repository
+            .map(|r| r.pull_requests)
+            .ok_or_else(|| Error::Decode(format!("repository {repo} not found")))
+    }
+}
+
+/// The branches of one open pull request.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenBranch {
+    id: NodeId,
+    number: u64,
+    base_ref_name: String,
+    head_ref_name: String,
+    is_cross_repository: bool,
+}
+
+/// Every open pull request's branches, `fetch` returning the page after a
+/// cursor (`None` for the first). `None` when the repository has more open
+/// pull requests than [`MAX_OPEN_BRANCHES_PAGES`] pages hold, since a stack
+/// read from part of them could miss members.
+fn open_branches(
+    mut fetch: impl FnMut(Option<&str>) -> Result<WireConnection<OpenBranch>>,
+) -> Result<Option<Vec<OpenBranch>>> {
+    let mut open = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_OPEN_BRANCHES_PAGES {
+        let page = fetch(cursor.as_deref())?;
+        let next = page
+            .page_info
+            .as_ref()
+            .filter(|info| info.has_next_page)
+            .and_then(|info| info.end_cursor.clone());
+        open.extend(page.into_vec());
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(Some(open)),
+        }
+    }
+    Ok(None)
+}
+
+/// The stack holding pull request `current` among `open`: its root and its
+/// members, root first. The root is reached by following each base to the
+/// one open pull request of the repository whose head it is; the members are
+/// every open pull request built on the root, level by level (one from a fork
+/// joins, but nothing builds on its head). `None` when `current` is alone,
+/// sits on a loop of branches, or the stack passes [`MAX_STACK_NODES`].
+fn stack_members(current: u64, open: &[OpenBranch]) -> Option<(u64, Vec<&OpenBranch>)> {
+    let mut root = open.iter().find(|branch| branch.number == current)?;
+    let mut heads: HashSet<&str> = HashSet::from([root.head_ref_name.as_str()]);
+    loop {
+        let mut parents = open.iter().filter(|p| {
+            !p.is_cross_repository
+                && p.number != root.number
+                && p.head_ref_name == root.base_ref_name
+        });
+        let (Some(parent), None) = (parents.next(), parents.next()) else {
+            break;
+        };
+        if !heads.insert(parent.head_ref_name.as_str()) {
+            return None;
+        }
+        root = parent;
     }
 
-    fn stack_children(&self, repo: &RepoRef, bases: &[String]) -> Result<(Vec<StackNode>, bool)> {
-        let mut vars = serde_json::Map::new();
-        vars.insert("owner".into(), json!(repo.owner));
-        vars.insert("name".into(), json!(repo.name));
-        for (at, base) in bases.iter().enumerate() {
-            vars.insert(format!("b{at}"), json!(base));
+    let mut members = vec![root];
+    let mut known: HashSet<u64> = HashSet::from([root.number]);
+    let mut walked: HashSet<&str> = HashSet::new();
+    let mut frontier: VecDeque<&str> = VecDeque::new();
+    if !root.is_cross_repository && !root.head_ref_name.is_empty() {
+        frontier.push_back(&root.head_ref_name);
+    }
+    while let Some(branch) = frontier.pop_front() {
+        if !walked.insert(branch) {
+            continue;
         }
-        #[derive(Deserialize)]
-        struct Data {
-            repository: Option<HashMap<String, WireConnection<WireStackNode>>>,
-        }
-        let data: Data = self.graphql(&stack_children_query(bases.len()), Value::Object(vars))?;
-        let Some(map) = data.repository else {
-            return Ok((Vec::new(), false));
-        };
-        let mut nodes = Vec::new();
-        let mut truncated = false;
-        for at in 0..bases.len() {
-            if let Some(conn) = map.get(&format!("c{at}")) {
-                if conn.page_info.as_ref().is_some_and(|p| p.has_next_page) {
-                    truncated = true;
-                }
-                if let Some(raw) = &conn.nodes {
-                    for item in raw.iter().flatten() {
-                        nodes.push(item.clone().into_node(repo));
-                    }
+        for child in open.iter().filter(|child| child.base_ref_name == branch) {
+            if !child.is_cross_repository && !child.head_ref_name.is_empty() {
+                frontier.push_back(&child.head_ref_name);
+            }
+            if known.insert(child.number) {
+                members.push(child);
+                if members.len() > MAX_STACK_NODES {
+                    return None;
                 }
             }
         }
-        Ok((nodes, truncated))
     }
+    (members.len() > 1).then_some((root.number, members))
 }
 
 fn allowed_methods(merge: bool, squash: bool, rebase: bool) -> Vec<MergeMethod> {
@@ -491,6 +456,8 @@ struct WireRefName {
 #[serde(rename_all = "camelCase")]
 struct WirePageInfo {
     has_next_page: bool,
+    #[serde(default)]
+    end_cursor: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -716,10 +683,166 @@ fn decision_from_reviews(latest: &[WireReview]) -> Option<ReviewDecision> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    use super::WireStackNode;
-    use crate::{ChecksState, MergeStateStatus, Mergeable, PrState, RepoRef, ReviewDecision};
+    use super::{
+        MAX_OPEN_BRANCHES_PAGES, MAX_STACK_NODES, OpenBranch, WireConnection, WireStackNode,
+        open_branches, stack_members,
+    };
+    use crate::{
+        ChecksState, Error, MergeStateStatus, Mergeable, PrState, RepoRef, ReviewDecision,
+    };
+
+    /// Open pull request `number` from branch `head` into `base`.
+    fn branch(number: u64, base: &str, head: &str) -> OpenBranch {
+        OpenBranch {
+            id: format!("PR_{number}"),
+            number,
+            base_ref_name: base.into(),
+            head_ref_name: head.into(),
+            is_cross_repository: false,
+        }
+    }
+
+    /// A chain of `len` pull requests numbered from 1: #1 into `main`, each
+    /// next one on the head of the one before.
+    fn chain(len: u64) -> Vec<OpenBranch> {
+        (1..=len)
+            .map(|n| {
+                let base = if n == 1 {
+                    "main".to_owned()
+                } else {
+                    format!("layer-{}", n - 1)
+                };
+                branch(n, &base, &format!("layer-{n}"))
+            })
+            .collect()
+    }
+
+    /// One page of `OpenPullRequestBranches` holding `branches`.
+    fn page(branches: &[OpenBranch], next: Option<&str>) -> WireConnection<OpenBranch> {
+        let nodes: Vec<Value> = branches
+            .iter()
+            .map(|b| {
+                json!({
+                    "id": b.id,
+                    "number": b.number,
+                    "baseRefName": b.base_ref_name,
+                    "headRefName": b.head_ref_name,
+                    "isCrossRepository": b.is_cross_repository,
+                })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+            "nodes": nodes,
+        }))
+        .unwrap()
+    }
+
+    fn numbers(members: &[&OpenBranch]) -> Vec<u64> {
+        members.iter().map(|m| m.number).collect()
+    }
+
+    #[test]
+    fn a_stack_of_120_pull_requests_takes_one_request_per_hundred_open_ones() {
+        // 120 stacked pull requests and 30 loose ones into main: 150 open,
+        // two pages. Walking the chain level by level took a request per
+        // level and gave up at 50.
+        let mut all = chain(120);
+        all.extend((121..=150).map(|n| branch(n, "main", &format!("loose-{n}"))));
+        let mut asked: Vec<Option<String>> = Vec::new();
+        let open = open_branches(|cursor| {
+            asked.push(cursor.map(str::to_owned));
+            Ok(match cursor {
+                None => page(&all[..100], Some("after-100")),
+                Some("after-100") => page(&all[100..], None),
+                Some(other) => panic!("unexpected cursor {other}"),
+            })
+        })
+        .unwrap()
+        .expect("every open pull request listed");
+        assert_eq!(asked, [None, Some("after-100".to_owned())]);
+        assert_eq!(open.len(), 150);
+
+        for current in [1, 60, 120] {
+            let (root, members) = stack_members(current, &open).expect("one stack");
+            assert_eq!(root, 1, "from #{current}");
+            assert_eq!(numbers(&members), (1..=120).collect::<Vec<_>>());
+        }
+        assert!(stack_members(130, &open).is_none(), "a loose one is alone");
+    }
+
+    #[test]
+    fn listing_open_pull_requests_stops_at_the_page_cap_and_surfaces_errors() {
+        let mut calls = 0;
+        let open = open_branches(|_| {
+            calls += 1;
+            Ok(page(&[branch(calls as u64, "main", "a")], Some("more")))
+        })
+        .unwrap();
+        assert_eq!(calls, MAX_OPEN_BRANCHES_PAGES);
+        assert_eq!(
+            open, None,
+            "a stack read from part of them could miss members"
+        );
+
+        let failure = open_branches(|_| {
+            Err(Error::Http {
+                status: 502,
+                message: String::new(),
+            })
+        });
+        assert!(matches!(failure, Err(Error::Http { status: 502, .. })));
+    }
+
+    #[test]
+    fn a_container_tree_joins_every_branch_built_on_its_root() {
+        // 10 into main; 11 and 12 on 10; 13 on 11; a fork's 14 on 10 joins,
+        // but 15 on the fork's head (same name as a branch here) does not.
+        let mut fork = branch(14, "a", "x");
+        fork.is_cross_repository = true;
+        let open = [
+            branch(10, "main", "a"),
+            branch(11, "a", "b"),
+            branch(12, "a", "c"),
+            branch(13, "b", "d"),
+            fork,
+            branch(15, "x", "y"),
+            branch(20, "main", "z"),
+        ];
+        let (root, members) = stack_members(13, &open).expect("one stack");
+        assert_eq!(root, 10);
+        let mut got = numbers(&members);
+        got.sort_unstable();
+        assert_eq!(got, [10, 11, 12, 13, 14]);
+        assert!(stack_members(20, &open).is_none());
+    }
+
+    #[test]
+    fn an_ambiguous_parent_a_loop_or_a_runaway_stack_is_no_stack_above_it() {
+        // Two open pull requests have `a` as head: 12 roots its own stack.
+        let shared = [
+            branch(10, "main", "a"),
+            branch(11, "dev", "a"),
+            branch(12, "a", "b"),
+            branch(13, "b", "c"),
+        ];
+        let (root, members) = stack_members(13, &shared).expect("12 and 13");
+        assert_eq!((root, numbers(&members)), (12, vec![12, 13]));
+
+        let looped = [
+            branch(1, "b", "a"),
+            branch(2, "a", "b"),
+            branch(3, "a", "c"),
+        ];
+        assert!(stack_members(3, &looped).is_none());
+
+        let long = chain(MAX_STACK_NODES as u64 + 1);
+        assert!(stack_members(1, &long).is_none());
+        let fits = chain(MAX_STACK_NODES as u64);
+        assert_eq!(stack_members(1, &fits).unwrap().1.len(), MAX_STACK_NODES);
+    }
 
     #[test]
     fn parses_wire_stack_node_with_review_fallback_ignoring_bots() {
