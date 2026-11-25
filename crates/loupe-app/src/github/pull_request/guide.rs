@@ -1536,13 +1536,27 @@ impl GuideTab {
                         .with_size(scale::icon_sm())
                         .text_color(muted),
                 )
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(scale::code())
                 .child(
-                    div()
+                    h_flex()
                         .min_w_0()
-                        .truncate()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_size(scale::code())
-                        .child(path.clone()),
+                        .when_some(path.rsplit_once('/'), |name, (folder, _)| {
+                            name.child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis_start()
+                                    .text_color(muted)
+                                    .child(format!("{folder}/")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .child(path.rsplit('/').next().unwrap_or(&path).to_owned()),
+                        ),
                 )
                 .tooltip({
                     let path = path.clone();
@@ -1637,7 +1651,12 @@ impl GuideTab {
                                      walkthrough. Biggest changes first.",
                                 ),
                         )
-                        .children(rows),
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .max_w(dp(ui::READING_WIDTH))
+                                .children(rows),
+                        ),
                 )
             })
             .into_any_element()
@@ -1690,7 +1709,9 @@ impl GuideTab {
                 .child(
                     div()
                         .min_w_0()
-                        .truncate()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_start()
                         .font_family(mono.clone())
                         .text_size(scale::code())
                         .child(format!("{}/", child.name)),
@@ -2628,8 +2649,6 @@ impl Render for GuideTab {
     }
 }
 
-/// Markdown at most `ui::READING_WIDTH` wide, so prose keeps a readable
-/// line length while the cards and diff snippets around it fill the tab.
 /// `count` and the noun that goes with it: "1 file", "21 files".
 fn count_of(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
@@ -2784,6 +2803,8 @@ fn group_by_folder(paths: &[String], stats: &LineCounts) -> UncoveredFolder {
     build(String::new(), String::new(), root, stats)
 }
 
+/// Markdown at most `ui::READING_WIDTH` wide, so prose keeps a readable
+/// line length while the cards and diff snippets around it fill the tab.
 fn prose(id: impl Into<ElementId>, text: impl Into<SharedString>) -> AnyElement {
     ui::markdown(id, text)
         .max_w(dp(ui::READING_WIDTH))
