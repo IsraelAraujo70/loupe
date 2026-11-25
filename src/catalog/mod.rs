@@ -2,4 +2,4 @@
 
 mod ingredients;
 
-pub use ingredients::{CATALOG, Category, Ingredient, find};
+pub use ingredients::{CATALOG, Category, Ingredient, find, in_category};
