@@ -75,11 +75,17 @@ pub(crate) fn format_duration(seconds: i64) -> String {
     }
 }
 
-/// The time a check took, or what it is doing while it has no end time.
+/// The time a check took, what it is doing while it has no end time, or
+/// the outcome in words when it did not run to a verdict: an icon alone does
+/// not say "skipped".
 fn run_duration(run: &CheckRun) -> Option<String> {
     match run.status {
         CheckStatus::Queued => Some("queued".into()),
         CheckStatus::Running => Some("running".into()),
+        CheckStatus::Skipped => Some("skipped".into()),
+        CheckStatus::Cancelled => Some("cancelled".into()),
+        CheckStatus::Neutral => Some("neutral".into()),
+        CheckStatus::ActionRequired => Some("action required".into()),
         _ => match (run.started_at, run.completed_at) {
             (Some(start), Some(end)) => Some(format_duration((end - start).num_seconds())),
             _ => None,
@@ -544,7 +550,7 @@ impl ChecksTab {
             .child(
                 div()
                     .flex_none()
-                    .w_16()
+                    .w_24()
                     .text_right()
                     .text_size(scale::meta())
                     .text_color(muted)
@@ -702,6 +708,11 @@ mod tests {
             Some("queued")
         );
         assert_eq!(run_duration(&run(CheckStatus::Passed)), None);
+
+        let mut skipped = run(CheckStatus::Skipped);
+        skipped.started_at = at(1_000);
+        skipped.completed_at = at(1_000);
+        assert_eq!(run_duration(&skipped).as_deref(), Some("skipped"));
     }
 
     #[test]
