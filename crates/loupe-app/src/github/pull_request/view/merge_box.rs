@@ -48,11 +48,13 @@ fn share(part: usize, total: usize) -> f32 {
 }
 
 /// A labeled progress cell: an icon and the title, a count on the right,
-/// then a 4 px bar of one width in every cell. With `total` at zero there
-/// is nothing to make progress on: the icon is a green check, the count
-/// says so in words, and the bar is its neutral track.
+/// then a 4 px bar of one width in every cell. The icon turns into a green
+/// check only once every item is done. With `total` at zero there is
+/// nothing to count, which is not a success: the icon stays neutral, the
+/// count says so in words, and the bar is its neutral track.
 /// A cell with `open` set is the button that opens and closes the list it
-/// summarizes, with a chevron after its count.
+/// summarizes, with a chevron after its count. `action` takes the count's
+/// place on screen; the cell's accessible name keeps the count.
 #[allow(clippy::too_many_arguments)]
 fn bar_cell(
     id: &'static str,
@@ -63,12 +65,13 @@ fn bar_cell(
     total: usize,
     runs: Vec<Run>,
     open: Option<bool>,
+    action: Option<AnyElement>,
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
     let (muted, foreground) = (theme.muted_foreground, theme.foreground);
     let settled = total == 0;
-    let (icon, icon_color) = if settled {
+    let (icon, icon_color) = if !settled && done >= 1. {
         (IconName::CircleCheck, tokens::open())
     } else {
         (icon, muted)
@@ -109,7 +112,13 @@ fn bar_cell(
                                 .child(title),
                         )
                         .child(div().flex_1())
-                        .child(div().truncate().text_color(muted).child(count))
+                        .child(action.unwrap_or_else(|| {
+                            div()
+                                .truncate()
+                                .text_color(muted)
+                                .child(count)
+                                .into_any_element()
+                        }))
                         .children(open.map(|open| {
                             Icon::new(if open {
                                 IconName::ChevronDown
@@ -223,6 +232,31 @@ impl PullRequestView {
             (total, 0) => format!("{} of {total} passed", checks.passed),
             (_, skipped) => format!("{} passed, {skipped} skipped", checks.passed - skipped),
         };
+        // Nobody is asked yet: where the viewer may ask, the cell offers to,
+        // on GitHub, where reviewers are picked.
+        let request_review =
+            (approved.total == 0 && detail.state == PrState::Open && detail.viewer_can_update)
+                .then(|| {
+                    let url = detail.url.clone();
+                    h_flex()
+                        .id("merge-box-request-review")
+                        .debug_selector(|| "merge-box-request-review".to_owned())
+                        .role(Role::Link)
+                        .aria_label("Request review on GitHub")
+                        .flex_none()
+                        .gap_1()
+                        .items_center()
+                        .text_color(cx.theme().link)
+                        .cursor_pointer()
+                        .hover(|link| link.text_decoration_1())
+                        .child("Request review")
+                        .child(Icon::new(IconName::ExternalLink).with_size(dp(12.)))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Pick reviewers on GitHub").build(window, cx)
+                        })
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .into_any_element()
+                });
         let has_runs = !detail.checks.runs.is_empty();
         let checks_open = self
             .checks_open
@@ -321,13 +355,14 @@ impl PullRequestView {
                             "Checks",
                             checks_count,
                             share(checks.passed, checks.total),
-                            checks.total.max(1),
+                            checks.total,
                             vec![
                                 (share(checks.passed, checks.total), tokens::open()),
                                 (share(checks.pending, checks.total), tokens::pending()),
                                 (share(checks.failed, checks.total), tokens::closed()),
                             ],
                             has_runs.then_some(checks_open),
+                            None,
                             cx,
                         )
                         .when(has_runs, |cell| {
@@ -342,10 +377,11 @@ impl PullRequestView {
                         "merge-box-comments",
                         IconName::MessageSquare,
                         "Comments",
-                        progress_count(threads, "resolved", "None unresolved"),
+                        progress_count(threads, "resolved", "No review threads"),
                         share(threads.done, threads.total),
                         threads.total,
                         vec![(share(threads.done, threads.total), tokens::open())],
+                        None,
                         None,
                         cx,
                     ))
@@ -356,9 +392,10 @@ impl PullRequestView {
                         "Approvals",
                         progress_count(approved, "approved", "No reviewers"),
                         share(approved.done, approved.total),
-                        approved.total.max(1),
+                        approved.total,
                         vec![(share(approved.done, approved.total), tokens::open())],
                         None,
+                        request_review,
                         cx,
                     )),
             )
@@ -667,6 +704,35 @@ mod tests {
             cx.debug_bounds("pr-ready-for-review").is_some(),
             "the button stays to try again"
         );
+    }
+
+    fn offers_request_review(detail: PullRequestDetail, cx: &mut TestAppContext) -> bool {
+        open(detail, Submit::Idle, cx)
+            .debug_bounds("merge-box-request-review")
+            .is_some()
+    }
+
+    #[gpui_kit::test]
+    fn an_open_pull_request_nobody_reviews_offers_request_review(cx: &mut TestAppContext) {
+        assert!(offers_request_review(model::tests::detail(), cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_merged_pull_request_does_not_offer_request_review(cx: &mut TestAppContext) {
+        let detail = PullRequestDetail {
+            state: PrState::Merged,
+            ..model::tests::detail()
+        };
+        assert!(!offers_request_review(detail, cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_viewer_who_cannot_update_is_not_offered_request_review(cx: &mut TestAppContext) {
+        let detail = PullRequestDetail {
+            viewer_can_update: false,
+            ..model::tests::detail()
+        };
+        assert!(!offers_request_review(detail, cx));
     }
 
     fn stack_node(number: u64, base: &str, head: &str) -> loupe_github::StackNode {

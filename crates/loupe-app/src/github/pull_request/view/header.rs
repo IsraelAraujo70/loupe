@@ -7,18 +7,16 @@ use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_github::PullRequestDetail;
 
 use super::PullRequestView;
-use super::model::{MergeAction, available_actions, head_label};
+use super::model::{ReviewButton, available_actions, head_label, review_button};
 use crate::github::pull_request::checks::ChecksSummary;
 use crate::github::widgets;
 use crate::theme::scale::{self, dp};
 use crate::ui::{self, ControlSize as _, WindowDragArea as _};
-
-/// How long Copy link says "Copied" after a click.
-const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Characters of a branch name the metadata line shows.
 const BRANCH_CHARS: usize = 40;
@@ -88,18 +86,14 @@ impl PullRequestView {
         let muted = cx.theme().muted_foreground;
         let reference = format!("{} #{}", detail.pr.repo, detail.pr.number);
         let pr_actions = available_actions(detail);
-        // Review is the page's filled action on an open pull request until it
-        // can be merged; once merged or closed it steps back to outlined.
-        let review_is_primary = detail.state == loupe_github::PrState::Open
-            && !matches!(pr_actions.merge, MergeAction::Available { .. });
-        // The actions with a label are in sight; the ones that were icons
-        // alone (edit the title, the repository's list, refresh) are items
-        // of the "More actions" menu, with the state changes.
+        // The actions with a label are in sight; Copy link and the ones that
+        // were icons alone (edit the title, the repository's list, refresh)
+        // are items of the "More actions" menu, with the state changes.
+        let review = review_button(detail);
         let actions = h_flex()
             .flex_none()
             .gap_2()
             .items_center()
-            .child(self.render_copy_link(detail, cx))
             .child(
                 Button::new("pr-open-in-browser")
                     .ghost()
@@ -111,7 +105,13 @@ impl PullRequestView {
                     .on_click(move |_, _, cx| cx.open_url(&url)),
             )
             .child(self.render_summarize_button(detail, cx))
-            .child(self.render_review_controls(detail, review_is_primary, cx))
+            .when(review != ReviewButton::Hidden, |actions| {
+                actions.child(self.render_review_controls(
+                    detail,
+                    review == ReviewButton::Primary,
+                    cx,
+                ))
+            })
             .child(self.render_action_controls(&pr_actions, detail, can_edit, cx));
         let meta = self.render_meta(detail, cx);
         // The title has a line of its own, where it can wrap, with the
@@ -258,42 +258,6 @@ impl PullRequestView {
                                 )
                             })
                     }),
-            )
-    }
-
-    /// Copy link, which copies the pull request's address on GitHub and
-    /// says "Copied" for [`COPIED_FOR`]. It comes before Open on GitHub, so
-    /// the shorter label moves nothing else on the line.
-    fn render_copy_link(&self, detail: &PullRequestDetail, cx: &mut Context<Self>) -> Div {
-        let url = detail.url.clone();
-        let (icon, label) = match self.link_copied {
-            Some(_) => (IconName::Check, "Copied"),
-            None => (IconName::Link, "Copy link"),
-        };
-        div()
-            .flex_none()
-            .debug_selector(move || format!("pr-copy-link:{label}"))
-            .child(
-                Button::new("pr-copy-link")
-                    .ghost()
-                    .control()
-                    .icon(icon)
-                    .label(label)
-                    .tooltip("Copy the link to this pull request on GitHub")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-                        // A new task drops the one before it: a second click
-                        // starts the time over.
-                        this.link_copied = Some(cx.spawn(async move |this, cx| {
-                            cx.background_executor().timer(COPIED_FOR).await;
-                            this.update(cx, |this, cx| {
-                                this.link_copied = None;
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                        cx.notify();
-                    })),
             )
     }
 
@@ -466,18 +430,7 @@ impl PullRequestView {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use gpui_kit::{
-        AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, WindowBounds,
-        WindowOptions, px, size,
-    };
-
-    use super::super::{PullRequestView, model};
-    use super::{COPIED_FOR, HEAD_BRANCH_MIN, MetaWidths, branch_label, meta_basis};
-    use crate::github::common::Loadable;
-    use crate::services::{Accounts, Services};
-    use crate::store::Settings;
+    use super::{HEAD_BRANCH_MIN, MetaWidths, branch_label, meta_basis};
 
     fn widths(head: f32, checks: f32) -> MetaWidths {
         MetaWidths {
@@ -502,60 +455,6 @@ mod tests {
         assert_eq!(long, longer);
         // What never shrinks is asked for whole.
         assert_eq!(meta_basis(&widths(36., 200.)) - short, 140.);
-    }
-
-    /// Copy link puts the pull request's address on GitHub on the
-    /// clipboard and says "Copied" for a moment.
-    #[gpui_kit::test]
-    fn copy_link_copies_the_pull_requests_url(cx: &mut TestAppContext) {
-        let detail = Arc::new(model::tests::detail());
-        let (handle, view) = cx.update(|cx| {
-            gpui_kit::init(cx);
-            crate::theme::init(cx);
-            cx.set_global(Settings::default());
-            cx.set_global(Services::default());
-            cx.set_global(Accounts::default());
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                        Default::default(),
-                        size(px(1280.), px(820.)),
-                    ))),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| cx.new(|cx| PullRequestView::new(detail.pr.clone(), window, cx)),
-            )
-            .expect("open a window")
-        });
-        let cx = &mut VisualTestContext::from_window(handle, cx);
-        cx.run_until_parked();
-        view.update(cx, |view, cx| {
-            view.incoming = Some(detail.clone());
-            view.detail = Loadable::Loaded(detail.clone());
-            cx.notify();
-        });
-        let button = |cx: &mut VisualTestContext, label: &'static str| {
-            cx.update(|window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            cx.debug_bounds(format!("pr-copy-link:{label}").leak())
-        };
-        let at = button(cx, "Copy link").expect("Copy link is in the header");
-        cx.simulate_click(at.center(), Modifiers::none());
-        assert_eq!(
-            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
-                .as_deref(),
-            Some("https://github.com/acme/app/pull/12")
-        );
-        assert!(button(cx, "Copied").is_some(), "the button says it copied");
-        cx.executor().advance_clock(COPIED_FOR);
-        cx.run_until_parked();
-        assert!(
-            button(cx, "Copy link").is_some(),
-            "and goes back to Copy link"
-        );
     }
 
     #[test]

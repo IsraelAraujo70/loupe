@@ -231,9 +231,6 @@ pub struct PullRequestView {
     /// When that poll last went out; `None` right after a load.
     pr_polled_at: Option<Instant>,
     pr_poll_task: Option<Task<()>>,
-    /// Runs while the header's Copy link button says "Copied", and puts its
-    /// label back when it ends.
-    link_copied: Option<Task<()>>,
     /// Last `(head_oid, guide_service::revision, language, stack)` synchronized
     /// into `GuideTab`.
     guide_sync: Option<(String, u64, loupe_guide::GuideLanguage, Option<StackGraph>)>,
@@ -321,7 +318,6 @@ impl PullRequestView {
             pr_seen: PrSeen::Unknown,
             pr_polled_at: None,
             pr_poll_task: None,
-            link_copied: None,
             guide_sync: None,
             _ticker: ticker,
         };

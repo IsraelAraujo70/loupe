@@ -90,10 +90,12 @@ pub(super) enum Panel {
 
 impl Panel {
     /// Whether the panel still makes sense for a freshly loaded detail: a
-    /// reload can remove the pending review or make merging unavailable.
+    /// reload can remove the pending review, make merging unavailable, or
+    /// leave nothing to review.
     pub(super) fn still_valid(self, detail: &PullRequestDetail) -> bool {
         match self {
-            Panel::Closed | Panel::Review | Panel::StackMergeProgress => true,
+            Panel::Closed | Panel::StackMergeProgress => true,
+            Panel::Review => review_button(detail) != ReviewButton::Hidden,
             Panel::ConfirmDiscard => detail.pending_review.is_some(),
             Panel::ConfirmMerge(method) => matches!(
                 available_actions(detail).merge,
@@ -169,6 +171,33 @@ pub(super) fn available_actions(detail: &PullRequestDetail) -> PrActions {
             }),
             state: Some(StateAction::Close),
         },
+    }
+}
+
+/// How the header shows Review changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReviewButton {
+    /// A merged or closed pull request with no pending review: there is
+    /// nothing left to review.
+    Hidden,
+    /// The page's one filled action, on an open pull request Merge is not
+    /// offered for.
+    Primary,
+    /// Outlined: Merge is the filled action, or a pending review is left to
+    /// finish or discard on a merged or closed pull request.
+    Outline,
+}
+
+pub(super) fn review_button(detail: &PullRequestDetail) -> ReviewButton {
+    if detail.state != PrState::Open {
+        return match detail.pending_review {
+            Some(_) => ReviewButton::Outline,
+            None => ReviewButton::Hidden,
+        };
+    }
+    match available_actions(detail).merge {
+        MergeAction::Available { .. } => ReviewButton::Outline,
+        MergeAction::Hidden | MergeAction::Unavailable(_) => ReviewButton::Primary,
     }
 }
 
@@ -679,11 +708,11 @@ pub(super) mod tests {
     };
 
     use super::{
-        CheckGroup, DraftAction, MergeAction, MergeTone, Panel, PrTab, Progress, StateAction,
-        approvals, available_actions, can_approve, check_groups, check_outcome, check_tally,
-        checks_open_at_first, discard_confirm_text, head_label, merge_button_label,
+        CheckGroup, DraftAction, MergeAction, MergeTone, Panel, PrTab, Progress, ReviewButton,
+        StateAction, approvals, available_actions, can_approve, check_groups, check_outcome,
+        check_tally, checks_open_at_first, discard_confirm_text, head_label, merge_button_label,
         merge_confirm_text, merge_status, pending_comments_label, resolve_method, review_blocker,
-        stack_entry_problems, stack_merge, stack_merge_confirm_text,
+        review_button, stack_entry_problems, stack_merge, stack_merge_confirm_text,
     };
 
     fn actor(login: &str) -> Actor {
@@ -897,6 +926,29 @@ pub(super) mod tests {
         assert!(checks_open_at_first(&detail));
         detail.checks.runs = vec![run(CheckStatus::Passed), run(CheckStatus::Cancelled)];
         assert!(checks_open_at_first(&detail));
+    }
+
+    #[test]
+    fn review_changes_is_filled_only_while_merge_is_not_the_action() {
+        let mut detail = detail();
+        assert_eq!(review_button(&detail), ReviewButton::Outline);
+        detail.merge_state = MergeStateStatus::Blocked;
+        assert_eq!(review_button(&detail), ReviewButton::Primary);
+        detail.viewer_can_update = false;
+        assert_eq!(review_button(&detail), ReviewButton::Primary);
+    }
+
+    #[test]
+    fn a_merged_or_closed_pull_request_offers_review_only_to_finish_a_pending_one() {
+        for state in [PrState::Merged, PrState::Closed] {
+            let mut detail = PullRequestDetail { state, ..detail() };
+            assert_eq!(review_button(&detail), ReviewButton::Hidden);
+            detail.pending_review = Some(PendingReview {
+                id: "PRR_1".into(),
+                comment_count: 2,
+            });
+            assert_eq!(review_button(&detail), ReviewButton::Outline);
+        }
     }
 
     #[test]
@@ -1132,6 +1184,8 @@ pub(super) mod tests {
         detail.state = PrState::Closed;
         assert!(!Panel::ConfirmClose.still_valid(&detail));
         assert!(Panel::Review.still_valid(&detail));
+        detail.pending_review = None;
+        assert!(!Panel::Review.still_valid(&detail));
     }
 
     #[test]

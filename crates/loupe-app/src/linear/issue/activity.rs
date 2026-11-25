@@ -2,10 +2,8 @@
 
 use chrono::Utc;
 use gpui_kit::component::avatar::Avatar;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Textarea;
-use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use loupe_linear::{Author, Comment};
@@ -101,12 +99,6 @@ fn author_line(author: &Author) -> AuthorLine {
     }
 }
 
-/// The Cmd+Enter keyboard hint.
-fn send_hint() -> Option<AnyElement> {
-    crate::ui::platform_keystroke("cmd-enter")
-        .map(|keystroke| Kbd::new(keystroke).into_any_element())
-}
-
 impl IssueView {
     /// The comments' heading: the real count when there are comments, and
     /// words when there are none.
@@ -200,21 +192,9 @@ impl IssueView {
         let (muted, danger) = (theme.muted_foreground, theme.danger);
         let border = if focused { theme.ring } else { theme.input };
 
-        let send = Button::new("send-comment")
+        let send = crate::ui::send_button("send-comment", "Comment", empty, self.sending, cx)
             .control()
-            .loading(self.sending)
-            .disabled(self.sending || empty)
             .on_click(cx.listener(|view, _, window, cx| view.submit_comment(window, cx)));
-        // With nothing to send the button is neutral and its label keeps
-        // the muted color, which stays readable; the kit's disabled primary
-        // is a faint label on a faint fill.
-        let send = if empty {
-            send.outline()
-                .accessibility_label("Comment")
-                .child(div().text_color(muted).child("Comment"))
-        } else {
-            send.primary().label("Comment")
-        };
         v_flex()
             .w_full()
             .rounded(theme.radius_lg)
@@ -236,9 +216,7 @@ impl IssueView {
                         .child(div().flex_1().min_w_0().text_xs().map(|this| {
                             match &self.comment_error {
                                 Some(error) => this.text_color(danger).child(error.clone()),
-                                None => this
-                                    .text_color(muted)
-                                    .child(h_flex().gap_1().children(send_hint()).child("to send")),
+                                None => this.text_color(muted).child(crate::ui::send_hint(cx)),
                             }
                         }))
                         .child(send),
