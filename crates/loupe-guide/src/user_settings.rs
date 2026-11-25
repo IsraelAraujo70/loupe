@@ -320,11 +320,10 @@ mod tests {
         std::fs::create_dir_all(&trusted).unwrap();
         let marker = root.join("pwned");
         let evil = checkout.join("key.sh");
-        std::fs::write(&evil, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_executable(
+            &evil,
+            &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        );
 
         let forwarded =
             connection_settings(&json!({"apiKeyHelper": "pwd; ./key.sh"}), &trusted).unwrap();

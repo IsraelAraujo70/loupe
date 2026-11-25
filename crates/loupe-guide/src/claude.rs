@@ -840,8 +840,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawned_child_does_not_inherit_non_allowlisted_env_vars() {
-        use std::os::unix::fs::PermissionsExt;
-
         // `CARGO_MANIFEST_DIR` is guaranteed to exist in the parent `cargo test`
         // environment and is NOT in `SAFE_ENV_ALLOWLIST`.
         assert!(
@@ -857,8 +855,7 @@ mod tests {
                 .unwrap()
                 .subsec_nanos()
         ));
-        std::fs::write(&stub, "#!/bin/sh\nenv\n").unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&stub, "#!/bin/sh\nenv\n");
 
         let mut cmd = build_command(
             &stub,

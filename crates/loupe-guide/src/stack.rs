@@ -690,7 +690,6 @@ mod tests {
     /// chapter guide or, for the overview schema, an overview.
     #[cfg(unix)]
     fn stub_agent(record: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let chapter = serde_json::json!({
             "type": "result", "is_error": false, "duration_ms": 5,
             "modelUsage": { "claude-stub": {} },
@@ -702,15 +701,13 @@ mod tests {
             "structured_output": { "headline": "Stack headline", "why": "Stack why." },
         });
         let stub = record.with_extension("sh");
-        fs::write(
+        crate::test_support::write_executable(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\n{{ echo '=====RUN'; cat; }} >> '{record}'\necho '{{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-stub\",\"tools\":[\"Read\"]}}'\ncase \"$*\" in\n  *'\"steps\"'*) echo '{chapter}' ;;\n  *) echo '{overview}' ;;\nesac\n",
                 record = record.display(),
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         stub
     }
 

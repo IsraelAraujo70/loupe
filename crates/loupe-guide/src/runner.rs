@@ -495,16 +495,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runner_aborts_if_agent_exposes_any_non_readonly_tool() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (src, sha) = create_malicious_test_repo();
         let stub = std::env::temp_dir().join(format!("loupe-bad-stub-{}.sh", std::process::id()));
-        fs::write(
+        crate::test_support::write_executable(
             &stub,
             "#!/bin/sh\necho '{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"stub\",\"tools\":[\"Read\",\"Bash\"]}'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let checkout_path;
         {
@@ -570,20 +566,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_agent_never_runs_in_the_checkout() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (src, sha) = create_malicious_test_repo();
         let record = std::env::temp_dir().join(format!("loupe-cwd-record-{}", std::process::id()));
         let stub = std::env::temp_dir().join(format!("loupe-cwd-stub-{}.sh", std::process::id()));
-        fs::write(
+        crate::test_support::write_executable(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\n{{ pwd; ls -A; prev=; for a in \"$@\"; do [ \"$prev\" = --add-dir ] && echo \"add-dir=$a\"; prev=$a; done; }} > '{}'\necho '{{\"type\":\"result\",\"is_error\":true,\"result\":\"stub\"}}'\n",
                 record.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let checkout = TempCheckout::from_local_repo(&src, &sha).unwrap();
         let input = GuidePromptInput {
@@ -634,12 +626,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runner_times_out_stalled_agent_and_cleans_up() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (src, sha) = create_malicious_test_repo();
         let stub = std::env::temp_dir().join(format!("loupe-stall-stub-{}.sh", std::process::id()));
-        fs::write(&stub, "#!/bin/sh\nsleep 30 &\nwait\n").unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&stub, "#!/bin/sh\nsleep 30 &\nwait\n");
 
         let checkout_path;
         {
