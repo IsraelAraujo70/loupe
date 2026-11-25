@@ -3,3 +3,4 @@
 - Entry 003: a one-line change, so the pull request has more than 250 commits.
 - Entry 004: a one-line change, so the pull request has more than 250 commits.
 - Entry 005: a one-line change, so the pull request has more than 250 commits.
+- Entry 006: a one-line change, so the pull request has more than 250 commits.
