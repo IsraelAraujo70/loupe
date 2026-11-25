@@ -855,7 +855,7 @@ mod tests {
                 .unwrap()
                 .subsec_nanos()
         ));
-        crate::test_support::write_executable(&stub, "#!/bin/sh\nenv\n");
+        loupe_test_support::write_executable(&stub, "#!/bin/sh\nenv\n");
 
         let mut cmd = build_command(
             &stub,

@@ -3893,6 +3893,7 @@ name = "loupe-guide"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "loupe-test-support",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -3924,10 +3925,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "loupe-test-support"
+version = "0.1.0"
+
+[[package]]
 name = "loupe-update"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "loupe-test-support",
  "serde",
  "ureq",
 ]

@@ -497,7 +497,7 @@ mod tests {
     fn runner_aborts_if_agent_exposes_any_non_readonly_tool() {
         let (src, sha) = create_malicious_test_repo();
         let stub = std::env::temp_dir().join(format!("loupe-bad-stub-{}.sh", std::process::id()));
-        crate::test_support::write_executable(
+        loupe_test_support::write_executable(
             &stub,
             "#!/bin/sh\necho '{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"stub\",\"tools\":[\"Read\",\"Bash\"]}'\n",
         );
@@ -569,7 +569,7 @@ mod tests {
         let (src, sha) = create_malicious_test_repo();
         let record = std::env::temp_dir().join(format!("loupe-cwd-record-{}", std::process::id()));
         let stub = std::env::temp_dir().join(format!("loupe-cwd-stub-{}.sh", std::process::id()));
-        crate::test_support::write_executable(
+        loupe_test_support::write_executable(
             &stub,
             &format!(
                 "#!/bin/sh\n{{ pwd; ls -A; prev=; for a in \"$@\"; do [ \"$prev\" = --add-dir ] && echo \"add-dir=$a\"; prev=$a; done; }} > '{}'\necho '{{\"type\":\"result\",\"is_error\":true,\"result\":\"stub\"}}'\n",
@@ -628,7 +628,7 @@ mod tests {
     fn runner_times_out_stalled_agent_and_cleans_up() {
         let (src, sha) = create_malicious_test_repo();
         let stub = std::env::temp_dir().join(format!("loupe-stall-stub-{}.sh", std::process::id()));
-        crate::test_support::write_executable(&stub, "#!/bin/sh\nsleep 30 &\nwait\n");
+        loupe_test_support::write_executable(&stub, "#!/bin/sh\nsleep 30 &\nwait\n");
 
         let checkout_path;
         {
