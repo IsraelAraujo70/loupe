@@ -543,7 +543,11 @@ impl PullRequestView {
                             .ok();
                     }
                     GuideAction::OpenSettings => {
-                        crate::shell::navigate(crate::route::Route::Settings, window, cx);
+                        crate::settings::view::open_section(
+                            crate::settings::catalog::Section::GuidedReview,
+                            window,
+                            cx,
+                        );
                     }
                     GuideAction::RecheckClaude => {
                         crate::github::guide_service::recheck_availability(cx);
