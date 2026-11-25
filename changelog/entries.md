@@ -21,3 +21,4 @@
 - Entry 021: a one-line change, so the pull request has more than 250 commits.
 - Entry 022: a one-line change, so the pull request has more than 250 commits.
 - Entry 023: a one-line change, so the pull request has more than 250 commits.
+- Entry 024: a one-line change, so the pull request has more than 250 commits.
