@@ -22,8 +22,13 @@ use crate::theme::tokens;
 
 /// Zed's dense project panel row.
 pub const ROW_HEIGHT: f32 = 22.;
-/// Zed's default `project_panel.indent_size`.
+/// Zed's default `project_panel.indent_size`, for the first levels.
 const INDENT: f32 = 20.;
+/// How many levels take the full indent.
+const FULL_INDENT_LEVELS: usize = 3;
+/// The indent of each level past those, so a file deep in a large pull
+/// request keeps the room for its whole name.
+const DEEP_INDENT: f32 = 10.;
 /// The row's inner padding before the first indent level.
 const ROW_PADDING: f32 = 8.;
 const ICON_SIZE: f32 = 16.;
@@ -46,6 +51,8 @@ pub struct RowView {
     pub icon_color: Hsla,
     pub additions: u32,
     pub deletions: u32,
+    /// How many files a folder holds; 0 for a file.
+    pub files: usize,
     /// A file's status letter and its color.
     pub status: Option<(&'static str, Hsla)>,
     pub viewed: ViewedMark,
@@ -105,7 +112,7 @@ pub fn row(
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left(dp(ROW_PADDING + level as f32 * INDENT + ICON_SIZE / 2. - 1.))
+                .left(dp(ROW_PADDING + indent(level) + ICON_SIZE / 2. - 1.))
                 .w(px(1.))
                 .bg(if *active {
                     tokens::indent_guide_active()
@@ -129,7 +136,7 @@ pub fn row(
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .pl(dp(ROW_PADDING + view.depth as f32 * INDENT - 1.))
+                .pl(dp(ROW_PADDING + indent(view.depth) - 1.))
                 .gap(dp(2.))
                 .items_center()
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -154,71 +161,18 @@ pub fn row(
                 })
                 .child(icon(view.icon, view.icon_color))
                 .child(if folder_row {
-                    let (head, between, tail) = split_label(&view.label);
-                    // A folder's name is whole at the tree's opening width;
-                    // in a narrower tree it is cut at its end, and the lanes
-                    // beside it keep their place.
-                    h_flex()
-                        .min_w_0()
-                        .ml(dp(4.))
-                        .text_size(scale::body())
-                        .text_color(view.label_color)
-                        .flex_shrink(1.)
-                        .overflow_hidden()
-                        .child(div().flex_none().child(head))
-                        .when(!between.is_empty(), |label| {
-                            label.child(div().flex_none().text_color(muted).child(between))
-                        })
-                        .child(div().flex_none().child(tail))
-                        .into_any_element()
+                    folder_label(view, muted).into_any_element()
                 } else {
-                    file_name(view.label.clone(), view.name_from)
-                        .text_color(view.label_color)
-                        .into_any_element()
+                    name_and_size(
+                        view.label.clone(),
+                        view.name_from,
+                        view.additions,
+                        view.deletions,
+                    )
+                    .text_color(view.label_color)
+                    .into_any_element()
                 })
-                // What is left of a folder's row, so its lanes sit at the
-                // trailing edge like a file's.
-                .when(folder_row, |item| item.child(div().flex_1()))
-                .child(
-                    // One fixed band at the trailing edge of every row:
-                    // the size, the status letter, then the viewed box
-                    // after it, each in a lane of its own width and 8 px
-                    // from the next. The band never shrinks, so the three
-                    // form columns down the tree whatever the name beside
-                    // them.
-                    h_flex()
-                        .flex_none()
-                        .ml(dp(8.))
-                        .gap(dp(LANE_GAP))
-                        .text_size(scale::label())
-                        .child(
-                            h_flex()
-                                .w(dp(STAT_LANE))
-                                .justify_end()
-                                .gap(dp(3.))
-                                .child(
-                                    div()
-                                        .text_color(tokens::diff_added_text())
-                                        .child(format!("+{}", view.additions)),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(tokens::diff_removed_text())
-                                        .child(format!("−{}", view.deletions)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w(dp(12.))
-                                .text_center()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .children(
-                                    view.status.map(|(letter, color)| {
-                                        div().text_color(color).child(letter)
-                                    }),
-                                ),
-                        ),
-                ),
+                .child(status_lane(view.status).ml(dp(LANE_GAP))),
         )
         .child(viewed_box(
             ElementId::NamedInteger(format!("{id_prefix}-viewed").into(), ix as u64),
@@ -237,8 +191,6 @@ pub fn row(
         .into_any_element()
 }
 
-/// Width of the lane for `+added −removed`.
-const STAT_LANE: f32 = 56.;
 /// The space between the lanes of a row's trailing band (the size, the
 /// status letter, and the viewed box) and after the last one. With the
 /// tree at its opening width, a folded folder name still fits whole.
@@ -290,9 +242,37 @@ fn abbreviate_name(name: &str, from: usize, max: f32, width: impl Fn(&str) -> f3
     cut_name(name, max, &width)
 }
 
-/// A file's name in the room its row leaves, cut as `abbreviate_name` cuts
-/// it, so siblings with the same start still read apart in a narrow tree.
-fn file_name(name: SharedString, from: usize) -> Div {
+/// The left edge of a row's content at `depth`, past the row's padding.
+fn indent(depth: usize) -> f32 {
+    let full = depth.min(FULL_INDENT_LEVELS);
+    full as f32 * INDENT + (depth - full) as f32 * DEEP_INDENT
+}
+
+/// What a file row shows in `room`, as `width` measures text: the whole
+/// name with its size `size_width` beside it, then the whole name alone,
+/// and only when the name alone does not fit, the name cut as
+/// `abbreviate_name` cuts it. The size is also in the row's tooltip and
+/// accessible name, so it is what gives way.
+fn fit_file_row(
+    name: &str,
+    from: usize,
+    room: f32,
+    size_width: f32,
+    width: impl Fn(&str) -> f32,
+) -> (String, bool) {
+    let whole = width(name);
+    if whole + size_width <= room {
+        (name.to_owned(), true)
+    } else if whole <= room {
+        (name.to_owned(), false)
+    } else {
+        (abbreviate_name(name, from, room, width), false)
+    }
+}
+
+/// A file's name and, at the trailing edge, its size, in the room its row
+/// leaves (`fit_file_row`): the name is cut only when it cannot be whole.
+fn name_and_size(name: SharedString, from: usize, additions: u32, deletions: u32) -> Div {
     div()
         .flex_1()
         .min_w_0()
@@ -302,20 +282,169 @@ fn file_name(name: SharedString, from: usize) -> Div {
         .child(
             canvas(
                 move |bounds, window, cx| {
-                    let label: SharedString = {
+                    let mut size = size_label(additions, deletions).into_any_element();
+                    let size_box = size.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let (label, with_size) = {
                         let measure = text_width(window, FontWeight::NORMAL);
-                        abbreviate_name(&name, from, f32::from(bounds.size.width), measure).into()
+                        fit_file_row(
+                            &name,
+                            from,
+                            f32::from(bounds.size.width),
+                            f32::from(size_box.width + dp(LANE_GAP)),
+                            measure,
+                        )
                     };
                     let mut text = div().whitespace_nowrap().child(label).into_any_element();
-                    let size = text.layout_as_root(AvailableSpace::min_size(), window, cx);
-                    let top = bounds.top() + (bounds.size.height - size.height) / 2.;
-                    text.prepaint_at(point(bounds.left(), top), window, cx);
-                    text
+                    let text_box = text.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let middle = |height: Pixels| bounds.top() + (bounds.size.height - height) / 2.;
+                    text.prepaint_at(point(bounds.left(), middle(text_box.height)), window, cx);
+                    let size = with_size.then(|| {
+                        let left = bounds.right() - size_box.width;
+                        size.prepaint_at(point(left, middle(size_box.height)), window, cx);
+                        size
+                    });
+                    (text, size)
                 },
-                |_, mut text, window, cx| text.paint(window, cx),
+                |_, (mut text, size), window, cx| {
+                    text.paint(window, cx);
+                    if let Some(mut size) = size {
+                        size.paint(window, cx);
+                    }
+                },
             )
             .size_full(),
         )
+}
+
+/// Which of a folder row's file count and size fit in `room` beside its
+/// whole label, as (count, size): the size gives way first, then the count,
+/// so the name is the last thing a narrow tree loses.
+fn fit_folder_row(label: f32, count: f32, size: f32, room: f32) -> (bool, bool) {
+    if label + count + size <= room {
+        (true, true)
+    } else if label + count <= room {
+        (true, false)
+    } else {
+        (false, false)
+    }
+}
+
+/// A folder's label, its file count after it, and its size at the trailing
+/// edge, in the room its row leaves (`fit_folder_row`). A label wider than
+/// the whole room is cut at its end.
+fn folder_label(view: &RowView, muted: Hsla) -> Div {
+    let label = view.label.clone();
+    let color = view.label_color;
+    let (files, additions, deletions) = (view.files, view.additions, view.deletions);
+    div()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .ml(dp(4.))
+        .text_size(scale::body())
+        .text_color(color)
+        .child(
+            canvas(
+                move |bounds, window, cx| {
+                    let room = f32::from(bounds.size.width);
+                    let (head, between, tail) = split_label(&label);
+                    let mut name = h_flex()
+                        .whitespace_nowrap()
+                        .child(head.clone())
+                        .when(!between.is_empty(), |name| {
+                            name.child(div().text_color(muted).child(between.clone()))
+                        })
+                        .child(tail.clone())
+                        .into_any_element();
+                    let name_box = name.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let mut count = file_count(files).into_any_element();
+                    let count_box = count.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let mut size = size_label(additions, deletions).into_any_element();
+                    let size_box = size.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let name_width = f32::from(name_box.width);
+                    let (with_count, with_size) = fit_folder_row(
+                        name_width,
+                        f32::from(count_box.width),
+                        f32::from(size_box.width + dp(LANE_GAP)),
+                        room,
+                    );
+                    if name_width > room {
+                        let text = format!("{head}{between}{tail}");
+                        let cut: SharedString = {
+                            let measure = text_width(window, FontWeight::NORMAL);
+                            cut_name(&text, room, &measure).into()
+                        };
+                        name = div().whitespace_nowrap().child(cut).into_any_element();
+                        name.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    }
+                    let middle = |height: Pixels| bounds.top() + (bounds.size.height - height) / 2.;
+                    name.prepaint_at(point(bounds.left(), middle(name_box.height)), window, cx);
+                    let count = with_count.then(|| {
+                        let left = bounds.left() + name_box.width;
+                        count.prepaint_at(point(left, middle(count_box.height)), window, cx);
+                        count
+                    });
+                    let size = with_size.then(|| {
+                        let left = bounds.right() - size_box.width;
+                        size.prepaint_at(point(left, middle(size_box.height)), window, cx);
+                        size
+                    });
+                    (name, count, size)
+                },
+                |_, (mut name, count, size), window, cx| {
+                    name.paint(window, cx);
+                    for mut part in count.into_iter().chain(size) {
+                        part.paint(window, cx);
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
+
+/// `+added −removed`, in the diff's colors.
+fn size_label(additions: u32, deletions: u32) -> Div {
+    h_flex()
+        .flex_none()
+        .gap(dp(3.))
+        .text_size(scale::label())
+        .whitespace_nowrap()
+        .child(
+            div()
+                .text_color(tokens::diff_added_text())
+                .child(format!("+{additions}")),
+        )
+        .child(
+            div()
+                .text_color(tokens::diff_removed_text())
+                .child(format!("−{deletions}")),
+        )
+}
+
+/// The lane of a file's status letter; a folder's stays empty so the
+/// columns line up.
+fn status_lane(status: Option<(&'static str, Hsla)>) -> Div {
+    div()
+        .flex_none()
+        .w(dp(12.))
+        .text_size(scale::label())
+        .text_center()
+        .font_weight(FontWeight::SEMIBOLD)
+        .children(status.map(|(letter, color)| div().text_color(color).child(letter)))
+}
+
+/// How many files a folder holds, so a closed folder says how much is in
+/// it. The row's accessible name says it too.
+fn file_count(files: usize) -> Div {
+    div()
+        .flex_none()
+        .ml(dp(6.))
+        .px(dp(5.))
+        .rounded(dp(4.))
+        .bg(tokens::glass_hover())
+        .text_size(scale::label())
+        .text_color(tokens::text_muted())
+        .child(files.to_string())
 }
 
 fn icon(path: &'static str, color: Hsla) -> Svg {
@@ -457,7 +586,7 @@ impl UniformListDecoration for StickyFolders {
 
 #[cfg(test)]
 mod tests {
-    use super::{abbreviate_name, split_label};
+    use super::{abbreviate_name, fit_file_row, fit_folder_row, indent, split_label};
 
     fn parts(label: &str) -> String {
         let (head, between, tail) = split_label(label);
@@ -505,6 +634,42 @@ mod tests {
             .map(|name| abbreviate_name(name, 13, 9., chars))
             .collect();
         assert_eq!(cut, ["…cont….ts", "…repo….ts", "…serv….ts"]);
+    }
+
+    #[test]
+    fn the_size_gives_way_before_the_name() {
+        let name = "repository_context.rs";
+        let whole = (name.to_owned(), true);
+        assert_eq!(fit_file_row(name, 0, 30., 9., chars), whole);
+        // Too narrow for both: the name stays whole, the size goes.
+        assert_eq!(
+            fit_file_row(name, 0, 25., 9., chars),
+            (name.to_owned(), false)
+        );
+        assert_eq!(
+            fit_file_row(name, 0, 21., 9., chars),
+            (name.to_owned(), false)
+        );
+        // Only a name wider than the whole row is cut.
+        assert_eq!(
+            fit_file_row(name, 0, 15., 9., chars),
+            ("repository_….rs".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn a_folder_keeps_its_name_before_its_size_and_count() {
+        assert_eq!(fit_folder_row(10., 3., 6., 19.), (true, true));
+        assert_eq!(fit_folder_row(10., 3., 6., 18.), (true, false));
+        assert_eq!(fit_folder_row(10., 3., 6., 12.), (false, false));
+        assert_eq!(fit_folder_row(10., 3., 6., 8.), (false, false));
+    }
+
+    #[test]
+    fn deep_levels_indent_less() {
+        assert_eq!(indent(0), 0.);
+        assert_eq!(indent(3), 60.);
+        assert_eq!(indent(5), 80.);
     }
 
     #[test]
