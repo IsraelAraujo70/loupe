@@ -8,17 +8,28 @@
 use std::ops::Range;
 use std::rc::Rc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::FilesTab;
 use super::header::{ELLIPSIS, cut_name, text_width};
-use super::tree::{TreeRow, ViewedMark, sticky_folders};
-use crate::assets;
+use super::model::{Missing, is_viewed, split_path, status_letter};
+use super::tree::{
+    Facet, GitTint, LOW_SIGNAL, NOT_COVERED, RowKind, TreeRow, ViewedMark, active_folder,
+    ancestors, distinct_starts, file_tint, folder_tint, is_group, split_group, step_of,
+    sticky_folders, viewed_mark,
+};
+use super::{FilesTab, LOW_SIGNAL_HINT, LOW_SIGNAL_ICON, tint_color};
 use crate::theme::scale::{self, dp};
 use crate::theme::tokens;
+use crate::ui::MenuTriggerExt as _;
+use crate::{assets, ui};
 
 /// Zed's dense project panel row.
 pub const ROW_HEIGHT: f32 = 22.;
@@ -63,6 +74,11 @@ pub struct RowView {
     pub guides: Vec<bool>,
     pub tooltip: SharedString,
     pub accessible_name: SharedString,
+    /// Open review threads on the file, or on the files under the folder.
+    pub threads: usize,
+    /// A group of the Guide order: a step's (its number, from 1) or
+    /// [`NOT_COVERED`]'s (`Some(None)`), whose label is a title, not a path.
+    pub guide_group: Option<Option<usize>>,
 }
 
 /// One tree row. `sticky` rows are the pinned copies drawn over the list.
@@ -160,7 +176,9 @@ pub fn row(
                     None => div().flex_none().size(dp(ICON_SIZE)).into_any_element(),
                 })
                 .child(icon(view.icon, view.icon_color))
-                .child(if folder_row {
+                .child(if let Some(step) = view.guide_group {
+                    guide_group_label(view, step, muted).into_any_element()
+                } else if folder_row {
                     folder_label(view, muted).into_any_element()
                 } else {
                     name_and_size(
@@ -171,6 +189,9 @@ pub fn row(
                     )
                     .text_color(view.label_color)
                     .into_any_element()
+                })
+                .when(view.threads > 0, |item| {
+                    item.child(thread_badge(id_prefix, ix, view.threads).ml(dp(LANE_GAP)))
                 })
                 .child(status_lane(view.status).ml(dp(LANE_GAP))),
         )
@@ -402,6 +423,67 @@ fn folder_label(view: &RowView, muted: Hsla) -> Div {
         )
 }
 
+/// A step of the Guide order: its number, muted, then its title cut at its
+/// end, and how many files it holds. [`NOT_COVERED`] has no number.
+fn guide_group_label(view: &RowView, step: Option<usize>, muted: Hsla) -> Div {
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .ml(dp(4.))
+        .gap(dp(4.))
+        .items_center()
+        .text_size(scale::body())
+        .text_color(view.label_color)
+        .children(step.map(|step| {
+            div()
+                .flex_none()
+                .text_color(muted)
+                .child(format!("{step}."))
+        }))
+        .child(
+            div()
+                .min_w_0()
+                .whitespace_nowrap()
+                .truncate()
+                .child(view.label.clone()),
+        )
+        .child(file_count(view.files).ml(dp(2.)))
+}
+
+/// How many review threads on a row are still open: a speech bubble and the
+/// count in the accent, since an open thread waits on someone.
+fn thread_badge(id_prefix: &str, ix: usize, threads: usize) -> Stateful<Div> {
+    h_flex()
+        .id(ElementId::NamedInteger(
+            format!("{id_prefix}-threads").into(),
+            ix as u64,
+        ))
+        .role(Role::Status)
+        .aria_label(open_threads_label(threads))
+        .flex_none()
+        .gap(dp(2.))
+        .items_center()
+        .text_size(scale::label())
+        .text_color(tokens::accent())
+        .child(icon(THREAD_ICON, tokens::accent()).size(dp(12.)))
+        .child(threads.to_string())
+}
+
+/// "1 open thread", "3 open threads".
+pub fn open_threads_label(threads: usize) -> String {
+    match threads {
+        1 => "1 open thread".to_owned(),
+        threads => format!("{threads} open threads"),
+    }
+}
+
+const THREAD_ICON: &str = "icons/message-square.svg";
+const STEP_ICON: &str = "icons/book-open.svg";
+const NOT_COVERED_ICON: &str = "icons/circle-dashed.svg";
+/// What the group of the files no step cites holds.
+const NOT_COVERED_HINT: &str = "changed files no step of the guide cites";
+
 /// `+added −removed`, in the diff's colors.
 fn size_label(additions: u32, deletions: u32) -> Div {
     h_flex()
@@ -582,6 +664,381 @@ impl UniformListDecoration for StickyFolders {
             )
             .into_any_element()
     }
+}
+
+impl FilesTab {
+    pub(super) fn row_views(&self, rows: &[TreeRow], focused: bool, cx: &App) -> Vec<RowView> {
+        let selected = self
+            .selected
+            .as_deref()
+            .and_then(|path| self.shown(rows, path));
+        let active = selected.and_then(|ix| active_folder(rows, ix));
+        let starts = distinct_starts(rows);
+        let threads = self.open_thread_counts();
+        let muted = cx.theme().muted_foreground;
+        let foreground = cx.theme().foreground;
+        rows.iter()
+            .enumerate()
+            .map(|(ix, row)| {
+                let guides = ancestors(rows, ix)
+                    .into_iter()
+                    .map(|folder| Some(folder) == active)
+                    .collect();
+                let path = SharedString::from(row.path.clone());
+                let is_selected = selected == Some(ix);
+                match &row.kind {
+                    RowKind::Dir(dir) => {
+                        let files = dir.files.iter().map(|&ix| &self.files[ix]);
+                        let viewed = viewed_mark(files.clone().map(|file| is_viewed(file.viewed)));
+                        let open: usize = files
+                            .clone()
+                            .map(|file| threads.get(file.path.as_str()).copied().unwrap_or(0))
+                            .sum();
+                        // A folder that is all new or all deleted says so on
+                        // its icon; any other folder's icon stays muted.
+                        let icon_color = match folder_tint(files.map(|file| file.status)) {
+                            GitTint::Created => tokens::open(),
+                            GitTint::Deleted => tokens::closed(),
+                            GitTint::Modified | GitTint::Renamed => muted,
+                        };
+                        let count = dir.files.len();
+                        let noun = if count == 1 { "file" } else { "files" };
+                        let size = format!("+{} −{}", dir.additions, dir.deletions);
+                        let group = row.parent.is_none() && is_group(&row.path);
+                        let step = group.then(|| step_of(&row.path)).flatten();
+                        let guide_group = match (step, row.path == NOT_COVERED) {
+                            (Some(step), _) => Some(Some(step + 1)),
+                            (None, true) => Some(None),
+                            (None, false) => None,
+                        };
+                        // A folder in a group is named for the folder it
+                        // mirrors.
+                        let (shown_path, section) = match split_group(&row.path) {
+                            Some((group, inner)) => {
+                                let section = match step_of(group) {
+                                    Some(step) => format!(" (step {})", step + 1),
+                                    None => format!(" ({})", group.to_lowercase()),
+                                };
+                                (inner, section)
+                            }
+                            None => (row.path.as_str(), String::new()),
+                        };
+                        let threads_note = match open {
+                            0 => String::new(),
+                            open => format!(", {}", open_threads_label(open)),
+                        };
+                        let (tooltip, accessible_name) = if let Some(step) = step {
+                            (
+                                format!("{}. {} · {count} {noun} · {size}", step + 1, dir.label),
+                                format!(
+                                    "Guide step {}: {}, {count} {noun}, {size}",
+                                    step + 1,
+                                    dir.label
+                                ),
+                            )
+                        } else if row.path == LOW_SIGNAL && group {
+                            (
+                                format!(
+                                    "{LOW_SIGNAL} · {count} {noun} · {size} · {LOW_SIGNAL_HINT}"
+                                ),
+                                format!("{LOW_SIGNAL} group, {count} {noun}, {size}"),
+                            )
+                        } else if row.path == NOT_COVERED && group {
+                            (
+                                format!(
+                                    "{NOT_COVERED} · {count} {noun} · {size} · {NOT_COVERED_HINT}"
+                                ),
+                                format!("{NOT_COVERED} group, {count} {noun}, {size}"),
+                            )
+                        } else if group {
+                            (
+                                format!("{} · {count} {noun} · {size}", row.path),
+                                format!("{} group, {count} {noun}, {size}", row.path),
+                            )
+                        } else {
+                            (
+                                format!("{shown_path}{section} · {count} {noun} · {size}"),
+                                format!("Folder {shown_path}{section}, {count} {noun}, {size}"),
+                            )
+                        };
+                        RowView {
+                            depth: row.depth,
+                            folder: Some(dir.expanded),
+                            label: dir.label.clone().into(),
+                            name_from: 0,
+                            // Names stay neutral; the status letter carries
+                            // the color.
+                            label_color: if viewed == ViewedMark::All {
+                                muted
+                            } else {
+                                foreground
+                            },
+                            icon: if step.is_some() {
+                                STEP_ICON
+                            } else if guide_group.is_some() {
+                                NOT_COVERED_ICON
+                            } else if row.path == LOW_SIGNAL && group {
+                                LOW_SIGNAL_ICON
+                            } else if dir.expanded {
+                                assets::FOLDER_OPEN
+                            } else {
+                                assets::FOLDER
+                            },
+                            icon_color: if group { muted } else { icon_color },
+                            additions: dir.additions,
+                            deletions: dir.deletions,
+                            files: count,
+                            status: None,
+                            viewed,
+                            selected: is_selected,
+                            focused,
+                            guides,
+                            tooltip: format!("{tooltip}{}", threads_note.replacen(',', " ·", 1))
+                                .into(),
+                            accessible_name: format!("{accessible_name}{threads_note}").into(),
+                            path,
+                            threads: open,
+                            guide_group,
+                        }
+                    }
+                    RowKind::File { index } => {
+                        let file = &self.files[*index];
+                        let viewed = is_viewed(file.viewed);
+                        let tint = tint_color(file_tint(file.status));
+                        let open = threads.get(file.path.as_str()).copied().unwrap_or(0);
+                        let missing = match self.missing.get(&file.path) {
+                            Some(Missing::Omitted) => " · diff not loaded",
+                            Some(Missing::Unreadable) => " · diff not shown",
+                            None => "",
+                        };
+                        let kind = self
+                            .low
+                            .get(&file.path)
+                            .map(|kind| format!(", {}", kind.label(file)))
+                            .unwrap_or_default();
+                        let threads_note = match open {
+                            0 => String::new(),
+                            open => format!(", {}", open_threads_label(open)),
+                        };
+                        RowView {
+                            depth: row.depth,
+                            folder: None,
+                            label: split_path(&file.path).1.to_owned().into(),
+                            name_from: starts[ix],
+                            label_color: if viewed { muted } else { foreground },
+                            icon: assets::file_icon(&file.path),
+                            icon_color: muted,
+                            additions: file.additions,
+                            deletions: file.deletions,
+                            files: 0,
+                            status: Some((status_letter(file.status), tint)),
+                            viewed: if viewed {
+                                ViewedMark::All
+                            } else {
+                                ViewedMark::None
+                            },
+                            selected: is_selected,
+                            focused,
+                            guides,
+                            tooltip: format!(
+                                "{} · +{} −{}{}{}{}",
+                                file.path,
+                                file.additions,
+                                file.deletions,
+                                kind.replacen(',', " ·", 1),
+                                threads_note.replacen(',', " ·", 1),
+                                missing
+                            )
+                            .into(),
+                            accessible_name: format!(
+                                "File {}{kind}, +{} −{}{threads_note}",
+                                file.path, file.additions, file.deletions
+                            )
+                            .into(),
+                            path,
+                            threads: open,
+                            guide_group: None,
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Under the filter's text: Filter, with the facets that narrow the
+    /// tree and the diff; Group, for folders or the Guide order; and Next
+    /// open thread. The facets set follow as chips, each with its ×, and
+    /// Clear.
+    pub(super) fn tree_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tab = cx.entity().downgrade();
+        let muted = cx.theme().muted_foreground;
+        let counts = self.facet_counts();
+        let set = self.tree.facets.clone();
+        let has_guide = !self.tree.guide.is_empty();
+        let in_commit = self.commit.is_some();
+        let filter = {
+            let tab = tab.clone();
+            let set = set.clone();
+            Button::new("files-tree-filter")
+                .debug_selector(|| "files-tree-filter".into())
+                .ghost()
+                .xsmall()
+                .icon(IconName::ListFilter)
+                .label("Filter")
+                .dropdown_caret(true)
+                .selected(!set.is_empty())
+                .tooltip("Show only some files in the tree and the diff")
+                .accessibility_label("Filter files by state")
+                .menu_trigger()
+                .dropdown_menu(move |menu: PopupMenu, _, _| {
+                    Facet::ALL
+                        .into_iter()
+                        .fold(menu.min_w(scale::dp(220.)), |menu, facet| {
+                            let count = counts.get(&facet).copied().unwrap_or(0);
+                            let on = set.contains(&facet);
+                            let unavailable = match facet {
+                                Facet::CitedByGuide if !has_guide => Some("no guide yet"),
+                                Facet::HasThreads if in_commit => Some("not in a commit"),
+                                _ => None,
+                            };
+                            let label = match unavailable {
+                                Some(why) => format!("{} ({why})", facet.label()),
+                                None => format!("{} · {count}", facet.label()),
+                            };
+                            let tab = tab.clone();
+                            menu.item(
+                                PopupMenuItem::new(label)
+                                    .checked(on)
+                                    .disabled(unavailable.is_some() && !on)
+                                    .on_click(move |_, _, cx| {
+                                        tab.update(cx, |tab, cx| tab.toggle_facet(facet, cx)).ok();
+                                    }),
+                            )
+                        })
+                })
+        };
+        let guide_order = self.tree.guide_order && has_guide;
+        let group = {
+            let tab = tab.clone();
+            Button::new("files-tree-group")
+                .debug_selector(|| "files-tree-group".into())
+                .ghost()
+                .xsmall()
+                .icon(if guide_order {
+                    IconName::BookOpen
+                } else {
+                    IconName::ListTree
+                })
+                .label(if guide_order {
+                    "Guide order"
+                } else {
+                    "Folders"
+                })
+                .dropdown_caret(true)
+                .tooltip("Group the files by folder or by the steps of the guide")
+                .accessibility_label(if guide_order {
+                    "Group files: Guide order"
+                } else {
+                    "Group files: Folders"
+                })
+                .menu_trigger()
+                .dropdown_menu(move |menu: PopupMenu, _, _| {
+                    let pick = |label: &str, on: bool, disabled: bool| {
+                        let tab = tab.clone();
+                        PopupMenuItem::new(label.to_owned())
+                            .checked(guide_order == on)
+                            .disabled(disabled)
+                            .on_click(move |_, _, cx| {
+                                tab.update(cx, |tab, cx| tab.set_guide_order(on, cx)).ok();
+                            })
+                    };
+                    menu.min_w(scale::dp(220.))
+                        .item(pick("Folders", false, false))
+                        .item(if has_guide {
+                            pick("Guide order", true, false)
+                        } else {
+                            pick("Guide order (no guide yet)", true, true)
+                        })
+                })
+        };
+        let stops = self.open_thread_stops(cx);
+        let next_thread = {
+            let position = super::tree::next_stop(&stops, self.tree.last_thread.as_ref())
+                .filter(|_| self.tree.last_thread.is_some());
+            let tooltip = match (stops.len(), position) {
+                (0, _) if in_commit => "Threads belong to the whole pull request".to_owned(),
+                (0, _) => "No open threads in the files shown".to_owned(),
+                (total, Some(next)) => format!("Next open thread ({} of {total})", next + 1),
+                (total, None) => format!("Next open thread (1 of {total})"),
+            };
+            Button::new("files-next-thread")
+                .debug_selector(|| "files-next-thread".into())
+                .ghost()
+                .xsmall()
+                .icon(IconName::MessageSquare)
+                .label(stops.len().to_string())
+                .tooltip(tooltip)
+                .accessibility_label(format!(
+                    "Next open thread, {}",
+                    open_threads_label(stops.len())
+                ))
+                .disabled(stops.is_empty())
+                .on_click(cx.listener(|tab, _, _, cx| tab.next_open_thread(cx)))
+        };
+        let chips: Vec<AnyElement> = set
+            .iter()
+            .map(|&facet| {
+                ui::chip_button(
+                    SharedString::from(format!("files-facet-{}", facet.label())),
+                    format!("Remove filter: {}", facet.label()),
+                    cx,
+                )
+                .tooltip(|window, cx| Tooltip::new("Remove filter").build(window, cx))
+                .on_click(cx.listener(move |tab, _, _, cx| tab.toggle_facet(facet, cx)))
+                .child(
+                    h_flex().gap_1().items_center().child(facet.label()).child(
+                        Icon::new(IconName::Close)
+                            .with_size(scale::icon_xs())
+                            .text_color(muted),
+                    ),
+                )
+                .into_any_element()
+            })
+            .collect();
+        v_flex_bar()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(filter)
+                    .child(group)
+                    .child(div().flex_1())
+                    .child(next_thread),
+            )
+            .when(!chips.is_empty(), |bar| {
+                bar.child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .items_center()
+                        .children(chips)
+                        .child(
+                            Button::new("files-facets-clear")
+                                .ghost()
+                                .xsmall()
+                                .label("Clear")
+                                .accessibility_label("Clear filters")
+                                .on_click(cx.listener(|tab, _, _, cx| tab.clear_facets(cx))),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+/// The tree's bar on the toolbar's 16 px edge, its rows 4 px apart.
+fn v_flex_bar() -> Div {
+    div().flex().flex_col().flex_none().gap_1().px_4().pb_1()
 }
 
 #[cfg(test)]

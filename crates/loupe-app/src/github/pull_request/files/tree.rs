@@ -13,8 +13,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use loupe_github::{ChangedFile, FileStatus};
+use gpui_kit::{App, Context};
+use loupe_github::{ChangedFile, FileStatus, NodeId, ReviewThread, Side};
+use loupe_guide::GuideStep;
 
+use super::FilesTab;
+use loupe_github::diff::find_line;
+
+use super::model::is_viewed;
+use super::search::LEAD;
 use super::signal::Signal;
 
 /// The low-signal group: its row's label and the key the tree opens and
@@ -173,32 +180,69 @@ pub fn filter_keeps(path: &str, filter: &str) -> bool {
     filter.is_empty() || path.to_lowercase().contains(&filter)
 }
 
+/// What the tree and the diff show: the files the filter's text keeps and,
+/// while a facet is set, the files the facets kept when they were set.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeQuery<'a> {
+    pub text: &'a str,
+    pub kept: Option<&'a HashSet<String>>,
+}
+
+impl<'a> TreeQuery<'a> {
+    pub fn text(text: &'a str) -> Self {
+        Self { text, kept: None }
+    }
+
+    pub fn keeps(&self, path: &str) -> bool {
+        filter_keeps(path, self.text) && self.kept.is_none_or(|kept| kept.contains(path))
+    }
+
+    /// Something narrows the files, so every folder opens to show what is
+    /// left.
+    pub fn narrows(&self) -> bool {
+        !self.text.trim().is_empty() || self.kept.is_some()
+    }
+}
+
 /// The tree at the top, and each group with files and its tree, in reading
-/// order. `signals` holds each file's kind, in file order.
-fn build(
+/// order, each group as its key and its label. `signals` holds each file's
+/// kind, in file order. With `guide`, every file sits in a group of the
+/// Guide order and the tree at the top is empty.
+fn build<'a>(
     files: &[ChangedFile],
     signals: &[Signal],
-    filter: &str,
-) -> (Dir, Vec<(&'static str, Dir)>) {
+    query: &TreeQuery,
+    guide: Option<&'a GuideLayout>,
+) -> (Dir, Vec<(&'a str, &'a str, Dir)>) {
     let mut main = Dir::default();
-    let mut groups: Vec<(&'static str, Dir)> =
-        GROUPS.iter().map(|name| (*name, Dir::default())).collect();
-    let file_groups = file_groups(signals);
+    let order: Vec<(&str, &str)> = match guide {
+        Some(guide) => guide.order().collect(),
+        None => GROUPS.iter().map(|name| (*name, *name)).collect(),
+    };
+    let mut groups: Vec<(&str, &str, Dir)> = order
+        .into_iter()
+        .map(|(key, label)| (key, label, Dir::default()))
+        .collect();
+    let review_groups = file_groups(signals);
     for (index, file) in files.iter().enumerate() {
-        if !filter_keeps(&file.path, filter) {
+        if !query.keeps(&file.path) {
             continue;
         }
         let signal = signals.get(index).copied().unwrap_or(Signal::Code);
-        let tree = match file_groups.get(index).copied().flatten() {
-            Some(name) => match groups.iter_mut().find(|(group, _)| *group == name) {
-                Some((_, tree)) => tree,
+        let group = match guide {
+            Some(guide) => Some(guide.group(&file.path, signal.is_low())),
+            None => review_groups.get(index).copied().flatten(),
+        };
+        let tree = match group {
+            Some(name) => match groups.iter_mut().find(|(key, ..)| *key == name) {
+                Some((.., tree)) => tree,
                 None => &mut main,
             },
             None => &mut main,
         };
         tree.insert(&file.path, index, signal.rank());
     }
-    groups.retain(|(_, tree)| !tree.is_empty());
+    groups.retain(|(.., tree)| !tree.is_empty());
     (main, groups)
 }
 
@@ -212,18 +256,30 @@ pub fn tree_rows(
     filter: &str,
     collapsed: &HashSet<String>,
 ) -> Vec<TreeRow> {
+    query_rows(files, signals, &TreeQuery::text(filter), None, collapsed)
+}
+
+/// [`tree_rows`] for the files `query` keeps, grouped in Guide order when
+/// `guide` is given.
+pub fn query_rows(
+    files: &[ChangedFile],
+    signals: &[Signal],
+    query: &TreeQuery,
+    guide: Option<&GuideLayout>,
+    collapsed: &HashSet<String>,
+) -> Vec<TreeRow> {
     let mut emitter = Emitter {
         files,
         collapsed,
-        force_open: !filter.trim().is_empty(),
+        force_open: query.narrows(),
         rows: Vec::new(),
     };
-    let (main, groups) = build(files, signals, filter);
+    let (main, groups) = build(files, signals, query, guide);
     emitter.emit(&main, "", 0, None);
-    for (name, tree) in &groups {
-        let row = emitter.push_dir(tree, (*name).to_owned(), (*name).to_owned(), 0, None);
+    for (key, label, tree) in &groups {
+        let row = emitter.push_dir(tree, (*key).to_owned(), (*label).to_owned(), 0, None);
         if let Some(row) = row {
-            emitter.emit(tree, name, 1, Some(row));
+            emitter.emit(tree, key, 1, Some(row));
         }
     }
     emitter.rows
@@ -381,9 +437,9 @@ pub fn into_tree_order(
     signals: Vec<Signal>,
 ) -> (Vec<ChangedFile>, Vec<Signal>) {
     let mut order = Vec::with_capacity(files.len());
-    let (main, groups) = build(&files, &signals, "");
+    let (main, groups) = build(&files, &signals, &TreeQuery::text(""), None);
     main.collect_files(&mut order);
-    for (_, tree) in &groups {
+    for (.., tree) in &groups {
         tree.collect_files(&mut order);
     }
     let mut slots: Vec<Option<(ChangedFile, Signal)>> =
@@ -513,11 +569,7 @@ pub fn holds(folder: &str, path: &str, group: Option<&str>) -> bool {
     if group == Some(folder) {
         return true;
     }
-    let inside = GROUPS.iter().find_map(|name| {
-        let inner = folder.strip_prefix(name)?.strip_prefix('/')?;
-        Some((*name, inner))
-    });
-    let real = match inside {
+    let real = match split_group(folder) {
         Some((name, inner)) if group == Some(name) => inner,
         None if group.is_none() => folder,
         _ => return false,
@@ -667,6 +719,413 @@ pub fn folder_tint(statuses: impl IntoIterator<Item = FileStatus>) -> GitTint {
     }
 }
 
+/// A filter of the tree beside its text. The ones set narrow the tree and
+/// the diff to the files that pass all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Facet {
+    Unviewed,
+    HasThreads,
+    CitedByGuide,
+    LowSignal,
+}
+
+impl Facet {
+    pub const ALL: [Facet; 4] = [
+        Facet::Unviewed,
+        Facet::HasThreads,
+        Facet::CitedByGuide,
+        Facet::LowSignal,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Facet::Unviewed => "Unviewed",
+            Facet::HasThreads => "Has threads",
+            Facet::CitedByGuide => "Cited by Guide",
+            Facet::LowSignal => "Low signal",
+        }
+    }
+
+    pub fn keeps(self, file: &FileFacts) -> bool {
+        match self {
+            Facet::Unviewed => !file.viewed,
+            Facet::HasThreads => file.open_threads > 0,
+            Facet::CitedByGuide => file.cited,
+            Facet::LowSignal => file.low,
+        }
+    }
+}
+
+/// What the facets know of one file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileFacts {
+    pub viewed: bool,
+    /// Review threads on the file nobody resolved yet.
+    pub open_threads: usize,
+    /// A step of the guide cites it.
+    pub cited: bool,
+    pub low: bool,
+}
+
+/// The paths of `files` that pass every facet in `facets`, or `None` while
+/// none is set.
+pub fn kept_by<'a>(
+    facets: &[Facet],
+    files: impl IntoIterator<Item = (&'a str, FileFacts)>,
+) -> Option<HashSet<String>> {
+    if facets.is_empty() {
+        return None;
+    }
+    Some(
+        files
+            .into_iter()
+            .filter(|(_, facts)| facets.iter().all(|facet| facet.keeps(facts)))
+            .map(|(path, _)| path.to_owned())
+            .collect(),
+    )
+}
+
+/// The group of the files no step of the guide cites, in Guide order.
+pub const NOT_COVERED: &str = "Not covered";
+/// What the key of a step's group starts with, before its number from 1.
+const STEP_KEY: &str = "Guide step ";
+
+fn step_key(ix: usize) -> String {
+    format!("{STEP_KEY}{}", ix + 1)
+}
+
+/// The step, from 0, whose group `key` is.
+pub fn step_of(key: &str) -> Option<usize> {
+    key.strip_prefix(STEP_KEY)?
+        .parse::<usize>()
+        .ok()?
+        .checked_sub(1)
+}
+
+/// Whether `key` is a group's: one of [`GROUPS`], a guide step's, or
+/// [`NOT_COVERED`].
+pub fn is_group(key: &str) -> bool {
+    GROUPS.contains(&key) || key == NOT_COVERED || step_of(key).is_some()
+}
+
+/// The group a folder inside one is keyed under, and the folder it names:
+/// `Tests/src` is `src` among the tests.
+pub fn split_group(folder: &str) -> Option<(&str, &str)> {
+    let (head, inner) = folder.split_once('/')?;
+    is_group(head).then_some((head, inner))
+}
+
+/// The tree in Guide order: each file under the first step of the guide that
+/// cites it, then the files no step cites ([`NOT_COVERED`]), then the
+/// low-signal ones no step cites ([`LOW_SIGNAL`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuideLayout {
+    /// Each step's group key and title, in the guide's order.
+    pub steps: Vec<(String, String)>,
+    /// The first step citing each file, by path.
+    first_step: HashMap<String, usize>,
+}
+
+impl GuideLayout {
+    pub fn new(steps: &[GuideStep]) -> Self {
+        let mut first_step = HashMap::new();
+        for (ix, step) in steps.iter().enumerate() {
+            for path in step.cited_paths() {
+                first_step.entry(path.to_owned()).or_insert(ix);
+            }
+        }
+        Self {
+            steps: steps
+                .iter()
+                .enumerate()
+                .map(|(ix, step)| (step_key(ix), step.title.clone()))
+                .collect(),
+            first_step,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    pub fn cites(&self, path: &str) -> bool {
+        self.first_step.contains_key(path)
+    }
+
+    /// The key of the group `path` sits in; `low` for a low-signal file.
+    pub fn group(&self, path: &str, low: bool) -> &str {
+        match self.first_step.get(path) {
+            Some(&step) => &self.steps[step].0,
+            None if low => LOW_SIGNAL,
+            None => NOT_COVERED,
+        }
+    }
+
+    /// Each group's key and label, in the order they show.
+    fn order(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.steps
+            .iter()
+            .map(|(key, title)| (key.as_str(), title.as_str()))
+            .chain([(NOT_COVERED, NOT_COVERED), (LOW_SIGNAL, LOW_SIGNAL)])
+    }
+}
+
+/// How the tree narrows and groups the files beyond the filter's text.
+#[derive(Debug, Default)]
+pub struct TreeOptions {
+    /// The facets set, in the order they were set.
+    pub facets: Vec<Facet>,
+    /// The files the facets kept when they last changed. A file marked
+    /// viewed while Unviewed is set stays until the facets change, so the
+    /// diff does not move under the reader.
+    pub kept: Option<HashSet<String>>,
+    pub guide_order: bool,
+    /// The guide of the pull request (or its chapter), empty without one.
+    pub guide: GuideLayout,
+    /// The thread Next open thread went to last.
+    pub last_thread: Option<NodeId>,
+}
+
+/// Open review threads on each path.
+pub fn open_threads(threads: &[ReviewThread]) -> HashMap<&str, usize> {
+    let mut counts = HashMap::new();
+    for thread in threads.iter().filter(|thread| !thread.is_resolved) {
+        *counts.entry(thread.path.as_str()).or_default() += 1;
+    }
+    counts
+}
+
+/// An open review thread as Next open thread visits it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadStop {
+    pub id: NodeId,
+    pub path: String,
+    /// `None` for a thread that no longer maps to a line: its file's header.
+    pub line: Option<u32>,
+    pub side: Side,
+}
+
+/// The open threads on the files `keeps` keeps, in the diff's order: by
+/// file, then the ones off the diff at the file's header, then by line.
+pub fn thread_stops(
+    files: &[ChangedFile],
+    threads: &[ReviewThread],
+    keeps: impl Fn(&str) -> bool,
+) -> Vec<ThreadStop> {
+    let place: HashMap<&str, usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| keeps(&file.path))
+        .map(|(ix, file)| (file.path.as_str(), ix))
+        .collect();
+    let mut stops: Vec<(usize, ThreadStop)> = threads
+        .iter()
+        .filter(|thread| !thread.is_resolved)
+        .filter_map(|thread| {
+            let file = *place.get(thread.path.as_str())?;
+            Some((
+                file,
+                ThreadStop {
+                    id: thread.id.clone(),
+                    path: thread.path.clone(),
+                    line: thread.line,
+                    side: thread.side,
+                },
+            ))
+        })
+        .collect();
+    stops.sort_by_key(|(file, stop)| (*file, stop.line));
+    stops.into_iter().map(|(_, stop)| stop).collect()
+}
+
+/// The stop after `last`, going round at the end; the first one when `last`
+/// is not among them.
+pub fn next_stop(stops: &[ThreadStop], last: Option<&NodeId>) -> Option<usize> {
+    if stops.is_empty() {
+        return None;
+    }
+    let at = last.and_then(|last| stops.iter().position(|stop| &stop.id == last));
+    Some(at.map_or(0, |at| (at + 1) % stops.len()))
+}
+
+impl FilesTab {
+    /// The review threads the tree marks: none in a commit's files, which
+    /// show no threads.
+    fn tree_threads(&self) -> &[ReviewThread] {
+        if self.commit.is_some() {
+            &[]
+        } else {
+            &self.context.detail.threads
+        }
+    }
+
+    /// Open review threads on each path.
+    pub(super) fn open_thread_counts(&self) -> HashMap<&str, usize> {
+        open_threads(self.tree_threads())
+    }
+
+    fn guide_layout(&self) -> Option<&GuideLayout> {
+        (self.tree.guide_order && !self.tree.guide.is_empty()).then_some(&self.tree.guide)
+    }
+
+    /// Whether the filter's text and the facets keep `path` in the tree and
+    /// the diff.
+    pub(super) fn tree_keeps(&self, path: &str, cx: &App) -> bool {
+        let text = self.filter.read(cx).value();
+        TreeQuery {
+            text: &text,
+            kept: self.tree.kept.as_ref(),
+        }
+        .keeps(path)
+    }
+
+    /// Whether the filter's text or a facet narrows the files.
+    pub(super) fn tree_narrows(&self, cx: &App) -> bool {
+        !self.filter.read(cx).value().trim().is_empty() || self.tree.kept.is_some()
+    }
+
+    pub(super) fn current_rows(&self, cx: &App) -> Vec<TreeRow> {
+        let text = self.filter.read(cx).value();
+        let query = TreeQuery {
+            text: &text,
+            kept: self.tree.kept.as_ref(),
+        };
+        query_rows(
+            &self.files,
+            &self.signals,
+            &query,
+            self.guide_layout(),
+            &self.collapsed,
+        )
+    }
+
+    /// The group `path` sits in as the tree groups files now.
+    pub(super) fn tree_group(&self, path: &str) -> Option<&str> {
+        match self.guide_layout() {
+            Some(guide) => Some(guide.group(path, self.low.contains_key(path))),
+            None => self.groups.get(path).copied(),
+        }
+    }
+
+    /// Each file with what the facets know of it.
+    fn file_facts(&self) -> Vec<(&str, FileFacts)> {
+        let threads = self.open_thread_counts();
+        self.files
+            .iter()
+            .map(|file| {
+                let path = file.path.as_str();
+                let facts = FileFacts {
+                    viewed: is_viewed(file.viewed),
+                    open_threads: threads.get(path).copied().unwrap_or(0),
+                    cited: self.tree.guide.cites(path),
+                    low: self.low.contains_key(path),
+                };
+                (path, facts)
+            })
+            .collect()
+    }
+
+    /// How many files each facet keeps on its own.
+    pub(super) fn facet_counts(&self) -> HashMap<Facet, usize> {
+        let facts = self.file_facts();
+        Facet::ALL
+            .into_iter()
+            .map(|facet| {
+                let count = facts.iter().filter(|(_, file)| facet.keeps(file)).count();
+                (facet, count)
+            })
+            .collect()
+    }
+
+    pub(super) fn toggle_facet(&mut self, facet: Facet, cx: &mut Context<Self>) {
+        match self.tree.facets.iter().position(|set| *set == facet) {
+            Some(ix) => {
+                self.tree.facets.remove(ix);
+            }
+            None => self.tree.facets.push(facet),
+        }
+        self.refilter(cx);
+    }
+
+    pub(super) fn clear_facets(&mut self, cx: &mut Context<Self>) {
+        self.tree.facets.clear();
+        self.refilter(cx);
+    }
+
+    /// Takes the files the facets keep now, and shows only them in the diff.
+    fn refilter(&mut self, cx: &mut Context<Self>) {
+        let kept = kept_by(&self.tree.facets, self.file_facts());
+        self.tree.kept = kept;
+        self.show_filtered(cx);
+        cx.notify();
+    }
+
+    /// While a facet hides `path`, drops the facets, so a file opened from
+    /// elsewhere is in the tree and the diff.
+    pub(super) fn show_in_tree(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self
+            .tree
+            .kept
+            .as_ref()
+            .is_some_and(|kept| !kept.contains(path))
+        {
+            self.clear_facets(cx);
+        }
+    }
+
+    pub(super) fn set_guide_order(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.tree.guide_order = on;
+        cx.notify();
+    }
+
+    /// Takes the steps of the pull request's guide (or its chapter of the
+    /// stack guide), for Cited by Guide and Guide order.
+    pub fn set_guide_steps(&mut self, steps: &[GuideStep], cx: &mut Context<Self>) {
+        let guide = GuideLayout::new(steps);
+        if guide == self.tree.guide {
+            return;
+        }
+        self.tree.guide = guide;
+        if self.tree.facets.contains(&Facet::CitedByGuide) {
+            self.refilter(cx);
+        }
+        cx.notify();
+    }
+
+    /// The open threads of the files shown, in the diff's order.
+    pub(super) fn open_thread_stops(&self, cx: &App) -> Vec<ThreadStop> {
+        thread_stops(&self.files, self.tree_threads(), |path| {
+            self.tree_keeps(path, cx)
+        })
+    }
+
+    /// Shows the open thread after the one shown last, in the tree and the
+    /// diff.
+    pub(super) fn next_open_thread(&mut self, cx: &mut Context<Self>) {
+        let stops = self.open_thread_stops(cx);
+        let Some(stop) = next_stop(&stops, self.tree.last_thread.as_ref()).map(|ix| &stops[ix])
+        else {
+            return;
+        };
+        let group = self.tree_group(&stop.path).map(str::to_owned);
+        self.collapsed
+            .retain(|folder| !holds(folder, &stop.path, group.as_deref()));
+        self.tree.last_thread = Some(stop.id.clone());
+        // A few lines above the thread, as Find lands, so the lines it is
+        // about show over it instead of behind the file's pinned header.
+        let line = stop.line.map(|line| {
+            let lead = line.saturating_sub(LEAD as u32).max(1);
+            let hunks = self.hunks.get(&stop.path);
+            match hunks.is_some_and(|hunks| find_line(hunks, lead, stop.side).is_some()) {
+                true => lead,
+                false => line,
+            }
+        });
+        self.apply_reveal(&stop.path, line, stop.side, cx);
+        cx.notify();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -675,10 +1134,11 @@ mod tests {
 
     use super::super::signal::{Attributes, Signal, classify_all};
     use super::{
-        DOCS, GitTint, LARGE_TREE, LOW_SIGNAL, Move, RowKind, Sticky, TESTS, TreeRow, ViewedMark,
-        active_folder, distinct_starts, folder_tint, holds, initial_collapsed, into_tree_order,
-        move_down, move_left, move_right, move_up, shown_row, sticky_folders, tree_rows,
-        viewed_mark,
+        DOCS, Facet, FileFacts, GitTint, GuideLayout, LARGE_TREE, LOW_SIGNAL, Move, NOT_COVERED,
+        RowKind, Sticky, TESTS, TreeQuery, TreeRow, ViewedMark, active_folder, distinct_starts,
+        folder_tint, holds, initial_collapsed, into_tree_order, is_group, kept_by, move_down,
+        move_left, move_right, move_up, next_stop, open_threads, query_rows, shown_row,
+        split_group, step_of, sticky_folders, thread_stops, tree_rows, viewed_mark,
     };
 
     /// Every file as code, so a tree sorts by name alone.
@@ -1261,5 +1721,216 @@ mod tests {
         );
         let rows = tree_rows(&files, &signals, "units.rs", &collapsed);
         assert!(!rows.iter().any(|row| row.path == LOW_SIGNAL));
+    }
+
+    fn step(title: &str, paths: &[&str]) -> loupe_guide::GuideStep {
+        loupe_guide::GuideStep {
+            id: title.to_lowercase(),
+            kind: loupe_guide::StepKind::Flow,
+            title: title.to_owned(),
+            explanation: String::new(),
+            snippets: paths
+                .iter()
+                .map(|path| loupe_guide::DiffSnippet {
+                    path: (*path).to_owned(),
+                    start_line: 1,
+                    end_line: 1,
+                    side: loupe_guide::SnippetSide::New,
+                    caption: String::new(),
+                    diff: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn thread(
+        id: &str,
+        path: &str,
+        line: Option<u32>,
+        resolved: bool,
+    ) -> loupe_github::ReviewThread {
+        loupe_github::ReviewThread {
+            id: id.to_owned(),
+            path: path.to_owned(),
+            line,
+            start_line: None,
+            original_line: line,
+            original_start_line: None,
+            side: loupe_github::Side::Right,
+            start_side: None,
+            is_outdated: line.is_none(),
+            is_resolved: resolved,
+            resolved_by: None,
+            viewer_can_reply: true,
+            viewer_can_resolve: true,
+            viewer_can_unresolve: false,
+            comments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn facets_keep_the_files_that_pass_every_one() {
+        let facts = |viewed, open_threads, cited, low| FileFacts {
+            viewed,
+            open_threads,
+            cited,
+            low,
+        };
+        let files = [
+            ("a.rs", facts(false, 1, true, false)),
+            ("b.rs", facts(true, 2, false, false)),
+            ("c.lock", facts(false, 0, false, true)),
+        ];
+        assert_eq!(kept_by(&[], files), None, "no facet keeps every file");
+        let kept = |facets: &[Facet]| {
+            let mut kept: Vec<String> = kept_by(facets, files).unwrap().into_iter().collect();
+            kept.sort();
+            kept
+        };
+        assert_eq!(kept(&[Facet::Unviewed]), ["a.rs", "c.lock"]);
+        assert_eq!(kept(&[Facet::HasThreads]), ["a.rs", "b.rs"]);
+        assert_eq!(kept(&[Facet::Unviewed, Facet::HasThreads]), ["a.rs"]);
+        assert_eq!(kept(&[Facet::CitedByGuide]), ["a.rs"]);
+        assert_eq!(kept(&[Facet::LowSignal]), ["c.lock"]);
+    }
+
+    #[test]
+    fn kept_files_narrow_the_tree_and_open_its_folders() {
+        let files = sample();
+        let kept = HashSet::from(["src/lib/http/retry.rs".to_owned()]);
+        let collapsed = HashSet::from(["src".to_owned()]);
+        let query = TreeQuery {
+            text: "",
+            kept: Some(&kept),
+        };
+        assert!(query.narrows());
+        let rows = query_rows(&files, &code(&files), &query, None, &collapsed);
+        assert_eq!(
+            outline(&files, &rows),
+            ["src/lib/http/ [1] +3 -1", "  src/lib/http/retry.rs"]
+        );
+        // The text narrows what the facets kept.
+        let query = TreeQuery {
+            text: "client",
+            kept: Some(&kept),
+        };
+        assert!(query_rows(&files, &code(&files), &query, None, &collapsed).is_empty());
+    }
+
+    #[test]
+    fn guide_order_puts_each_file_under_the_first_step_citing_it() {
+        let mut files = sample();
+        files.push(file("Cargo.lock", 9, 9));
+        let mut signals = code(&files);
+        *signals.last_mut().unwrap() = Signal::Low(super::super::signal::LowSignal::Lockfile);
+        let guide = GuideLayout::new(&[
+            step("Retry on errors", &["src/lib/http/retry.rs", "src/main.rs"]),
+            step("Wire it in", &["src/main.rs", "src/App.rs", "gone.rs"]),
+        ]);
+        let rows = query_rows(
+            &files,
+            &signals,
+            &TreeQuery::text(""),
+            Some(&guide),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            outline(&files, &rows),
+            [
+                "Retry on errors/ [2] +7 -5",
+                "  src/ [2] +7 -5",
+                "    lib/http/ [1] +3 -1",
+                "      src/lib/http/retry.rs",
+                "    src/main.rs",
+                "Wire it in/ [1] +1 -0",
+                "  src/ [1] +1 -0",
+                "    src/App.rs",
+                "Not covered/ [4] +14 -3",
+                "  docs/guide/ [1] +2 -0",
+                "    docs/guide/intro.md",
+                "  src/lib/http/ [1] +10 -2",
+                "    src/lib/http/client.rs",
+                "  Cargo.toml",
+                "  README.md",
+                "Low signal/ [1] +9 -9",
+                "  Cargo.lock",
+            ]
+        );
+        assert_eq!(rows[0].path, "Guide step 1");
+        assert_eq!(step_of(&rows[5].path), Some(1));
+        assert_eq!(rows[1].path, "Guide step 1/src");
+        assert_eq!(guide.group("src/main.rs", false), "Guide step 1");
+        assert_eq!(guide.group("README.md", false), NOT_COVERED);
+        assert!(guide.cites("src/App.rs") && !guide.cites("README.md"));
+        // A folder inside a step holds that step's files, not the same
+        // folder's under another group.
+        assert!(holds(
+            "Guide step 1/src",
+            "src/main.rs",
+            Some("Guide step 1")
+        ));
+        assert!(!holds(
+            "Guide step 1/src",
+            "src/App.rs",
+            Some("Guide step 2")
+        ));
+        assert_eq!(
+            shown_row(&rows, "src/App.rs", Some("Guide step 2")),
+            Some(7)
+        );
+        // Behind its closed step, a file shows as the step's row.
+        let collapsed = HashSet::from(["Guide step 2".to_owned()]);
+        let rows = query_rows(
+            &files,
+            &signals,
+            &TreeQuery::text(""),
+            Some(&guide),
+            &collapsed,
+        );
+        assert_eq!(
+            shown_row(&rows, "src/App.rs", Some("Guide step 2")),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn group_keys_are_told_from_folders() {
+        assert!(is_group(TESTS) && is_group(NOT_COVERED) && is_group("Guide step 12"));
+        assert!(!is_group("src") && !is_group("Guide step x"));
+        assert_eq!(step_of("Guide step 3"), Some(2));
+        assert_eq!(step_of("Guide step 0"), None);
+        assert_eq!(
+            split_group("Guide step 3/src/lib"),
+            Some(("Guide step 3", "src/lib"))
+        );
+        assert_eq!(split_group("src/lib"), None);
+        assert_eq!(split_group(LOW_SIGNAL), None);
+    }
+
+    #[test]
+    fn next_open_thread_goes_by_file_then_line_and_round() {
+        let files = sample();
+        let threads = [
+            thread("late", "src/main.rs", Some(40), false),
+            thread("done", "src/main.rs", Some(1), true),
+            thread("early", "src/main.rs", Some(3), false),
+            thread("first", "docs/guide/intro.md", Some(9), false),
+            thread("outdated", "src/main.rs", None, false),
+            thread("gone", "removed.rs", Some(1), false),
+        ];
+        assert_eq!(open_threads(&threads).get("src/main.rs"), Some(&3));
+        let stops = thread_stops(&files, &threads, |_| true);
+        // In the order of `files` (main.rs before intro.md), then the
+        // thread off the diff, then by line.
+        let ids: Vec<&str> = stops.iter().map(|stop| stop.id.as_str()).collect();
+        assert_eq!(ids, ["outdated", "early", "late", "first"]);
+        assert_eq!(next_stop(&stops, None), Some(0));
+        assert_eq!(next_stop(&stops, Some(&"early".to_owned())), Some(2));
+        assert_eq!(next_stop(&stops, Some(&"first".to_owned())), Some(0));
+        assert_eq!(next_stop(&stops, Some(&"done".to_owned())), Some(0));
+        // Only the files shown are visited.
+        let shown = thread_stops(&files, &threads, |path| path.starts_with("src/"));
+        assert_eq!(shown.len(), 3);
+        assert_eq!(next_stop(&[], None), None);
     }
 }

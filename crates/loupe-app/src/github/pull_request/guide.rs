@@ -358,6 +358,14 @@ impl GuideTab {
         Some((viewed, steps.len()))
     }
 
+    /// The steps of this pull request's own guide, or of its chapter of the
+    /// stack guide; none without one.
+    pub fn own_steps(&self) -> &[GuideStep] {
+        own_read_target(&self.state, &self.context.pr)
+            .and_then(|target| steps_of(&self.state, &target))
+            .unwrap_or_default()
+    }
+
     /// Follows the Viewed marks of this pull request's files, by path: a
     /// step whose cited files are all viewed is viewed, and one with a cited
     /// file left unviewed is not (`GuideReadState::sync_with_files`).
