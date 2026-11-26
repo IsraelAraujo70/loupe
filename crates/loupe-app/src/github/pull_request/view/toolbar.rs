@@ -72,6 +72,11 @@ impl PendingComments {
     }
 }
 
+/// The narrowest window, 1880 px, where the Files tab keeps its tree, a
+/// readable diff, and its whole toolbar beside a docked composer. The other
+/// tabs dock from the details column's breakpoint, whose place it takes.
+const FILES_DOCK_BREAKPOINT: Rems = Rems(1880. / 16.);
+
 /// How a confirmation commits: the merge is the pull request's goal, the
 /// others destroy something.
 #[derive(Clone, Copy)]
@@ -169,8 +174,10 @@ impl PullRequestView {
 
     /// The review button, filled when `primary`: it is the page's main
     /// action while the pull request cannot be merged, and an outlined
-    /// secondary action once the merge button is on screen. It opens and
-    /// closes the review composer; discarding a pending review is there.
+    /// secondary action once the merge button is on screen. It opens the
+    /// review composer, or brings the caret back to it when it is open; the
+    /// composer's own × and Esc close it. Discarding a pending review is in
+    /// the composer.
     pub(super) fn render_review_controls(
         &self,
         detail: &PullRequestDetail,
@@ -188,29 +195,27 @@ impl PullRequestView {
                 )
             })
             .child(
-                Button::new("pr-review")
-                    .control()
-                    .map(|button| {
-                        if primary {
-                            button.primary()
+                div().debug_selector(|| "pr-review".to_owned()).child(
+                    Button::new("pr-review")
+                        .control()
+                        .map(|button| {
+                            if primary {
+                                button.primary()
+                            } else {
+                                button.outline()
+                            }
+                        })
+                        .icon(IconName::MessageSquareDiff)
+                        // No ellipsis: at this size it reads as a cut label.
+                        .label(if pending.is_some() {
+                            "Finish review"
                         } else {
-                            button.outline()
-                        }
-                    })
-                    .icon(IconName::MessageSquareDiff)
-                    // No ellipsis: at this size it reads as a cut label.
-                    .label(if pending.is_some() {
-                        "Finish review"
-                    } else {
-                        "Review changes"
-                    })
-                    .tooltip(if self.composer_open() {
-                        "Close the review"
-                    } else {
-                        "Open the review: summary, pending comments, and verdict"
-                    })
-                    .selected(self.composer_open())
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_review_composer(cx))),
+                            "Review changes"
+                        })
+                        .tooltip("Open the review: summary, pending comments, and verdict")
+                        .selected(self.composer_open())
+                        .on_click(cx.listener(|this, _, _, cx| this.open_review_composer(cx))),
+                ),
             )
     }
 
@@ -241,12 +246,16 @@ impl PullRequestView {
         cx.notify();
     }
 
-    fn toggle_review_composer(&mut self, cx: &mut Context<Self>) {
-        if self.composer_open() {
-            self.close_review_composer(cx);
+    /// Whether the composer takes a column of its own beside the tab's
+    /// content (a wide window) or floats over the content's trailing edge,
+    /// so a narrow window never squeezes the diff or cuts its toolbar.
+    pub(super) fn composer_docks(&self, window: &Window) -> bool {
+        let needed = if self.tab == PrTab::Files {
+            FILES_DOCK_BREAKPOINT
         } else {
-            self.open_review_composer(cx);
-        }
+            scale::side_column_breakpoint()
+        };
+        window.viewport_size().width >= needed.to_pixels(window.rem_size())
     }
 
     /// Closes the composer and keeps what was typed in the summary.
@@ -947,12 +956,13 @@ impl PullRequestView {
     }
 
     /// The review composer, a column at the trailing edge of the tab's
-    /// content: what goes out with the review (files viewed, pending inline
+    /// content (`docked`) or floating over that edge in a narrow window: what goes out with the review (files viewed, pending inline
     /// comments), the summary, and the verdict. A verdict that cannot go out
     /// yet is outlined and neutral, with the reason in its tooltip.
     pub(super) fn render_review_composer(
         &self,
         detail: &PullRequestDetail,
+        docked: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
@@ -1111,6 +1121,8 @@ impl PullRequestView {
                     div()
                         .id("pr-review-pending")
                         .debug_selector(|| "pr-review-pending".to_owned())
+                        .role(Role::Status)
+                        .aria_label(pending_comments_label(review.comment_count))
                         .flex_1()
                         .min_w_0()
                         .child(
@@ -1134,6 +1146,8 @@ impl PullRequestView {
             (_, None) => div()
                 .id("pr-review-pending")
                 .debug_selector(|| "pr-review-pending".to_owned())
+                .role(Role::Status)
+                .aria_label(pending_comments_label(0))
                 .text_size(scale::meta())
                 .text_color(muted)
                 .child(format!(
@@ -1150,7 +1164,11 @@ impl PullRequestView {
         let summary = v_flex()
             .gap_1()
             .child(ui::section_label("Summary", cx))
-            .child(Textarea::new(&self.review_body).disabled(busy))
+            .child(
+                Textarea::new(&self.review_body)
+                    .aria_label(format!("Review summary for #{}", detail.pr.number))
+                    .disabled(busy),
+            )
             .child(ui::send_hint(cx).child("as a comment"));
 
         let error = self.write.error().map(|message| {
@@ -1183,6 +1201,7 @@ impl PullRequestView {
                 div()
                     .id("pr-review-status")
                     .role(Role::Status)
+                    .aria_label(status.clone())
                     .text_size(scale::meta())
                     .text_color(muted)
                     .child(status),
@@ -1230,6 +1249,16 @@ impl PullRequestView {
             .bg(tokens::panel())
             .border_l_1()
             .border_color(border)
+            .when(!docked, |composer| {
+                composer
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .border_color(cx.theme().border)
+                    .shadow_lg()
+                    .occlude()
+            })
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
                     cx.stop_propagation();
@@ -1564,6 +1593,7 @@ mod tests {
     };
     use loupe_github::{Actor, PendingReview, PullRequestDetail, ReviewEvent};
 
+    use super::super::model::PrTab;
     use super::super::{PullRequestView, Write, model};
     use super::OpenReviewComposer;
     use crate::github::common::Loadable;
@@ -1574,6 +1604,15 @@ mod tests {
     /// is not connected, so every write lands in `sent_writes` only.
     fn open(
         detail: PullRequestDetail,
+        cx: &mut TestAppContext,
+    ) -> (Entity<PullRequestView>, VisualTestContext) {
+        open_at(detail, px(1600.), cx)
+    }
+
+    /// [`open`] in a window `width` wide.
+    fn open_at(
+        detail: PullRequestDetail,
+        width: gpui_kit::Pixels,
         cx: &mut TestAppContext,
     ) -> (Entity<PullRequestView>, VisualTestContext) {
         let detail = Arc::new(detail);
@@ -1587,7 +1626,7 @@ mod tests {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                         Default::default(),
-                        size(px(1600.), px(900.)),
+                        size(width, px(800.)),
                     ))),
                     ..Default::default()
                 },
@@ -1672,6 +1711,60 @@ mod tests {
         assert!(
             composer.origin.x > after.origin.x,
             "it is a column at the trailing edge"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn on_a_laptop_the_composer_floats_over_the_files_tab(cx: &mut TestAppContext) {
+        let (view, mut cx) = open_at(model::tests::detail(), px(1280.), cx);
+        view.update(&mut cx, |view, cx| {
+            view.tab = PrTab::Files;
+            cx.notify();
+        });
+        draw(&mut cx);
+        let before = cx
+            .debug_bounds("pr-tab-content")
+            .expect("the tab's content");
+
+        open_composer(&view, &mut cx);
+        let composer = cx.debug_bounds("pr-review-composer").expect("the composer");
+        let after = cx
+            .debug_bounds("pr-tab-content")
+            .expect("the tab's content");
+        assert_eq!(
+            before.size.width, after.size.width,
+            "the diff keeps its width"
+        );
+        assert!(
+            composer.origin.x < after.origin.x + after.size.width,
+            "it floats over it"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_wide_window_docks_the_composer_beside_the_files_tab(cx: &mut TestAppContext) {
+        let (view, mut cx) = open_at(model::tests::detail(), px(1920.), cx);
+        view.update(&mut cx, |view, cx| {
+            view.tab = PrTab::Files;
+            cx.notify();
+        });
+        draw(&mut cx);
+        open_composer(&view, &mut cx);
+        let composer = cx.debug_bounds("pr-review-composer").expect("the composer");
+        let content = cx
+            .debug_bounds("pr-tab-content")
+            .expect("the tab's content");
+        assert!(composer.origin.x >= content.origin.x + content.size.width);
+    }
+
+    #[gpui_kit::test]
+    fn the_review_button_never_closes_the_composer(cx: &mut TestAppContext) {
+        let (view, mut cx) = open(with_pending(model::tests::detail()), cx);
+        open_composer(&view, &mut cx);
+        click("pr-review", &mut cx);
+        assert!(
+            cx.debug_bounds("pr-review-composer").is_some(),
+            "Finish review keeps it open"
         );
     }
 

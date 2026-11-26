@@ -1720,18 +1720,21 @@ impl Render for PullRequestView {
                 .into_any_element();
         };
         let composing = self.composer_open();
-        let side = self.tab.has_side_column() && details_open && !composing;
+        let docked = self.composer_docks(window);
+        let side = self.tab.has_side_column() && details_open && !(composing && docked);
         page.child(self.render_header(&detail, window, cx))
             .children(self.render_title_edit(cx))
             .child(self.render_panel_band(&detail, cx))
             .child(self.render_tabs(&detail, wide, details_open, cx))
             .child(
                 h_flex()
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
                     .child(
                         v_flex()
+                            .debug_selector(|| "pr-tab-content".to_owned())
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
@@ -1741,7 +1744,7 @@ impl Render for PullRequestView {
                         row.child(self.render_side(&detail, &loaded, cx))
                     })
                     .when(composing, |row| {
-                        row.child(self.render_review_composer(&detail, cx))
+                        row.child(self.render_review_composer(&detail, docked, cx))
                     }),
             )
             .into_any_element()
