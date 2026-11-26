@@ -550,8 +550,8 @@ pub fn start_generation(detail: Arc<PullRequestDetail>, cx: &mut App) {
                 None => Vec::new(),
             },
         };
-        let changed_files: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         let input = build_prompt_input(&worker_detail, &files, previous_step_ids, worker_language);
+        let changed_files = loupe_guide::runner::changed_files_by_size(&input.files);
         let outcome = generate_for_pr(
             &input,
             github_token.as_deref(),
