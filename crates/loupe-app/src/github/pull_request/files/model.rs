@@ -1,5 +1,7 @@
 //! Pure view-model logic of the files tab: side mapping, thread placement,
-//! composer labels, viewed bookkeeping. No GPUI state, so it is unit tested.
+//! composer labels, viewed bookkeeping. No GPUI state, so it is unit tested,
+//! except the few `FilesTab` methods at the end through which the pull
+//! request page reads and sets the Viewed marks for its review progress.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,6 +71,26 @@ pub fn set_viewed(files: &mut [ChangedFile], path: &str, viewed: bool) -> Option
         ViewedState::Unviewed
     };
     Some(previous)
+}
+
+/// The place of the first unviewed file after `current` (from `current`
+/// itself when `include_current`), going round past the last file; the
+/// first unviewed one without a current file, and `None` once every file is
+/// viewed.
+pub fn next_unviewed(
+    viewed: &[bool],
+    current: Option<usize>,
+    include_current: bool,
+) -> Option<usize> {
+    let len = viewed.len();
+    let start = match current {
+        Some(ix) if include_current => ix,
+        Some(ix) => ix + 1,
+        None => 0,
+    };
+    (0..len)
+        .map(|offset| (start + offset) % len)
+        .find(|ix| !viewed[*ix])
 }
 
 pub fn restore_viewed(files: &mut [ChangedFile], path: &str, state: ViewedState) {
@@ -313,13 +335,68 @@ pub fn resolved_summary(thread: &ReviewThread) -> String {
     }
 }
 
+impl super::FilesTab {
+    /// How many files are viewed, once the files have loaded.
+    pub(in crate::github::pull_request) fn viewed_progress(&self) -> Option<ViewedCounts> {
+        self.load.value().map(|_| viewed_counts(&self.files))
+    }
+
+    /// Whether each changed file is viewed, by path, once the files have
+    /// loaded.
+    pub(in crate::github::pull_request) fn viewed_by_path(&self) -> Option<HashMap<String, bool>> {
+        self.load.value()?;
+        Some(
+            self.files
+                .iter()
+                .map(|file| (file.path.clone(), is_viewed(file.viewed)))
+                .collect(),
+        )
+    }
+
+    /// Each file's Viewed mark, in file order: what the page compares to
+    /// tell whether a mark changed since it last looked.
+    pub(in crate::github::pull_request) fn viewed_marks(&self) -> Vec<bool> {
+        self.files
+            .iter()
+            .map(|file| is_viewed(file.viewed))
+            .collect()
+    }
+
+    /// Marks those of `paths` the pull request changes viewed or unviewed,
+    /// and writes them to GitHub, as the files' own Viewed boxes do.
+    pub(in crate::github::pull_request) fn set_paths_viewed(
+        &mut self,
+        paths: &[String],
+        viewed: bool,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        self.set_files_viewed(paths, viewed, cx);
+    }
+
+    /// The next file not viewed yet, in the tree's order, going round: after
+    /// the file at the top of the diff (or the one picked in the tree), or
+    /// from it when `include_current`.
+    pub(in crate::github::pull_request) fn next_unviewed_path(
+        &self,
+        include_current: bool,
+        cx: &gpui_kit::App,
+    ) -> Option<String> {
+        let current = self.top_file(cx).or_else(|| {
+            let selected = self.selected.as_deref()?;
+            self.files.iter().position(|file| file.path == selected)
+        });
+        let ix = next_unviewed(&self.viewed_marks(), current, include_current)?;
+        Some(self.files[ix].path.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Missing, Placement, anchor_error_message, build_files, composer_label, diff_mode, file_doc,
-        is_viewed, outdated_label, place_threads, placeholder_patch, resolved_summary,
-        restore_viewed, set_viewed, split_path, status_letter, to_diff_side, to_side,
-        viewed_counts,
+        is_viewed, next_unviewed, outdated_label, place_threads, placeholder_patch,
+        resolved_summary, restore_viewed, set_viewed, split_path, status_letter, to_diff_side,
+        to_side, viewed_counts,
     };
     use crate::store::DiffLayout;
     use gpui_kit::component::diff::{DiffFile, DiffMode, DiffSide};
@@ -585,5 +662,30 @@ mod tests {
             doc.original_path().map(|path| path.as_str()),
             Some("src/old.rs")
         );
+    }
+
+    #[test]
+    fn the_next_unviewed_file_comes_after_the_current_one_and_goes_round() {
+        let viewed = [true, false, true, false, true];
+        assert_eq!(next_unviewed(&viewed, None, false), Some(1));
+        assert_eq!(next_unviewed(&viewed, Some(1), false), Some(3));
+        assert_eq!(
+            next_unviewed(&viewed, Some(1), true),
+            Some(1),
+            "from another tab"
+        );
+        assert_eq!(
+            next_unviewed(&viewed, Some(3), false),
+            Some(1),
+            "goes round"
+        );
+        assert_eq!(next_unviewed(&viewed, Some(4), false), Some(1));
+        assert_eq!(
+            next_unviewed(&[false], Some(0), false),
+            Some(0),
+            "the only file left"
+        );
+        assert_eq!(next_unviewed(&[true, true], Some(0), false), None);
+        assert_eq!(next_unviewed(&[], None, false), None);
     }
 }

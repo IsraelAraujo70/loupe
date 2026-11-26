@@ -671,6 +671,10 @@ impl PullRequestView {
                     .child(widgets::diff_stat(detail.additions, detail.deletions)),
             )
             .child(div().flex_none().child(checks))
+            .children(
+                self.render_review_progress(cx)
+                    .map(|progress| h_flex().flex_1().min_w_0().justify_end().child(progress)),
+            )
     }
 }
 

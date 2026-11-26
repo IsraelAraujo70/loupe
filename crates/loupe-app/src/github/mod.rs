@@ -29,7 +29,7 @@ pub use self::inbox::{
     ClearReviewsSelection, CloseStack, OpenReviewsFilter, OpenStack, SelectTabRows,
     enqueue_auto_guide_if_watched, start_auto_guide, start_bells, start_group_sync,
 };
-pub use self::pull_request::FindInDiff;
+pub use self::pull_request::{FindInDiff, NEXT_UNVIEWED_KEYS, NextUnviewedFile};
 
 /// Runs page `view`'s Refresh when it is a GitHub page with one; false
 /// otherwise.

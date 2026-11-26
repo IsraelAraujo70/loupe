@@ -338,6 +338,50 @@ impl GuideTab {
         }
     }
 
+    /// How many steps of this pull request's own guide (or its chapter of
+    /// the stack guide) are viewed, and how many it has, whichever chapter
+    /// is on screen.
+    pub fn step_progress(&self, cx: &App) -> Option<(usize, usize)> {
+        let target = own_read_target(&self.state, &self.context.pr)?;
+        let steps = steps_of(&self.state, &target)?;
+        let count = |state: &GuideReadState| {
+            steps
+                .iter()
+                .filter(|step| state.is_viewed(&step.id))
+                .count()
+        };
+        let viewed = if self.read_target.as_ref() == Some(&target) {
+            count(&self.read_state)
+        } else {
+            count(&load_read_state(cx, &target))
+        };
+        Some((viewed, steps.len()))
+    }
+
+    /// Follows the Viewed marks of this pull request's files, by path: a
+    /// step whose cited files are all viewed is viewed, and one with a cited
+    /// file left unviewed is not (`GuideReadState::sync_with_files`).
+    pub fn sync_viewed_files(&mut self, files: &HashMap<String, bool>, cx: &mut Context<Self>) {
+        let Some(target) = own_read_target(&self.state, &self.context.pr) else {
+            return;
+        };
+        let Some(steps) = steps_of(&self.state, &target) else {
+            return;
+        };
+        let file_viewed = |path: &str| files.get(path).copied();
+        if self.read_target.as_ref() == Some(&target) {
+            if self.read_state.sync_with_files(steps, file_viewed) {
+                save_read_state(cx, &target, &self.read_state);
+                cx.notify();
+            }
+        } else {
+            let mut state = load_read_state(cx, &target);
+            if state.sync_with_files(steps, file_viewed) {
+                save_read_state(cx, &target, &state);
+            }
+        }
+    }
+
     /// The pull request whose guide or chapter is on screen.
     fn shown_pr_number(&self) -> u64 {
         self.read_target
@@ -507,6 +551,17 @@ impl GuideTab {
             .insert(step_id.to_owned(), !now_viewed);
         if let Some(target) = &self.read_target {
             save_read_state(cx, target, &self.read_state);
+            let paths: Vec<String> = steps_of(&self.state, target)
+                .and_then(|steps| steps.iter().find(|step| step.id == step_id))
+                .map(|step| step.cited_paths().into_iter().map(str::to_owned).collect())
+                .unwrap_or_default();
+            if !paths.is_empty() {
+                cx.emit(PrTabEvent::StepViewed {
+                    pr: target.pr.clone(),
+                    paths,
+                    viewed: now_viewed,
+                });
+            }
         }
         cx.notify();
     }
@@ -2913,6 +2968,37 @@ fn render_diff_line(
             div().flex_none().whitespace_nowrap().child(text)
         })
         .into_any_element()
+}
+
+/// The steps `target`'s viewed marks are about, in `state`'s guide.
+fn steps_of<'a>(state: &'a GuideViewState, target: &ReadTarget) -> Option<&'a [GuideStep]> {
+    match state {
+        GuideViewState::Ready { stored, .. } if !target.chapter => Some(&stored.guide.steps),
+        GuideViewState::StackReady { stored, .. } if target.chapter => stored
+            .chapter(target.pr.number)
+            .map(|(_, chapter)| chapter.guide.steps.as_slice()),
+        _ => None,
+    }
+}
+
+/// Whose viewed marks `pr`'s own steps are under: its guide, or its chapter
+/// of the stack guide.
+fn own_read_target(state: &GuideViewState, pr: &PrRef) -> Option<ReadTarget> {
+    match state {
+        GuideViewState::Ready { stored, .. } => Some(ReadTarget {
+            pr: pr.clone(),
+            head_oid: stored.head_oid.clone(),
+            chapter: false,
+        }),
+        GuideViewState::StackReady { stored, .. } => {
+            stored.chapter(pr.number).map(|(_, chapter)| ReadTarget {
+                pr: pr.clone(),
+                head_oid: chapter.head_oid.clone(),
+                chapter: true,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Where `target`'s viewed marks are kept. A stack chapter's are apart from
