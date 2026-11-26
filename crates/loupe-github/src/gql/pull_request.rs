@@ -164,8 +164,9 @@ query PullRequestDetail($owner: String!, $name: String!, $number: Int!) {
         }
       }
       latestReviews(first: 50) {
-        nodes { author { login avatarUrl } state commit { oid } }
+        nodes { author { login avatarUrl } state }
       }
+      viewerLatestReview { state submittedAt commit { oid } }
       labels(first: 50) { nodes { id name color } }
       assignees(first: 50) { nodes { login avatarUrl } }
       commits(first: 100) {
@@ -675,6 +676,7 @@ struct WirePullRequest {
     viewer_can_update: bool,
     review_requests: Connection<WireReviewRequest>,
     latest_reviews: Connection<WireLatestReview>,
+    viewer_latest_review: Option<WireViewerLatestReview>,
     labels: Connection<WireLabel>,
     assignees: Connection<WireActor>,
     commits: Connection<WireCommitNode>,
@@ -743,6 +745,13 @@ struct WireRequestedReviewer {
 struct WireLatestReview {
     author: Option<WireActor>,
     state: WireReviewState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireViewerLatestReview {
+    state: WireReviewState,
+    submitted_at: Option<Timestamp>,
     commit: Option<WireOid>,
 }
 
@@ -968,7 +977,7 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
 
     let author: Option<Actor> = wire.author.map(Actor::from);
     let latest_reviews = wire.latest_reviews.into_nodes();
-    let viewer_review = viewer_review(&latest_reviews, &data.viewer.login);
+    let viewer_review = wire.viewer_latest_review.and_then(viewer_review);
     let reviewers = collect_reviewers(
         wire.review_requests.into_nodes(),
         latest_reviews,
@@ -1098,23 +1107,20 @@ fn parse_detail(pr: &PrRef, data: Data) -> Result<FirstPage> {
     })
 }
 
-/// The viewer's latest review when it approves or asks for changes, with
-/// the head commit it was given on.
-fn viewer_review(latest: &[WireLatestReview], viewer: &str) -> Option<ViewerReview> {
-    let review = latest.iter().find(|review| {
-        review
-            .author
-            .as_ref()
-            .is_some_and(|author| author.login.eq_ignore_ascii_case(viewer))
-    })?;
+/// The viewer's latest submitted review, with the head commit it was given
+/// on. GitHub's `latestReviews` leaves out the author's own reviews, so this
+/// reads `viewerLatestReview`; a review still pending is not given yet.
+fn viewer_review(review: WireViewerLatestReview) -> Option<ViewerReview> {
     let verdict = match review.state {
-        WireReviewState::Approved => Verdict::Approved,
-        WireReviewState::ChangesRequested => Verdict::ChangesRequested,
-        _ => return None,
+        WireReviewState::Approved => Some(Verdict::Approved),
+        WireReviewState::ChangesRequested => Some(Verdict::ChangesRequested),
+        WireReviewState::Commented | WireReviewState::Dismissed => None,
+        WireReviewState::Pending | WireReviewState::Unknown => return None,
     };
     Some(ViewerReview {
         verdict,
-        commit_oid: review.commit.as_ref()?.oid.clone(),
+        commit_oid: review.commit?.oid,
+        submitted_at: review.submitted_at,
     })
 }
 
@@ -1435,6 +1441,11 @@ mod tests {
                 { "author": null, "state": "APPROVED" },
                 { "author": actor("Me"), "state": "APPROVED", "commit": { "oid": "abc123" } }
             ] },
+            "viewerLatestReview": {
+                "state": "APPROVED",
+                "submittedAt": "2026-01-03T01:00:00Z",
+                "commit": { "oid": "abc123" }
+            },
             "labels": { "nodes": [{ "id": "LA_bug", "name": "bug", "color": "d73a4a" }] },
             "assignees": { "nodes": [actor("dave")] },
             "commits": { "nodes": [
@@ -1738,26 +1749,55 @@ mod tests {
         assert_eq!(detail.standing_verdict(), None, "a commit landed after it");
 
         let mut json = pull_request_json();
-        json["latestReviews"]["nodes"] = json!([
-            { "author": actor("alice"), "state": "APPROVED", "commit": { "oid": "abc123" } },
-            { "author": actor("me"), "state": "CHANGES_REQUESTED", "commit": { "oid": "abc123" } }
-        ]);
+        json["viewerLatestReview"]["state"] = json!("CHANGES_REQUESTED");
         let detail = parse_detail(&pr_ref(), data(json.clone())).unwrap().detail;
         assert_eq!(detail.standing_verdict(), Some(Verdict::ChangesRequested));
 
         for state in ["COMMENTED", "DISMISSED"] {
-            json["latestReviews"]["nodes"][1]["state"] = json!(state);
+            json["viewerLatestReview"]["state"] = json!(state);
             let detail = parse_detail(&pr_ref(), data(json.clone())).unwrap().detail;
             assert_eq!(detail.standing_verdict(), None, "{state} decides nothing");
         }
-        json["latestReviews"]["nodes"] = json!([
-            { "author": actor("alice"), "state": "APPROVED", "commit": { "oid": "abc123" } }
-        ]);
+        json["viewerLatestReview"] = Value::Null;
         let detail = parse_detail(&pr_ref(), data(json)).unwrap().detail;
         assert_eq!(
             detail.standing_verdict(),
             None,
             "only someone else approved"
+        );
+    }
+
+    /// "Since your last review" starts at the commit your latest submitted
+    /// review was given on, a comment included, once commits land after it.
+    #[test]
+    fn your_last_review_marks_where_new_commits_start() {
+        let mut json = pull_request_json();
+        json["viewerLatestReview"] = json!({
+            "state": "COMMENTED",
+            "submittedAt": "2026-01-03T01:00:00Z",
+            "commit": { "oid": "c1" }
+        });
+        let detail = parse_detail(&pr_ref(), data(json.clone())).unwrap().detail;
+        let review = detail
+            .reviewed_before_head()
+            .expect("a comment is a review");
+        assert_eq!(review.commit_oid, "c1");
+        assert_eq!(review.verdict, None);
+        assert!(review.submitted_at.is_some());
+
+        json["viewerLatestReview"]["commit"]["oid"] = json!("abc123");
+        let detail = parse_detail(&pr_ref(), data(json.clone())).unwrap().detail;
+        assert!(detail.viewer_review.is_some());
+        assert!(
+            detail.reviewed_before_head().is_none(),
+            "nothing landed after a review of the head"
+        );
+
+        json["viewerLatestReview"]["state"] = json!("PENDING");
+        let detail = parse_detail(&pr_ref(), data(json)).unwrap().detail;
+        assert_eq!(
+            detail.viewer_review, None,
+            "a pending review is not given yet"
         );
     }
 
