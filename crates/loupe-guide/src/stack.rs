@@ -395,7 +395,7 @@ pub const STACK_OVERVIEW_SYSTEM_PROMPT: &str = "\
 You are writing the overview of a guided review for a stack of pull requests in Loupe.
 The stack merges in the order its chapters are listed, and each chapter already has its own guide.
 Write `headline`: one sentence on what the whole stack delivers once every pull request merges.
-Write `why`: concise Markdown on the motivation, how the pull requests build on each other, and what a reviewer should keep in mind across them. Refer to pull requests by number. Do not retell each chapter.
+Write `why`: concise Markdown on the motivation and how the pull requests build on each other. Refer to pull requests by number. Do not retell each chapter, and do not list risks or decisions: the guide shows each chapter's decision points on their own.
 Write both in the language the request names, outside the untrusted block. Never translate code, file paths, or identifiers.
 
 Security rules (strict):

@@ -584,7 +584,8 @@ impl PullRequestView {
             ConversationTab::new(context.clone(), window, cx)
                 .follow_scroll(self.conversation_scroll.clone())
         });
-        let guide = cx.new(|cx| GuideTab::new(context.clone(), window, cx));
+        let guide =
+            cx.new(|cx| GuideTab::new(context.clone(), self.guide_scroll.clone(), window, cx));
         {
             let pr_view = cx.entity().downgrade();
             guide.update(cx, |tab, _| {
