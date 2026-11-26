@@ -345,6 +345,51 @@ pub fn git_patch(file: &ChangedFile) -> Option<String> {
     Some(out)
 }
 
+/// Which of a pull request's files changed since a review the branch was
+/// rewritten after, told apart by their own changes rather than by commits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangedSince {
+    /// The paths in `now` whose change is not the one reviewed, in its order.
+    pub changed: Vec<String>,
+    /// Files the pull request changed at the review and no longer changes.
+    pub dropped: usize,
+}
+
+/// Sets the pull request's files at a review, `reviewed`, beside its files
+/// now, `now`. A file is changed when it is new to the pull request, or its
+/// status, old path, or patch differ. Patches compare without their hunk
+/// headers, so a rebase that only moves the lines leaves a file alone; a
+/// file whose patch GitHub left out on either side compares by its line
+/// counts.
+pub fn changed_since(reviewed: &[ChangedFile], now: &[ChangedFile]) -> ChangedSince {
+    fn body(patch: &str) -> impl Iterator<Item = &str> {
+        patch.lines().filter(|line| !line.starts_with("@@"))
+    }
+    let same = |then: &ChangedFile, file: &ChangedFile| {
+        then.status == file.status
+            && then.previous_path == file.previous_path
+            && match (&then.patch, &file.patch) {
+                (Some(then), Some(now)) => body(then).eq(body(now)),
+                _ => (then.additions, then.deletions) == (file.additions, file.deletions),
+            }
+    };
+    let changed = now
+        .iter()
+        .filter(|file| {
+            !reviewed
+                .iter()
+                .find(|then| then.path == file.path)
+                .is_some_and(|then| same(then, file))
+        })
+        .map(|file| file.path.clone())
+        .collect();
+    let dropped = reviewed
+        .iter()
+        .filter(|then| !now.iter().any(|file| file.path == then.path))
+        .count();
+    ChangedSince { changed, dropped }
+}
+
 /// The hunks between two versions of a file in the shape GitHub's patches
 /// have: three lines of context, starting at `@@`, empty when the text is
 /// the same. `None` when either version is binary: a NUL byte in the first
@@ -368,8 +413,8 @@ pub fn text_patch(old: &[u8], new: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorError, DiffLine, Hunk, LineKind, anchor_for_range, c_quote, find_line, git_patch,
-        parse_patch, text_patch,
+        AnchorError, ChangedSince, DiffLine, Hunk, LineKind, anchor_for_range, c_quote,
+        changed_since, find_line, git_patch, parse_patch, text_patch,
     };
     use crate::{ChangedFile, FileStatus, LineAnchor, Side, ViewedState};
 
@@ -910,5 +955,45 @@ mod tests {
     fn text_patch_is_none_for_binary_contents() {
         assert_eq!(text_patch(b"\x89PNG\r\n\x1a\n\0\0", b"text\n"), None);
         assert_eq!(text_patch(b"text\n", &[0xff, 0xfe, 0x41]), None);
+    }
+
+    #[test]
+    fn after_a_rebase_only_files_whose_own_change_moved_count() {
+        let file = |path: &str, patch: Option<&str>, counts: (u32, u32)| ChangedFile {
+            path: path.into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            additions: counts.0,
+            deletions: counts.1,
+            patch: patch.map(str::to_owned),
+            viewed: ViewedState::Unviewed,
+        };
+        let reviewed = [
+            file("same.rs", Some("@@ -1,2 +1,2 @@\n a\n-b\n+c"), (1, 1)),
+            file("edited.rs", Some("@@ -1 +1 @@\n-x\n+y"), (1, 1)),
+            file("huge.csv", None, (9000, 0)),
+            file("reverted.rs", Some("@@ -1 +1 @@\n-p\n+q"), (1, 1)),
+        ];
+        let now = [
+            file("same.rs", Some("@@ -40,2 +40,2 @@\n a\n-b\n+c"), (1, 1)),
+            file("edited.rs", Some("@@ -1 +1 @@\n-x\n+z"), (1, 1)),
+            file("huge.csv", None, (9000, 0)),
+            file("new.rs", Some("@@ -0,0 +1 @@\n+n"), (1, 0)),
+        ];
+        assert_eq!(
+            changed_since(&reviewed, &now),
+            ChangedSince {
+                changed: vec!["edited.rs".into(), "new.rs".into()],
+                dropped: 1,
+            },
+            "a hunk the rebase only moved stays; an edit, a new file, and a revert count"
+        );
+        let mut grown = now.clone();
+        grown[2].additions = 9001;
+        assert_eq!(
+            changed_since(&reviewed, &grown).changed,
+            ["edited.rs", "huge.csv", "new.rs"],
+            "a left-out patch compares by its line counts"
+        );
     }
 }

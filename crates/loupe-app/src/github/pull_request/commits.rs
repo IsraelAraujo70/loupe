@@ -9,7 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::{Commit, PR_COMMITS_LIMIT, PullRequestDetail};
+use loupe_github::{Commit, PR_COMMITS_LIMIT, PullRequestDetail, Verdict, ViewerReview};
 
 use crate::github::pr_row::hint;
 use crate::github::widgets;
@@ -62,6 +62,43 @@ fn neighbors<'a>(
     let ix = commits.iter().position(|commit| commit.oid == oid)?;
     let previous = ix.checked_sub(1).map(|ix| &commits[ix]);
     Some((ix, previous, commits.get(ix + 1)))
+}
+
+/// Where "Your last review" goes in the list: after the commit the viewer
+/// last reviewed, by its index. `None` without a review, or when the list
+/// does not hold that commit.
+fn reviewed_at(commits: &[Commit], review: Option<&ViewerReview>) -> Option<usize> {
+    let review = review?;
+    commits
+        .iter()
+        .position(|commit| commit.oid == review.commit_oid)
+}
+
+/// What the line after the reviewed commit says: how the viewer reviewed
+/// and when, then how many commits came after it.
+fn review_mark_text(
+    review: &ViewerReview,
+    after: usize,
+    now: chrono::DateTime<Utc>,
+) -> (String, String) {
+    let verb = match review.verdict {
+        Some(Verdict::Approved) => "You approved",
+        Some(Verdict::ChangesRequested) => "You requested changes",
+        None => "You reviewed",
+    };
+    let said = match review.submitted_at {
+        Some(at) => match ui::relative_time(at, now) {
+            age if age == "now" => format!("{verb} just now"),
+            age => format!("{verb} {age} ago"),
+        },
+        None => verb.to_owned(),
+    };
+    let after = match after {
+        0 => "Nothing new since".to_owned(),
+        1 => "1 new commit".to_owned(),
+        after => format!("{after} new commits"),
+    };
+    (said, after)
 }
 
 fn short_sha(oid: &str) -> String {
@@ -135,8 +172,65 @@ pub fn render(
                 .into_any_element()
         }
     });
+    let review = detail.viewer_review.as_ref();
+    let reviewed = reviewed_at(&detail.commits, review);
+    let review_gone = review
+        .filter(|_| reviewed.is_none() && detail.has_every_commit() && !loading)
+        .map(|review| {
+            let text = format!(
+                "Your last review was on {}, which is no longer in this pull request.",
+                short_sha(&review.commit_oid)
+            );
+            h_flex()
+                .id("commits-review-gone")
+                .role(Role::Note)
+                .aria_label(SharedString::from(text.clone()))
+                .w_full()
+                .px(scale::content_inset())
+                .py_2()
+                .gap_2()
+                .items_center()
+                .text_size(scale::meta())
+                .text_color(muted)
+                .child(
+                    Icon::new(IconName::RotateCcwClock)
+                        .small()
+                        .text_color(muted),
+                )
+                .child(div().flex_1().min_w_0().child(text))
+        });
+    let mut mark = reviewed.zip(review).map(|(ix, review)| {
+        let after = total.saturating_sub(ix + 1);
+        let (said, after) = review_mark_text(review, after, now);
+        let border = cx.theme().border;
+        let name = format!("Your last review. {said}. {after}.");
+        (
+            ix,
+            h_flex()
+                .id("commits-last-review")
+                .debug_selector(|| "commits-last-review".into())
+                .role(Role::Note)
+                .aria_label(SharedString::from(name))
+                .w_full()
+                .h(scale::column_header_height())
+                .px_2()
+                .gap_2()
+                .items_center()
+                .text_size(scale::meta())
+                .child(
+                    Icon::new(IconName::RotateCcwClock)
+                        .small()
+                        .text_color(muted),
+                )
+                .child(div().flex_none().child("Your last review"))
+                .child(div().flex_none().text_color(muted).child(said))
+                .child(div().flex_1().h(px(1.)).bg(border))
+                .child(div().flex_none().text_color(muted).child(after))
+                .into_any_element(),
+        )
+    });
     let list = ui::list_container()
-        .children(detail.commits.iter().enumerate().map(|(ix, commit)| {
+        .children(detail.commits.iter().enumerate().flat_map(|(ix, commit)| {
             let url = format!("{repo_url}/commit/{}", commit.oid);
             let oid = commit.oid.clone();
             let on_show = on_show.clone();
@@ -145,7 +239,7 @@ pub fn render(
                 .author
                 .as_ref()
                 .map_or_else(String::new, |actor| actor.avatar_url.clone());
-            ui::list_row(("commit", ix), cx)
+            let row = ui::list_row(("commit", ix), cx)
                 .role(Role::Link)
                 .aria_label(format!(
                     "Commit {}: {}",
@@ -218,7 +312,9 @@ pub fn render(
                         cx.stop_propagation();
                         cx.open_url(&url);
                     }),
-                )
+                );
+            let after = mark.take_if(|(at, _)| *at == ix).map(|(_, mark)| mark);
+            std::iter::once(row.into_any_element()).chain(after)
         }))
         .when(loading, |list| {
             list.child(
@@ -232,6 +328,7 @@ pub fn render(
     v_flex()
         .w_full()
         .children(notice)
+        .children(review_gone)
         .child(list)
         .into_any_element()
 }
@@ -349,10 +446,12 @@ pub fn commit_bar(
 
 #[cfg(test)]
 mod tests {
-    use chrono::DateTime;
-    use loupe_github::{Actor, Commit};
+    use chrono::{DateTime, Duration};
+    use loupe_github::{Actor, Commit, Verdict, ViewerReview};
 
-    use super::{Rest, author_name, neighbors, short_sha, shortfall};
+    use super::{
+        Rest, author_name, neighbors, review_mark_text, reviewed_at, short_sha, shortfall,
+    };
 
     fn commit(author: Option<&str>) -> Commit {
         Commit {
@@ -425,6 +524,56 @@ mod tests {
         assert!(
             neighbors(&commits, "gone").is_none(),
             "a commit a force push dropped has no place"
+        );
+    }
+
+    #[test]
+    fn your_last_review_goes_after_the_commit_it_was_given_on() {
+        let commits: Vec<Commit> = ["a1", "b2", "c3"]
+            .into_iter()
+            .map(|oid| Commit {
+                oid: oid.into(),
+                ..commit(None)
+            })
+            .collect();
+        let review = |oid: &str| ViewerReview {
+            verdict: None,
+            commit_oid: oid.into(),
+            submitted_at: None,
+        };
+        assert_eq!(reviewed_at(&commits, Some(&review("a1"))), Some(0));
+        assert_eq!(reviewed_at(&commits, Some(&review("c3"))), Some(2));
+        assert_eq!(reviewed_at(&commits, None), None, "no review, no mark");
+        assert_eq!(
+            reviewed_at(&commits, Some(&review("gone"))),
+            None,
+            "a commit a force push dropped has no place"
+        );
+    }
+
+    #[test]
+    fn your_last_review_says_how_and_when_and_what_came_after() {
+        let now = DateTime::from_timestamp(10_000, 0).unwrap();
+        let mut review = ViewerReview {
+            verdict: None,
+            commit_oid: "a1".into(),
+            submitted_at: Some(now - Duration::hours(2)),
+        };
+        assert_eq!(
+            review_mark_text(&review, 2, now),
+            ("You reviewed 2h ago".to_owned(), "2 new commits".to_owned())
+        );
+        review.verdict = Some(Verdict::Approved);
+        review.submitted_at = None;
+        assert_eq!(
+            review_mark_text(&review, 1, now),
+            ("You approved".to_owned(), "1 new commit".to_owned())
+        );
+        review.verdict = Some(Verdict::ChangesRequested);
+        assert_eq!(
+            review_mark_text(&review, 0, now).1,
+            "Nothing new since",
+            "a review of the head"
         );
     }
 
