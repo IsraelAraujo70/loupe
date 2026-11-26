@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 use ureq::RequestBuilder;
 
 use crate::{
-    Actor, BranchCi, BranchPullRequest, ChangedFile, Commit, CommitFiles, Error, FailedRun,
-    FileStatus, GitHub, Notification, NotificationSubject, PrRef, PrState, RepoRef, Result,
-    Timestamp, ViewedState,
+    Actor, BranchCi, BranchPullRequest, ChangedFile, Commit, CommitFiles, Comparison, Error,
+    FailedRun, FileStatus, GitHub, Notification, NotificationSubject, PrRef, PrState, RepoRef,
+    Result, SinceReview, Timestamp, ViewedState,
 };
 
 pub(crate) const REST_URL: &str = "https://api.github.com";
@@ -25,6 +25,8 @@ const COMMITS_PER_PAGE: usize = 100;
 /// The most commits [`GitHub::pull_request_commits`] lists of a pull
 /// request; a list this long may have been cut.
 pub const PR_COMMITS_LIMIT: usize = 3000;
+/// The most files GitHub lists of a comparison of two commits.
+pub const COMPARE_FILES_LIMIT: usize = 300;
 /// Compare pages read at the same time.
 const PARALLEL_PAGES: usize = 4;
 /// GitHub lists at most 3000 files of a pull request.
@@ -167,6 +169,49 @@ impl GitHub {
             }
         }
         Ok(commit)
+    }
+
+    /// What changed from `base_oid` to `head_oid` (from their merge base,
+    /// as GitHub compares), with the files' patches: one call, since GitHub
+    /// lists the files of a comparison on its first page only, at most
+    /// [`COMPARE_FILES_LIMIT`] of them. A file GitHub left the patch out of
+    /// keeps its line counts; [`GitHub::omitted_patch`] loads it.
+    pub fn compare(&self, repo: &RepoRef, base_oid: &str, head_oid: &str) -> Result<Comparison> {
+        for oid in [base_oid, head_oid] {
+            if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(Error::Decode(format!("invalid commit sha {oid:?}")));
+            }
+        }
+        let body = self.rest(
+            RestMethod::Get,
+            &format!(
+                "/repos/{}/{}/compare/{base_oid}...{head_oid}?per_page=1",
+                repo.owner, repo.name
+            ),
+        )?;
+        parse_comparison(&body)
+    }
+
+    /// What changed since the viewer reviewed `reviewed`, for a pull request
+    /// on `base_oid` whose head is now `head_oid`. Three compares, read at
+    /// once: the reviewed commit to the head, and the base to each of them,
+    /// which tells whether the branch was rewritten or took the base in
+    /// since. See [`SinceReview`].
+    pub fn since_review(
+        &self,
+        repo: &RepoRef,
+        base_oid: &str,
+        reviewed: &str,
+        head_oid: &str,
+    ) -> Result<SinceReview> {
+        let (after, then, now) = std::thread::scope(|scope| {
+            let then = scope.spawn(|| self.compare(repo, base_oid, reviewed));
+            let now = scope.spawn(|| self.merge_base(repo, base_oid, head_oid));
+            let after = self.compare(repo, reviewed, head_oid);
+            (after, joined(then), joined(now))
+        });
+        let (after, then, now) = (after?, then?, now?);
+        Ok(since_review(after, then, &now))
     }
 
     /// Sets each file's viewed state in pull request `pr` from GraphQL and
@@ -934,6 +979,45 @@ struct WireCompare {
 }
 
 #[derive(Deserialize)]
+struct WireCompareFiles {
+    ahead_by: u32,
+    #[serde(default)]
+    status: String,
+    merge_base_commit: WireCommitSha,
+    #[serde(default)]
+    files: Vec<WireFile>,
+}
+
+/// Parses the first page of `GET /compare/{base}...{head}`.
+fn parse_comparison(body: &str) -> Result<Comparison> {
+    let wire: WireCompareFiles =
+        serde_json::from_str(body).map_err(|error| Error::Decode(error.to_string()))?;
+    Ok(Comparison {
+        truncated: wire.files.len() >= COMPARE_FILES_LIMIT,
+        files: wire.files.into_iter().map(changed_file).collect(),
+        commits: wire.ahead_by,
+        merge_base: wire.merge_base_commit.sha,
+        diverged: !matches!(wire.status.as_str(), "ahead" | "identical"),
+    })
+}
+
+/// Reads the three compares of [`GitHub::since_review`]: `after` from the
+/// reviewed commit to the head, `then` from the base to the reviewed commit,
+/// and `now`, the merge base of the base and the head. The commits after the
+/// review are the change only when the reviewed commit is under the head
+/// and the branch still forks from the base where it did.
+fn since_review(after: Comparison, then: Comparison, now: &str) -> SinceReview {
+    if !after.diverged && then.merge_base == now {
+        return SinceReview::Linear(after);
+    }
+    SinceReview::Rewritten {
+        reviewed_files: then.files,
+        truncated: then.truncated,
+        rebased: after.diverged,
+    }
+}
+
+#[derive(Deserialize)]
 struct WireCommitSha {
     sha: String,
 }
@@ -1160,6 +1244,98 @@ mod tests {
             parse_commit_page(r#"{"sha":"root","parents":[]}"#).expect("a root commit parses");
         assert_eq!(parent, None);
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn a_comparison_has_its_files_and_how_many_commits_it_spans() {
+        let body = r#"{"status":"ahead","ahead_by":2,"behind_by":0,"total_commits":2,
+            "merge_base_commit":{"sha":"aaa1"},"commits":[{"sha":"c1"}],
+            "files":[
+                {"filename":"src/new.rs","previous_filename":"src/old.rs","status":"renamed",
+                 "additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-a\n+b"},
+                {"filename":"data/huge.csv","status":"modified","additions":9000,"deletions":0}
+            ]}"#;
+        let comparison = parse_comparison(body).expect("fixture parses");
+        assert_eq!(comparison.commits, 2);
+        assert!(!comparison.truncated);
+        assert_eq!(comparison.merge_base, "aaa1");
+        assert!(!comparison.diverged, "ahead: the first is under the second");
+        assert_eq!(comparison.files.len(), 2);
+        assert_eq!(comparison.files[0].status, FileStatus::Renamed);
+        assert_eq!(
+            comparison.files[0].previous_path.as_deref(),
+            Some("src/old.rs")
+        );
+        assert_eq!(
+            comparison.files[1].patch, None,
+            "a patch GitHub left out stays out"
+        );
+        assert_eq!(comparison.files[1].additions, 9000, "with its line counts");
+
+        let empty = parse_comparison(
+            r#"{"status":"identical","ahead_by":0,"merge_base_commit":{"sha":"a"}}"#,
+        )
+        .expect("a comparison with no files parses");
+        assert!(empty.files.is_empty());
+        assert!(!empty.diverged);
+
+        let rewritten = parse_comparison(
+            r#"{"status":"diverged","ahead_by":11,"behind_by":1,"merge_base_commit":{"sha":"m"}}"#,
+        )
+        .expect("parses");
+        assert!(
+            rewritten.diverged,
+            "a force push left the first off the branch"
+        );
+
+        let file = r#"{"filename":"f","status":"modified","additions":1,"deletions":0}"#;
+        let full = format!(
+            r#"{{"status":"ahead","ahead_by":1,"merge_base_commit":{{"sha":"m"}},"files":[{}]}}"#,
+            vec![file; COMPARE_FILES_LIMIT].join(",")
+        );
+        assert!(
+            parse_comparison(&full).expect("parses").truncated,
+            "GitHub stops listing at the limit, so a full list may be cut"
+        );
+    }
+
+    #[test]
+    fn the_commits_after_a_review_are_the_change_only_on_an_unrewritten_branch() {
+        let comparison = |merge_base: &str, diverged: bool, path: &str| Comparison {
+            files: vec![ChangedFile {
+                path: path.into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+                patch: None,
+                viewed: ViewedState::Unviewed,
+            }],
+            commits: 2,
+            truncated: false,
+            merge_base: merge_base.into(),
+            diverged,
+        };
+        assert!(matches!(
+            since_review(comparison("r", false, "after"), comparison("fork", false, "pr"), "fork"),
+            SinceReview::Linear(after) if after.files[0].path == "after"
+        ));
+        assert!(matches!(
+            since_review(comparison("m", true, "after"), comparison("fork", false, "pr"), "fork"),
+            SinceReview::Rewritten { rebased: true, ref reviewed_files, .. }
+                if reviewed_files[0].path == "pr"
+        ));
+        assert!(
+            matches!(
+                since_review(
+                    comparison("r", false, "after"),
+                    comparison("fork", false, "pr"),
+                    "newer-fork"
+                ),
+                SinceReview::Rewritten { rebased: false, .. }
+            ),
+            "the base merged in since moved the fork point"
+        );
     }
 
     #[test]
