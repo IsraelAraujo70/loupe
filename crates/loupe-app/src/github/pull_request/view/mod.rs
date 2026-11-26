@@ -286,7 +286,7 @@ impl PullRequestView {
     pub(super) fn new(pr: PrRef, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let review_body = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(6, 18)
+                .auto_grow(4, 12)
                 .placeholder("Leave a comment on this pull request")
         });
         // The composer's verdicts say why they cannot go out yet, which
@@ -1729,7 +1729,6 @@ impl Render for PullRequestView {
             .child(self.render_tabs(&detail, wide, details_open, cx))
             .child(
                 h_flex()
-                    .relative()
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
@@ -1744,10 +1743,13 @@ impl Render for PullRequestView {
                     .when(side, |row| {
                         row.child(self.render_side(&detail, &loaded, cx))
                     })
-                    .when(composing, |row| {
-                        row.child(self.render_review_composer(&detail, docked, cx))
+                    .when(composing && docked, |row| {
+                        row.child(self.render_review_composer(&detail, true, cx))
                     }),
             )
+            .when(composing && !docked, |page| {
+                page.child(self.render_review_composer(&detail, false, cx))
+            })
             .into_any_element()
     }
 }

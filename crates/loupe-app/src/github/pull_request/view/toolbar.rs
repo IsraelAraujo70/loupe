@@ -74,7 +74,8 @@ impl PendingComments {
 
 /// The narrowest window, 1880 px, where the Files tab keeps its tree, a
 /// readable diff, and its whole toolbar beside a docked composer. The other
-/// tabs dock from the details column's breakpoint, whose place it takes.
+/// tabs dock from the details column's breakpoint, whose place it takes;
+/// under either, the composer is a bar under the content.
 const FILES_DOCK_BREAKPOINT: Rems = Rems(1880. / 16.);
 
 /// How a confirmation commits: the merge is the pull request's goal, the
@@ -247,8 +248,8 @@ impl PullRequestView {
     }
 
     /// Whether the composer takes a column of its own beside the tab's
-    /// content (a wide window) or floats over the content's trailing edge,
-    /// so a narrow window never squeezes the diff or cuts its toolbar.
+    /// content (a wide window) or a bar under it (a narrow one), so a narrow
+    /// window never squeezes the diff, cuts a toolbar, or hides an action.
     pub(super) fn composer_docks(&self, window: &Window) -> bool {
         let needed = if self.tab == PrTab::Files {
             FILES_DOCK_BREAKPOINT
@@ -956,7 +957,7 @@ impl PullRequestView {
     }
 
     /// The review composer, a column at the trailing edge of the tab's
-    /// content (`docked`) or floating over that edge in a narrow window: what goes out with the review (files viewed, pending inline
+    /// content (`docked`) or a bar under it in a narrow window: what goes out with the review (files viewed, pending inline
     /// comments), the summary, and the verdict. A verdict that cannot go out
     /// yet is outlined and neutral, with the reason in its tooltip.
     pub(super) fn render_review_composer(
@@ -1010,6 +1011,8 @@ impl PullRequestView {
                 .child(button)
         };
 
+        let meter = self.render_review_progress(cx);
+        let (bar_meter, meter) = if docked { (None, meter) } else { (meter, None) };
         let header = h_flex()
             .flex_none()
             .h(scale::toolbar_height())
@@ -1029,25 +1032,29 @@ impl PullRequestView {
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
                     .text_size(scale::meta())
                     .text_color(muted)
                     .child(format!("#{}", detail.pr.number)),
             )
+            .children(bar_meter)
+            .child(div().flex_1())
             .child(
                 ui::icon_button("pr-review-close", IconName::Close, "Close review")
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| this.close_review_composer(cx))),
             );
 
-        let viewed = v_flex()
-            .gap_1()
-            .child(ui::section_label("Viewed", cx))
-            .child(match self.render_review_progress(cx) {
-                Some(meter) => h_flex().child(meter).into_any_element(),
-                None => ui::empty_line(IconName::Loader, "Counting files…", cx).into_any_element(),
-            });
+        let viewed = docked.then(|| {
+            v_flex()
+                .gap_1()
+                .child(ui::section_label("Viewed", cx))
+                .child(match meter {
+                    Some(meter) => h_flex().child(meter).into_any_element(),
+                    None => {
+                        ui::empty_line(IconName::Loader, "Counting files…", cx).into_any_element()
+                    }
+                })
+        });
 
         let pending_body = match (self.panel, pending) {
             (Panel::ConfirmDiscard, Some(review)) => {
@@ -1163,7 +1170,9 @@ impl PullRequestView {
 
         let summary = v_flex()
             .gap_1()
-            .child(ui::section_label("Summary", cx))
+            .when(docked, |summary| {
+                summary.child(ui::section_label("Summary", cx))
+            })
             .child(
                 Textarea::new(&self.review_body)
                     .aria_label(format!("Review summary for #{}", detail.pr.number))
@@ -1190,96 +1199,111 @@ impl PullRequestView {
                 ),
             }
         };
-        let footer = v_flex()
-            .flex_none()
-            .px(scale::content_inset())
-            .py_3()
+        let status = div()
+            .id("pr-review-status")
+            .role(Role::Status)
+            .aria_label(status.clone())
+            .text_size(scale::meta())
+            .text_color(muted)
+            .child(status);
+        let verdicts = h_flex()
             .gap_2()
-            .border_t_1()
-            .border_color(border)
-            .child(
-                div()
-                    .id("pr-review-status")
-                    .role(Role::Status)
-                    .aria_label(status.clone())
-                    .text_size(scale::meta())
-                    .text_color(muted)
-                    .child(status),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
-                    .child(verdict(
-                        "pr-review-comment",
-                        "Comment",
-                        ReviewEvent::Comment,
-                        |button| button.outline(),
-                        format!("Comment ({})", ui::shortcut("cmd-enter")),
-                        cx,
-                    ))
-                    .child(verdict(
-                        "pr-review-changes",
-                        "Request changes",
-                        ReviewEvent::RequestChanges,
-                        |button| button.danger().outline(),
-                        "Request changes before this can merge".to_owned(),
-                        cx,
-                    ))
-                    .child(verdict(
-                        "pr-review-approve",
-                        "Approve",
-                        ReviewEvent::Approve,
-                        // The screen's one primary tone. Green is for the
-                        // merge alone.
-                        |button| button.primary(),
-                        "Approve these changes".to_owned(),
-                        cx,
-                    )),
-            );
+            .justify_end()
+            .child(verdict(
+                "pr-review-comment",
+                "Comment",
+                ReviewEvent::Comment,
+                |button| button.outline(),
+                format!("Comment ({})", ui::shortcut("cmd-enter")),
+                cx,
+            ))
+            .child(verdict(
+                "pr-review-changes",
+                "Request changes",
+                ReviewEvent::RequestChanges,
+                |button| button.danger().outline(),
+                "Request changes before this can merge".to_owned(),
+                cx,
+            ))
+            .child(verdict(
+                "pr-review-approve",
+                "Approve",
+                ReviewEvent::Approve,
+                // The screen's one primary tone. Green is for the
+                // merge alone.
+                |button| button.primary(),
+                "Approve these changes".to_owned(),
+                cx,
+            ));
 
-        v_flex()
+        let composer = v_flex()
             .id("pr-review-composer")
             .debug_selector(|| "pr-review-composer".to_owned())
             .role(Role::Group)
             .aria_label(format!("Review #{}", detail.pr.number))
             .flex_none()
-            .w(scale::side_wide_width())
-            .h_full()
             .bg(tokens::panel())
-            .border_l_1()
             .border_color(border)
-            .when(!docked, |composer| {
-                composer
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .border_color(cx.theme().border)
-                    .shadow_lg()
-                    .occlude()
-            })
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
                     cx.stop_propagation();
                     this.close_review_composer(cx);
                 }
             }))
-            .child(header)
+            .child(header);
+        if docked {
+            return composer
+                .w(scale::side_wide_width())
+                .h_full()
+                .border_l_1()
+                .child(
+                    v_flex()
+                        .id("pr-review-composer-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p(scale::content_inset())
+                        .gap(scale::section_gap())
+                        .children(viewed)
+                        .child(pending_section)
+                        .child(summary)
+                        .children(error),
+                )
+                .child(
+                    v_flex()
+                        .flex_none()
+                        .px(scale::content_inset())
+                        .py_3()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(border)
+                        .child(status)
+                        .child(verdicts),
+                )
+                .into_any_element();
+        }
+        // A narrow window: a bar under the tab's content, which gives up
+        // height and keeps its width and every control.
+        composer
+            .w_full()
+            .border_t_1()
             .child(
-                v_flex()
-                    .id("pr-review-composer-body")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
+                h_flex()
                     .p(scale::content_inset())
-                    .gap(scale::section_gap())
-                    .child(viewed)
-                    .child(pending_section)
-                    .child(summary)
-                    .children(error),
+                    .gap_4()
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(summary))
+                    .child(
+                        v_flex()
+                            .flex_none()
+                            .w(scale::side_wide_width())
+                            .gap_2()
+                            .child(pending_section)
+                            .children(error)
+                            .child(status)
+                            .child(verdicts),
+                    ),
             )
-            .child(footer)
             .into_any_element()
     }
 }
@@ -1714,11 +1738,12 @@ mod tests {
         );
     }
 
-    #[gpui_kit::test]
-    fn on_a_laptop_the_composer_floats_over_the_files_tab(cx: &mut TestAppContext) {
-        let (view, mut cx) = open_at(model::tests::detail(), px(1280.), cx);
+    /// The composer as a narrow window shows it: a bar under the tab's
+    /// content that covers none of it, whatever the tab.
+    fn assert_bar_covers_nothing(width: f32, tab: PrTab, cx: &mut TestAppContext) {
+        let (view, mut cx) = open_at(model::tests::detail(), px(width), cx);
         view.update(&mut cx, |view, cx| {
-            view.tab = PrTab::Files;
+            view.tab = tab;
             cx.notify();
         });
         draw(&mut cx);
@@ -1726,19 +1751,65 @@ mod tests {
             .debug_bounds("pr-tab-content")
             .expect("the tab's content");
 
-        open_composer(&view, &mut cx);
-        let composer = cx.debug_bounds("pr-review-composer").expect("the composer");
+        click("pr-review", &mut cx);
+        let composer = cx
+            .debug_bounds("pr-review-composer")
+            .unwrap_or_else(|| panic!("the composer opens on {tab:?} at {width}"));
         let after = cx
             .debug_bounds("pr-tab-content")
             .expect("the tab's content");
         assert_eq!(
             before.size.width, after.size.width,
-            "the diff keeps its width"
+            "{tab:?} keeps its width"
         );
         assert!(
-            composer.origin.x < after.origin.x + after.size.width,
-            "it floats over it"
+            composer.origin.y >= after.origin.y + after.size.height,
+            "{tab:?}: the composer sits under the content, not over it"
         );
+        assert!(after.size.height > px(200.), "{tab:?} keeps room to read");
+    }
+
+    #[gpui_kit::test]
+    fn on_a_laptop_the_composer_is_a_bar_under_every_tab(cx: &mut TestAppContext) {
+        for width in [1280., 1440.] {
+            for tab in PrTab::ALL {
+                assert_bar_covers_nothing(width, tab, cx);
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn on_a_laptop_the_conversation_actions_stay_clickable(cx: &mut TestAppContext) {
+        for width in [1280., 1440.] {
+            let (view, mut cx) = open_at(model::tests::detail(), px(width), cx);
+            open_composer(&view, &mut cx);
+            let composer = cx.debug_bounds("pr-review-composer").expect("the composer");
+            let content = cx.debug_bounds("pr-tab-content").expect("the content");
+            for action in ["merge-box-merge", "merge-box-request-review"] {
+                let bounds = cx
+                    .debug_bounds(action)
+                    .unwrap_or_else(|| panic!("{action} at {width}"));
+                assert!(
+                    bounds.origin.x + bounds.size.width <= content.origin.x + content.size.width
+                        && bounds.origin.y + bounds.size.height <= composer.origin.y,
+                    "{action} is whole and clear of the composer at {width}"
+                );
+            }
+            let merge = cx.debug_bounds("merge-box-merge").expect("Merge");
+            let point = gpui_kit::point(
+                merge.origin.x + merge.size.width / 4.,
+                merge.origin.y + merge.size.height / 2.,
+            );
+            cx.simulate_click(point, Modifiers::none());
+            draw(&mut cx);
+            assert!(
+                view.read_with(&cx, |view, _| matches!(
+                    view.panel,
+                    super::Panel::ConfirmMerge(_)
+                )),
+                "the click reaches Merge at {width}"
+            );
+        }
     }
 
     #[gpui_kit::test]
