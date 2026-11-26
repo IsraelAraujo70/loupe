@@ -56,19 +56,19 @@ use self::emphasis::{Emphasis, SharedEmphasis, SyntaxCache};
 use self::expand::{Direction, Gap, Source};
 use self::model::{
     LoadedFiles, Missing, PlacedThread, Placement, anchor_error_message, build_files, diff_mode,
-    file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
-    to_diff_side, to_side, viewed_counts,
+    file_doc, is_viewed, place_threads, restore_viewed, set_viewed, to_diff_side, to_side,
+    viewed_counts,
 };
 use self::on_screen::{CardWidth, on_screen};
 use self::search::{Match, Needle};
 use self::signal::{Attributes, LowSignal, Signal, classify_all, thousands};
 use self::sticky::HeaderWatch;
 use self::tree::{
-    GROUPS, GitTint, LOW_SIGNAL, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors,
-    distinct_starts, file_groups, file_tint, filter_keeps, folder_tint, holds, initial_collapsed,
-    into_tree_order, move_down, move_left, move_right, move_up, shown_row, tree_rows, viewed_mark,
+    GitTint, LOW_SIGNAL, Move, RowKind, TreeOptions, TreeRow, ViewedMark, file_groups, holds,
+    initial_collapsed, into_tree_order, move_down, move_left, move_right, move_up, shown_row,
+    viewed_mark,
 };
-use self::tree_view::{RowView, StickyFolders};
+use self::tree_view::StickyFolders;
 use super::tab::{PrTabContext, PrTabEvent};
 use super::thread::{HeadRef, ThreadEvent, ThreadView};
 
@@ -78,8 +78,8 @@ use crate::github::{live, widgets};
 use crate::store::{DiffLayout, FileTreePosition, Settings, update_settings};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
+use crate::ui;
 use crate::ui::{ControlSize as _, MenuTriggerExt as _};
-use crate::{assets, ui};
 
 /// The files tree's starting width and the range its edge drags within.
 const FILE_LIST_WIDTH: f32 = 340.;
@@ -613,6 +613,8 @@ pub struct FilesTab {
     /// The tab's own focus, so Find reaches it while nothing in it is focused.
     focus: FocusHandle,
     find: Find,
+    /// The tree's facets and grouping, beside the filter's text.
+    tree: TreeOptions,
 }
 
 impl FilesTab {
@@ -740,6 +742,7 @@ impl FilesTab {
             composer: None,
             pending_reveal: None,
             focus: cx.focus_handle(),
+            tree: TreeOptions::default(),
             find: Find {
                 input: find_input,
                 _events: find_events,
@@ -1258,21 +1261,28 @@ impl FilesTab {
 
     /// The diffs of the files the filter keeps, in the tree's order.
     fn filtered_docs(&self, cx: &App) -> Vec<DiffFile> {
-        let filter = self.filter.read(cx).value();
-        self.docs
+        let place: HashMap<&str, usize> = self
+            .file_order()
+            .into_iter()
+            .enumerate()
+            .map(|(place, ix)| (self.files[ix].path.as_str(), place))
+            .collect();
+        let mut docs: Vec<DiffFile> = self
+            .docs
             .iter()
-            .filter(|doc| filter_keeps(doc.path(), &filter))
+            .filter(|doc| self.tree_keeps(doc.path(), cx))
             .cloned()
-            .collect()
+            .collect();
+        docs.sort_by_key(|doc| place.get(doc.path().as_ref()).copied());
+        docs
     }
 
     /// The low-signal files the filter keeps, for the divider over them.
     fn low_group(&self, cx: &App) -> Option<LowGroup> {
-        let filter = self.filter.read(cx).value();
         let files: Vec<&ChangedFile> = self
             .files
             .iter()
-            .filter(|file| self.low.contains_key(&file.path) && filter_keeps(&file.path, &filter))
+            .filter(|file| self.in_low_group(&file.path) && self.tree_keeps(&file.path, cx))
             .collect();
         if files.is_empty() {
             return None;
@@ -2023,6 +2033,7 @@ impl FilesTab {
                 .update(cx, |filter, cx| filter.set_value("", window, cx));
             self.show_filtered(cx);
         }
+        self.show_in_tree(path, cx);
         if self.diff.is_none() {
             self.pending_reveal = Some((path.to_owned(), line, side));
             cx.notify();
@@ -2148,11 +2159,10 @@ impl FilesTab {
             .current
             .and_then(|ix| self.find.matches.get(ix))
             .cloned();
-        let filter = self.filter.read(cx).value();
         let files = self
             .files
             .iter()
-            .filter(|file| filter_keeps(&file.path, &filter))
+            .filter(|file| self.tree_keeps(&file.path, cx))
             .map(|file| {
                 let hunks = self.shown_hunks(&file.path);
                 (
@@ -2279,11 +2289,10 @@ impl FilesTab {
             )),
             None => Some(("No results".to_owned(), "No match in the diff".to_owned())),
         };
-        let filter = self.filter.read(cx).value();
         let not_searched = self
             .missing
             .iter()
-            .filter(|(path, reason)| **reason == Missing::Omitted && filter_keeps(path, &filter))
+            .filter(|(path, reason)| **reason == Missing::Omitted && self.tree_keeps(path, cx))
             .count();
         let hint = match self.scope() {
             Scope::PullRequest => NOT_SEARCHED_HINT,
@@ -2668,12 +2677,11 @@ impl FilesTab {
             Scope::Commit => COMMIT_OMITTED_HINT,
             Scope::SinceReview => SINCE_OMITTED_HINT,
         };
-        let filter = self.filter.read(cx).value();
-        let shown = (!filter.trim().is_empty()).then(|| {
+        let shown = self.tree_narrows(cx).then(|| {
             let kept = self
                 .files
                 .iter()
-                .filter(|file| filter_keeps(&file.path, &filter))
+                .filter(|file| self.tree_keeps(&file.path, cx))
                 .count();
             format!("Showing {kept} of {} files", self.files.len())
         });
@@ -3171,18 +3179,9 @@ impl FilesTab {
         )
     }
 
-    fn current_rows(&self, cx: &App) -> Vec<TreeRow> {
-        tree_rows(
-            &self.files,
-            &self.signals,
-            &self.filter.read(cx).value(),
-            &self.collapsed,
-        )
-    }
-
     /// The row that stands for `path` in `rows` (`tree::shown_row`).
     fn shown(&self, rows: &[TreeRow], path: &str) -> Option<usize> {
-        shown_row(rows, path, self.groups.get(path).copied())
+        shown_row(rows, path, self.tree_group(path))
     }
 
     /// A click selects the row and focuses the tree. A file also scrolls the
@@ -3255,8 +3254,9 @@ impl FilesTab {
         if file == rows[ix].path || self.shown(rows, &file) != Some(ix) {
             return;
         }
-        let group = self.groups.get(&file).copied();
-        self.collapsed.retain(|folder| !holds(folder, &file, group));
+        let group = self.tree_group(&file).map(str::to_owned);
+        self.collapsed
+            .retain(|folder| !holds(folder, &file, group.as_deref()));
         if let Some(at) = self.shown(&self.current_rows(cx), &file) {
             self.tree_scroll.scroll_to_item(at, ScrollStrategy::Nearest);
         }
@@ -3330,171 +3330,6 @@ impl FilesTab {
         cx.notify();
     }
 
-    fn row_views(&self, rows: &[TreeRow], focused: bool, cx: &App) -> Vec<RowView> {
-        let selected = self
-            .selected
-            .as_deref()
-            .and_then(|path| self.shown(rows, path));
-        let active = selected.and_then(|ix| active_folder(rows, ix));
-        let starts = distinct_starts(rows);
-        let muted = cx.theme().muted_foreground;
-        let foreground = cx.theme().foreground;
-        rows.iter()
-            .enumerate()
-            .map(|(ix, row)| {
-                let guides = ancestors(rows, ix)
-                    .into_iter()
-                    .map(|folder| Some(folder) == active)
-                    .collect();
-                let path = SharedString::from(row.path.clone());
-                let is_selected = selected == Some(ix);
-                match &row.kind {
-                    RowKind::Dir(dir) => {
-                        let files = dir.files.iter().map(|&ix| &self.files[ix]);
-                        let viewed = viewed_mark(files.clone().map(|file| is_viewed(file.viewed)));
-                        // A folder that is all new or all deleted says so on
-                        // its icon; any other folder's icon stays muted.
-                        let icon_color = match folder_tint(files.map(|file| file.status)) {
-                            GitTint::Created => tokens::open(),
-                            GitTint::Deleted => tokens::closed(),
-                            GitTint::Modified | GitTint::Renamed => muted,
-                        };
-                        let count = dir.files.len();
-                        let noun = if count == 1 { "file" } else { "files" };
-                        let low_group = row.path == LOW_SIGNAL;
-                        let group = GROUPS.contains(&row.path.as_str());
-                        // A folder in a group is named for the folder it
-                        // mirrors.
-                        let (shown_path, section) = match GROUPS.iter().find_map(|name| {
-                            let inner = row.path.strip_prefix(name)?.strip_prefix('/')?;
-                            Some((inner, format!(" ({})", name.to_lowercase())))
-                        }) {
-                            Some(inside) => inside,
-                            None => (row.path.as_str(), String::new()),
-                        };
-                        let (tooltip, accessible_name) = if group && !low_group {
-                            (
-                                format!(
-                                    "{} · {count} {noun} · +{} −{}",
-                                    row.path, dir.additions, dir.deletions
-                                ),
-                                format!(
-                                    "{} group, {count} {noun}, +{} −{}",
-                                    row.path, dir.additions, dir.deletions
-                                ),
-                            )
-                        } else if low_group {
-                            (
-                                format!(
-                                    "{LOW_SIGNAL} · {count} {noun} · +{} −{} · {LOW_SIGNAL_HINT}",
-                                    dir.additions, dir.deletions
-                                ),
-                                format!(
-                                    "{LOW_SIGNAL} group, {count} {noun}, +{} −{}",
-                                    dir.additions, dir.deletions
-                                ),
-                            )
-                        } else {
-                            (
-                                format!(
-                                    "{shown_path}{section} · {count} {noun} · +{} −{}",
-                                    dir.additions, dir.deletions
-                                ),
-                                format!(
-                                    "Folder {shown_path}{section}, {count} {noun}, +{} −{}",
-                                    dir.additions, dir.deletions
-                                ),
-                            )
-                        };
-                        RowView {
-                            depth: row.depth,
-                            folder: Some(dir.expanded),
-                            label: dir.label.clone().into(),
-                            name_from: 0,
-                            // Names stay neutral; the status letter carries
-                            // the color.
-                            label_color: if viewed == ViewedMark::All {
-                                muted
-                            } else {
-                                foreground
-                            },
-                            icon: if low_group {
-                                LOW_SIGNAL_ICON
-                            } else if dir.expanded {
-                                assets::FOLDER_OPEN
-                            } else {
-                                assets::FOLDER
-                            },
-                            icon_color: if group { muted } else { icon_color },
-                            additions: dir.additions,
-                            deletions: dir.deletions,
-                            files: count,
-                            status: None,
-                            viewed,
-                            selected: is_selected,
-                            focused,
-                            guides,
-                            tooltip: tooltip.into(),
-                            accessible_name: accessible_name.into(),
-                            path,
-                        }
-                    }
-                    RowKind::File { index } => {
-                        let file = &self.files[*index];
-                        let viewed = is_viewed(file.viewed);
-                        let tint = tint_color(file_tint(file.status));
-                        let missing = match self.missing.get(&file.path) {
-                            Some(Missing::Omitted) => " · diff not loaded",
-                            Some(Missing::Unreadable) => " · diff not shown",
-                            None => "",
-                        };
-                        let kind = self
-                            .low
-                            .get(&file.path)
-                            .map(|kind| format!(", {}", kind.label(file)))
-                            .unwrap_or_default();
-                        RowView {
-                            depth: row.depth,
-                            folder: None,
-                            label: split_path(&file.path).1.to_owned().into(),
-                            name_from: starts[ix],
-                            label_color: if viewed { muted } else { foreground },
-                            icon: assets::file_icon(&file.path),
-                            icon_color: muted,
-                            additions: file.additions,
-                            deletions: file.deletions,
-                            files: 0,
-                            status: Some((status_letter(file.status), tint)),
-                            viewed: if viewed {
-                                ViewedMark::All
-                            } else {
-                                ViewedMark::None
-                            },
-                            selected: is_selected,
-                            focused,
-                            guides,
-                            tooltip: format!(
-                                "{} · +{} −{}{}{}",
-                                file.path,
-                                file.additions,
-                                file.deletions,
-                                kind.replacen(',', " ·", 1),
-                                missing
-                            )
-                            .into(),
-                            accessible_name: format!(
-                                "File {}{kind}, +{} −{}",
-                                file.path, file.additions, file.deletions
-                            )
-                            .into(),
-                            path,
-                        }
-                    }
-                }
-            })
-            .collect()
-    }
-
     fn file_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let rows = Rc::new(self.current_rows(cx));
         let focused = self.tree_focus.is_focused(window);
@@ -3542,6 +3377,7 @@ impl FilesTab {
                         .aria_label("Filter files"),
                 ),
             )
+            .child(self.tree_bar(cx))
             .child(
                 div()
                     .id("files-tree")
@@ -3685,11 +3521,12 @@ impl FilesTab {
         // before them: under its last line while it is open, and under its
         // header while it is folded or has no lines. Without a file before
         // them it heads the diff.
-        let filter = self.filter.read(cx).value();
         let before_low = low_group.as_ref().and_then(|_| {
-            self.files.iter().rev().find(|file| {
-                !self.low.contains_key(&file.path) && filter_keeps(&file.path, &filter)
-            })
+            self.file_order()
+                .into_iter()
+                .rev()
+                .map(|ix| &self.files[ix])
+                .find(|file| !self.in_low_group(&file.path) && self.tree_keeps(&file.path, cx))
         });
         let mut divider_at: Option<(SharedString, bool)> = None;
         if let Some(file) = before_low {

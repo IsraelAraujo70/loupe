@@ -101,11 +101,16 @@ impl PullRequestView {
         cx.notify();
     }
 
-    /// Brings the Guide's steps in line with the files' Viewed marks.
+    /// Brings the Guide's steps in line with the files' Viewed marks, and
+    /// hands the Files tab the steps, for its tree's Guide order.
     pub(super) fn sync_guide_with_files(&mut self, cx: &mut Context<Self>) {
         let Some(loaded) = &self.loaded else {
             return;
         };
+        let steps = loaded.guide.read(cx).own_steps().to_vec();
+        loaded
+            .files
+            .update(cx, |files, cx| files.set_guide_steps(&steps, cx));
         let Some(files) = loaded.files.read(cx).viewed_by_path() else {
             return;
         };
