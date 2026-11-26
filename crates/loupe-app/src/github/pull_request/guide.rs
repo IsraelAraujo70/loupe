@@ -38,6 +38,7 @@ use loupe_guide::{
 use super::files::{FADE_WIDTH, LONG_LINE};
 use super::tab::{PrTabContext, PrTabEvent};
 use super::view::{ReviewButton, can_approve, pending_comments_label, review_button};
+use crate::github::common;
 use crate::github::highlight::{highlight_lines, language_for_path};
 use crate::github::widgets;
 use crate::store::Settings;
@@ -237,6 +238,9 @@ pub struct GuideTab {
     /// Tracks the walkthrough's steps, one child each, to find where one is.
     steps_list: ScrollHandle,
     hunks: RefCell<CitedHunks>,
+    /// Reads of a pull request's files for its snippets' line numbers, by
+    /// pull request number, kept so each is read once.
+    patch_loads: HashMap<u64, Task<()>>,
     _submit_on_secondary_enter: Subscription,
 }
 
@@ -289,6 +293,7 @@ impl GuideTab {
             scroll,
             steps_list: ScrollHandle::new(),
             hunks: RefCell::new(None),
+            patch_loads: HashMap::new(),
             _submit_on_secondary_enter: submit_on_secondary_enter,
         }
     }
@@ -358,6 +363,55 @@ impl GuideTab {
         self.read_target = Some(target);
         self.expanded_override.clear();
         self.focused_step = None;
+        self.load_patches(cx);
+    }
+
+    /// Reads the files of the pull request on screen, for the line numbers
+    /// of its snippets, unless the Files tab or an earlier read kept them.
+    fn load_patches(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.read_target.clone() else {
+            return;
+        };
+        if self.patch_loads.contains_key(&target.pr.number) {
+            return;
+        }
+        let keys = self.patch_keys(cx);
+        if keys
+            .iter()
+            .any(|key| crate::cache::get::<Vec<ChangedFile>>(key).is_some())
+        {
+            return;
+        }
+        let Some(key) = keys.last().cloned() else {
+            return;
+        };
+        let pr = target.pr.clone();
+        let task = common::run(
+            cx,
+            move |gh| gh.pull_request_files(&pr),
+            move |_: &mut Self, result, _| {
+                if let Ok(files) = result {
+                    crate::cache::put(&key, &files);
+                }
+            },
+        );
+        self.patch_loads.insert(target.pr.number, task);
+    }
+
+    /// Where the files of the pull request on screen are kept, best first:
+    /// the Files tab's read of the open pull request, then the Guide's own.
+    fn patch_keys(&self, cx: &App) -> Vec<String> {
+        let Some(target) = &self.read_target else {
+            return Vec::new();
+        };
+        let files_tab = (target.pr.number == self.context.pr.number)
+            .then(|| self.files_cache_key(cx))
+            .flatten();
+        let own = crate::cache::github_key(
+            cx,
+            &format!("guide-files/{}/{}", target.pr.url(), target.head_oid),
+        );
+        files_tab.into_iter().chain(own).collect()
     }
 
     /// Shows the stack guide's chapter for pull request `number`.
@@ -616,10 +670,10 @@ impl GuideTab {
     }
 
     /// Opens step `step_ix` (`step_id`), marks it, and scrolls its top to
-    /// the top of the tab. Opening it only grows it downward, so where the
-    /// last frame drew it is still right; after a switch of chapter the last
-    /// frame drew another chapter, so the scroll is done again once the new
-    /// one is laid out.
+    /// the top of the tab. After a switch of chapter the last frame drew
+    /// another chapter, and the new one's folded summaries measure
+    /// themselves over the next frames, moving the step: the scroll follows
+    /// it until it stays put.
     fn focus_step(
         &mut self,
         step_ix: usize,
@@ -630,23 +684,50 @@ impl GuideTab {
         self.expanded_override.insert(step_id.to_owned(), true);
         self.focused_step = Some(step_id.to_owned());
         self.scroll_to_step(step_ix);
-        cx.on_next_frame(window, move |_, window, cx| {
-            cx.on_next_frame(window, move |this: &mut Self, _, cx| {
-                this.scroll_to_step(step_ix);
-                cx.notify();
-            });
-        });
+        self.follow_step(step_ix, 0, 0, window, cx);
         cx.notify();
     }
 
-    fn scroll_to_step(&self, step_ix: usize) {
+    /// Scrolls step `step_ix` to the top again on the next frame, until it
+    /// has stayed there for a few frames in a row.
+    fn follow_step(
+        &self,
+        step_ix: usize,
+        still: u8,
+        frames: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const STILL_FRAMES: u8 = 3;
+        const MAX_FRAMES: u8 = 30;
+        cx.on_next_frame(window, move |this: &mut Self, window, cx| {
+            let still = if this.scroll_to_step(step_ix) {
+                0
+            } else {
+                still + 1
+            };
+            if still < STILL_FRAMES && frames < MAX_FRAMES {
+                this.follow_step(step_ix, still, frames + 1, window, cx);
+                cx.notify();
+            }
+        });
+    }
+
+    /// Scrolls the top of step `step_ix` to the top of the tab, as the last
+    /// frame laid it out; whether that moved the scroll.
+    fn scroll_to_step(&self, step_ix: usize) -> bool {
         let Some(bounds) = self.steps_list.bounds_for_item(step_ix) else {
-            return;
+            return true;
         };
         let viewport = self.scroll.bounds();
         let mut offset = self.scroll.offset();
-        offset.y += viewport.top() - bounds.top();
+        let shift = viewport.top() - bounds.top();
+        if shift.abs() < px(1.) {
+            return false;
+        }
+        offset.y += shift;
         self.scroll.set_offset(offset);
+        true
     }
 
     /// Whether the content area is wide enough for prose beside code; true
@@ -1639,7 +1720,7 @@ impl GuideTab {
                         cx,
                     )),
             )
-            .child(self.render_folded(id, body, cx))
+            .child(self.render_folded(id, "summary", body, cx))
             .into_any_element()
     }
 
@@ -1648,6 +1729,7 @@ impl GuideTab {
     fn render_folded(
         &self,
         id: SharedString,
+        name: &str,
         body: AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1724,6 +1806,11 @@ impl GuideTab {
                                 IconName::ChevronDown
                             })
                             .label(if open { "Collapse" } else { "Expand" })
+                            .accessibility_label(if open {
+                                format!("Collapse {name}")
+                            } else {
+                                format!("Expand {name}")
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.open_summaries.remove(&toggle_id) {
                                     this.open_summaries.insert(toggle_id.clone());
@@ -2436,7 +2523,6 @@ impl GuideTab {
                 .into_any_element();
         }
 
-        let shown_pr = self.shown_pr_number() == self.context.pr.number;
         let left = v_flex()
             .w_full()
             .gap_3()
@@ -2467,10 +2553,7 @@ impl GuideTab {
                 .w_full()
                 .gap_3()
                 .children(step.snippets.iter().enumerate().map(|(snip_ix, snippet)| {
-                    let file_hunks = shown_pr
-                        .then(|| hunks.get(&snippet.path))
-                        .flatten()
-                        .map(Vec::as_slice);
+                    let file_hunks = hunks.get(&snippet.path).map(Vec::as_slice);
                     self.render_snippet(ix, snip_ix, snippet, file_hunks, cx)
                 }))
                 .into_any_element()
@@ -2671,33 +2754,30 @@ impl GuideTab {
             .into_any_element()
     }
 
-    /// The patch of each file the steps cite, parsed from the files the
-    /// Files tab keeps for this pull request's head: empty until it read
-    /// them, and for a stack chapter of another pull request.
+    /// The patch of each file the steps cite, parsed from the files kept for
+    /// the pull request on screen (`patch_keys`): empty until they are read.
     fn cited_hunks(&self, steps: &[GuideStep], cx: &App) -> Rc<HashMap<String, Vec<Hunk>>> {
-        if self.shown_pr_number() != self.context.pr.number {
-            return Rc::default();
-        }
-        let Some(key) = self.files_cache_key(cx) else {
-            return Rc::default();
-        };
         let cited: BTreeSet<&str> = steps
             .iter()
             .flat_map(|step| step.snippets.iter().map(|snippet| snippet.path.as_str()))
             .collect();
-        let memo_key = format!(
-            "{key}\n{}",
-            cited.iter().copied().collect::<Vec<_>>().join("\n")
-        );
+        let cited_list = cited.iter().copied().collect::<Vec<_>>().join("\n");
+        let keys = self.patch_keys(cx);
         let mut memo = self.hunks.borrow_mut();
         if let Some((read, hunks)) = memo.as_ref()
-            && *read == memo_key
+            && keys
+                .iter()
+                .any(|key| *read == format!("{key}\n{cited_list}"))
         {
             return hunks.clone();
         }
-        let Some(files) = crate::cache::get::<Vec<ChangedFile>>(&key) else {
+        let Some((key, files)) = keys.into_iter().find_map(|key| {
+            let files = crate::cache::get::<Vec<ChangedFile>>(&key)?;
+            Some((key, files))
+        }) else {
             return Rc::default();
         };
+        let memo_key = format!("{key}\n{cited_list}");
         let hunks: Rc<HashMap<String, Vec<Hunk>>> = Rc::new(
             files
                 .into_iter()
@@ -2885,6 +2965,7 @@ impl GuideTab {
             )
             .child(self.render_folded(
                 "guide-stack-why-body".into(),
+                "stack overview",
                 prose("guide-stack-why", stored.overview.why.clone()),
                 cx,
             ))
@@ -3499,72 +3580,69 @@ fn inline_code_pieces(text: &str) -> Vec<InlinePiece> {
     pieces
 }
 
-/// The number on its side of the diff of each line of `snippet`, or none for
-/// a line only the other side has. A snippet skips lines of its range, so
-/// the numbers come from the pull request's patch of the file, `hunks`: each
-/// line is found there in order, from the start of the range. Without the
-/// patch, a snippet whose lines fill its range is numbered from its start,
-/// and any other has none rather than wrong ones.
+/// The number on its side of the diff of each line of `snippet`, or none
+/// for a line only the other side has. The numbers come from the pull
+/// request's patch of the file, `hunks`, never from the snippet's range: a
+/// model can cite the wrong range, and a wrong number is worse than none.
+/// The snippet's lines are found in the patch in order, skipping lines
+/// between them; of every place they all fit, the tightest one nearest the
+/// cited range wins. When they fit nowhere, or there is no patch, no line
+/// gets a number.
 fn snippet_line_numbers(snippet: &DiffSnippet, hunks: Option<&[Hunk]>) -> Vec<Option<u32>> {
-    let lines: Vec<(char, &str)> = snippet.diff.lines().map(strip_diff_prefix).collect();
-    let (other, number): (char, fn(&DiffLine) -> Option<u32>) = match snippet.side {
-        SnippetSide::New => ('-', |line| line.new_line),
-        SnippetSide::Old => ('+', |line| line.old_line),
-    };
-    if let Some(hunks) = hunks {
-        let patch: Vec<&DiffLine> = hunks.iter().flat_map(|hunk| &hunk.lines).collect();
-        if let Some(mut cursor) = patch
-            .iter()
-            .position(|line| number(line).is_some_and(|n| n >= snippet.start_line))
-        {
-            while cursor > 0 && number(patch[cursor - 1]).is_none() {
-                cursor -= 1;
-            }
-            // A model's range can stop short of its last lines.
-            let last = snippet.end_line + lines.len() as u32;
-            let found: Vec<Option<u32>> = lines
-                .iter()
-                .map(|(sign, text)| {
-                    let kind = match sign {
-                        '+' => LineKind::Added,
-                        '-' => LineKind::Removed,
-                        _ => LineKind::Context,
-                    };
-                    let window: Vec<&DiffLine> = patch[cursor..]
-                        .iter()
-                        .copied()
-                        .take_while(|line| number(line).is_none_or(|n| n <= last))
-                        .collect();
-                    let same_text = |line: &&DiffLine| line.text.trim() == text.trim();
-                    // A model may mark a line it kept as added: the text
-                    // alone finds it when no line of its kind does.
-                    let offset = window
-                        .iter()
-                        .position(|line| line.kind == kind && same_text(line))
-                        .or_else(|| window.iter().position(same_text))?;
-                    cursor += offset + 1;
-                    number(patch[cursor - 1])
-                })
-                .collect();
-            if found.iter().any(Option::is_some) {
-                return found;
-            }
-        }
-    }
-    let on_side = lines.iter().filter(|(sign, _)| *sign != other).count() as u32;
-    if on_side != snippet.end_line - snippet.start_line + 1 {
-        return vec![None; lines.len()];
-    }
-    let mut next = snippet.start_line;
-    lines
-        .iter()
-        .map(|(sign, _)| {
-            (*sign != other).then(|| {
-                next += 1;
-                next - 1
-            })
+    let lines: Vec<(LineKind, &str)> = snippet
+        .diff
+        .lines()
+        .map(strip_diff_prefix)
+        .map(|(sign, text)| {
+            let kind = match sign {
+                '+' => LineKind::Added,
+                '-' => LineKind::Removed,
+                _ => LineKind::Context,
+            };
+            (kind, text.trim())
         })
-        .collect()
+        .collect();
+    let none = vec![None; lines.len()];
+    let Some(hunks) = hunks else {
+        return none;
+    };
+    let Some(&(_, first)) = lines.first() else {
+        return none;
+    };
+    let number: fn(&DiffLine) -> Option<u32> = match snippet.side {
+        SnippetSide::New => |line| line.new_line,
+        SnippetSide::Old => |line| line.old_line,
+    };
+    let patch: Vec<&DiffLine> = hunks.iter().flat_map(|hunk| &hunk.lines).collect();
+    // A model may mark a line it kept as added: the text alone finds it
+    // when no line of its kind does.
+    let find = |from: usize, (kind, text): (LineKind, &str)| {
+        let rest = &patch[from..];
+        rest.iter()
+            .position(|line| line.kind == kind && line.text.trim() == text)
+            .or_else(|| rest.iter().position(|line| line.text.trim() == text))
+            .map(|offset| from + offset)
+    };
+    let distance = |at: usize| {
+        patch[at..]
+            .iter()
+            .find_map(|line| number(line))
+            .map_or(u32::MAX, |n| n.abs_diff(snippet.start_line))
+    };
+    let best = (0..patch.len())
+        .filter(|&at| patch[at].text.trim() == first)
+        .filter_map(|at| {
+            let mut found = vec![at];
+            for &line in &lines[1..] {
+                found.push(find(*found.last()? + 1, line)?);
+            }
+            Some(found)
+        })
+        .min_by_key(|found| (found[found.len() - 1] - found[0], distance(found[0])));
+    match best {
+        Some(found) => found.into_iter().map(|at| number(patch[at])).collect(),
+        None => none,
+    }
 }
 
 /// A decision point written out in the step that explains it.
@@ -4351,13 +4429,30 @@ mod tests {
             snippet_line_numbers(&skipping, Some(&hunks)),
             [None, Some(2), Some(5), Some(6)]
         );
-        // Without the patch, only a snippet that fills its range is numbered.
+        // Without the patch, no line is numbered from the cited range.
         assert_eq!(
             snippet_line_numbers(&snippet(2, 3, "+a\n+b"), None),
-            [Some(2), Some(3)]
+            [None, None]
         );
+        // The cited range is wrong, and a lone brace matches an earlier
+        // line: the numbers still come from where the whole snippet is.
+        let shifted = loupe_github::diff::parse_patch(
+            "@@ -0,0 +1,9 @@\n+fn a() {\n+}\n+\n+fn b() {\n+    if x {\n+        return 1;\n+    }\n+\n+}",
+        )
+        .unwrap();
         assert_eq!(
-            snippet_line_numbers(&snippet(2, 5, "+a\n+b"), None),
+            snippet_line_numbers(
+                &snippet(1, 3, "+    if x {\n+        return 1;\n+    }\n+\n+}"),
+                Some(&shifted)
+            ),
+            [Some(5), Some(6), Some(7), Some(8), Some(9)]
+        );
+        // A line the patch does not have leaves the whole snippet unnumbered.
+        assert_eq!(
+            snippet_line_numbers(
+                &snippet(5, 6, "+    if x {\n+        return 2;"),
+                Some(&shifted)
+            ),
             [None, None]
         );
     }
