@@ -528,6 +528,28 @@ pub struct Comparison {
     pub commits: u32,
     /// GitHub lists at most [`crate::COMPARE_FILES_LIMIT`] files, so there may be more.
     pub truncated: bool,
+    /// The commit the files are compared from.
+    pub merge_base: String,
+    /// The first is not under the second: one of them was rewritten.
+    pub diverged: bool,
+}
+
+/// Where the changes since the viewer's last review come from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SinceReview {
+    /// The reviewed commit is still under the head and the base branch did
+    /// not come in since: what the commits after it changed.
+    Linear(Comparison),
+    /// The branch was rewritten since the review (`rebased`: rebased or
+    /// force-pushed; otherwise the base branch was merged in), so comparing
+    /// the commits would bring in the base's changes. Instead, the pull
+    /// request's files as they were at the review, to set beside its files
+    /// now: see [`crate::diff::changed_since`].
+    Rewritten {
+        reviewed_files: Vec<ChangedFile>,
+        truncated: bool,
+        rebased: bool,
+    },
 }
 
 /// One edit of a pull request's description.

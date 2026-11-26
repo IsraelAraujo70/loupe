@@ -14,7 +14,7 @@ mod sticky;
 mod tree;
 mod tree_view;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
@@ -32,6 +32,7 @@ use gpui_kit::component::diff::{
 };
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Search};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable::resize_handle;
 use gpui_kit::component::skeleton::Skeleton;
@@ -42,10 +43,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::diff::{DiffLine, Hunk, anchor_for_range, find_line, git_patch, parse_patch};
+use loupe_github::diff::{
+    DiffLine, Hunk, anchor_for_range, changed_since, find_line, git_patch, parse_patch,
+};
 use loupe_github::{
-    COMPARE_FILES_LIMIT, ChangedFile, CommitFiles, Comparison, FileStatus, GitHub, NodeId,
-    PullRequestDetail, RepoRef, Verdict, ViewedFailure, ViewedState,
+    COMPARE_FILES_LIMIT, ChangedFile, CommitFiles, FileStatus, GitHub, NodeId, PullRequestDetail,
+    RepoRef, SinceReview, Verdict, ViewedFailure, ViewedState,
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
@@ -75,7 +78,7 @@ use crate::github::{live, widgets};
 use crate::store::{DiffLayout, FileTreePosition, Settings, update_settings};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
-use crate::ui::ControlSize as _;
+use crate::ui::{ControlSize as _, MenuTriggerExt as _};
 use crate::{assets, ui};
 
 /// The files tree's starting width and the range its edge drags within.
@@ -295,9 +298,8 @@ struct CommitSource {
     /// The commit the diff starts from: the commit's first parent once its
     /// files load, or the commit the viewer last reviewed.
     parent: Option<String>,
-    /// Set for the changes since the viewer's last review: how many commits
-    /// they span, and whether GitHub cut its list of files, once compared.
-    since_review: Option<Option<Compared>>,
+    /// Set for the changes since the viewer's last review.
+    since_review: Option<Since>,
 }
 
 impl CommitSource {
@@ -306,22 +308,71 @@ impl CommitSource {
     }
 }
 
-/// What GitHub's comparison of the reviewed commit and the head says
-/// beside the files.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Compared {
-    commits: u32,
+/// The changes since the viewer's last review, as the toggle shows them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Since {
+    /// The files to show, with their patches.
+    files: Vec<ChangedFile>,
+    /// GitHub cut a list it read at [`COMPARE_FILES_LIMIT`] files.
     truncated: bool,
+    how: SinceHow,
+}
+
+/// Where the changes since a review come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SinceHow {
+    /// The commits after the reviewed one, this many: their diff.
+    Commits(u32),
+    /// The branch was rebased or force-pushed after the review, or it took
+    /// the base branch in (`rebased` false): the pull request's files whose
+    /// own change differs from the reviewed one, each whole, and how many
+    /// reviewed files it no longer changes.
+    Rewritten { rebased: bool, dropped: usize },
+}
+
+impl Since {
+    /// What GitHub said beside the pull request's own files now.
+    fn new(answer: &SinceReview, files: &[ChangedFile]) -> Self {
+        match answer {
+            SinceReview::Linear(comparison) => Since {
+                files: comparison.files.clone(),
+                truncated: comparison.truncated,
+                how: SinceHow::Commits(comparison.commits),
+            },
+            SinceReview::Rewritten {
+                reviewed_files,
+                truncated,
+                rebased,
+            } => {
+                let since = changed_since(reviewed_files, files);
+                let changed: HashSet<&str> = since.changed.iter().map(String::as_str).collect();
+                Since {
+                    files: files
+                        .iter()
+                        .filter(|file| changed.contains(file.path.as_str()))
+                        .cloned()
+                        .collect(),
+                    truncated: *truncated,
+                    how: SinceHow::Rewritten {
+                        rebased: *rebased,
+                        dropped: since.dropped,
+                    },
+                }
+            }
+        }
+    }
 }
 
 /// "Since your last review" in the pull request's own tab: the commits it
-/// compares, how many files changed once GitHub said, and the tab that
-/// shows those changes while the toggle is on.
-struct SinceReview {
+/// starts from and ends at, GitHub's answer, what it comes to beside the
+/// pull request's files once both are here, and the tab that shows those
+/// changes while the toggle is on.
+struct SinceToggle {
     reviewed: String,
     head: String,
-    /// The number of files and the comparison, or why it failed.
-    files: Option<Result<(usize, Compared), SharedString>>,
+    base: String,
+    answer: Option<Result<SinceReview, SharedString>>,
+    since: Option<Since>,
     _load: Task<()>,
     shown: Option<SinceTab>,
 }
@@ -347,6 +398,100 @@ fn files_label(files: usize, truncated: bool) -> String {
     }
 }
 
+/// What the toggle knows of the changes since a review: how many files,
+/// whether GitHub cut the list, and where they come from; or why GitHub did
+/// not answer.
+type SinceCount = Result<(usize, bool, SinceHow), SharedString>;
+
+/// What the toggle and the bar say about the changes since a review: what
+/// they are and where they come from.
+fn since_hint(files: usize, how: SinceHow) -> String {
+    let shown = files_label(files, false);
+    match (how, files) {
+        (SinceHow::Commits(_), 0) => "Nothing changed since your last review".to_owned(),
+        (SinceHow::Commits(commits), _) => format!(
+            "Show only the {shown} that the {} after your last review changed",
+            commits_label(commits)
+        ),
+        (SinceHow::Rewritten { rebased, .. }, files) => {
+            let what = if rebased {
+                "The branch was rebased or force-pushed since your last review"
+            } else {
+                "The base branch was merged in since your last review"
+            };
+            match files {
+                0 => format!("{what}, and no file's change differs from what you reviewed"),
+                _ => format!(
+                    "{what}, so its commits would bring in the base's changes. Show the {shown} whose change differs from what you reviewed, each whole"
+                ),
+            }
+        }
+    }
+}
+
+/// How much of the Files bar folds away so it fits its width, and the
+/// widths of what folds, as last drawn (window pixels; zero until drawn).
+#[derive(Default)]
+struct BarFit {
+    /// 0: everything shows. 1: "Since your last review" is its icon and
+    /// count. 2: Long lines, Scroll/Wrap, and Unified/Split go into one
+    /// menu. 3: the count of diffs not loaded goes, its Load all stays.
+    level: Cell<u8>,
+    toggle: Cell<f32>,
+    toggle_compact: Cell<f32>,
+    layout: Cell<f32>,
+    menu: Cell<f32>,
+    omitted: Cell<f32>,
+}
+
+/// The space between the bar's parts, in px at 100% zoom (`gap_3`).
+const BAR_GAP: f32 = 12.;
+
+impl BarFit {
+    /// The level the bar takes when the room left between its two ends is
+    /// `room` at the current level: one more fold while nothing is left,
+    /// one fewer once the fold's own width would fit back with some left.
+    fn next_level(&self, room: f32) -> u8 {
+        let level = self.level.get();
+        if room < 1. && level < 3 {
+            return level + 1;
+        }
+        let saved = match level {
+            1 => self.toggle.get() - self.toggle_compact.get(),
+            2 => self.layout.get() - self.menu.get(),
+            3 => self.omitted.get() + BAR_GAP,
+            _ => return level,
+        };
+        if room > saved.max(0.) + BAR_GAP {
+            level - 1
+        } else {
+            level
+        }
+    }
+}
+
+/// `element` with its drawn width kept in `slot` of `fit`.
+fn measured(
+    fit: &Rc<BarFit>,
+    slot: fn(&BarFit) -> &Cell<f32>,
+    element: impl IntoElement,
+) -> AnyElement {
+    let fit = fit.clone();
+    div()
+        .flex_none()
+        .relative()
+        .child(element)
+        .child(
+            canvas(
+                move |bounds, _, _| slot(&fit).set(f32::from(bounds.size.width)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .into_any_element()
+}
+
 /// "1 commit" or "3 commits".
 fn commits_label(commits: u32) -> String {
     match commits {
@@ -359,25 +504,19 @@ fn short_sha(oid: &str) -> String {
     oid.chars().take(7).collect()
 }
 
-/// Where GitHub's comparison of `reviewed` and `head` is kept; it never
-/// changes.
-fn comparison_key(cx: &App, repo: &RepoRef, reviewed: &str, head: &str) -> Option<String> {
-    crate::cache::github_key(cx, &format!("compare/{}/{reviewed}...{head}", repo.url()))
-}
-
-/// GitHub's comparison of `reviewed` and `head`, from the cache under
-/// `key` when it is there.
-fn comparison(
-    gh: &GitHub,
+/// Where GitHub's answer about the changes since a review is kept: it never
+/// changes for the same three commits.
+fn since_review_key(
+    cx: &App,
     repo: &RepoRef,
+    base: &str,
     reviewed: &str,
     head: &str,
-    key: Option<&str>,
-) -> loupe_github::Result<Comparison> {
-    match key.and_then(crate::cache::get::<Comparison>) {
-        Some(comparison) => Ok(comparison),
-        None => gh.compare(repo, reviewed, head),
-    }
+) -> Option<String> {
+    crate::cache::github_key(
+        cx,
+        &format!("since-review/{}/{base}/{reviewed}...{head}", repo.url()),
+    )
 }
 
 /// Load all: every diff GitHub left out, read a few at a time and put in the
@@ -409,7 +548,7 @@ pub struct FilesTab {
     commit: Option<CommitSource>,
     /// "Since your last review", while commits landed after it: only in
     /// the pull request's own tab.
-    since: Option<SinceReview>,
+    since: Option<SinceToggle>,
     load: Loadable<()>,
     _load: Option<Task<()>>,
     files: Vec<ChangedFile>,
@@ -457,6 +596,8 @@ pub struct FilesTab {
     _theme_changes: Subscription,
     /// Where the diff drew its file headers, to tell the file at its top.
     headers: Rc<RefCell<HeaderWatch>>,
+    /// How much of the bar folds away so it fits.
+    bar_fit: Rc<BarFit>,
     /// How wide the threads and the composer are in the diff on screen.
     card_width: CardWidth,
     layout: DiffLayout,
@@ -506,6 +647,7 @@ impl FilesTab {
     fn for_since_review(
         context: PrTabContext,
         reviewed: String,
+        since: Since,
         find: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -513,7 +655,7 @@ impl FilesTab {
         let commit = CommitSource {
             oid: context.detail.head_oid.clone(),
             parent: Some(reviewed),
-            since_review: Some(None),
+            since_review: Some(since),
         };
         Self::build(context, Some(commit), find, window, cx)
     }
@@ -585,6 +727,7 @@ impl FilesTab {
             syntax_theme: cx.theme().highlight_theme.clone(),
             _theme_changes: cx.observe_global::<Theme>(Self::theme_changed),
             headers: Rc::default(),
+            bar_fit: Rc::default(),
             card_width: CardWidth::default(),
             layout: Settings::get(cx).diff_layout,
             viewed_error: None,
@@ -666,13 +809,20 @@ impl FilesTab {
             return;
         }
         let detail = self.context.detail.clone();
-        let wanted = detail
-            .reviewed_before_head()
-            .map(|review| (review.commit_oid.clone(), detail.head_oid.clone()));
-        let current = self
-            .since
-            .as_ref()
-            .map(|since| (since.reviewed.clone(), since.head.clone()));
+        let wanted = detail.reviewed_before_head().map(|review| {
+            (
+                review.commit_oid.clone(),
+                detail.head_oid.clone(),
+                detail.base_oid.clone(),
+            )
+        });
+        let current = self.since.as_ref().map(|since| {
+            (
+                since.reviewed.clone(),
+                since.head.clone(),
+                since.base.clone(),
+            )
+        });
         if wanted == current {
             if let Some(shown) = self.since.as_ref().and_then(|since| since.shown.as_ref()) {
                 shown
@@ -685,53 +835,74 @@ impl FilesTab {
             .since
             .as_ref()
             .is_some_and(|since| since.shown.is_some());
-        self.since = wanted.map(|(reviewed, head)| self.compare_since(reviewed, head, cx));
+        self.since = wanted.map(|(reviewed, head, base)| self.ask_since(reviewed, head, base, cx));
         if was_on {
             self.show_since(true, window, cx);
         }
         cx.notify();
     }
 
-    /// Asks GitHub what changed from `reviewed` to `head`, for the toggle's
-    /// count; the tab the toggle opens reads the same comparison.
-    fn compare_since(&self, reviewed: String, head: String, cx: &mut Context<Self>) -> SinceReview {
+    /// Works out what GitHub's answer comes to beside the pull request's
+    /// files, once both are here: the toggle's count and the files its tab
+    /// shows.
+    fn settle_since(&mut self) {
+        if self.load.value().is_none() {
+            return;
+        }
+        let Some(since) = &mut self.since else {
+            return;
+        };
+        if let Some(Ok(answer)) = &since.answer {
+            since.since = Some(Since::new(answer, &self.files));
+        }
+    }
+
+    /// Asks GitHub what changed since the review of `reviewed`, kept by the
+    /// three commits: see [`GitHub::since_review`].
+    fn ask_since(
+        &self,
+        reviewed: String,
+        head: String,
+        base: String,
+        cx: &mut Context<Self>,
+    ) -> SinceToggle {
         let repo = self.context.pr.repo.clone();
-        let key = comparison_key(cx, &repo, &reviewed, &head);
+        let key = since_review_key(cx, &repo, &base, &reviewed, &head);
         let read_key = key.clone();
-        let (from, to) = (reviewed.clone(), head.clone());
-        let (asked_from, asked_to) = (reviewed.clone(), head.clone());
+        let asked = (reviewed.clone(), head.clone(), base.clone());
         let load = common::run(
             cx,
-            move |gh| comparison(gh, &repo, &from, &to, read_key.as_deref()),
-            move |this: &mut Self, result, _| {
-                let Some(since) = this
-                    .since
-                    .as_mut()
-                    .filter(|since| since.reviewed == asked_from && since.head == asked_to)
-                else {
-                    return;
-                };
-                since.files = Some(match result {
-                    Ok(comparison) => {
-                        if let Some(key) = &key {
-                            crate::cache::put(key, &comparison);
-                        }
-                        Ok((
-                            comparison.files.len(),
-                            Compared {
-                                commits: comparison.commits,
-                                truncated: comparison.truncated,
-                            },
-                        ))
+            move |gh| match read_key
+                .as_deref()
+                .and_then(crate::cache::get::<SinceReview>)
+            {
+                Some(answer) => Ok(answer),
+                None => gh.since_review(&repo, &asked.2, &asked.0, &asked.1),
+            },
+            {
+                let (reviewed, head) = (reviewed.clone(), head.clone());
+                move |this: &mut Self, result, _| {
+                    let Some(since) = this
+                        .since
+                        .as_mut()
+                        .filter(|since| since.reviewed == reviewed && since.head == head)
+                    else {
+                        return;
+                    };
+                    if let (Some(key), Ok(answer)) = (&key, &result) {
+                        crate::cache::put(key, answer);
                     }
-                    Err(error) => Err(error.message().into()),
-                });
+                    since.answer = Some(result.map_err(|error| error.message().into()));
+                    this.settle_since();
+                }
             },
         );
-        SinceReview {
+        SinceToggle {
             reviewed,
             head,
-            files: None,
+            base,
+            answer: None,
+            since: None,
             _load: load,
             shown: None,
         }
@@ -877,46 +1048,29 @@ impl FilesTab {
         ));
     }
 
-    /// Loads the changes since the viewer's last review, kept by the commits
-    /// compared since they never change, and reads their viewed marks in the
-    /// pull request every time.
+    /// Lays out the changes since the viewer's last review, which the
+    /// pull request's tab already read, with their viewed marks read again
+    /// from the pull request.
     fn load_since_review_files(&mut self, cx: &mut Context<Self>) {
-        let Some((reviewed, head)) = self
+        let Some(mut files) = self
             .commit
             .as_ref()
-            .and_then(|source| Some((source.parent.clone()?, source.oid.clone())))
+            .and_then(|source| Some(source.since_review.as_ref()?.files.clone()))
         else {
             return;
         };
         let pr = self.context.pr.clone();
-        let key = comparison_key(cx, &pr.repo, &reviewed, &head);
+        let head = self.context.detail.head_oid.clone();
         let attributes_key = attributes_key(cx, &pr.repo, &head);
         self.load.start_refresh();
-        let read_key = key.clone();
         self._load = Some(common::run(
             cx,
             move |gh| {
-                let comparison = comparison(gh, &pr.repo, &reviewed, &head, read_key.as_deref())?;
-                let mut files = comparison.files.clone();
                 gh.merge_viewed_states(&pr, &mut files)?;
                 let attributes = read_attributes(gh, &pr.repo, &head, attributes_key.as_deref());
-                Ok((comparison, review_files(files, &attributes)))
+                Ok(review_files(files, &attributes))
             },
-            move |this, result, cx| {
-                let loaded = result.map(|(comparison, loaded)| {
-                    if let Some(key) = &key {
-                        crate::cache::put(key, &comparison);
-                    }
-                    if let Some(source) = &mut this.commit {
-                        source.since_review = Some(Some(Compared {
-                            commits: comparison.commits,
-                            truncated: comparison.truncated,
-                        }));
-                    }
-                    loaded
-                });
-                this.finish_load(loaded, cx);
-            },
+            |this, result, cx| this.finish_load(result, cx),
         ));
     }
 
@@ -947,10 +1101,14 @@ impl FilesTab {
         if since.shown.is_some() {
             return;
         }
+        let Some(shows) = since.since.clone() else {
+            return;
+        };
         let reviewed = since.reviewed.clone();
         let context = self.context.clone();
         let find = self.open_find_text(cx);
-        let tab = cx.new(|cx| FilesTab::for_since_review(context, reviewed, find, window, cx));
+        let tab =
+            cx.new(|cx| FilesTab::for_since_review(context, reviewed, shows, find, window, cx));
         let events = cx.subscribe(&tab, |_, _, event: &PrTabEvent, cx| cx.emit(event.clone()));
         let back = cx.subscribe_in(&tab, window, |this, _, _: &ShowAllChanges, window, cx| {
             this.show_since(false, window, cx)
@@ -979,6 +1137,7 @@ impl FilesTab {
         self.load.finish(Ok(()));
         let first_load = self.diff.is_none();
         self.set_files(loaded.files, signals);
+        self.settle_since();
         if first_load {
             self.collapsed = initial_collapsed(&self.files, &self.signals);
         }
@@ -1277,15 +1436,25 @@ impl FilesTab {
 
     /// The commits the diff runs between. A commit's diff is against its
     /// first parent; a root commit only adds files, so it needs no older side.
+    /// The files of a branch rewritten after the review are the pull
+    /// request's own.
     fn diff_ends(&self) -> (String, String) {
         match &self.commit {
+            Some(CommitSource {
+                since_review:
+                    Some(Since {
+                        how: SinceHow::Rewritten { .. },
+                        ..
+                    }),
+                ..
+            })
+            | None => (
+                self.context.detail.base_oid.clone(),
+                self.context.detail.head_oid.clone(),
+            ),
             Some(commit) => (
                 commit.parent.clone().unwrap_or_else(|| commit.oid.clone()),
                 commit.oid.clone(),
-            ),
-            None => (
-                self.context.detail.base_oid.clone(),
-                self.context.detail.head_oid.clone(),
             ),
         }
     }
@@ -2532,11 +2701,45 @@ impl FilesTab {
                 .into_any_element(),
             widgets::diff_stat(additions, deletions).into_any_element(),
         ];
-        parts.extend(self.since_toggle(cx));
+        let fit = self.bar_fit.clone();
+        let level = fit.level.get();
+        let compact = level >= 1;
+        if let Some(toggle) = self.since_toggle(compact, cx) {
+            let slot: fn(&BarFit) -> &Cell<f32> = if compact {
+                |fit| &fit.toggle_compact
+            } else {
+                |fit| &fit.toggle
+            };
+            parts.push(measured(&fit, slot, toggle));
+        }
         if self.load.is_busy() {
             parts.push(Spinner::new().xsmall().color(muted).into_any_element());
         }
-        parts.push(div().flex_1().into_any_element());
+        // The room left between the two ends says when the bar folds.
+        let watch = fit.clone();
+        let view = this.clone();
+        parts.push(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .relative()
+                .child(
+                    canvas(
+                        move |bounds, _, cx| {
+                            let next = watch.next_level(f32::from(bounds.size.width));
+                            if next != watch.level.get() {
+                                watch.level.set(next);
+                                view.update(cx, |_, cx| cx.notify()).ok();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .into_any_element(),
+        );
         if let Some(shown) = shown {
             parts.push(
                 div()
@@ -2551,10 +2754,6 @@ impl FilesTab {
                     .into_any_element(),
             );
         }
-        // In words, beside the control that answers it: lines go on
-        // past the edge. The edge's fade alone is dark on dark and says
-        // nothing on a line with no tint, and the component shows its
-        // own horizontal bar only while it scrolls.
         if self.load_all.is_some() {
             parts.push(self.load_all_progress("load-all-progress", cx));
             parts.push(
@@ -2567,36 +2766,29 @@ impl FilesTab {
                     .into_any_element(),
             );
         } else if omitted > 0 {
-            parts.push(
-                div()
-                    .id("omitted-diffs-note")
-                    .flex_none()
-                    .text_size(scale::meta())
-                    .text_color(muted)
-                    .tooltip(move |window, cx| Tooltip::new(omitted_hint).build(window, cx))
-                    .child(match omitted {
-                        1 => "1 diff not loaded".to_owned(),
-                        omitted => format!("{omitted} diffs not loaded"),
-                    })
-                    .into_any_element(),
-            );
+            if level < 3 {
+                parts.push(measured(
+                    &fit,
+                    |fit| &fit.omitted,
+                    div()
+                        .id("omitted-diffs-note")
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .tooltip(move |window, cx| Tooltip::new(omitted_hint).build(window, cx))
+                        .child(match omitted {
+                            1 => "1 diff not loaded".to_owned(),
+                            omitted => format!("{omitted} diffs not loaded"),
+                        }),
+                ));
+            }
             parts.extend(self.load_all_button("load-all-diffs", cx));
         }
-        if long > 0 {
-            parts.push(
-                div()
-                    .id("long-lines-note")
-                    .flex_none()
-                    .text_size(scale::meta())
-                    .text_color(muted)
-                    .tooltip(|window, cx| Tooltip::new(LONG_LINES_HINT).build(window, cx))
-                    .child(match long {
-                        1 => "Long lines in 1 file".to_owned(),
-                        long => format!("Long lines in {long} files"),
-                    })
-                    .into_any_element(),
-            );
-        }
+        let long_note = match long {
+            0 => None,
+            1 => Some("Long lines in 1 file".to_owned()),
+            long => Some(format!("Long lines in {long} files")),
+        };
         parts.push(
             ui::icon_button("files-find-open", IconName::Search, "Find in diff")
                 .tooltip(format!(
@@ -2607,43 +2799,36 @@ impl FilesTab {
                 .on_click(cx.listener(|this, _, window, cx| this.open_find(window, cx)))
                 .into_any_element(),
         );
-        // Both choices about how the diff is laid out use the one
-        // segmented control, side by side.
-        parts.push(
-            ui::segmented(
-                "diff-wrap",
-                "Long lines",
-                [
-                    (Some(IconName::MoveHorizontal), "Scroll"),
-                    (Some(IconName::TextWrap), "Wrap"),
-                ],
-                usize::from(wrap),
-                |index, _, cx| {
-                    update_settings(cx, |settings| settings.diff_wrap = index == 1);
-                },
-            )
-            .into_any_element(),
-        );
-        parts.push(
-            ui::segmented(
-                "diff-layout",
-                "Diff layout",
-                [
-                    (Some(IconName::Rows2), "Unified"),
-                    (Some(IconName::Columns2), "Split"),
-                ],
-                usize::from(self.layout == DiffLayout::Split),
-                move |index, _, cx| {
-                    let layout = if index == 1 {
-                        DiffLayout::Split
-                    } else {
-                        DiffLayout::Unified
-                    };
-                    this.update(cx, |this, cx| this.set_layout(layout, cx)).ok();
-                },
-            )
-            .into_any_element(),
-        );
+        if level >= 2 {
+            parts.push(measured(
+                &fit,
+                |fit| &fit.menu,
+                self.view_menu(wrap, long_note, cx),
+            ));
+        } else {
+            // In words, beside the control that answers it: lines go on
+            // past the edge. The edge's fade alone is dark on dark and says
+            // nothing on a line with no tint, and the component shows its
+            // own horizontal bar only while it scrolls.
+            let note = long_note.map(|note| {
+                div()
+                    .id("long-lines-note")
+                    .flex_none()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .tooltip(|window, cx| Tooltip::new(LONG_LINES_HINT).build(window, cx))
+                    .child(note)
+            });
+            let layout = h_flex()
+                .debug_selector(|| "files-view-controls".into())
+                .flex_none()
+                .gap_3()
+                .items_center()
+                .children(note)
+                .child(self.wrap_control(wrap))
+                .child(self.layout_control(this.clone()));
+            parts.push(measured(&fit, |fit| &fit.layout, layout));
+        }
         // The bar mirrors with the tree: the viewed count stays over the
         // tree's filter, and the diff's controls over the diff.
         if tree_right {
@@ -2655,69 +2840,175 @@ impl FilesTab {
             .px(scale::content_inset())
             .gap_3()
             .items_center()
+            .overflow_hidden()
             .border_b_1()
             .border_color(border)
             .children(parts)
             .into_any_element()
     }
 
+    fn wrap_control(&self, wrap: bool) -> AnyElement {
+        ui::segmented(
+            "diff-wrap",
+            "Long lines",
+            [
+                (Some(IconName::MoveHorizontal), "Scroll"),
+                (Some(IconName::TextWrap), "Wrap"),
+            ],
+            usize::from(wrap),
+            |index, _, cx| {
+                update_settings(cx, |settings| settings.diff_wrap = index == 1);
+            },
+        )
+        .into_any_element()
+    }
+
+    fn layout_control(&self, this: WeakEntity<Self>) -> AnyElement {
+        ui::segmented(
+            "diff-layout",
+            "Diff layout",
+            [
+                (Some(IconName::Rows2), "Unified"),
+                (Some(IconName::Columns2), "Split"),
+            ],
+            usize::from(self.layout == DiffLayout::Split),
+            move |index, _, cx| {
+                let layout = if index == 1 {
+                    DiffLayout::Split
+                } else {
+                    DiffLayout::Unified
+                };
+                this.update(cx, |this, cx| this.set_layout(layout, cx)).ok();
+            },
+        )
+        .into_any_element()
+    }
+
+    /// Scroll or Wrap and Unified or Split in one menu, for a bar too
+    /// narrow for both controls; the button names the layout in use.
+    fn view_menu(
+        &self,
+        wrap: bool,
+        long_note: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let split = self.layout == DiffLayout::Split;
+        let (icon, layout) = if split {
+            (IconName::Columns2, "Split")
+        } else {
+            (IconName::Rows2, "Unified")
+        };
+        let lines = if wrap { "Wrap" } else { "Scroll" };
+        let view = cx.weak_entity();
+        Button::new("files-view-menu")
+            .debug_selector(|| "files-view-menu".into())
+            .ghost()
+            .control()
+            .icon(icon)
+            .label(layout)
+            .tooltip("Diff layout and long lines")
+            .accessibility_label(format!("Diff view: {layout}, long lines {lines}"))
+            .menu_trigger()
+            .dropdown_menu(move |menu, _, _| {
+                let wrap_item = |label: &'static str, on: bool| {
+                    PopupMenuItem::new(label)
+                        .checked(wrap == on)
+                        .on_click(move |_, _, cx| {
+                            update_settings(cx, |settings| settings.diff_wrap = on);
+                        })
+                };
+                let layout_item = |label: &'static str, to: DiffLayout| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label)
+                        .checked((to == DiffLayout::Split) == split)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.set_layout(to, cx)).ok();
+                        })
+                };
+                let menu = menu
+                    .min_w(dp(220.))
+                    .item(PopupMenuItem::label("Diff layout"));
+                let menu = menu
+                    .item(layout_item("Unified", DiffLayout::Unified))
+                    .item(layout_item("Split", DiffLayout::Split))
+                    .item(PopupMenuItem::separator())
+                    .item(PopupMenuItem::label(
+                        long_note.clone().unwrap_or_else(|| "Long lines".to_owned()),
+                    ));
+                menu.item(wrap_item("Scroll", false))
+                    .item(wrap_item("Wrap", true))
+            })
+            .into_any_element()
+    }
+
     /// The toggle between every change and the changes since the viewer's
     /// last review, with how many files changed since: in the pull
     /// request's tab while commits landed after the review, selected in the
-    /// tab it opens.
-    fn since_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (on, files) = match (&self.commit, &self.since) {
+    /// tab it opens. `compact`, it is its icon and count, for a narrow bar.
+    fn since_toggle(&self, compact: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (on, answer): (bool, Option<SinceCount>) = match (&self.commit, &self.since) {
             (Some(source), _) => {
-                let compared = source.since_review?;
+                let since = source.since_review.as_ref()?;
                 (
                     true,
-                    compared.map(|compared| Ok((self.files.len(), compared))),
+                    Some(Ok((self.files.len(), since.truncated, since.how))),
                 )
             }
-            (None, Some(since)) => (false, since.files.clone()),
+            (None, Some(toggle)) => (
+                false,
+                match (&toggle.answer, &toggle.since) {
+                    (Some(Err(error)), _) => Some(Err(error.clone())),
+                    (_, Some(since)) => Some(Ok((since.files.len(), since.truncated, since.how))),
+                    _ => None,
+                },
+            ),
             (None, None) => return None,
         };
         let muted = cx.theme().muted_foreground;
-        let count = match &files {
-            Some(Ok((files, compared))) => Some(files_label(*files, compared.truncated)),
+        let count = match &answer {
+            Some(Ok((0, _, _))) => Some("no changes".to_owned()),
+            Some(Ok((files, truncated, _))) => Some(files_label(*files, *truncated)),
             _ => None,
         };
         let name = match &count {
             Some(count) => format!("Since your last review, {count}"),
             None => "Since your last review".to_owned(),
         };
-        let tooltip = match (on, &files) {
+        let tooltip = match (on, &answer) {
             (true, _) => "Show every change of the pull request".to_owned(),
             (false, Some(Err(error))) => format!("GitHub did not compare the commits: {error}"),
-            (false, files) => {
-                let commits = match files {
-                    Some(Ok((_, compared))) => commits_label(compared.commits),
-                    _ => "the commits".to_owned(),
-                };
-                format!("Show only what changed in the {commits} after your last review")
-            }
+            (false, Some(Ok((files, _, how)))) => since_hint(*files, *how),
+            (false, None) => "Asking GitHub what changed since your last review".to_owned(),
         };
-        let status = match (&files, count) {
+        let status = match (&answer, count) {
             (Some(Ok(_)), Some(count)) => Some(
                 div()
                     .text_size(scale::meta())
                     .text_color(muted)
-                    .child(count)
+                    .child(match compact {
+                        true => count
+                            .trim_end_matches(" files")
+                            .trim_end_matches(" file")
+                            .to_owned(),
+                        false => count,
+                    })
                     .into_any_element(),
             ),
             (None, _) => Some(Spinner::new().xsmall().color(muted).into_any_element()),
             _ => None,
         };
+        let empty = !on && matches!(answer, Some(Ok((0, _, _))));
         Some(
             Button::new("files-since-review")
                 .debug_selector(|| "files-since-review".into())
                 .ghost()
                 .control()
                 .icon(IconName::RotateCcwClock)
-                .label("Since your last review")
+                .when(!compact, |button| button.label("Since your last review"))
                 .children(status)
                 .selected(on)
                 .toggled(on)
+                .disabled(empty)
                 .tooltip(tooltip)
                 .accessibility_label(name)
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -2732,15 +3023,13 @@ impl FilesTab {
     }
 
     /// The bar over the changes since the viewer's last review, as over one
-    /// commit: back to all changes, which review they start at and how many
-    /// commits came after it, and the comparison on GitHub.
+    /// commit: back to all changes, which review they start at, and where
+    /// they come from: the commits after it, with the comparison on GitHub,
+    /// or a branch rewritten since, with the files whose change differs.
     fn since_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let source = self
-            .commit
-            .as_ref()
-            .filter(|source| source.is_since_review())?;
+        let source = self.commit.as_ref()?;
+        let since = source.since_review.as_ref()?;
         let reviewed = source.parent.clone()?;
-        let compared = source.since_review.flatten();
         let theme = cx.theme();
         let (muted, mono) = (theme.muted_foreground, theme.mono_font_family.clone());
         let review = self
@@ -2761,22 +3050,26 @@ impl FilesTab {
                 age => format!("{age} ago"),
             });
         let sha = short_sha(&reviewed);
+        let source_note = match since.how {
+            SinceHow::Commits(commits) => format!("{} since", commits_label(commits)),
+            SinceHow::Rewritten { rebased: true, .. } => "Rebased since".to_owned(),
+            SinceHow::Rewritten { rebased: false, .. } => "Base branch merged in since".to_owned(),
+        };
         let mut summary = format!("Since your last review. {verb} {sha}");
         if let Some(when) = &when {
             summary.push_str(&format!(" {when}"));
         }
-        if let Some(compared) = compared {
-            summary.push_str(&format!(
-                ", then {} landed",
-                commits_label(compared.commits)
-            ));
-        }
+        summary.push_str(&format!(". {source_note}"));
+        let hint: SharedString = since_hint(self.files.len(), since.how).into();
         let url = format!(
             "{}/compare/{reviewed}...{}",
             self.context.pr.repo.url(),
             source.oid
         );
-        let truncated = compared.is_some_and(|compared| compared.truncated);
+        let dropped = match since.how {
+            SinceHow::Rewritten { dropped, .. } if dropped > 0 => Some(dropped),
+            _ => None,
+        };
         Some(
             ui::toolbar()
                 .id("since-review-bar")
@@ -2798,6 +3091,7 @@ impl FilesTab {
                         .aria_label(summary.clone())
                         .flex_1()
                         .min_w_0()
+                        .overflow_hidden()
                         .gap_2()
                         .items_center()
                         .child(
@@ -2823,14 +3117,32 @@ impl FilesTab {
                         }))
                         .tooltip(move |window, cx| Tooltip::new(summary.clone()).build(window, cx)),
                 )
-                .children(compared.map(|compared| {
+                .child(
                     div()
+                        .id("since-review-source")
+                        .role(Role::Note)
+                        .aria_label(hint.clone())
                         .flex_none()
                         .text_size(scale::meta())
                         .text_color(muted)
-                        .child(format!("{} since", commits_label(compared.commits)))
+                        .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+                        .child(source_note),
+                )
+                .children(dropped.map(|dropped| {
+                    let text = match dropped {
+                        1 => "1 reviewed file no longer changed".to_owned(),
+                        dropped => format!("{dropped} reviewed files no longer changed"),
+                    };
+                    div()
+                        .id("since-review-dropped")
+                        .role(Role::Note)
+                        .aria_label(SharedString::from(text.clone()))
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .child(text)
                 }))
-                .when(truncated, |bar| {
+                .when(since.truncated, |bar| {
                     bar.child(
                         div()
                             .id("since-review-cut")
@@ -2843,16 +3155,18 @@ impl FilesTab {
                             .child(format!("First {COMPARE_FILES_LIMIT} files")),
                     )
                 })
-                .child(
-                    Button::new("since-review-on-github")
-                        .ghost()
-                        .control()
-                        .icon(IconName::ExternalLink)
-                        .label("Open on GitHub")
-                        .tooltip("Compare the reviewed commit with the head in the browser")
-                        .accessibility_label("Open the comparison on GitHub")
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
-                )
+                .when(matches!(since.how, SinceHow::Commits(_)), |bar| {
+                    bar.child(
+                        Button::new("since-review-on-github")
+                            .ghost()
+                            .control()
+                            .icon(IconName::ExternalLink)
+                            .label("Open on GitHub")
+                            .tooltip("Compare the reviewed commit with the head in the browser")
+                            .accessibility_label("Open the comparison on GitHub")
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -4234,7 +4548,7 @@ pub(super) mod tests {
     use loupe_github::diff::{git_patch, parse_patch};
     use loupe_github::{
         ChangedFile, Checks, FileStatus, MergeMethod, MergeStateStatus, Mergeable, PrRef, PrState,
-        PullRequestDetail, RepoRef, ViewedState, ViewerReview,
+        PullRequestDetail, RepoRef, SinceReview, ViewedState, ViewerReview,
     };
 
     use super::emphasis::PLAIN;
@@ -4243,8 +4557,9 @@ pub(super) mod tests {
     use super::signal::{Attributes, classify_all};
     use super::tree::{LOW_SIGNAL, TESTS};
     use super::{
-        Compared, FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab,
-        MODE_CHANGE_NOTE, PrTabContext, Scope, ShowAllChanges, files_label, review_files,
+        BarFit, FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab,
+        MODE_CHANGE_NOTE, PrTabContext, Scope, ShowAllChanges, Since, SinceHow, files_label,
+        review_files,
     };
     use crate::services::{Accounts, Services};
     use crate::store::{FileTreePosition, Settings, update_settings};
@@ -5470,9 +5785,10 @@ pub(super) mod tests {
     fn since_your_last_review_shows_the_changes_after_it_and_back(cx: &mut TestAppContext) {
         let (mut cx, tab) = open_reviewed_tab(cx, "0ld");
         let cx = &mut cx;
-        let compared = Compared {
-            commits: 2,
+        let compared = Since {
+            files: vec![modified("src/b.rs")],
             truncated: false,
+            how: SinceHow::Commits(2),
         };
         tab.update(cx, |tab, _| {
             let since = tab.since.as_mut().expect("commits landed after the review");
@@ -5480,7 +5796,7 @@ pub(super) mod tests {
                 (since.reviewed.as_str(), since.head.as_str()),
                 ("0ld", "abc")
             );
-            since.files = Some(Ok((1, compared)));
+            since.since = Some(compared.clone());
         });
         draw(cx);
         assert!(
@@ -5514,13 +5830,24 @@ pub(super) mod tests {
                 cx,
             );
             if let Some(source) = &mut since.commit {
-                source.since_review = Some(Some(compared));
+                source.since_review = Some(compared);
             }
         });
-        draw(cx);
+        for _ in 0..4 {
+            draw(cx);
+            cx.run_until_parked();
+        }
         assert!(
             cx.debug_bounds("files-since-review").is_some(),
             "the toggle stays in the bar, on"
+        );
+        let controls = cx
+            .debug_bounds("files-view-controls")
+            .or_else(|| cx.debug_bounds("files-view-menu"))
+            .expect("the diff's view controls, or their menu, are in the bar");
+        assert!(
+            f32::from(controls.right()) <= WINDOW_WIDTH,
+            "the bar fits a 1280 window with the toggle on: {controls:?}"
         );
         assert_eq!(shown.read_with(cx, |since, _| since.files.len()), 1);
 
@@ -5534,6 +5861,67 @@ pub(super) mod tests {
             "All changes or the toggle shows every change again"
         );
         assert_eq!(tab.read_with(cx, |tab, _| tab.files.len()), 2);
+    }
+
+    #[test]
+    fn after_a_rebase_the_files_whose_change_moved_show_whole() {
+        let mut moved = modified("src/a.rs");
+        moved.patch = Some("@@ -4 +4 @@\n-old\n+newer".into());
+        let mut shifted = modified("src/b.rs");
+        shifted.patch = Some("@@ -9 +9 @@\n-old\n+new".into());
+        let reviewed = vec![
+            modified("src/a.rs"),
+            modified("src/b.rs"),
+            modified("src/c.rs"),
+        ];
+        let now = vec![moved.clone(), shifted, modified("src/d.rs")];
+        let answer = SinceReview::Rewritten {
+            reviewed_files: reviewed,
+            truncated: false,
+            rebased: true,
+        };
+        assert_eq!(
+            Since::new(&answer, &now),
+            Since {
+                files: vec![moved, modified("src/d.rs")],
+                truncated: false,
+                how: SinceHow::Rewritten {
+                    rebased: true,
+                    dropped: 1,
+                },
+            },
+            "a file the rebase only moved stays out, and a reviewed file gone is counted"
+        );
+    }
+
+    #[test]
+    fn the_bar_folds_one_step_at_a_time_and_unfolds_with_room_to_spare() {
+        let fit = BarFit::default();
+        fit.toggle.set(220.);
+        fit.toggle_compact.set(60.);
+        fit.layout.set(300.);
+        fit.menu.set(110.);
+        fit.omitted.set(100.);
+        assert_eq!(fit.next_level(40.), 0, "room left, nothing folds");
+        assert_eq!(fit.next_level(0.), 1, "no room: the toggle folds first");
+        fit.level.set(1);
+        assert_eq!(fit.next_level(0.), 2, "then the diff's view controls");
+        fit.level.set(2);
+        assert_eq!(fit.next_level(0.), 3, "then the count of diffs not loaded");
+        fit.level.set(3);
+        assert_eq!(fit.next_level(0.), 3, "nothing more folds");
+        assert_eq!(fit.next_level(100.), 3, "the note does not fit back yet");
+        assert_eq!(fit.next_level(130.), 2, "the note fits back with room left");
+        fit.level.set(2);
+        assert_eq!(fit.next_level(190.), 2, "the controls need 190 more");
+        assert_eq!(fit.next_level(210.), 1);
+        fit.level.set(1);
+        assert_eq!(
+            fit.next_level(170.),
+            1,
+            "the full toggle needs 160 and a gap"
+        );
+        assert_eq!(fit.next_level(180.), 0, "the full toggle fits back");
     }
 
     #[gpui_kit::test]
