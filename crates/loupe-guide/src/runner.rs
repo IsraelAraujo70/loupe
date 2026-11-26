@@ -37,8 +37,8 @@ use crate::prompt::{
     SYSTEM_PROMPT, build_repair_prompt, build_user_prompt, copy_evidence, truncate_utf8,
 };
 use crate::schema::{
-    DiffSnippet, GuideStep, GuideValidationError, ReviewGuide, SnippetSide, StepKind,
-    guide_json_schema, validate,
+    DiffSnippet, GuideStep, GuideValidationError, MAX_SNIPPET_BYTES, MAX_SNIPPET_LINES,
+    ReviewGuide, SnippetSide, StepKind, guide_json_schema, validate,
 };
 use crate::user_settings::ForwardedSettings;
 
@@ -260,7 +260,15 @@ pub fn run_in_checkout_with_timeout(
 fn parse_guide(structured: serde_json::Value) -> Result<ReviewGuide, GuideValidationError> {
     let guide: ReviewGuide = serde_json::from_value(structured)
         .map_err(|err| GuideValidationError::MalformedJson(err.to_string()))?;
-    validate(&guide)?;
+    // An empty snippet is a finding for the repair run and is dropped when
+    // Loupe settles, so it must not fail the whole generation here.
+    let mut shape = guide.clone();
+    for snippet in shape.steps.iter_mut().flat_map(|s| &mut s.snippets) {
+        if snippet.diff.trim().is_empty() {
+            snippet.diff = "+".into();
+        }
+    }
+    validate(&shape)?;
     Ok(guide)
 }
 
@@ -624,6 +632,11 @@ fn snippet_problem(
     if !files.is_empty() && file.is_none() {
         return Some("this pull request does not change that file".into());
     }
+    if snippet.diff.trim().is_empty() {
+        return Some(
+            "it quotes no lines; cite the lines of the diff that carry the behavior".into(),
+        );
+    }
     let patch = file.and_then(|f| f.patch.as_deref()).map(PatchLines::new);
     let mut head_lines: Vec<&str> = Vec::new();
     for raw in snippet.diff.lines() {
@@ -703,8 +716,8 @@ fn find_in_order<'a>(
 /// A snippet of a file the pull request adds, as the lines it really adds:
 /// every line of the file at the head commit from the first to the last line
 /// the snippet quotes, blank lines included, each marked `+`, at their own
-/// line numbers. None when the snippet is not on the new side or its lines
-/// are not found there.
+/// line numbers, cut where it would pass the snippet size limit. None when
+/// the snippet is not on the new side or its lines are not found there.
 fn as_added(snippet: &DiffSnippet, checkout: &Path) -> Option<DiffSnippet> {
     if snippet.side != SnippetSide::New {
         return None;
@@ -726,14 +739,23 @@ fn as_added(snippet: &DiffSnippet, checkout: &Path) -> Option<DiffSnippet> {
     let raw: Vec<&str> = text.lines().collect();
     let lines: Vec<&str> = raw.iter().map(|l| l.trim()).collect();
     let (first, last) = find_in_order(&lines, &wanted, snippet).ok()?;
-    let diff = raw[first..=last]
-        .iter()
-        .map(|line| format!("+{}", line.trim_end()))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut diff = String::new();
+    let mut kept = None;
+    for (ix, line) in raw.iter().enumerate().take(last + 1).skip(first) {
+        let line = format!("+{}", line.trim_end());
+        let bytes = diff.len() + usize::from(!diff.is_empty()) + line.len();
+        if ix - first >= MAX_SNIPPET_LINES || bytes > MAX_SNIPPET_BYTES {
+            break;
+        }
+        if !diff.is_empty() {
+            diff.push('\n');
+        }
+        diff.push_str(&line);
+        kept = Some(ix);
+    }
     Some(DiffSnippet {
         start_line: u32::try_from(first + 1).ok()?,
-        end_line: u32::try_from(last + 1).ok()?,
+        end_line: u32::try_from(kept? + 1).ok()?,
         diff,
         ..snippet.clone()
     })
@@ -1905,6 +1927,70 @@ mod check_tests {
                 "- `crates/web2`: 42.6% of the changed lines, 1 file(s); resembles `crates/web`: 1 of 1 files have a counterpart there, 0% of their lines identical"
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_added_snippet_with_its_blank_lines_back_stays_within_the_size_limit() {
+        let functions: Vec<String> = (0..50).map(|n| format!("pub fn f{n}() {{}}")).collect();
+        let file = functions.join("\n\n") + "\n";
+        let extra = [("crates/ai2/src/lib.rs", file.as_str())];
+        let quoted = functions
+            .iter()
+            .map(|line| format!("+{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ai = GuideStep {
+            id: "ai".into(),
+            kind: StepKind::Subsystem,
+            title: "The ai2 port".into(),
+            explanation: "Adds fifty functions.".into(),
+            snippets: vec![DiffSnippet {
+                path: "crates/ai2/src/lib.rs".into(),
+                start_line: 1,
+                end_line: 99,
+                side: SnippetSide::New,
+                caption: "Every function".into(),
+                diff: quoted,
+            }],
+        };
+        let mut draft = guide(vec![snippet(5, 7, REAL)], vec![ai]);
+        draft.decisions[0].snippet_index = Some(0);
+        let (generated, prompts) = generate_in(&extra, files(), &[draft]);
+
+        assert_eq!(prompts.len(), 1, "the draft passes the check");
+        let shown = &generated.steps[1].snippets[0];
+        assert_eq!(shown.diff.lines().count(), super::MAX_SNIPPET_LINES);
+        assert!(shown.diff.lines().all(|line| line.starts_with('+')));
+        assert!(
+            shown
+                .diff
+                .starts_with("+pub fn f0() {}\n+\n+pub fn f1() {}")
+        );
+        assert_eq!((shown.start_line, shown.end_line), (1, 80));
+        super::validate(&generated).expect("the settled guide stays valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_snippet_goes_to_the_repair_run_instead_of_failing_the_guide() {
+        let empty = DiffSnippet {
+            diff: " ".into(),
+            ..snippet(5, 7, REAL)
+        };
+        let mut draft = guide(vec![snippet(5, 7, REAL), empty], vec![mechanical()]);
+        draft.decisions[0].snippet_index = Some(0);
+        let (generated, prompts) = generate(&[draft]);
+
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[1].contains(
+                "Snippet 1 of step `auth` (crates/core/src/auth.rs lines 5-7): it quotes no lines"
+            ),
+            "{}",
+            prompts[1]
+        );
+        assert_eq!(generated.steps[0].snippets, vec![snippet(5, 7, REAL)]);
     }
 
     #[cfg(unix)]
