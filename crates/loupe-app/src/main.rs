@@ -3,6 +3,7 @@ extern crate gpui_kit as gpui;
 
 mod assets;
 mod cache;
+mod debug;
 mod desktop;
 mod github;
 mod linear;
@@ -52,8 +53,9 @@ fn main() {
         updater::start(cx);
         settings::session::start(cx);
 
+        let (width, height) = debug::window_size().unwrap_or((1280., 820.));
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
+            window_bounds: Some(WindowBounds::centered(size(px(width), px(height)), cx)),
             titlebar: Some(TitlebarOptions {
                 title: Some(format!("Loupe {}", env!("CARGO_PKG_VERSION")).into()),
                 appears_transparent: true,
@@ -77,6 +79,9 @@ fn main() {
         })
         .expect("open the main window");
         cx.activate(true);
+        if let Some(url) = debug::open_url() {
+            shell::open_system_urls(vec![url], cx);
+        }
         cx.spawn(async move |cx| {
             while let Some(urls) = urls_rx.next().await {
                 cx.update(|cx| shell::open_system_urls(urls, cx));

@@ -12,6 +12,7 @@ mod error;
 mod gql;
 mod ids;
 mod merge;
+pub mod queue;
 mod rate;
 mod rest;
 pub mod reviews;
@@ -29,7 +30,10 @@ pub use gql::{Changes, ChangesQuery, PrStamp, ViewedFailure};
 pub use ids::{PrRef, RepoRef};
 pub use merge::{MergeOutcome, MergeResult};
 pub use rate::{RateLimit, RateLimits};
-pub use rest::{ChecksEtag, ChecksPoll, NOTIFICATIONS_LIMIT, PR_COMMITS_LIMIT, PullRequestPoll};
+pub use rest::{
+    COMPARE_FILES_LIMIT, ChecksEtag, ChecksPoll, NOTIFICATIONS_LIMIT, PR_COMMITS_LIMIT,
+    PullRequestPoll,
+};
 pub use stack::{PrStack, StackEntry, StackMember, StackSummary};
 pub use stack_merge::{
     RetryPolicy, StackBlocker, StackDisplayEntry, StackGraph, StackGraphNode, StackMergeBackend,

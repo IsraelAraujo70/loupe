@@ -133,6 +133,19 @@ pub struct GuideStep {
     pub snippets: Vec<DiffSnippet>,
 }
 
+impl GuideStep {
+    /// The files this step's snippets cite, each once, in the order they
+    /// first appear.
+    pub fn cited_paths(&self) -> Vec<&str> {
+        let mut seen = HashSet::new();
+        self.snippets
+            .iter()
+            .map(|snippet| snippet.path.as_str())
+            .filter(|path| seen.insert(*path))
+            .collect()
+    }
+}
+
 /// Which side of the diff a snippet line range anchors to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -271,6 +284,35 @@ impl GuideReadState {
             .iter()
             .filter(|step| self.viewed_steps.contains(&step.id))
             .count()
+    }
+
+    /// Follows the files' Viewed marks: a step that cites files of the pull
+    /// request is viewed exactly when every one of them is. `file_viewed`
+    /// answers whether a file is viewed, or `None` for a path the pull
+    /// request does not change; a step that cites none of its files keeps
+    /// its own mark. Returns whether any step changed.
+    pub fn sync_with_files(
+        &mut self,
+        steps: &[GuideStep],
+        file_viewed: impl Fn(&str) -> Option<bool>,
+    ) -> bool {
+        let mut changed = false;
+        for step in steps {
+            let marks: Vec<bool> = step
+                .cited_paths()
+                .into_iter()
+                .filter_map(&file_viewed)
+                .collect();
+            if marks.is_empty() {
+                continue;
+            }
+            let viewed = marks.iter().all(|viewed| *viewed);
+            if viewed != self.is_viewed(&step.id) {
+                self.toggle(&step.id);
+                changed = true;
+            }
+        }
+        changed
     }
 }
 
@@ -1014,5 +1056,128 @@ mod tests {
         let round_trip: StoredGuide =
             serde_json::from_str(&serde_json::to_string(&localized).unwrap()).unwrap();
         assert_eq!(round_trip.language, localized.language);
+    }
+
+    fn snippet(path: &str) -> DiffSnippet {
+        DiffSnippet {
+            path: path.into(),
+            start_line: 1,
+            end_line: 2,
+            side: SnippetSide::New,
+            caption: "Why it matters".into(),
+            diff: "+line".into(),
+        }
+    }
+
+    fn step(id: &str, paths: &[&str]) -> GuideStep {
+        GuideStep {
+            id: id.into(),
+            kind: StepKind::Subsystem,
+            title: id.into(),
+            explanation: "What changed".into(),
+            snippets: paths.iter().map(|path| snippet(path)).collect(),
+        }
+    }
+
+    /// The pull request's files and whether each is viewed.
+    fn files(viewed: &[(&str, bool)]) -> impl Fn(&str) -> Option<bool> {
+        let viewed: std::collections::HashMap<String, bool> = viewed
+            .iter()
+            .map(|(path, viewed)| ((*path).to_owned(), *viewed))
+            .collect();
+        move |path| viewed.get(path).copied()
+    }
+
+    #[test]
+    fn a_step_cites_each_file_once_in_order() {
+        let step = step("scale", &["src/scale.rs", "src/units.rs", "src/scale.rs"]);
+        assert_eq!(step.cited_paths(), vec!["src/scale.rs", "src/units.rs"]);
+        assert!(
+            super::GuideStep {
+                snippets: Vec::new(),
+                ..step
+            }
+            .cited_paths()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_step_is_viewed_once_every_file_it_cites_is() {
+        let steps = vec![
+            step("scale", &["src/scale.rs", "src/units.rs"]),
+            step("expiry", &["src/expiry.rs"]),
+        ];
+        let mut state = GuideReadState::default();
+
+        let changed = state.sync_with_files(
+            &steps,
+            files(&[
+                ("src/scale.rs", true),
+                ("src/units.rs", false),
+                ("src/expiry.rs", false),
+            ]),
+        );
+        assert!(!changed, "half of a step's files leave it unviewed");
+        assert!(!state.is_viewed("scale"));
+
+        let changed = state.sync_with_files(
+            &steps,
+            files(&[
+                ("src/scale.rs", true),
+                ("src/units.rs", true),
+                ("src/expiry.rs", false),
+            ]),
+        );
+        assert!(changed);
+        assert!(state.is_viewed("scale"));
+        assert!(!state.is_viewed("expiry"));
+    }
+
+    #[test]
+    fn unviewing_a_cited_file_unviews_every_step_that_cites_it() {
+        let steps = vec![
+            step("scale", &["src/scale.rs", "src/units.rs"]),
+            step("units", &["src/units.rs"]),
+        ];
+        let mut state = GuideReadState::default();
+        state.toggle("scale");
+        state.toggle("units");
+
+        let changed = state.sync_with_files(
+            &steps,
+            files(&[("src/scale.rs", true), ("src/units.rs", false)]),
+        );
+        assert!(changed);
+        assert!(!state.is_viewed("scale"));
+        assert!(!state.is_viewed("units"));
+        assert!(
+            !state.sync_with_files(
+                &steps,
+                files(&[("src/scale.rs", true), ("src/units.rs", false)]),
+            ),
+            "a second sync with the same files changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_step_without_files_of_the_pull_request_keeps_its_own_mark() {
+        let steps = vec![
+            step("overview", &[]),
+            step("renamed", &["src/gone.rs"]),
+            step("mixed", &["src/gone.rs", "src/scale.rs"]),
+        ];
+        let mut state = GuideReadState::default();
+        state.toggle("overview");
+        state.toggle("renamed");
+
+        let changed = state.sync_with_files(&steps, files(&[("src/scale.rs", true)]));
+        assert!(changed, "the file the pull request changes decides `mixed`");
+        assert!(state.is_viewed("overview"), "no snippet: manual");
+        assert!(
+            state.is_viewed("renamed"),
+            "a path the pull request does not change is ignored"
+        );
+        assert!(state.is_viewed("mixed"));
     }
 }

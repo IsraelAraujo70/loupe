@@ -34,6 +34,13 @@ pub enum PrTabEvent {
         line: Option<u32>,
         side: Side,
     },
+    /// A Guide step of `pr` was marked viewed (or unviewed): mark the files
+    /// it cites, `paths`, the same way.
+    StepViewed {
+        pr: PrRef,
+        paths: Vec<String>,
+        viewed: bool,
+    },
     /// Submit a review to `pr`: this pull request, or another of its stack
     /// whose Guide chapter is on screen.
     SubmitReview {

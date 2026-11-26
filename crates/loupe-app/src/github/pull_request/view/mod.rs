@@ -5,6 +5,7 @@ mod header;
 mod merge_box;
 mod model;
 mod poll;
+mod progress;
 mod side;
 mod stack_panel;
 mod toolbar;
@@ -44,6 +45,8 @@ use model::{Panel, PrTab, review_blocker};
 pub(in crate::github::pull_request) use model::{
     ReviewButton, can_approve, pending_comments_label, review_button,
 };
+pub use progress::{NEXT_UNVIEWED_KEYS, NextUnviewedFile};
+pub(in crate::github::pull_request) use toolbar::{OpenReviewComposer, PendingComments};
 
 /// What exists only after the first successful load.
 #[derive(Clone)]
@@ -218,9 +221,9 @@ pub struct PullRequestView {
     /// tab without a focus of its own (Conversation, Guide, Commits).
     focus: FocusHandle,
     conversation_scroll: ScrollHandle,
-    /// Details opened in a window too narrow to show the side column on
-    /// its own.
-    details_open: bool,
+    /// The widths of the header's title line and its actions on the last
+    /// frame, which decide what fits.
+    header_measure: Rc<header::HeaderMeasure>,
     guide_scroll: ScrollHandle,
     commits_scroll: ScrollHandle,
     checks_scroll: ScrollHandle,
@@ -269,6 +272,13 @@ pub struct PullRequestView {
     /// Last `(head_oid, guide_service::revision, language, stack)` synchronized
     /// into `GuideTab`.
     guide_sync: Option<(String, u64, loupe_guide::GuideLanguage, Option<StackGraph>)>,
+    /// Each file's Viewed mark when the Files tab last changed, to tell
+    /// when one changes.
+    viewed_marks: Vec<bool>,
+    /// Every write sent, in order: the tests' stand-in for GitHub, which
+    /// refuses a verdict on the fixture's own pull request.
+    #[cfg(test)]
+    sent_writes: Vec<Write>,
     _ticker: Task<()>,
 }
 
@@ -276,22 +286,20 @@ impl PullRequestView {
     pub(super) fn new(pr: PrRef, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let review_body = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(3, 10)
+                .auto_grow(4, 12)
                 .placeholder("Leave a comment on this pull request")
         });
-        let submit_on_secondary_enter = cx.subscribe_in(
+        // The composer's verdicts say why they cannot go out yet, which
+        // depends on the summary as it is typed.
+        let review_body_events = cx.subscribe_in(
             &review_body,
             window,
-            |this, _, event: &InputEvent, _window, cx| {
-                if matches!(
-                    event,
-                    InputEvent::PressEnter {
-                        secondary: true,
-                        ..
-                    }
-                ) {
-                    this.submit_review(ReviewEvent::Comment, cx);
-                }
+            |this, _, event: &InputEvent, _window, cx| match event {
+                InputEvent::PressEnter {
+                    secondary: true, ..
+                } => this.submit_review(ReviewEvent::Comment, cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
             },
         );
         let ticker = cx.spawn(async move |this, cx| {
@@ -315,7 +323,7 @@ impl PullRequestView {
             stack_task: None,
             stack_merge_run: None,
             stack_merge_task: None,
-            tab: PrTab::Conversation,
+            tab: PrTab::initial(),
             loaded: None,
             commit: None,
             incoming: None,
@@ -332,7 +340,7 @@ impl PullRequestView {
             focus_review_body: false,
             focus: cx.focus_handle(),
             conversation_scroll: ScrollHandle::new(),
-            details_open: false,
+            header_measure: Rc::default(),
             guide_scroll: ScrollHandle::new(),
             commits_scroll: ScrollHandle::new(),
             checks_scroll: ScrollHandle::new(),
@@ -342,7 +350,12 @@ impl PullRequestView {
             commits_error: None,
             write_task: None,
             guide_review_task: None,
-            subscriptions: vec![submit_on_secondary_enter],
+            // The details column leaves out Linear and T3 while they are not
+            // connected, so connecting one brings its section back.
+            subscriptions: vec![
+                review_body_events,
+                cx.observe_global::<crate::services::Services>(|_, cx| cx.notify()),
+            ],
             last_fetch: Instant::now(),
             checked_at: None,
             checks_etag: None,
@@ -358,6 +371,9 @@ impl PullRequestView {
             pr_polled_at: None,
             pr_poll_task: None,
             guide_sync: None,
+            viewed_marks: Vec::new(),
+            #[cfg(test)]
+            sent_writes: Vec::new(),
             _ticker: ticker,
         };
         let page = cx.entity_id();
@@ -523,6 +539,14 @@ impl PullRequestView {
         if !self.panel.still_valid(&detail) {
             self.panel = Panel::Closed;
         }
+        PendingComments::set(
+            &detail.id,
+            detail
+                .pending_review
+                .as_ref()
+                .map_or(0, |r| r.comment_count),
+            cx,
+        );
         let link_context = PrLinkContext {
             pr: self.pr.clone(),
             ..PrLinkContext::from_detail(&detail)
@@ -556,8 +580,12 @@ impl PullRequestView {
             pr: self.pr.clone(),
             detail: detail.clone(),
         };
-        let conversation = cx.new(|cx| ConversationTab::new(context.clone(), window, cx));
-        let guide = cx.new(|cx| GuideTab::new(context.clone(), window, cx));
+        let conversation = cx.new(|cx| {
+            ConversationTab::new(context.clone(), window, cx)
+                .follow_scroll(self.conversation_scroll.clone())
+        });
+        let guide =
+            cx.new(|cx| GuideTab::new(context.clone(), self.guide_scroll.clone(), window, cx));
         {
             let pr_view = cx.entity().downgrade();
             guide.update(cx, |tab, _| {
@@ -611,6 +639,11 @@ impl PullRequestView {
             window,
             Self::reload_on_tab_event::<ChecksTab>,
         ));
+        self.subscriptions
+            .push(cx.observe(&files, |this, _, cx| this.files_changed(cx)));
+        // The header counts the Guide's viewed steps.
+        self.subscriptions
+            .push(cx.observe(&guide, |_, _, cx| cx.notify()));
         let linear = crate::linear::pr_linked_issues(link_context.clone(), window, cx);
         let t3 = crate::t3::pr_linked_threads(link_context.clone(), window, cx);
         self.loaded = Some(Loaded {
@@ -651,6 +684,9 @@ impl PullRequestView {
             }
             PrTabEvent::SubmitReview { pr, event, body } => {
                 self.submit_guide_review(pr.clone(), *event, body.clone(), cx);
+            }
+            PrTabEvent::StepViewed { pr, paths, viewed } => {
+                self.step_viewed(pr, paths, *viewed, cx);
             }
         }
     }
@@ -871,6 +907,8 @@ impl PullRequestView {
         let Some(detail) = self.detail.value().cloned() else {
             return;
         };
+        #[cfg(test)]
+        self.sent_writes.push(write.clone());
         let clears_review_body = matches!(write, Write::Review { .. });
         let is_merge = matches!(write, Write::Merge(_));
         let marks_ready = matches!(write, Write::MarkReady);
@@ -1325,10 +1363,10 @@ impl PullRequestView {
     }
 
     /// The page in the shape it will load into, so nothing moves when the
-    /// pull request arrives: the state and branch band, the tabs (named from
-    /// the first frame), the status card, the description, and the side
-    /// column's sections.
-    fn render_loading(&self, cx: &App) -> Div {
+    /// pull request arrives: the title's line and the meta line, the tabs
+    /// (named from the first frame), the status card, the description, and
+    /// the side column's sections while it is open.
+    fn render_loading(&self, details_open: bool, cx: &App) -> Div {
         let border = cx.theme().border;
         let tabs = PrTab::ALL.into_iter().map(|tab| {
             ui::section_tab(("pr-tab-loading", tab.index()), tab.title()).icon(tab.icon())
@@ -1340,24 +1378,42 @@ impl PullRequestView {
                 .child(Skeleton::new().h_3().w_20())
                 .child(Skeleton::new().secondary().h_3().w_32())
         };
+        let reference = SharedString::from(self.pr.to_string());
         v_flex()
             .size_full()
-            .child(self.placeholder_header())
             .child(
-                h_flex()
+                v_flex()
                     .flex_none()
-                    .h(scale::band_height())
+                    .w_full()
                     .px(scale::content_inset())
+                    .py_2()
                     .gap_2()
                     .child(
-                        Skeleton::new()
-                            .h(scale::chip_height())
-                            .w_16()
-                            .rounded_full(),
+                        h_flex()
+                            .id("pr-title-loading")
+                            .role(Role::Heading)
+                            .aria_label(reference.clone())
+                            .h(scale::control_height())
+                            .items_center()
+                            .text_size(scale::heading())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(reference),
                     )
-                    .child(Skeleton::new().size_4().rounded_full())
-                    .child(Skeleton::new().secondary().h_3().w_24())
-                    .child(Skeleton::new().secondary().h(scale::chip_height()).w_32()),
+                    .child(
+                        h_flex()
+                            .h(scale::chip_height())
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Skeleton::new()
+                                    .h(scale::chip_height())
+                                    .w_16()
+                                    .rounded_full(),
+                            )
+                            .child(Skeleton::new().size_4().rounded_full())
+                            .child(Skeleton::new().secondary().h_3().w_24())
+                            .child(Skeleton::new().secondary().h(scale::chip_height()).w_32()),
+                    ),
             )
             .child(ui::section_tabs("pr-tabs-loading", self.tab.index()).tabs(tabs))
             .child(
@@ -1396,17 +1452,19 @@ impl PullRequestView {
                                     .child(line(0.4)),
                             ),
                     )
-                    .child(
-                        v_flex()
-                            .flex_none()
-                            .w(scale::side_width())
-                            .h_full()
-                            .p_4()
-                            .gap_6()
-                            .border_l_1()
-                            .border_color(border)
-                            .children((0..4).map(side_section)),
-                    ),
+                    .when(details_open && self.tab.has_side_column(), |row| {
+                        row.child(
+                            v_flex()
+                                .flex_none()
+                                .w(scale::side_width())
+                                .h_full()
+                                .p_4()
+                                .gap_6()
+                                .border_l_1()
+                                .border_color(border)
+                                .children((0..2).map(side_section)),
+                        )
+                    }),
             )
     }
 
@@ -1422,10 +1480,14 @@ impl PullRequestView {
             ))
     }
 
+    /// The tabs, and at their trailing edge the toggle of the details
+    /// column on the tabs that have one. `wide` is the window's width
+    /// class, whose choice the toggle keeps.
     fn render_tabs(
         &self,
         detail: &PullRequestDetail,
-        narrow: bool,
+        wide: bool,
+        details_open: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let guide_count = self
@@ -1445,23 +1507,22 @@ impl PullRequestView {
                     cx.notify();
                 }))
         });
-        let details = (narrow && self.tab.has_side_column()).then(|| {
-            let name = if self.details_open {
-                "Hide details"
+        // The review composer takes the details column's place while open.
+        let details = (self.tab.has_side_column() && !self.composer_open()).then(|| {
+            use gpui_kit::assets::IconName;
+            let (name, icon) = if details_open {
+                ("Hide details", IconName::PanelRightClose)
             } else {
-                "Show details"
+                ("Show details", IconName::PanelRightOpen)
             };
-            ui::icon_button(
-                "pr-details-toggle",
-                gpui_kit::assets::IconName::PanelRight,
-                name,
-            )
-            .label("Details")
-            .selected(self.details_open)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.details_open = !this.details_open;
-                cx.notify();
-            }))
+            ui::icon_button("pr-details-toggle", icon, name)
+                .label("Details")
+                .selected(details_open)
+                .on_click(move |_, _, cx| {
+                    crate::store::update_settings(cx, |settings| {
+                        settings.pr_details.set_open(wide, !details_open)
+                    });
+                })
         });
         ui::section_tabs("pr-tabs", self.tab.index())
             .tabs(tabs)
@@ -1587,6 +1648,7 @@ impl Render for PullRequestView {
             self.reveal_file(&path, line, side, window, cx);
         }
         self.maybe_open_requested_stack_confirm(window, cx);
+        let mut guide_changed = false;
         if let Some(loaded) = &self.loaded {
             let freshness = self.freshness();
             loaded
@@ -1609,8 +1671,12 @@ impl Render for PullRequestView {
                         .guide
                         .update(cx, |tab, cx| tab.set_state(guide_state, cx));
                     self.guide_sync = Some(sync_key);
+                    guide_changed = true;
                 }
             }
+        }
+        if guide_changed {
+            self.sync_guide_with_files(cx);
         }
         if std::mem::take(&mut self.focus_review_body) {
             let summary = self.review_body.read(cx).focus_handle(cx);
@@ -1635,23 +1701,32 @@ impl Render for PullRequestView {
             .aria_label(self.pr.to_string())
             .size_full()
             .key_context("PullRequestView")
-            .track_focus(&self.focus);
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &NextUnviewedFile, window, cx| {
+                this.next_unviewed_file(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &OpenReviewComposer, _, cx| this.open_review_composer(cx)),
+            );
+        let wide = window.viewport_size().width
+            >= scale::side_column_breakpoint().to_pixels(window.rem_size());
+        let details_open = crate::store::Settings::get(cx).pr_details.is_open(wide);
         let (Some(detail), Some(loaded)) = (self.detail.value().cloned(), self.loaded.clone())
         else {
             return page
                 .child(match &self.detail {
                     Loadable::Failed(error) => self.render_failed(error, cx),
-                    _ => self.render_loading(cx),
+                    _ => self.render_loading(details_open, cx),
                 })
                 .into_any_element();
         };
-        let narrow = window.viewport_size().width
-            < scale::side_column_breakpoint().to_pixels(window.rem_size());
-        let side = self.tab.has_side_column() && (!narrow || self.details_open);
-        page.child(self.render_header(&detail, cx))
+        let composing = self.composer_open();
+        let docked = self.composer_docks(window);
+        let side = self.tab.has_side_column() && details_open && !(composing && docked);
+        page.child(self.render_header(&detail, window, cx))
             .children(self.render_title_edit(cx))
             .child(self.render_panel_band(&detail, cx))
-            .child(self.render_tabs(&detail, narrow, cx))
+            .child(self.render_tabs(&detail, wide, details_open, cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -1659,6 +1734,7 @@ impl Render for PullRequestView {
                     .items_stretch()
                     .child(
                         v_flex()
+                            .debug_selector(|| "pr-tab-content".to_owned())
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
@@ -1666,8 +1742,14 @@ impl Render for PullRequestView {
                     )
                     .when(side, |row| {
                         row.child(self.render_side(&detail, &loaded, cx))
+                    })
+                    .when(composing && docked, |row| {
+                        row.child(self.render_review_composer(&detail, true, cx))
                     }),
             )
+            .when(composing && !docked, |page| {
+                page.child(self.render_review_composer(&detail, false, cx))
+            })
             .into_any_element()
     }
 }

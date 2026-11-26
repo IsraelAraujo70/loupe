@@ -9,11 +9,12 @@ mod header;
 mod model;
 mod on_screen;
 mod search;
+mod signal;
 mod sticky;
 mod tree;
 mod tree_view;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
@@ -31,8 +32,9 @@ use gpui_kit::component::diff::{
 };
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Search};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::resize_handle;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -41,9 +43,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use loupe_github::diff::{Hunk, anchor_for_range, find_line, git_patch, parse_patch};
+use loupe_github::diff::{
+    DiffLine, Hunk, anchor_for_range, changed_since, find_line, git_patch, parse_patch,
+};
 use loupe_github::{
-    ChangedFile, CommitFiles, NodeId, PullRequestDetail, ViewedFailure, ViewedState,
+    COMPARE_FILES_LIMIT, ChangedFile, CommitFiles, FileStatus, GitHub, NodeId, PullRequestDetail,
+    RepoRef, SinceReview, Verdict, ViewedFailure, ViewedState,
 };
 
 use self::composer::{ComposerEvent, ComposerTarget, ComposerView};
@@ -51,18 +56,19 @@ use self::emphasis::{Emphasis, SharedEmphasis, SyntaxCache};
 use self::expand::{Direction, Gap, Source};
 use self::model::{
     LoadedFiles, Missing, PlacedThread, Placement, anchor_error_message, build_files, diff_mode,
-    file_doc, is_viewed, place_threads, restore_viewed, set_viewed, split_path, status_letter,
-    to_diff_side, to_side, viewed_counts,
+    file_doc, is_viewed, place_threads, restore_viewed, set_viewed, to_diff_side, to_side,
+    viewed_counts,
 };
 use self::on_screen::{CardWidth, on_screen};
 use self::search::{Match, Needle};
+use self::signal::{Attributes, LowSignal, Signal, classify_all, thousands};
 use self::sticky::HeaderWatch;
 use self::tree::{
-    GitTint, Move, RowKind, TreeRow, ViewedMark, active_folder, ancestors, distinct_starts,
-    file_tint, filter_keeps, folder_tint, into_tree_order, move_down, move_left, move_right,
-    move_up, tree_rows, viewed_mark,
+    GitTint, LOW_SIGNAL, Move, RowKind, TreeOptions, TreeRow, ViewedMark, file_groups, holds,
+    initial_collapsed, into_tree_order, move_down, move_left, move_right, move_up, shown_row,
+    viewed_mark,
 };
-use self::tree_view::{RowView, StickyFolders};
+use self::tree_view::StickyFolders;
 use super::tab::{PrTabContext, PrTabEvent};
 use super::thread::{HeadRef, ThreadEvent, ThreadView};
 
@@ -72,8 +78,8 @@ use crate::github::{live, widgets};
 use crate::store::{DiffLayout, FileTreePosition, Settings, update_settings};
 use crate::theme::scale::dp;
 use crate::theme::{scale, tokens};
-use crate::ui::ControlSize as _;
-use crate::{assets, ui};
+use crate::ui;
+use crate::ui::{ControlSize as _, MenuTriggerExt as _};
 
 /// The files tree's starting width and the range its edge drags within.
 const FILE_LIST_WIDTH: f32 = 340.;
@@ -86,7 +92,15 @@ const OMITTED_HINT: &str = "GitHub leaves some diffs out of a pull request this 
 /// The same note and hint for one commit.
 const COMMIT_OMITTED_NOTE: &str = "GitHub left this diff out because the commit is too large.";
 const COMMIT_OMITTED_HINT: &str = "GitHub leaves some diffs out of a commit this large. Their line counts are included; choose Load diff on a file, or Load all, to see them.";
-const FILE_LIST_MIN: f32 = 220.;
+/// The same note and hint for the changes since the viewer's last review.
+const SINCE_OMITTED_NOTE: &str =
+    "GitHub left this diff out because the changes since your last review are too large.";
+const SINCE_OMITTED_HINT: &str = "GitHub leaves some diffs out of changes this large. Their line counts are included; choose Load diff on a file, or Load all, to see them.";
+/// Wide enough for a whole file name five folders deep.
+const FILE_LIST_MIN: f32 = 320.;
+/// The most of the window the tree takes, so a width dragged in a wide
+/// window leaves the diff its room in a narrow one.
+const FILE_LIST_SHARE: f32 = 1. / 3.;
 const FILE_LIST_MAX: f32 = 640.;
 /// How wide the diff's trailing edge fades while long lines run past it.
 pub(super) const FADE_WIDTH: f32 = 32.;
@@ -94,6 +108,7 @@ pub(super) const FADE_WIDTH: f32 = 32.;
 /// What the find bar's note about diffs GitHub left out explains.
 const NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a pull request this large, so their lines are not searched. Choose Load all to search them too.";
 const COMMIT_NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of a commit this large, so their lines are not searched. Choose Load all to search them too.";
+const SINCE_NOT_SEARCHED_HINT: &str = "GitHub left these diffs out of changes this large, so their lines are not searched. Choose Load all to search them too.";
 /// How many left-out diffs Load all reads at once, so a large pull request
 /// does not send GitHub a burst of calls.
 const LOAD_ALL_AT_ONCE: usize = 4;
@@ -116,8 +131,109 @@ fn stopped_by(error: &LoadError) -> (SharedString, SharedString) {
     (error.title().into(), error.message().into())
 }
 
+/// What the low-signal group holds, in its tooltip and on its divider.
+const LOW_SIGNAL_HINT: &str = "binaries, lockfiles, generated, vendored, minified and data files, and new files over 1,000 lines, folded so the code reads first";
+/// The group's icon in the tree.
+const LOW_SIGNAL_ICON: &str = "icons/eye-off.svg";
+
 /// What a file's header in the diff shows.
 type HeaderFor = Rc<dyn Fn(&DiffFile) -> header::HeaderContent>;
+
+/// What a low-signal file's header says about it.
+#[derive(Clone)]
+struct LowNote {
+    path: String,
+    /// "Generated · 2,001 lines".
+    label: SharedString,
+    /// Why the diff is not here, and whether it is loading, for a file
+    /// GitHub left out.
+    omitted: Option<(SharedString, bool)>,
+    /// Whether the file has lines to show, and so a Show diff button.
+    openable: bool,
+}
+
+/// The ids of the divider over the low-signal files: under the header of
+/// the file before them, and under that file's last line.
+const DIVIDER_FOLDED: &str = "low-signal-divider:folded";
+const DIVIDER_OPEN: &str = "low-signal-divider:open";
+
+/// What the diff of a file whose only change is its mode says.
+const MODE_CHANGE_NOTE: &str = "Only the file mode changed";
+
+/// What a low-signal file's line says when GitHub left its diff out.
+const LOW_OMITTED_NOTE: &str = "diff left out by GitHub";
+
+/// What the low-signal group holds, for its divider in the diff.
+struct LowGroup {
+    files: usize,
+    additions: u32,
+    deletions: u32,
+    /// Every low-signal file the filter keeps, to mark them viewed at once.
+    paths: Vec<String>,
+    all_viewed: bool,
+}
+
+/// The changed files in review order (code, tests, docs, then low signal)
+/// with their kinds, and their diffs in the same order.
+fn review_files(files: Vec<ChangedFile>, attributes: &Attributes) -> (LoadedFiles, Vec<Signal>) {
+    let signals = classify_all(&files, attributes);
+    let (files, signals) = into_tree_order(files, signals);
+    let no_lines: HashMap<String, LowSignal> = files
+        .iter()
+        .zip(&signals)
+        .filter_map(|(file, signal)| match signal {
+            Signal::Low(kind @ (LowSignal::ModeChange | LowSignal::Empty)) => {
+                Some((file.path.clone(), *kind))
+            }
+            _ => None,
+        })
+        .collect();
+    let patch_for = |file: &ChangedFile| match no_lines.get(&file.path) {
+        Some(kind) => Some(no_lines_patch(file, *kind)),
+        None => git_patch(file),
+    };
+    let loaded = build_files(files, patch_for, |patch| parse_patch(patch).ok());
+    (loaded, signals)
+}
+
+/// The patch of a file with no lines, so its diff says what changed instead
+/// of passing for a binary: an empty file added or deleted, or a file whose
+/// mode alone changed.
+fn no_lines_patch(file: &ChangedFile, kind: LowSignal) -> String {
+    let path = &file.path;
+    match (kind, file.status) {
+        (LowSignal::Empty, FileStatus::Removed) => {
+            format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ /dev/null\n")
+        }
+        (LowSignal::Empty, _) => {
+            format!("diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n")
+        }
+        _ => format!("diff --git a/{path} b/{path}\n{MODE_CHANGE_NOTE}\n"),
+    }
+}
+
+/// Where the repository's `.gitattributes` at `sha` is kept.
+fn attributes_key(cx: &App, repo: &RepoRef, sha: &str) -> Option<String> {
+    crate::cache::github_key(cx, &format!("gitattributes/{}/{sha}", repo.url()))
+}
+
+/// The repository's root `.gitattributes` at `sha`, read from GitHub once
+/// and kept under `key`. A repository without one has no attributes; one
+/// GitHub cannot read now is read again on the next load.
+fn read_attributes(gh: &GitHub, repo: &RepoRef, sha: &str, key: Option<&str>) -> Attributes {
+    if let Some(text) = key.and_then(crate::cache::get::<String>) {
+        return Attributes::parse(&text);
+    }
+    let text = match gh.raw_contents(repo, ".gitattributes", sha) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(loupe_github::Error::Http { status: 404, .. }) => String::new(),
+        Err(_) => return Attributes::default(),
+    };
+    if let Some(key) = key {
+        crate::cache::put(key, &text);
+    }
+    Attributes::parse(&text)
+}
 
 struct ThreadSlot {
     view: Entity<ThreadView>,
@@ -166,11 +282,241 @@ struct Find {
     current: Option<usize>,
 }
 
-/// The one commit a tab shows instead of the whole pull request.
+/// What a files tab shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    PullRequest,
+    Commit,
+    SinceReview,
+}
+
+/// What a tab shows instead of the whole pull request: one commit against
+/// its first parent, or every change since the viewer's last review.
 struct CommitSource {
+    /// The commit the diff ends at: the commit, or the head.
     oid: String,
-    /// Its first parent, once its files load.
+    /// The commit the diff starts from: the commit's first parent once its
+    /// files load, or the commit the viewer last reviewed.
     parent: Option<String>,
+    /// Set for the changes since the viewer's last review.
+    since_review: Option<Since>,
+}
+
+impl CommitSource {
+    fn is_since_review(&self) -> bool {
+        self.since_review.is_some()
+    }
+}
+
+/// The changes since the viewer's last review, as the toggle shows them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Since {
+    /// The files to show, with their patches.
+    files: Vec<ChangedFile>,
+    /// GitHub cut a list it read at [`COMPARE_FILES_LIMIT`] files.
+    truncated: bool,
+    how: SinceHow,
+}
+
+/// Where the changes since a review come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SinceHow {
+    /// The commits after the reviewed one, this many: their diff.
+    Commits(u32),
+    /// The branch was rebased or force-pushed after the review, or it took
+    /// the base branch in (`rebased` false): the pull request's files whose
+    /// own change differs from the reviewed one, each whole, and how many
+    /// reviewed files it no longer changes.
+    Rewritten { rebased: bool, dropped: usize },
+}
+
+impl Since {
+    /// What GitHub said beside the pull request's own files now.
+    fn new(answer: &SinceReview, files: &[ChangedFile]) -> Self {
+        match answer {
+            SinceReview::Linear(comparison) => Since {
+                files: comparison.files.clone(),
+                truncated: comparison.truncated,
+                how: SinceHow::Commits(comparison.commits),
+            },
+            SinceReview::Rewritten {
+                reviewed_files,
+                truncated,
+                rebased,
+            } => {
+                let since = changed_since(reviewed_files, files);
+                let changed: HashSet<&str> = since.changed.iter().map(String::as_str).collect();
+                Since {
+                    files: files
+                        .iter()
+                        .filter(|file| changed.contains(file.path.as_str()))
+                        .cloned()
+                        .collect(),
+                    truncated: *truncated,
+                    how: SinceHow::Rewritten {
+                        rebased: *rebased,
+                        dropped: since.dropped,
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// "Since your last review" in the pull request's own tab: the commits it
+/// starts from and ends at, GitHub's answer, what it comes to beside the
+/// pull request's files once both are here, and the tab that shows those
+/// changes while the toggle is on.
+struct SinceToggle {
+    reviewed: String,
+    head: String,
+    base: String,
+    answer: Option<Result<SinceReview, SharedString>>,
+    since: Option<Since>,
+    _load: Task<()>,
+    shown: Option<SinceTab>,
+}
+
+struct SinceTab {
+    tab: Entity<FilesTab>,
+    _events: [Subscription; 2],
+}
+
+/// The changes-since-review tab asks its pull request's tab to show every
+/// change again.
+pub struct ShowAllChanges;
+
+/// What the bar over the changes since a review says when GitHub cut the list.
+const SINCE_CUT_HINT: &str = "GitHub lists at most 300 files of a comparison. The rest changed too; open the comparison on GitHub to see them.";
+
+/// "1 file", "12 files", or "300+ files" for a list GitHub cut.
+fn files_label(files: usize, truncated: bool) -> String {
+    match (files, truncated) {
+        (files, true) => format!("{files}+ files"),
+        (1, false) => "1 file".to_owned(),
+        (files, false) => format!("{files} files"),
+    }
+}
+
+/// What the toggle knows of the changes since a review: how many files,
+/// whether GitHub cut the list, and where they come from; or why GitHub did
+/// not answer.
+type SinceCount = Result<(usize, bool, SinceHow), SharedString>;
+
+/// What the toggle and the bar say about the changes since a review: what
+/// they are and where they come from.
+fn since_hint(files: usize, how: SinceHow) -> String {
+    let shown = files_label(files, false);
+    match (how, files) {
+        (SinceHow::Commits(_), 0) => "Nothing changed since your last review".to_owned(),
+        (SinceHow::Commits(commits), _) => format!(
+            "Show only the {shown} that the {} after your last review changed",
+            commits_label(commits)
+        ),
+        (SinceHow::Rewritten { rebased, .. }, files) => {
+            let what = if rebased {
+                "The branch was rebased or force-pushed since your last review"
+            } else {
+                "The base branch was merged in since your last review"
+            };
+            match files {
+                0 => format!("{what}, and no file's change differs from what you reviewed"),
+                _ => format!(
+                    "{what}, so its commits would bring in the base's changes. Show the {shown} whose change differs from what you reviewed, each whole"
+                ),
+            }
+        }
+    }
+}
+
+/// How much of the Files bar folds away so it fits its width, and the
+/// widths of what folds, as last drawn (window pixels; zero until drawn).
+#[derive(Default)]
+struct BarFit {
+    /// 0: everything shows. 1: "Since your last review" is its icon and
+    /// count. 2: Long lines, Scroll/Wrap, and Unified/Split go into one
+    /// menu. 3: the count of diffs not loaded goes, its Load all stays.
+    level: Cell<u8>,
+    toggle: Cell<f32>,
+    toggle_compact: Cell<f32>,
+    layout: Cell<f32>,
+    menu: Cell<f32>,
+    omitted: Cell<f32>,
+}
+
+/// The space between the bar's parts, in px at 100% zoom (`gap_3`).
+const BAR_GAP: f32 = 12.;
+
+impl BarFit {
+    /// The level the bar takes when the room left between its two ends is
+    /// `room` at the current level: one more fold while nothing is left,
+    /// one fewer once the fold's own width would fit back with some left.
+    fn next_level(&self, room: f32) -> u8 {
+        let level = self.level.get();
+        if room < 1. && level < 3 {
+            return level + 1;
+        }
+        let saved = match level {
+            1 => self.toggle.get() - self.toggle_compact.get(),
+            2 => self.layout.get() - self.menu.get(),
+            3 => self.omitted.get() + BAR_GAP,
+            _ => return level,
+        };
+        if room > saved.max(0.) + BAR_GAP {
+            level - 1
+        } else {
+            level
+        }
+    }
+}
+
+/// `element` with its drawn width kept in `slot` of `fit`.
+fn measured(
+    fit: &Rc<BarFit>,
+    slot: fn(&BarFit) -> &Cell<f32>,
+    element: impl IntoElement,
+) -> AnyElement {
+    let fit = fit.clone();
+    div()
+        .flex_none()
+        .relative()
+        .child(element)
+        .child(
+            canvas(
+                move |bounds, _, _| slot(&fit).set(f32::from(bounds.size.width)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .into_any_element()
+}
+
+/// "1 commit" or "3 commits".
+fn commits_label(commits: u32) -> String {
+    match commits {
+        1 => "1 commit".to_owned(),
+        commits => format!("{commits} commits"),
+    }
+}
+
+fn short_sha(oid: &str) -> String {
+    oid.chars().take(7).collect()
+}
+
+/// Where GitHub's answer about the changes since a review is kept: it never
+/// changes for the same three commits.
+fn since_review_key(
+    cx: &App,
+    repo: &RepoRef,
+    base: &str,
+    reviewed: &str,
+    head: &str,
+) -> Option<String> {
+    crate::cache::github_key(
+        cx,
+        &format!("since-review/{}/{base}/{reviewed}...{head}", repo.url()),
+    )
 }
 
 /// Load all: every diff GitHub left out, read a few at a time and put in the
@@ -200,11 +546,24 @@ impl LoadAll {
 pub struct FilesTab {
     context: PrTabContext,
     commit: Option<CommitSource>,
+    /// "Since your last review", while commits landed after it: only in
+    /// the pull request's own tab.
+    since: Option<SinceToggle>,
     load: Loadable<()>,
     _load: Option<Task<()>>,
     files: Vec<ChangedFile>,
+    /// Each file's kind, in file order.
+    signals: Vec<Signal>,
+    /// Why each low-signal file is low signal, by path.
+    low: HashMap<String, LowSignal>,
+    /// The low-signal files the viewer opened, kept open through reloads.
+    low_open: HashSet<String>,
+    /// The tree group each file in one sits in (`tree::file_groups`), by path.
+    groups: HashMap<String, &'static str>,
     /// Folders the viewer closed, by full path.
     collapsed: HashSet<String>,
+    /// The tree's width in points while its edge is dragged.
+    tree_drag: Option<f32>,
     /// The selected tree row, by path, so it survives filtering and reloads.
     selected: Option<String>,
     tree_focus: FocusHandle,
@@ -237,6 +596,8 @@ pub struct FilesTab {
     _theme_changes: Subscription,
     /// Where the diff drew its file headers, to tell the file at its top.
     headers: Rc<RefCell<HeaderWatch>>,
+    /// How much of the bar folds away so it fits.
+    bar_fit: Rc<BarFit>,
     /// How wide the threads and the composer are in the diff on screen.
     card_width: CardWidth,
     layout: DiffLayout,
@@ -252,6 +613,8 @@ pub struct FilesTab {
     /// The tab's own focus, so Find reaches it while nothing in it is focused.
     focus: FocusHandle,
     find: Find,
+    /// The tree's facets and grouping, beside the filter's text.
+    tree: TreeOptions,
 }
 
 impl FilesTab {
@@ -271,7 +634,31 @@ impl FilesTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let commit = CommitSource { oid, parent: None };
+        let commit = CommitSource {
+            oid,
+            parent: None,
+            since_review: None,
+        };
+        Self::build(context, Some(commit), find, window, cx)
+    }
+
+    /// The tab for every change from `reviewed`, the commit the viewer last
+    /// reviewed, to the head, as GitHub compares them. Like a commit's, its
+    /// Viewed marks are the pull request's, and it takes no threads or new
+    /// comments.
+    fn for_since_review(
+        context: PrTabContext,
+        reviewed: String,
+        since: Since,
+        find: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let commit = CommitSource {
+            oid: context.detail.head_oid.clone(),
+            parent: Some(reviewed),
+            since_review: Some(since),
+        };
         Self::build(context, Some(commit), find, window, cx)
     }
 
@@ -312,10 +699,16 @@ impl FilesTab {
         let mut tab = Self {
             context,
             commit,
+            since: None,
             load: Loadable::Loading,
             _load: None,
             files: Vec::new(),
+            signals: Vec::new(),
+            low: HashMap::new(),
+            low_open: HashSet::new(),
+            groups: HashMap::new(),
             collapsed: HashSet::new(),
+            tree_drag: None,
             selected: None,
             tree_focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
@@ -336,6 +729,7 @@ impl FilesTab {
             syntax_theme: cx.theme().highlight_theme.clone(),
             _theme_changes: cx.observe_global::<Theme>(Self::theme_changed),
             headers: Rc::default(),
+            bar_fit: Rc::default(),
             card_width: CardWidth::default(),
             layout: Settings::get(cx).diff_layout,
             viewed_error: None,
@@ -348,6 +742,7 @@ impl FilesTab {
             composer: None,
             pending_reveal: None,
             focus: cx.focus_handle(),
+            tree: TreeOptions::default(),
             find: Find {
                 input: find_input,
                 _events: find_events,
@@ -359,6 +754,7 @@ impl FilesTab {
             },
         };
         tab.load_files(cx);
+        tab.sync_since(window, cx);
         tab
     }
 
@@ -390,6 +786,8 @@ impl FilesTab {
         if head_changed {
             self.load = Loadable::Loading;
             self.files.clear();
+            self.signals.clear();
+            self.low.clear();
             self.hunks.clear();
             self.patch_loads.clear();
             self.patch_errors.clear();
@@ -402,13 +800,122 @@ impl FilesTab {
             self.load_files(cx);
         }
         self.sync_threads(window, cx);
+        self.sync_since(window, cx);
         cx.notify();
     }
 
-    fn load_files(&mut self, cx: &mut Context<Self>) {
+    /// Keeps "Since your last review" on the commits the pull request has
+    /// now: compares the reviewed commit and the head again when either
+    /// moved, keeping the toggle on, and hands the shown tab the detail.
+    fn sync_since(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.commit.is_some() {
-            self.load_commit_files(cx);
             return;
+        }
+        let detail = self.context.detail.clone();
+        let wanted = detail.reviewed_before_head().map(|review| {
+            (
+                review.commit_oid.clone(),
+                detail.head_oid.clone(),
+                detail.base_oid.clone(),
+            )
+        });
+        let current = self.since.as_ref().map(|since| {
+            (
+                since.reviewed.clone(),
+                since.head.clone(),
+                since.base.clone(),
+            )
+        });
+        if wanted == current {
+            if let Some(shown) = self.since.as_ref().and_then(|since| since.shown.as_ref()) {
+                shown
+                    .tab
+                    .update(cx, |tab, cx| tab.set_detail(detail, window, cx));
+            }
+            return;
+        }
+        let was_on = self
+            .since
+            .as_ref()
+            .is_some_and(|since| since.shown.is_some());
+        self.since = wanted.map(|(reviewed, head, base)| self.ask_since(reviewed, head, base, cx));
+        if was_on {
+            self.show_since(true, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Works out what GitHub's answer comes to beside the pull request's
+    /// files, once both are here: the toggle's count and the files its tab
+    /// shows.
+    fn settle_since(&mut self) {
+        if self.load.value().is_none() {
+            return;
+        }
+        let Some(since) = &mut self.since else {
+            return;
+        };
+        if let Some(Ok(answer)) = &since.answer {
+            since.since = Some(Since::new(answer, &self.files));
+        }
+    }
+
+    /// Asks GitHub what changed since the review of `reviewed`, kept by the
+    /// three commits: see [`GitHub::since_review`].
+    fn ask_since(
+        &self,
+        reviewed: String,
+        head: String,
+        base: String,
+        cx: &mut Context<Self>,
+    ) -> SinceToggle {
+        let repo = self.context.pr.repo.clone();
+        let key = since_review_key(cx, &repo, &base, &reviewed, &head);
+        let read_key = key.clone();
+        let asked = (reviewed.clone(), head.clone(), base.clone());
+        let load = common::run(
+            cx,
+            move |gh| match read_key
+                .as_deref()
+                .and_then(crate::cache::get::<SinceReview>)
+            {
+                Some(answer) => Ok(answer),
+                None => gh.since_review(&repo, &asked.2, &asked.0, &asked.1),
+            },
+            {
+                let (reviewed, head) = (reviewed.clone(), head.clone());
+                move |this: &mut Self, result, _| {
+                    let Some(since) = this
+                        .since
+                        .as_mut()
+                        .filter(|since| since.reviewed == reviewed && since.head == head)
+                    else {
+                        return;
+                    };
+                    if let (Some(key), Ok(answer)) = (&key, &result) {
+                        crate::cache::put(key, answer);
+                    }
+                    since.answer = Some(result.map_err(|error| error.message().into()));
+                    this.settle_since();
+                }
+            },
+        );
+        SinceToggle {
+            reviewed,
+            head,
+            base,
+            answer: None,
+            since: None,
+            _load: load,
+            shown: None,
+        }
+    }
+
+    fn load_files(&mut self, cx: &mut Context<Self>) {
+        match self.scope() {
+            Scope::PullRequest => {}
+            Scope::Commit => return self.load_commit_files(cx),
+            Scope::SinceReview => return self.load_since_review_files(cx),
         }
         let key = crate::cache::github_key(
             cx,
@@ -420,16 +927,19 @@ impl FilesTab {
                 self.context.detail.base_oid
             ),
         );
+        let repo = self.context.pr.repo.clone();
+        let head = self.context.detail.head_oid.clone();
+        let attributes_key = attributes_key(cx, &repo, &head);
         if let Some(files) = key
             .as_deref()
             .and_then(crate::cache::get::<Vec<ChangedFile>>)
         {
-            self.finish_load(
-                Ok(build_files(into_tree_order(files), git_patch, |patch| {
-                    parse_patch(patch).ok()
-                })),
-                cx,
-            );
+            let attributes = attributes_key
+                .as_deref()
+                .and_then(crate::cache::get::<String>)
+                .map(|text| Attributes::parse(&text))
+                .unwrap_or_default();
+            self.finish_load(Ok(review_files(files, &attributes)), cx);
         }
         let reused = self.load.value().is_some();
         self.load.start_refresh();
@@ -466,9 +976,8 @@ impl FilesTab {
                         files
                     }
                 };
-                Ok(build_files(into_tree_order(files), git_patch, |patch| {
-                    parse_patch(patch).ok()
-                }))
+                let attributes = read_attributes(gh, &repo, &head, attributes_key.as_deref());
+                Ok(review_files(files, &attributes))
             },
             move |this, result, cx| {
                 if write_key
@@ -478,13 +987,17 @@ impl FilesTab {
                     this.load_files(cx);
                     return;
                 }
-                if let (Some(key), Ok(loaded)) = (&write_key, &result) {
+                if let (Some(key), Ok((loaded, _))) = (&write_key, &result) {
                     crate::cache::put(key, &loaded.files);
                 }
-                if reused {
+                // Kinds read from GitHub for the first time can reorder the
+                // files: the diff is laid out again so it keeps the tree's
+                // order.
+                let reordered = matches!(&result, Ok((_, signals)) if *signals != this.signals);
+                if reused && !reordered {
                     match result {
-                        Ok(loaded) => {
-                            this.files = loaded.files;
+                        Ok((loaded, signals)) => {
+                            this.set_files(loaded.files, signals);
                             this.load.finish(Ok(()));
                             this.collapse_viewed(cx);
                         }
@@ -505,6 +1018,7 @@ impl FilesTab {
         };
         let pr = self.context.pr.clone();
         let key = crate::cache::github_key(cx, &format!("commit-files/{}/{oid}", pr.repo.url()));
+        let attributes_key = attributes_key(cx, &pr.repo, &oid);
         self.load.start_refresh();
         let read_key = key.clone();
         self._load = Some(common::run(
@@ -518,10 +1032,8 @@ impl FilesTab {
                     None => gh.commit_files(&pr.repo, &oid)?,
                 };
                 gh.merge_viewed_states(&pr, &mut commit.files)?;
-                let loaded =
-                    build_files(into_tree_order(commit.files.clone()), git_patch, |patch| {
-                        parse_patch(patch).ok()
-                    });
+                let attributes = read_attributes(gh, &pr.repo, &oid, attributes_key.as_deref());
+                let loaded = review_files(commit.files.clone(), &attributes);
                 Ok((commit, loaded))
             },
             move |this, result, cx| {
@@ -539,8 +1051,86 @@ impl FilesTab {
         ));
     }
 
-    fn finish_load(&mut self, result: Result<LoadedFiles, LoadError>, cx: &mut Context<Self>) {
-        let loaded = match result {
+    /// Lays out the changes since the viewer's last review, which the
+    /// pull request's tab already read, with their viewed marks read again
+    /// from the pull request.
+    fn load_since_review_files(&mut self, cx: &mut Context<Self>) {
+        let Some(mut files) = self
+            .commit
+            .as_ref()
+            .and_then(|source| Some(source.since_review.as_ref()?.files.clone()))
+        else {
+            return;
+        };
+        let pr = self.context.pr.clone();
+        let head = self.context.detail.head_oid.clone();
+        let attributes_key = attributes_key(cx, &pr.repo, &head);
+        self.load.start_refresh();
+        self._load = Some(common::run(
+            cx,
+            move |gh| {
+                gh.merge_viewed_states(&pr, &mut files)?;
+                let attributes = read_attributes(gh, &pr.repo, &head, attributes_key.as_deref());
+                Ok(review_files(files, &attributes))
+            },
+            |this, result, cx| this.finish_load(result, cx),
+        ));
+    }
+
+    fn scope(&self) -> Scope {
+        match &self.commit {
+            None => Scope::PullRequest,
+            Some(source) if source.is_since_review() => Scope::SinceReview,
+            Some(_) => Scope::Commit,
+        }
+    }
+
+    /// Turns "Since your last review" on or off. Off, the Viewed marks set
+    /// in the changes since the review are read again here.
+    fn show_since(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(since) = &mut self.since else {
+            return;
+        };
+        if !on {
+            let Some(shown) = since.shown.take() else {
+                return;
+            };
+            if shown.tab.read(cx).wrote_viewed() {
+                self.refresh_viewed(cx);
+            }
+            cx.notify();
+            return;
+        }
+        if since.shown.is_some() {
+            return;
+        }
+        let Some(shows) = since.since.clone() else {
+            return;
+        };
+        let reviewed = since.reviewed.clone();
+        let context = self.context.clone();
+        let find = self.open_find_text(cx);
+        let tab =
+            cx.new(|cx| FilesTab::for_since_review(context, reviewed, shows, find, window, cx));
+        let events = cx.subscribe(&tab, |_, _, event: &PrTabEvent, cx| cx.emit(event.clone()));
+        let back = cx.subscribe_in(&tab, window, |this, _, _: &ShowAllChanges, window, cx| {
+            this.show_since(false, window, cx)
+        });
+        if let Some(since) = &mut self.since {
+            since.shown = Some(SinceTab {
+                tab,
+                _events: [events, back],
+            });
+        }
+        cx.notify();
+    }
+
+    fn finish_load(
+        &mut self,
+        result: Result<(LoadedFiles, Vec<Signal>), LoadError>,
+        cx: &mut Context<Self>,
+    ) {
+        let (loaded, signals) = match result {
             Ok(loaded) => loaded,
             Err(error) => {
                 self.load.finish(Err(error));
@@ -549,7 +1139,11 @@ impl FilesTab {
         };
         self.load.finish(Ok(()));
         let first_load = self.diff.is_none();
-        self.files = loaded.files;
+        self.set_files(loaded.files, signals);
+        self.settle_since();
+        if first_load {
+            self.collapsed = initial_collapsed(&self.files, &self.signals);
+        }
         eprintln!(
             "review-files-ready pr={} files={} timestamp={}",
             self.context.pr.url(),
@@ -616,9 +1210,35 @@ impl FilesTab {
         self.run_find(jump, cx);
     }
 
-    /// Collapses viewed files, and files whose diff GitHub left out so the
-    /// header stands alone with its Load diff note. A commit keeps viewed
-    /// files open: one viewed in the pull request may change again in it.
+    /// Takes the files in review order with their kinds.
+    fn set_files(&mut self, files: Vec<ChangedFile>, signals: Vec<Signal>) {
+        self.low = files
+            .iter()
+            .zip(&signals)
+            .filter_map(|(file, signal)| match signal {
+                Signal::Low(kind) => Some((file.path.clone(), *kind)),
+                _ => None,
+            })
+            .collect();
+        self.groups = files
+            .iter()
+            .zip(file_groups(&signals))
+            .filter_map(|(file, group)| Some((file.path.clone(), group?)))
+            .collect();
+        self.files = files;
+        self.signals = signals;
+    }
+
+    /// Whether `path` opens folded for being low signal: until the viewer
+    /// opens it.
+    fn folds_low(&self, path: &str) -> bool {
+        self.low.contains_key(path) && !self.low_open.contains(path)
+    }
+
+    /// Collapses viewed files, low-signal files the viewer has not opened, and
+    /// files whose diff GitHub left out so the header stands alone with its
+    /// Load diff note. A commit keeps viewed files open: one viewed in the
+    /// pull request may change again in it.
     fn collapse_viewed(&mut self, cx: &mut Context<Self>) {
         let collapse_viewed = self.commit.is_none();
         self.folded = self
@@ -627,25 +1247,68 @@ impl FilesTab {
             .filter(|file| {
                 self.missing.get(&file.path) == Some(&Missing::Omitted)
                     || (collapse_viewed && is_viewed(file.viewed))
+                    || self.folds_low(&file.path)
             })
             .map(|file| file.path.clone())
             .collect();
         let Some(state) = &self.diff else { return };
         state.update(cx, |state, cx| {
-            for file in &self.files {
-                state.set_file_collapsed(&file.path, self.folded.contains(&file.path), cx);
+            for path in self.files.iter().map(|file| file.path.as_str()) {
+                state.set_file_collapsed(path, self.folded.contains(path), cx);
             }
         });
     }
 
     /// The diffs of the files the filter keeps, in the tree's order.
     fn filtered_docs(&self, cx: &App) -> Vec<DiffFile> {
-        let filter = self.filter.read(cx).value();
-        self.docs
+        let place: HashMap<&str, usize> = self
+            .file_order()
+            .into_iter()
+            .enumerate()
+            .map(|(place, ix)| (self.files[ix].path.as_str(), place))
+            .collect();
+        let mut docs: Vec<DiffFile> = self
+            .docs
             .iter()
-            .filter(|doc| filter_keeps(doc.path(), &filter))
+            .filter(|doc| self.tree_keeps(doc.path(), cx))
             .cloned()
-            .collect()
+            .collect();
+        docs.sort_by_key(|doc| place.get(doc.path().as_ref()).copied());
+        docs
+    }
+
+    /// The low-signal files the filter keeps, for the divider over them.
+    fn low_group(&self, cx: &App) -> Option<LowGroup> {
+        let files: Vec<&ChangedFile> = self
+            .files
+            .iter()
+            .filter(|file| self.in_low_group(&file.path) && self.tree_keeps(&file.path, cx))
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        Some(LowGroup {
+            files: files.len(),
+            additions: files.iter().map(|file| file.additions).sum(),
+            deletions: files.iter().map(|file| file.deletions).sum(),
+            all_viewed: files.iter().all(|file| is_viewed(file.viewed)),
+            paths: files.iter().map(|file| file.path.clone()).collect(),
+        })
+    }
+
+    /// Opens or folds a low-signal file from its label, and keeps it so
+    /// through reloads.
+    fn open_low(&mut self, path: &str, open: bool, cx: &mut Context<Self>) {
+        if open {
+            self.low_open.insert(path.to_owned());
+        } else {
+            self.low_open.remove(path);
+        }
+        self.set_collapsed(path, !open, cx);
+        if !open && let Some(state) = &self.diff {
+            state.update(cx, |state, cx| state.scroll_to_file(path, cx));
+        }
+        cx.notify();
     }
 
     /// Shows in the diff only the files the filter keeps, as GitHub does,
@@ -738,7 +1401,8 @@ impl FilesTab {
                     });
                     if let Some(file) = changed {
                         file.viewed = fresh.viewed;
-                        this.set_collapsed(&fresh.path, viewed, cx);
+                        let fold = viewed || this.folds_low(&fresh.path);
+                        this.set_collapsed(&fresh.path, fold, cx);
                     }
                 }
             },
@@ -782,15 +1446,25 @@ impl FilesTab {
 
     /// The commits the diff runs between. A commit's diff is against its
     /// first parent; a root commit only adds files, so it needs no older side.
+    /// The files of a branch rewritten after the review are the pull
+    /// request's own.
     fn diff_ends(&self) -> (String, String) {
         match &self.commit {
+            Some(CommitSource {
+                since_review:
+                    Some(Since {
+                        how: SinceHow::Rewritten { .. },
+                        ..
+                    }),
+                ..
+            })
+            | None => (
+                self.context.detail.base_oid.clone(),
+                self.context.detail.head_oid.clone(),
+            ),
             Some(commit) => (
                 commit.parent.clone().unwrap_or_else(|| commit.oid.clone()),
                 commit.oid.clone(),
-            ),
-            None => (
-                self.context.detail.base_oid.clone(),
-                self.context.detail.head_oid.clone(),
             ),
         }
     }
@@ -975,8 +1649,8 @@ impl FilesTab {
     }
 
     /// Puts loaded diffs (`None` for a binary file) in the viewer with one
-    /// change of its files, opens those not viewed, and shows the header of
-    /// `scroll_to`.
+    /// change of its files, opens those not viewed (a low-signal file only
+    /// once the viewer opened it), and shows the header of `scroll_to`.
     fn apply_omitted_patches(
         &mut self,
         patches: Vec<(String, Option<String>)>,
@@ -985,8 +1659,9 @@ impl FilesTab {
     ) {
         let mut docs = HashMap::new();
         for (path, patch) in patches {
-            if let Some(doc) = self.take_omitted_patch(&path, patch) {
-                docs.insert(path, doc);
+            if let Some((doc, viewed)) = self.take_omitted_patch(&path, patch) {
+                let fold = viewed || self.folds_low(&path);
+                docs.insert(path, (doc, fold));
             }
         }
         for (path, (doc, viewed)) in &docs {
@@ -1352,11 +2027,13 @@ impl FilesTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_since(false, window, cx);
         if !self.filter.read(cx).value().is_empty() {
             self.filter
                 .update(cx, |filter, cx| filter.set_value("", window, cx));
             self.show_filtered(cx);
         }
+        self.show_in_tree(path, cx);
         if self.diff.is_none() {
             self.pending_reveal = Some((path.to_owned(), line, side));
             cx.notify();
@@ -1482,11 +2159,10 @@ impl FilesTab {
             .current
             .and_then(|ix| self.find.matches.get(ix))
             .cloned();
-        let filter = self.filter.read(cx).value();
         let files = self
             .files
             .iter()
-            .filter(|file| filter_keeps(&file.path, &filter))
+            .filter(|file| self.tree_keeps(&file.path, cx))
             .map(|file| {
                 let hunks = self.shown_hunks(&file.path);
                 (
@@ -1613,16 +2289,15 @@ impl FilesTab {
             )),
             None => Some(("No results".to_owned(), "No match in the diff".to_owned())),
         };
-        let filter = self.filter.read(cx).value();
         let not_searched = self
             .missing
             .iter()
-            .filter(|(path, reason)| **reason == Missing::Omitted && filter_keeps(path, &filter))
+            .filter(|(path, reason)| **reason == Missing::Omitted && self.tree_keeps(path, cx))
             .count();
-        let hint = if self.commit.is_some() {
-            COMMIT_NOT_SEARCHED_HINT
-        } else {
-            NOT_SEARCHED_HINT
+        let hint = match self.scope() {
+            Scope::PullRequest => NOT_SEARCHED_HINT,
+            Scope::Commit => COMMIT_NOT_SEARCHED_HINT,
+            Scope::SinceReview => SINCE_NOT_SEARCHED_HINT,
         };
         let focus_input = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
             this.find
@@ -1764,7 +2439,8 @@ impl FilesTab {
         }
         self.viewed_error = None;
         for path in &batch {
-            self.set_collapsed(path, viewed, cx);
+            let fold = viewed || self.folds_low(path);
+            self.set_collapsed(path, fold, cx);
         }
         self.viewed_pending.extend(batch.iter().cloned());
         let write = self.viewed_writes;
@@ -1799,7 +2475,8 @@ impl FilesTab {
                 for failure in &failures {
                     if let Some(state) = previous.get(&failure.path) {
                         restore_viewed(&mut this.files, &failure.path, *state);
-                        this.set_collapsed(&failure.path, is_viewed(*state), cx);
+                        let fold = is_viewed(*state) || this.folds_low(&failure.path);
+                        this.set_collapsed(&failure.path, fold, cx);
                     }
                 }
                 if let Some(first) = failures.first() {
@@ -1995,17 +2672,16 @@ impl FilesTab {
             .values()
             .filter(|reason| **reason == Missing::Omitted)
             .count();
-        let omitted_hint = if self.commit.is_some() {
-            COMMIT_OMITTED_HINT
-        } else {
-            OMITTED_HINT
+        let omitted_hint = match self.scope() {
+            Scope::PullRequest => OMITTED_HINT,
+            Scope::Commit => COMMIT_OMITTED_HINT,
+            Scope::SinceReview => SINCE_OMITTED_HINT,
         };
-        let filter = self.filter.read(cx).value();
-        let shown = (!filter.trim().is_empty()).then(|| {
+        let shown = self.tree_narrows(cx).then(|| {
             let kept = self
                 .files
                 .iter()
-                .filter(|file| filter_keeps(&file.path, &filter))
+                .filter(|file| self.tree_keeps(&file.path, cx))
                 .count();
             format!("Showing {kept} of {} files", self.files.len())
         });
@@ -2033,10 +2709,45 @@ impl FilesTab {
                 .into_any_element(),
             widgets::diff_stat(additions, deletions).into_any_element(),
         ];
+        let fit = self.bar_fit.clone();
+        let level = fit.level.get();
+        let compact = level >= 1;
+        if let Some(toggle) = self.since_toggle(compact, cx) {
+            let slot: fn(&BarFit) -> &Cell<f32> = if compact {
+                |fit| &fit.toggle_compact
+            } else {
+                |fit| &fit.toggle
+            };
+            parts.push(measured(&fit, slot, toggle));
+        }
         if self.load.is_busy() {
             parts.push(Spinner::new().xsmall().color(muted).into_any_element());
         }
-        parts.push(div().flex_1().into_any_element());
+        // The room left between the two ends says when the bar folds.
+        let watch = fit.clone();
+        let view = this.clone();
+        parts.push(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .relative()
+                .child(
+                    canvas(
+                        move |bounds, _, cx| {
+                            let next = watch.next_level(f32::from(bounds.size.width));
+                            if next != watch.level.get() {
+                                watch.level.set(next);
+                                view.update(cx, |_, cx| cx.notify()).ok();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .into_any_element(),
+        );
         if let Some(shown) = shown {
             parts.push(
                 div()
@@ -2051,10 +2762,6 @@ impl FilesTab {
                     .into_any_element(),
             );
         }
-        // In words, beside the control that answers it: lines go on
-        // past the edge. The edge's fade alone is dark on dark and says
-        // nothing on a line with no tint, and the component shows its
-        // own horizontal bar only while it scrolls.
         if self.load_all.is_some() {
             parts.push(self.load_all_progress("load-all-progress", cx));
             parts.push(
@@ -2067,36 +2774,29 @@ impl FilesTab {
                     .into_any_element(),
             );
         } else if omitted > 0 {
-            parts.push(
-                div()
-                    .id("omitted-diffs-note")
-                    .flex_none()
-                    .text_size(scale::meta())
-                    .text_color(muted)
-                    .tooltip(move |window, cx| Tooltip::new(omitted_hint).build(window, cx))
-                    .child(match omitted {
-                        1 => "1 diff not loaded".to_owned(),
-                        omitted => format!("{omitted} diffs not loaded"),
-                    })
-                    .into_any_element(),
-            );
+            if level < 3 {
+                parts.push(measured(
+                    &fit,
+                    |fit| &fit.omitted,
+                    div()
+                        .id("omitted-diffs-note")
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .tooltip(move |window, cx| Tooltip::new(omitted_hint).build(window, cx))
+                        .child(match omitted {
+                            1 => "1 diff not loaded".to_owned(),
+                            omitted => format!("{omitted} diffs not loaded"),
+                        }),
+                ));
+            }
             parts.extend(self.load_all_button("load-all-diffs", cx));
         }
-        if long > 0 {
-            parts.push(
-                div()
-                    .id("long-lines-note")
-                    .flex_none()
-                    .text_size(scale::meta())
-                    .text_color(muted)
-                    .tooltip(|window, cx| Tooltip::new(LONG_LINES_HINT).build(window, cx))
-                    .child(match long {
-                        1 => "Long lines in 1 file".to_owned(),
-                        long => format!("Long lines in {long} files"),
-                    })
-                    .into_any_element(),
-            );
-        }
+        let long_note = match long {
+            0 => None,
+            1 => Some("Long lines in 1 file".to_owned()),
+            long => Some(format!("Long lines in {long} files")),
+        };
         parts.push(
             ui::icon_button("files-find-open", IconName::Search, "Find in diff")
                 .tooltip(format!(
@@ -2107,43 +2807,36 @@ impl FilesTab {
                 .on_click(cx.listener(|this, _, window, cx| this.open_find(window, cx)))
                 .into_any_element(),
         );
-        // Both choices about how the diff is laid out use the one
-        // segmented control, side by side.
-        parts.push(
-            ui::segmented(
-                "diff-wrap",
-                "Long lines",
-                [
-                    (Some(IconName::MoveHorizontal), "Scroll"),
-                    (Some(IconName::TextWrap), "Wrap"),
-                ],
-                usize::from(wrap),
-                |index, _, cx| {
-                    update_settings(cx, |settings| settings.diff_wrap = index == 1);
-                },
-            )
-            .into_any_element(),
-        );
-        parts.push(
-            ui::segmented(
-                "diff-layout",
-                "Diff layout",
-                [
-                    (Some(IconName::Rows2), "Unified"),
-                    (Some(IconName::Columns2), "Split"),
-                ],
-                usize::from(self.layout == DiffLayout::Split),
-                move |index, _, cx| {
-                    let layout = if index == 1 {
-                        DiffLayout::Split
-                    } else {
-                        DiffLayout::Unified
-                    };
-                    this.update(cx, |this, cx| this.set_layout(layout, cx)).ok();
-                },
-            )
-            .into_any_element(),
-        );
+        if level >= 2 {
+            parts.push(measured(
+                &fit,
+                |fit| &fit.menu,
+                self.view_menu(wrap, long_note, cx),
+            ));
+        } else {
+            // In words, beside the control that answers it: lines go on
+            // past the edge. The edge's fade alone is dark on dark and says
+            // nothing on a line with no tint, and the component shows its
+            // own horizontal bar only while it scrolls.
+            let note = long_note.map(|note| {
+                div()
+                    .id("long-lines-note")
+                    .flex_none()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .tooltip(|window, cx| Tooltip::new(LONG_LINES_HINT).build(window, cx))
+                    .child(note)
+            });
+            let layout = h_flex()
+                .debug_selector(|| "files-view-controls".into())
+                .flex_none()
+                .gap_3()
+                .items_center()
+                .children(note)
+                .child(self.wrap_control(wrap))
+                .child(self.layout_control(this.clone()));
+            parts.push(measured(&fit, |fit| &fit.layout, layout));
+        }
         // The bar mirrors with the tree: the viewed count stays over the
         // tree's filter, and the diff's controls over the diff.
         if tree_right {
@@ -2155,14 +2848,340 @@ impl FilesTab {
             .px(scale::content_inset())
             .gap_3()
             .items_center()
+            .overflow_hidden()
             .border_b_1()
             .border_color(border)
             .children(parts)
             .into_any_element()
     }
 
-    fn current_rows(&self, cx: &App) -> Vec<TreeRow> {
-        tree_rows(&self.files, &self.filter.read(cx).value(), &self.collapsed)
+    fn wrap_control(&self, wrap: bool) -> AnyElement {
+        ui::segmented(
+            "diff-wrap",
+            "Long lines",
+            [
+                (Some(IconName::MoveHorizontal), "Scroll"),
+                (Some(IconName::TextWrap), "Wrap"),
+            ],
+            usize::from(wrap),
+            |index, _, cx| {
+                update_settings(cx, |settings| settings.diff_wrap = index == 1);
+            },
+        )
+        .into_any_element()
+    }
+
+    fn layout_control(&self, this: WeakEntity<Self>) -> AnyElement {
+        ui::segmented(
+            "diff-layout",
+            "Diff layout",
+            [
+                (Some(IconName::Rows2), "Unified"),
+                (Some(IconName::Columns2), "Split"),
+            ],
+            usize::from(self.layout == DiffLayout::Split),
+            move |index, _, cx| {
+                let layout = if index == 1 {
+                    DiffLayout::Split
+                } else {
+                    DiffLayout::Unified
+                };
+                this.update(cx, |this, cx| this.set_layout(layout, cx)).ok();
+            },
+        )
+        .into_any_element()
+    }
+
+    /// Scroll or Wrap and Unified or Split in one menu, for a bar too
+    /// narrow for both controls; the button names the layout in use.
+    fn view_menu(
+        &self,
+        wrap: bool,
+        long_note: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let split = self.layout == DiffLayout::Split;
+        let (icon, layout) = if split {
+            (IconName::Columns2, "Split")
+        } else {
+            (IconName::Rows2, "Unified")
+        };
+        let lines = if wrap { "Wrap" } else { "Scroll" };
+        let view = cx.weak_entity();
+        Button::new("files-view-menu")
+            .debug_selector(|| "files-view-menu".into())
+            .ghost()
+            .control()
+            .icon(icon)
+            .label(layout)
+            .tooltip("Diff layout and long lines")
+            .accessibility_label(format!("Diff view: {layout}, long lines {lines}"))
+            .menu_trigger()
+            .dropdown_menu(move |menu, _, _| {
+                let wrap_item = |label: &'static str, on: bool| {
+                    PopupMenuItem::new(label)
+                        .checked(wrap == on)
+                        .on_click(move |_, _, cx| {
+                            update_settings(cx, |settings| settings.diff_wrap = on);
+                        })
+                };
+                let layout_item = |label: &'static str, to: DiffLayout| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label)
+                        .checked((to == DiffLayout::Split) == split)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.set_layout(to, cx)).ok();
+                        })
+                };
+                let menu = menu
+                    .min_w(dp(220.))
+                    .item(PopupMenuItem::label("Diff layout"));
+                let menu = menu
+                    .item(layout_item("Unified", DiffLayout::Unified))
+                    .item(layout_item("Split", DiffLayout::Split))
+                    .item(PopupMenuItem::separator())
+                    .item(PopupMenuItem::label(
+                        long_note.clone().unwrap_or_else(|| "Long lines".to_owned()),
+                    ));
+                menu.item(wrap_item("Scroll", false))
+                    .item(wrap_item("Wrap", true))
+            })
+            .into_any_element()
+    }
+
+    /// The toggle between every change and the changes since the viewer's
+    /// last review, with how many files changed since: in the pull
+    /// request's tab while commits landed after the review, selected in the
+    /// tab it opens. `compact`, it is its icon and count, for a narrow bar.
+    fn since_toggle(&self, compact: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (on, answer): (bool, Option<SinceCount>) = match (&self.commit, &self.since) {
+            (Some(source), _) => {
+                let since = source.since_review.as_ref()?;
+                (
+                    true,
+                    Some(Ok((self.files.len(), since.truncated, since.how))),
+                )
+            }
+            (None, Some(toggle)) => (
+                false,
+                match (&toggle.answer, &toggle.since) {
+                    (Some(Err(error)), _) => Some(Err(error.clone())),
+                    (_, Some(since)) => Some(Ok((since.files.len(), since.truncated, since.how))),
+                    _ => None,
+                },
+            ),
+            (None, None) => return None,
+        };
+        let muted = cx.theme().muted_foreground;
+        let count = match &answer {
+            Some(Ok((0, _, _))) => Some("no changes".to_owned()),
+            Some(Ok((files, truncated, _))) => Some(files_label(*files, *truncated)),
+            _ => None,
+        };
+        let name = match &count {
+            Some(count) => format!("Since your last review, {count}"),
+            None => "Since your last review".to_owned(),
+        };
+        let tooltip = match (on, &answer) {
+            (true, _) => "Show every change of the pull request".to_owned(),
+            (false, Some(Err(error))) => format!("GitHub did not compare the commits: {error}"),
+            (false, Some(Ok((files, _, how)))) => since_hint(*files, *how),
+            (false, None) => "Asking GitHub what changed since your last review".to_owned(),
+        };
+        let status = match (&answer, count) {
+            (Some(Ok(_)), Some(count)) => Some(
+                div()
+                    .text_size(scale::meta())
+                    .text_color(muted)
+                    .child(match compact {
+                        true => count
+                            .trim_end_matches(" files")
+                            .trim_end_matches(" file")
+                            .to_owned(),
+                        false => count,
+                    })
+                    .into_any_element(),
+            ),
+            (None, _) => Some(Spinner::new().xsmall().color(muted).into_any_element()),
+            _ => None,
+        };
+        let empty = !on && matches!(answer, Some(Ok((0, _, _))));
+        Some(
+            Button::new("files-since-review")
+                .debug_selector(|| "files-since-review".into())
+                .ghost()
+                .control()
+                .icon(IconName::RotateCcwClock)
+                .when(!compact, |button| button.label("Since your last review"))
+                .children(status)
+                .selected(on)
+                .toggled(on)
+                .disabled(empty)
+                .tooltip(tooltip)
+                .accessibility_label(name)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if on {
+                        cx.emit(ShowAllChanges);
+                    } else {
+                        this.show_since(true, window, cx);
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The bar over the changes since the viewer's last review, as over one
+    /// commit: back to all changes, which review they start at, and where
+    /// they come from: the commits after it, with the comparison on GitHub,
+    /// or a branch rewritten since, with the files whose change differs.
+    fn since_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let source = self.commit.as_ref()?;
+        let since = source.since_review.as_ref()?;
+        let reviewed = source.parent.clone()?;
+        let theme = cx.theme();
+        let (muted, mono) = (theme.muted_foreground, theme.mono_font_family.clone());
+        let review = self
+            .context
+            .detail
+            .viewer_review
+            .as_ref()
+            .filter(|review| review.commit_oid == reviewed);
+        let verb = match review.and_then(|review| review.verdict) {
+            Some(Verdict::Approved) => "You approved",
+            Some(Verdict::ChangesRequested) => "You requested changes on",
+            None => "You reviewed",
+        };
+        let when = review
+            .and_then(|review| review.submitted_at)
+            .map(|at| match ui::relative_time(at, Utc::now()) {
+                age if age == "now" => "just now".to_owned(),
+                age => format!("{age} ago"),
+            });
+        let sha = short_sha(&reviewed);
+        let source_note = match since.how {
+            SinceHow::Commits(commits) => format!("{} since", commits_label(commits)),
+            SinceHow::Rewritten { rebased: true, .. } => "Rebased since".to_owned(),
+            SinceHow::Rewritten { rebased: false, .. } => "Base branch merged in since".to_owned(),
+        };
+        let mut summary = format!("Since your last review. {verb} {sha}");
+        if let Some(when) = &when {
+            summary.push_str(&format!(" {when}"));
+        }
+        summary.push_str(&format!(". {source_note}"));
+        let hint: SharedString = since_hint(self.files.len(), since.how).into();
+        let url = format!(
+            "{}/compare/{reviewed}...{}",
+            self.context.pr.repo.url(),
+            source.oid
+        );
+        let dropped = match since.how {
+            SinceHow::Rewritten { dropped, .. } if dropped > 0 => Some(dropped),
+            _ => None,
+        };
+        Some(
+            ui::toolbar()
+                .id("since-review-bar")
+                .child(
+                    Button::new("since-review-all-changes")
+                        .ghost()
+                        .control()
+                        .icon(IconName::ArrowLeft)
+                        .label("All changes")
+                        .tooltip("Show every change of the pull request")
+                        .accessibility_label("Show all changes")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ShowAllChanges))),
+                )
+                .child(ui::vertical_divider(cx))
+                .child(
+                    h_flex()
+                        .id("since-review-summary")
+                        .role(Role::Group)
+                        .aria_label(summary.clone())
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::RotateCcwClock)
+                                .small()
+                                .text_color(muted),
+                        )
+                        .child(div().flex_none().text_size(scale::body()).child(verb))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(mono)
+                                .text_size(scale::code())
+                                .text_color(muted)
+                                .child(sha),
+                        )
+                        .children(when.map(|when| {
+                            div()
+                                .flex_none()
+                                .text_size(scale::meta())
+                                .text_color(muted)
+                                .child(when)
+                        }))
+                        .tooltip(move |window, cx| Tooltip::new(summary.clone()).build(window, cx)),
+                )
+                .child(
+                    div()
+                        .id("since-review-source")
+                        .role(Role::Note)
+                        .aria_label(hint.clone())
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+                        .child(source_note),
+                )
+                .children(dropped.map(|dropped| {
+                    let text = match dropped {
+                        1 => "1 reviewed file no longer changed".to_owned(),
+                        dropped => format!("{dropped} reviewed files no longer changed"),
+                    };
+                    div()
+                        .id("since-review-dropped")
+                        .role(Role::Note)
+                        .aria_label(SharedString::from(text.clone()))
+                        .flex_none()
+                        .text_size(scale::meta())
+                        .text_color(muted)
+                        .child(text)
+                }))
+                .when(since.truncated, |bar| {
+                    bar.child(
+                        div()
+                            .id("since-review-cut")
+                            .role(Role::Note)
+                            .aria_label(SINCE_CUT_HINT)
+                            .flex_none()
+                            .text_size(scale::meta())
+                            .text_color(muted)
+                            .tooltip(|window, cx| Tooltip::new(SINCE_CUT_HINT).build(window, cx))
+                            .child(format!("First {COMPARE_FILES_LIMIT} files")),
+                    )
+                })
+                .when(matches!(since.how, SinceHow::Commits(_)), |bar| {
+                    bar.child(
+                        Button::new("since-review-on-github")
+                            .ghost()
+                            .control()
+                            .icon(IconName::ExternalLink)
+                            .label("Open on GitHub")
+                            .tooltip("Compare the reviewed commit with the head in the browser")
+                            .accessibility_label("Open the comparison on GitHub")
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The row that stands for `path` in `rows` (`tree::shown_row`).
+    fn shown(&self, rows: &[TreeRow], path: &str) -> Option<usize> {
+        shown_row(rows, path, self.tree_group(path))
     }
 
     /// A click selects the row and focuses the tree. A file also scrolls the
@@ -2176,9 +3195,17 @@ impl FilesTab {
         cx: &mut Context<Self>,
     ) {
         self.tree_focus.focus(window, cx);
-        self.selected = Some(path.to_owned());
         let rows = self.current_rows(cx);
-        if let Some(ix) = rows.iter().position(|row| row.path == path) {
+        let ix = rows.iter().position(|row| row.path == path);
+        // A closed folder standing for the selected file keeps the file
+        // selected, so opening it lands on the file.
+        let stands_for_selection = self.selected.as_deref().is_some_and(|selected| {
+            selected != path && ix.is_some() && self.shown(&rows, selected) == ix
+        });
+        if !stands_for_selection {
+            self.selected = Some(path.to_owned());
+        }
+        if let Some(ix) = ix {
             if sticky {
                 // Below the folders that stay pinned above it.
                 self.tree_scroll.scroll_to_item_strict_with_offset(
@@ -2187,17 +3214,19 @@ impl FilesTab {
                     rows[ix].depth,
                 );
             } else {
-                self.open_row(&rows[ix], cx);
+                self.open_row(&rows, ix, cx);
             }
         }
         cx.notify();
     }
 
     /// Selects the file whose lines reached the top of the diff, scrolling
-    /// the tree only as far as it takes to show it.
+    /// the tree only as far as it takes to show it. While a closed folder
+    /// hides the file, the folder on screen that holds it is highlighted
+    /// instead, without opening, and opening it shows the file selected.
     fn follow_diff(&mut self, path: &str, cx: &mut Context<Self>) {
         let rows = self.current_rows(cx);
-        let Some(ix) = rows.iter().position(|row| row.path == path) else {
+        let Some(ix) = self.shown(&rows, path) else {
             return;
         };
         self.selected = Some(path.to_owned());
@@ -2205,10 +3234,31 @@ impl FilesTab {
         cx.notify();
     }
 
-    fn open_row(&mut self, row: &TreeRow, cx: &mut Context<Self>) {
-        match row.kind {
-            RowKind::Dir(_) => self.toggle_folder(&row.path, cx),
-            RowKind::File { .. } => self.scroll_to(&row.path, cx),
+    fn open_row(&mut self, rows: &[TreeRow], ix: usize, cx: &mut Context<Self>) {
+        match &rows[ix].kind {
+            RowKind::Dir(dir) if !dir.expanded => self.open_folder(rows, ix, cx),
+            RowKind::Dir(_) => self.toggle_folder(&rows[ix].path, cx),
+            RowKind::File { .. } => self.scroll_to(&rows[ix].path, cx),
+        }
+    }
+
+    /// Opens the closed folder at `ix`. When it stands for the selected file
+    /// (`shown_row`), the folders down to that file open too, and the tree
+    /// scrolls to show the file selected.
+    fn open_folder(&mut self, rows: &[TreeRow], ix: usize, cx: &mut Context<Self>) {
+        self.collapsed.remove(&rows[ix].path);
+        cx.notify();
+        let Some(file) = self.selected.clone() else {
+            return;
+        };
+        if file == rows[ix].path || self.shown(rows, &file) != Some(ix) {
+            return;
+        }
+        let group = self.tree_group(&file).map(str::to_owned);
+        self.collapsed
+            .retain(|folder| !holds(folder, &file, group.as_deref()));
+        if let Some(at) = self.shown(&self.current_rows(cx), &file) {
+            self.tree_scroll.scroll_to_item(at, ScrollStrategy::Nearest);
         }
     }
 
@@ -2247,7 +3297,7 @@ impl FilesTab {
         let selected = self
             .selected
             .as_deref()
-            .and_then(|path| rows.iter().position(|row| row.path == path));
+            .and_then(|path| self.shown(&rows, path));
         let step = match event.keystroke.key.as_str() {
             "down" => move_down(&rows, selected),
             "up" => move_up(&rows, selected),
@@ -2255,7 +3305,7 @@ impl FilesTab {
             "left" => selected.and_then(|ix| move_left(&rows, ix)),
             "enter" | "space" => {
                 if let Some(ix) = selected {
-                    self.open_row(&rows[ix], cx);
+                    self.open_row(&rows, ix, cx);
                 }
                 cx.stop_propagation();
                 cx.notify();
@@ -2269,9 +3319,7 @@ impl FilesTab {
                 self.selected = Some(rows[ix].path.clone());
                 self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
             }
-            Some(Move::Expand(ix)) => {
-                self.collapsed.remove(&rows[ix].path);
-            }
+            Some(Move::Expand(ix)) => self.open_folder(&rows, ix, cx),
             Some(Move::Collapse(ix)) => {
                 self.collapsed.insert(rows[ix].path.clone());
                 self.selected = Some(rows[ix].path.clone());
@@ -2280,121 +3328,6 @@ impl FilesTab {
             None => {}
         }
         cx.notify();
-    }
-
-    fn row_views(&self, rows: &[TreeRow], focused: bool, cx: &App) -> Vec<RowView> {
-        let selected = self
-            .selected
-            .as_deref()
-            .and_then(|path| rows.iter().position(|row| row.path == path));
-        let active = selected.and_then(|ix| active_folder(rows, ix));
-        let starts = distinct_starts(rows);
-        let muted = cx.theme().muted_foreground;
-        let foreground = cx.theme().foreground;
-        rows.iter()
-            .enumerate()
-            .map(|(ix, row)| {
-                let guides = ancestors(rows, ix)
-                    .into_iter()
-                    .map(|folder| Some(folder) == active)
-                    .collect();
-                let path = SharedString::from(row.path.clone());
-                let is_selected = selected == Some(ix);
-                match &row.kind {
-                    RowKind::Dir(dir) => {
-                        let files = dir.files.iter().map(|&ix| &self.files[ix]);
-                        let viewed = viewed_mark(files.clone().map(|file| is_viewed(file.viewed)));
-                        // A folder that is all new or all deleted says so on
-                        // its icon; any other folder's icon stays muted.
-                        let icon_color = match folder_tint(files.map(|file| file.status)) {
-                            GitTint::Created => tokens::open(),
-                            GitTint::Deleted => tokens::closed(),
-                            GitTint::Modified | GitTint::Renamed => muted,
-                        };
-                        let count = dir.files.len();
-                        let noun = if count == 1 { "file" } else { "files" };
-                        RowView {
-                            depth: row.depth,
-                            folder: Some(dir.expanded),
-                            label: dir.label.clone().into(),
-                            name_from: 0,
-                            // Names stay neutral; the status letter carries
-                            // the color.
-                            label_color: if viewed == ViewedMark::All {
-                                muted
-                            } else {
-                                foreground
-                            },
-                            icon: if dir.expanded {
-                                assets::FOLDER_OPEN
-                            } else {
-                                assets::FOLDER
-                            },
-                            icon_color,
-                            additions: dir.additions,
-                            deletions: dir.deletions,
-                            status: None,
-                            viewed,
-                            selected: is_selected,
-                            focused,
-                            guides,
-                            tooltip: format!(
-                                "{} · {count} {noun} · +{} −{}",
-                                row.path, dir.additions, dir.deletions
-                            )
-                            .into(),
-                            accessible_name: format!(
-                                "Folder {}, {count} {noun}, +{} −{}",
-                                row.path, dir.additions, dir.deletions
-                            )
-                            .into(),
-                            path,
-                        }
-                    }
-                    RowKind::File { index } => {
-                        let file = &self.files[*index];
-                        let viewed = is_viewed(file.viewed);
-                        let tint = tint_color(file_tint(file.status));
-                        let missing = match self.missing.get(&file.path) {
-                            Some(Missing::Omitted) => " · diff not loaded",
-                            Some(Missing::Unreadable) => " · diff not shown",
-                            None => "",
-                        };
-                        RowView {
-                            depth: row.depth,
-                            folder: None,
-                            label: split_path(&file.path).1.to_owned().into(),
-                            name_from: starts[ix],
-                            label_color: if viewed { muted } else { foreground },
-                            icon: assets::file_icon(&file.path),
-                            icon_color: muted,
-                            additions: file.additions,
-                            deletions: file.deletions,
-                            status: Some((status_letter(file.status), tint)),
-                            viewed: if viewed {
-                                ViewedMark::All
-                            } else {
-                                ViewedMark::None
-                            },
-                            selected: is_selected,
-                            focused,
-                            guides,
-                            tooltip: format!(
-                                "{} · +{} −{}{}",
-                                file.path, file.additions, file.deletions, missing
-                            )
-                            .into(),
-                            accessible_name: format!(
-                                "File {}, +{} −{}",
-                                file.path, file.additions, file.deletions
-                            )
-                            .into(),
-                            path,
-                        }
-                    }
-                }
-            })
-            .collect()
     }
 
     fn file_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2444,6 +3377,7 @@ impl FilesTab {
                         .aria_label("Filter files"),
                 ),
             )
+            .child(self.tree_bar(cx))
             .child(
                 div()
                     .id("files-tree")
@@ -2463,6 +3397,33 @@ impl FilesTab {
         let mut annotations = Vec::new();
         let mut views: Vec<(ElementId, AnyView)> = Vec::new();
         let mut notes: Vec<NoDiffNote> = Vec::new();
+        // Each low-signal file says what it is and how large in its header,
+        // with the control that opens it.
+        let mut lows: HashMap<String, LowNote> = HashMap::new();
+        for file in &self.files {
+            let Some(kind) = self.low.get(&file.path) else {
+                continue;
+            };
+            let omitted = (self.missing.get(&file.path) == Some(&Missing::Omitted)).then(|| {
+                let note = match self.patch_errors.get(&file.path) {
+                    Some(error) => SharedString::from(error.clone()),
+                    None => LOW_OMITTED_NOTE.into(),
+                };
+                (note, self.loading_patch(&file.path))
+            });
+            lows.insert(
+                file.path.clone(),
+                LowNote {
+                    path: file.path.clone(),
+                    label: kind.label(file).into(),
+                    omitted,
+                    openable: !matches!(kind, LowSignal::ModeChange | LowSignal::Empty),
+                },
+            );
+        }
+        let lows = Rc::new(lows);
+        let low_state = state.clone();
+        let low_group = self.low_group(cx).map(Rc::new);
         for placed in &self.placed {
             let Some(slot) = self.threads.get(&placed.thread_id) else {
                 continue;
@@ -2491,12 +3452,19 @@ impl FilesTab {
             views.push((id, slot.view.clone().into()));
         }
         for (path, reason) in &self.missing {
+            // A low-signal file's own line says its diff was left out.
+            if *reason == Missing::Omitted && self.low.contains_key(path) {
+                continue;
+            }
             let id = ElementId::Name(SharedString::from(format!("no-diff:{path}")));
             annotations.push(DiffAnnotation::file(id.clone(), path.clone()));
             let note = match self.patch_errors.get(path) {
                 Some(error) => error.clone().into(),
-                None if self.commit.is_some() && *reason == Missing::Omitted => {
+                None if *reason == Missing::Omitted && self.scope() == Scope::Commit => {
                     COMMIT_OMITTED_NOTE.into()
+                }
+                None if *reason == Missing::Omitted && self.scope() == Scope::SinceReview => {
+                    SINCE_OMITTED_NOTE.into()
                 }
                 None => reason.note().into(),
             };
@@ -2549,6 +3517,42 @@ impl FilesTab {
             }
         }
 
+        // The divider over the low-signal files goes under the last file
+        // before them: under its last line while it is open, and under its
+        // header while it is folded or has no lines. Without a file before
+        // them it heads the diff.
+        let before_low = low_group.as_ref().and_then(|_| {
+            self.file_order()
+                .into_iter()
+                .rev()
+                .map(|ix| &self.files[ix])
+                .find(|file| !self.in_low_group(&file.path) && self.tree_keeps(&file.path, cx))
+        });
+        let mut divider_at: Option<(SharedString, bool)> = None;
+        if let Some(file) = before_low {
+            annotations.push(DiffAnnotation::file(
+                ElementId::Name(DIVIDER_FOLDED.into()),
+                file.path.clone(),
+            ));
+            let last = self
+                .shown_hunks(&file.path)
+                .and_then(|hunks| hunks.last())
+                .and_then(|hunk| hunk.lines.last())
+                .map(DiffLine::anchor);
+            if let Some((line, side)) = last {
+                annotations.push(DiffAnnotation::line(
+                    ElementId::Name(DIVIDER_OPEN.into()),
+                    DiffLinePosition::new(file.path.clone(), to_diff_side(side), line as usize),
+                ));
+            }
+            divider_at = Some((file.path.clone().into(), last.is_some()));
+        }
+        let lone_divider = match (&low_group, before_low) {
+            (Some(group), None) => Some(low_divider(group, &weak, cx)),
+            _ => None,
+        };
+        let (divider_group, divider_weak) = (low_group.clone(), weak.clone());
+
         // Each file's size, for its header, as GitHub counts it.
         let sizes: Rc<HashMap<String, (u32, u32)>> = Rc::new(
             self.files
@@ -2587,6 +3591,7 @@ impl FilesTab {
         let card_width = self.card_width.clone();
         let content: HeaderFor = {
             let (viewed, sizes, weak) = (viewed.clone(), sizes.clone(), weak.clone());
+            let (low_notes, note_state) = (lows.clone(), state.clone());
             Rc::new(move |file: &DiffFile| {
                 let path = file.path().clone();
                 let title = match (file.original_path(), file.modified_path()) {
@@ -2601,6 +3606,13 @@ impl FilesTab {
                     DiffFileStatus::Copied => Some("Copied"),
                     _ => None,
                 };
+                let note = low_notes.get(path.as_ref()).map(|note| {
+                    let (note, state, weak) = (note.clone(), note_state.clone(), weak.clone());
+                    Rc::new(move |cx: &App| {
+                        let collapsed = state.read(cx).is_file_collapsed(&note.path);
+                        low_note(&note, collapsed, &weak, cx.theme().muted_foreground)
+                    }) as header::Note
+                });
                 let weak = weak.clone();
                 let toggle_path = path.to_string();
                 header::HeaderContent {
@@ -2616,6 +3628,7 @@ impl FilesTab {
                             .ok();
                     }),
                     on_drawn: None,
+                    note,
                 }
             })
         };
@@ -2632,23 +3645,22 @@ impl FilesTab {
             let (content, watch) = (content.clone(), self.headers.clone());
             move |file: &DiffFile, _: &mut Window, _: &mut App| {
                 let mut header = content(file);
-                if let Some(&ix) = file_ixs.get(file.path()) {
+                header.on_drawn = file_ixs.get(file.path()).map(|&ix| {
                     let watch = watch.clone();
-                    header.on_drawn = Some(Rc::new(move |bounds, viewport| {
-                        watch.borrow_mut().record(ix, bounds, viewport)
-                    }));
-                }
-                header::file_header(header)
+                    Rc::new(move |bounds, viewport| watch.borrow_mut().record(ix, bounds, viewport))
+                        as header::OnDrawn
+                });
+                header::file_header(header).into_any_element()
             }
         };
         let pinned = self.pinned_header(state, content, cx);
         let decorations = self.find_decorations(cx);
-        div()
+        let panel = div()
             .debug_selector(|| "files-diff".into())
             .relative()
             .flex_1()
-            .min_w_0()
-            .h_full()
+            .min_h_0()
+            .w_full()
             .child(
                 // Long lines scroll sideways by default, so a line keeps its
                 // indentation (the component has no hanging indent for a
@@ -2662,7 +3674,23 @@ impl FilesTab {
                     .hover_highlight(DiffHoverHighlight::Both)
                     .decorations(decorations)
                     .annotations(annotations)
-                    .render_annotation(move |annotation, _, _| {
+                    .render_annotation(move |annotation, _, cx| {
+                        if let ElementId::Name(name) = annotation.id()
+                            && (name.as_ref() == DIVIDER_FOLDED || name.as_ref() == DIVIDER_OPEN)
+                        {
+                            let shown = divider_at.as_ref().is_some_and(|(path, has_line)| {
+                                let folded = low_state.read(cx).is_file_collapsed(path);
+                                if name.as_ref() == DIVIDER_OPEN {
+                                    !folded
+                                } else {
+                                    folded || !has_line
+                                }
+                            });
+                            return match &divider_group {
+                                Some(group) if shown => low_divider(group, &divider_weak, cx),
+                                _ => div().into_any_element(),
+                            };
+                        }
                         if let Some(bar) = bars.get(annotation.id()) {
                             return gap_bar(bar, &gap_weak, muted, fold);
                         }
@@ -2749,7 +3777,13 @@ impl FilesTab {
                         )),
                 )
             })
-            .child(pinned)
+            .child(pinned);
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .children(lone_divider)
+            .child(panel)
             .into_any_element()
     }
 
@@ -2931,33 +3965,254 @@ impl FilesTab {
             }))
             .child(
                 // The tree's edge drags, so a deep path can be given the
-                // room to show whole.
+                // room to show whole; the width holds in every pull request
+                // and across restarts. A drag ends at the mouse up, wherever
+                // in the window it lands.
                 div().flex_1().min_h_0().w_full().child({
-                    let tree = resizable_panel()
-                        .size(dp(FILE_LIST_WIDTH))
-                        .size_range(dp(FILE_LIST_MIN)..dp(FILE_LIST_MAX))
+                    let tree_right =
+                        Settings::get(cx).file_tree_position == FileTreePosition::Right;
+                    let width = dp(self.tree_width(window, cx));
+                    let tree = div()
+                        .flex_none()
+                        .h_full()
+                        .w(width)
                         .child(self.file_list(window, cx));
                     let find_bar = self.find.open.then(|| self.find_bar(cx));
-                    let diff = resizable_panel().child(
-                        v_flex()
-                            .size_full()
-                            .children(find_bar)
-                            .child(h_flex().flex_1().min_h_0().w_full().child(diff_body)),
-                    );
-                    // One id per side: the group keeps its panels' widths by
-                    // index, and the tree's width must not land on the diff.
-                    match Settings::get(cx).file_tree_position {
-                        FileTreePosition::Left => {
-                            h_resizable("files-split").child(tree).child(diff)
-                        }
-                        FileTreePosition::Right => {
-                            h_resizable("files-split-right").child(diff).child(tree)
-                        }
+                    let diff = v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .children(find_bar)
+                        .child(h_flex().flex_1().min_h_0().w_full().child(diff_body));
+                    // Last, so the band straddling the seam is on top of both.
+                    let edge = div()
+                        .absolute()
+                        .top_0()
+                        .h_full()
+                        .w(px(0.))
+                        .map(|edge| {
+                            if tree_right {
+                                edge.right(width)
+                            } else {
+                                edge.left(width)
+                            }
+                        })
+                        .child(self.tree_edge(cx));
+                    let split = h_flex()
+                        .relative()
+                        .size_full()
+                        .on_drag_move(cx.listener(Self::drag_tree_edge))
+                        .capture_any_mouse_up(
+                            cx.listener(|this, _, _, cx| this.finish_tree_drag(cx)),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.finish_tree_drag(cx)),
+                        );
+                    if tree_right {
+                        split.child(diff).child(tree).child(edge)
+                    } else {
+                        split.child(tree).child(diff).child(edge)
                     }
                 }),
             )
             .into_any_element()
     }
+
+    /// The tree's width in points: the one being dragged, else the saved
+    /// one, within the limits and at most [`FILE_LIST_SHARE`] of the window.
+    fn tree_width(&self, window: &Window, cx: &App) -> f32 {
+        let settings = Settings::get(cx);
+        let window_width = f32::from(window.viewport_size().width) / settings.zoom.factor();
+        let max = (window_width * FILE_LIST_SHARE).clamp(FILE_LIST_MIN, FILE_LIST_MAX);
+        self.tree_drag
+            .or(settings.file_tree_width)
+            .unwrap_or(FILE_LIST_WIDTH)
+            .clamp(FILE_LIST_MIN, max)
+    }
+
+    fn drag_tree_edge(
+        &mut self,
+        event: &DragMoveEvent<ResizeFileTree>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = Settings::get(cx);
+        // From the split's edge on the tree's side to the pointer.
+        let dragged = match settings.file_tree_position {
+            FileTreePosition::Left => event.event.position.x - event.bounds.left(),
+            FileTreePosition::Right => event.bounds.right() - event.event.position.x,
+        };
+        let points = f32::from(dragged) / settings.zoom.factor();
+        let width = points.round().clamp(FILE_LIST_MIN, FILE_LIST_MAX);
+        if self.tree_drag != Some(width) {
+            self.tree_drag = Some(width);
+            cx.notify();
+        }
+    }
+
+    fn finish_tree_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(width) = self.tree_drag.take() {
+            update_settings(cx, move |settings| settings.file_tree_width = Some(width));
+        }
+    }
+
+    /// The band on the seam between the tree and the diff: drag to resize,
+    /// double click to restore the default width.
+    fn tree_edge(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        resize_handle::<ResizeFileTree, ResizeFileTree>("files-tree-edge", Axis::Horizontal)
+            .role(Role::Splitter)
+            .aria_label("Resize file tree")
+            .aria_description("Drag to resize. Double-click to restore the default width.")
+            .debug_selector(|| "files-tree-edge".into())
+            .on_drag(ResizeFileTree, |_, _, _, cx| cx.new(|_| ResizeFileTree))
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    this.tree_drag = None;
+                    update_settings(cx, |settings| settings.file_tree_width = None);
+                }
+            }))
+    }
+}
+
+/// A drag on the files tree's edge, and the (empty) view it drags.
+#[derive(Clone)]
+struct ResizeFileTree;
+
+impl Render for ResizeFileTree {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// The line under a low-signal file's header: what it is and how large,
+/// and the control that opens it (Load diff while GitHub left it out).
+/// A low-signal file's note in its header: what the file is and how large,
+/// and the button that opens or folds it, or loads the diff GitHub left
+/// out. A file with no lines to show has no button.
+fn low_note(
+    note: &LowNote,
+    collapsed: bool,
+    weak: &WeakEntity<FilesTab>,
+    muted: Hsla,
+) -> AnyElement {
+    let path = note.path.clone();
+    let weak = weak.clone();
+    let button = match &note.omitted {
+        Some((_, busy)) => Some(
+            Button::new(SharedString::from(format!("low-load:{path}")))
+                .outline()
+                .xsmall()
+                .label("Load diff")
+                .accessibility_label(format!("Load diff of {path}"))
+                .loading(*busy)
+                .disabled(*busy)
+                .on_click(move |_, _, cx| {
+                    weak.update(cx, |this, cx| {
+                        this.low_open.insert(path.clone());
+                        this.load_omitted_patch(&path, cx)
+                    })
+                    .ok();
+                }),
+        ),
+        None if note.openable => {
+            let verb = if collapsed { "Show" } else { "Hide" };
+            Some(
+                Button::new(SharedString::from(format!("low-toggle:{path}")))
+                    .outline()
+                    .xsmall()
+                    .label(format!("{verb} diff"))
+                    .accessibility_label(format!("{verb} diff of {path}"))
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| this.open_low(&path, collapsed, cx))
+                            .ok();
+                    }),
+            )
+        }
+        None => None,
+    };
+    h_flex()
+        .id(SharedString::from(format!("low-note:{}", note.path)))
+        .debug_selector(|| "low-signal-note".into())
+        .role(Role::Note)
+        .aria_label(format!("{}, {}", note.path, note.label))
+        .gap_2()
+        .items_center()
+        .text_size(scale::meta())
+        .text_color(muted)
+        .whitespace_nowrap()
+        .child(Icon::new(IconName::EyeOff).xsmall())
+        .child(note.label.clone())
+        .when_some(note.omitted.as_ref(), |row, (why, _)| {
+            row.child("·").child(why.clone())
+        })
+        .children(button)
+        .into_any_element()
+}
+
+/// The divider over the low-signal files in the diff: what the group holds,
+/// and Mark all low-signal viewed.
+fn low_divider(group: &LowGroup, weak: &WeakEntity<FilesTab>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let noun = if group.files == 1 { "file" } else { "files" };
+    let lines = group.additions + group.deletions;
+    let size = match lines {
+        0 => format!("{} {noun}", group.files),
+        1 => format!("{} {noun} · 1 line", group.files),
+        _ => format!("{} {noun} · {} lines", group.files, thousands(lines)),
+    };
+    let (paths, mark) = (group.paths.clone(), !group.all_viewed);
+    let weak = weak.clone();
+    let action = if mark {
+        "Mark all low-signal viewed"
+    } else {
+        "Unmark all low-signal viewed"
+    };
+    h_flex()
+        .id("low-signal-divider")
+        .debug_selector(|| "low-signal-divider".into())
+        .role(Role::Group)
+        .aria_label(format!(
+            "{LOW_SIGNAL}, {}, folded so the code reads first",
+            size.replace(" ·", ",")
+        ))
+        .w_full()
+        .min_h(rems(1.375))
+        .px_3()
+        .py_1()
+        .gap_2()
+        .items_center()
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(theme.muted.opacity(0.35))
+        .child(Icon::new(IconName::EyeOff).xsmall().text_color(muted))
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
+                .child(LOW_SIGNAL),
+        )
+        .child(
+            div()
+                .text_size(scale::meta())
+                .text_color(muted)
+                .whitespace_nowrap()
+                .child(format!("{size} · folded so the code reads first")),
+        )
+        .child(
+            Button::new("low-signal-viewed")
+                .outline()
+                .xsmall()
+                .label(action)
+                .accessibility_label(action)
+                .tooltip(LOW_SIGNAL_HINT)
+                .on_click(move |_, _, cx| {
+                    weak.update(cx, |this, cx| this.set_files_viewed(&paths, mark, cx))
+                        .ok();
+                }),
+        )
+        .into_any_element()
 }
 
 fn tint_color(tint: GitTint) -> Hsla {
@@ -3064,10 +4319,15 @@ fn skeleton(cx: &App) -> impl IntoElement {
 
 impl EventEmitter<PrTabEvent> for FilesTab {}
 
+impl EventEmitter<ShowAllChanges> for FilesTab {}
+
 impl Render for FilesTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.threads_dirty {
             self.sync_threads(window, cx);
+        }
+        if let Some(shown) = self.since.as_ref().and_then(|since| since.shown.as_ref()) {
+            return div().size_full().child(shown.tab.clone());
         }
         let body = match &self.load {
             Loadable::Loading => skeleton(cx).into_any_element(),
@@ -3079,10 +4339,10 @@ impl Render for FilesTab {
                 ui::empty_state(
                     IconName::FileDiff,
                     "No changed files",
-                    if self.commit.is_some() {
-                        "This commit does not change any files."
-                    } else {
-                        "This pull request does not change any files."
+                    match self.scope() {
+                        Scope::PullRequest => "This pull request does not change any files.",
+                        Scope::Commit => "This commit does not change any files.",
+                        Scope::SinceReview => "Nothing changed since your last review.",
                     },
                 )
                 .into_any_element()
@@ -3099,7 +4359,14 @@ impl Render for FilesTab {
             .on_action(cx.listener(|this, _: &FindInDiff, window, cx| this.open_find(window, cx)))
             // A text field answers Cmd+F with Search and passes it on.
             .on_action(cx.listener(|this, _: &Search, window, cx| this.open_find(window, cx)))
-            .child(body)
+            .child(match self.since_bar(cx) {
+                Some(bar) => v_flex()
+                    .size_full()
+                    .child(bar)
+                    .child(div().flex_1().min_h_0().w_full().child(body))
+                    .into_any_element(),
+                None => body,
+            })
     }
 }
 
@@ -3109,7 +4376,7 @@ pub(super) mod tests {
 
     use chrono::{DateTime, Utc};
     use gpui_kit::component::ActiveTheme as _;
-    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use gpui_kit::component::diff::{DiffFileStatus, DiffLineRange, DiffSide};
     use gpui_kit::{
         AppContext as _, Bounds, Context, Entity, InputEvent as _, Modifiers, MouseButton,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent,
@@ -3118,13 +4385,19 @@ pub(super) mod tests {
     use loupe_github::diff::{git_patch, parse_patch};
     use loupe_github::{
         ChangedFile, Checks, FileStatus, MergeMethod, MergeStateStatus, Mergeable, PrRef, PrState,
-        PullRequestDetail, RepoRef, ViewedState,
+        PullRequestDetail, RepoRef, SinceReview, ViewedState, ViewerReview,
     };
 
     use super::emphasis::PLAIN;
     use super::expand::{Direction, Source};
     use super::model::build_files;
-    use super::{FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_WIDTH, FilesTab, PrTabContext};
+    use super::signal::{Attributes, classify_all};
+    use super::tree::{LOW_SIGNAL, TESTS};
+    use super::{
+        BarFit, FILE_LIST_MAX, FILE_LIST_MIN, FILE_LIST_SHARE, FILE_LIST_WIDTH, FilesTab,
+        MODE_CHANGE_NOTE, PrTabContext, Scope, ShowAllChanges, Since, SinceHow, files_label,
+        review_files,
+    };
     use crate::services::{Accounts, Services};
     use crate::store::{FileTreePosition, Settings, update_settings};
 
@@ -3242,11 +4515,15 @@ pub(super) mod tests {
         let mut cx = VisualTestContext::from_window(handle, cx);
         // With no GitHub client the first load fails; then the files arrive.
         cx.run_until_parked();
+        // The files keep the order given; `review_files` is what puts them in
+        // review order on a real load.
+        let signals = classify_all(&files, &Attributes::default());
         tab.update(&mut cx, |tab, cx| {
             tab.finish_load(
-                Ok(build_files(files, git_patch, |patch| {
-                    parse_patch(patch).ok()
-                })),
+                Ok((
+                    build_files(files, git_patch, |patch| parse_patch(patch).ok()),
+                    signals,
+                )),
                 cx,
             );
             cx.notify();
@@ -3351,6 +4628,11 @@ pub(super) mod tests {
         drag_divider(cx, tree.right(), 60.);
         let (tree, _) = panes(cx);
         assert_eq!(width(tree), FILE_LIST_WIDTH + 60., "the edge drags");
+        assert_eq!(
+            cx.update(|_, cx| Settings::get(cx).file_tree_width),
+            Some(FILE_LIST_WIDTH + 60.),
+            "the width is kept"
+        );
 
         cx.update(|_, cx| {
             update_settings(cx, |settings| {
@@ -3361,13 +4643,13 @@ pub(super) mod tests {
         assert_eq!(f32::from(diff.left()), 0., "the diff starts on the left");
         assert!(tree.left() >= diff.right(), "the tree comes after the diff");
         assert_eq!(f32::from(tree.right()).round(), WINDOW_WIDTH);
-        assert_eq!(width(tree), FILE_LIST_WIDTH, "the same starting width");
+        assert_eq!(width(tree), FILE_LIST_WIDTH + 60., "the same width");
 
         // The same drag, mirrored: pulling the edge away from the tree's
         // side widens the tree, within the same limits.
-        drag_divider(cx, tree.left(), -60.);
+        drag_divider(cx, tree.left(), -20.);
         let (tree, diff) = panes(cx);
-        assert_eq!(width(tree), FILE_LIST_WIDTH + 60.);
+        assert_eq!(width(tree), FILE_LIST_WIDTH + 80.);
         assert_eq!(f32::from(tree.right()).round(), WINDOW_WIDTH);
         assert!(tree.left() >= diff.right());
 
@@ -3377,12 +4659,20 @@ pub(super) mod tests {
 
         drag_divider(cx, tree.left(), -900.);
         let (tree, diff) = panes(cx);
-        assert_eq!(width(tree), FILE_LIST_MAX, "no wider than the maximum");
+        assert_eq!(
+            width(tree),
+            (WINDOW_WIDTH * FILE_LIST_SHARE).round(),
+            "no wider than a third of the window"
+        );
         assert_eq!(f32::from(tree.right()).round(), WINDOW_WIDTH);
         assert!(
             (f32::from(diff.right()) - f32::from(tree.left())).abs() <= 1.,
             "the diff fills what the tree leaves"
         );
+
+        cx.simulate_resize(size(px(1920.), px(800.)));
+        let (tree, _) = panes(cx);
+        assert_eq!(width(tree), FILE_LIST_MAX, "no wider than the maximum");
     }
 
     /// A path far wider than the diff beside the tree at its opening width.
@@ -3622,6 +4912,61 @@ pub(super) mod tests {
         );
     }
 
+    #[gpui_kit::test]
+    fn a_closed_folder_stands_for_the_file_the_diff_reached(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_files_tab_with_files(
+            cx,
+            vec![
+                added("a/long.rs", 300),
+                added("b/c/next.rs", 100),
+                added("b/other.rs", 1),
+            ],
+        );
+        let cx = &mut cx;
+        panes(cx);
+        tab.update(cx, |tab, _| {
+            tab.collapsed.insert("b".to_owned());
+        });
+        for _ in 0..10 {
+            scroll_diff(cx, 600.);
+        }
+        let highlighted = |cx: &mut VisualTestContext| {
+            tab.read_with(cx, |tab, cx| {
+                let rows = tab.current_rows(cx);
+                let views = tab.row_views(&rows, false, cx);
+                views
+                    .iter()
+                    .filter(|view| view.selected)
+                    .map(|view| view.path.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            tab.read_with(cx, |tab, _| tab.selected.clone()).as_deref(),
+            Some("b/c/next.rs")
+        );
+        assert_eq!(
+            highlighted(cx),
+            ["b"],
+            "the closed folder holding the file is highlighted"
+        );
+        assert!(
+            tab.read_with(cx, |tab, _| tab.collapsed.contains("b")),
+            "and stays closed"
+        );
+        tab.update(cx, |tab, cx| {
+            tab.collapsed.insert("b/c".to_owned());
+            let rows = tab.current_rows(cx);
+            let folder = rows.iter().position(|row| row.path == "b").unwrap();
+            tab.open_row(&rows, folder, cx);
+        });
+        assert_eq!(
+            highlighted(cx),
+            ["b/c/next.rs"],
+            "opening it opens the way to the file and shows it selected"
+        );
+    }
+
     /// The current match: its place, the file, and the line.
     fn current_match(
         cx: &mut VisualTestContext,
@@ -3817,6 +5162,7 @@ pub(super) mod tests {
     fn left_out(path: &str) -> ChangedFile {
         ChangedFile {
             patch: None,
+            status: FileStatus::Modified,
             additions: 5000,
             ..added(path, 1)
         }
@@ -4125,5 +5471,312 @@ pub(super) mod tests {
             (Some("src/lib.rs".to_owned()), Some(1)),
             "the diff goes to the line and the tree follows"
         );
+    }
+
+    fn binary(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            previous_path: None,
+            status: FileStatus::Added,
+            additions: 0,
+            deletions: 0,
+            patch: None,
+            viewed: ViewedState::Unviewed,
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_lines_says_what_changed_and_never_passes_for_binary() {
+        let bare = |path: &str, status: FileStatus| ChangedFile {
+            status,
+            ..binary(path)
+        };
+        let files = vec![
+            bare("scripts/seed.sh", FileStatus::Modified),
+            bare("web/.gitkeep", FileStatus::Added),
+            bare("tools/old.keep", FileStatus::Removed),
+            binary("assets/badge.png"),
+        ];
+        let (loaded, _) = review_files(files, &Attributes::default());
+        let doc = |path: &str| {
+            loaded
+                .docs
+                .iter()
+                .find(|doc| doc.path().as_ref() == path)
+                .expect("a diff for every file")
+        };
+        let mode = doc("scripts/seed.sh");
+        assert!(!mode.is_binary());
+        let headers: Vec<&str> = mode
+            .extended_headers()
+            .iter()
+            .map(|line| line.as_ref())
+            .collect();
+        assert_eq!(headers, [MODE_CHANGE_NOTE]);
+        let added = doc("web/.gitkeep");
+        assert!(!added.is_binary());
+        assert_eq!(added.status(), DiffFileStatus::Added);
+        assert!(added.extended_headers().is_empty());
+        let removed = doc("tools/old.keep");
+        assert!(!removed.is_binary());
+        assert_eq!(removed.status(), DiffFileStatus::Deleted);
+        assert!(doc("assets/badge.png").is_binary());
+    }
+
+    #[gpui_kit::test]
+    fn code_comes_first_and_low_signal_files_open_folded_under_a_divider(cx: &mut TestAppContext) {
+        let files = vec![
+            binary("assets/badge.png"),
+            added("data/part-01.csv", 2_001),
+            added("README.md", 4),
+            added("src/units.rs", 30),
+            added("src/units.test.rs", 10),
+        ];
+        let (loaded, _) = review_files(files, &Attributes::default());
+        let (mut cx, tab) = open_files_tab_with_files(cx, loaded.files);
+        let cx = &mut cx;
+        draw(cx);
+        assert_eq!(
+            diff_paths(cx, &tab),
+            [
+                "src/units.rs",
+                "src/units.test.rs",
+                "README.md",
+                "assets/badge.png",
+                "data/part-01.csv",
+            ]
+        );
+        let collapsed = |cx: &mut VisualTestContext, path: &str| {
+            tab.read_with(cx, |tab, cx| {
+                tab.diff
+                    .as_ref()
+                    .expect("diff")
+                    .read(cx)
+                    .is_file_collapsed(path)
+            })
+        };
+        assert!(!collapsed(cx, "src/units.rs"));
+        assert!(collapsed(cx, "data/part-01.csv"), "data opens folded");
+        assert!(collapsed(cx, "assets/badge.png"), "a binary opens folded");
+        // The tests follow all the code in a group of their own, and the
+        // tree ends with the low-signal group, closed beside the code.
+        let rows = tab.read_with(cx, |tab, cx| tab.current_rows(cx));
+        assert!(rows.iter().any(|row| row.path == TESTS));
+        let last = rows.last().expect("rows");
+        assert_eq!(last.path, LOW_SIGNAL);
+        assert!(
+            last.dir()
+                .is_some_and(|dir| !dir.expanded && dir.files.len() == 2)
+        );
+        // Show diff opens one, and it stays open through a reload.
+        tab.update(cx, |tab, cx| tab.open_low("data/part-01.csv", true, cx));
+        assert!(!collapsed(cx, "data/part-01.csv"));
+        tab.update(cx, |tab, cx| tab.collapse_viewed(cx));
+        assert!(!collapsed(cx, "data/part-01.csv"));
+        assert!(collapsed(cx, "assets/badge.png"));
+        let group = tab
+            .read_with(cx, |tab, cx| tab.low_group(cx))
+            .expect("group");
+        assert_eq!(group.files, 2);
+        assert_eq!(group.additions, 2_001);
+        assert_eq!(group.paths, ["assets/badge.png", "data/part-01.csv"]);
+        assert!(!group.all_viewed);
+    }
+
+    fn modified(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+            patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
+            viewed: ViewedState::Unviewed,
+        }
+    }
+
+    /// The pull request's tab with the viewer's last review given on
+    /// `reviewed` (the head is `abc`).
+    fn open_reviewed_tab(
+        cx: &mut TestAppContext,
+        reviewed: &'static str,
+    ) -> (VisualTestContext, Entity<FilesTab>) {
+        open_tab(
+            cx,
+            vec![modified("src/a.rs"), modified("src/b.rs")],
+            move |mut context, window, cx| {
+                context.detail = Arc::new(PullRequestDetail {
+                    viewer_review: Some(ViewerReview {
+                        verdict: None,
+                        commit_oid: reviewed.into(),
+                        submitted_at: None,
+                    }),
+                    ..detail()
+                });
+                FilesTab::new(context, window, cx)
+            },
+        )
+    }
+
+    #[gpui_kit::test]
+    fn since_your_last_review_shows_the_changes_after_it_and_back(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_reviewed_tab(cx, "0ld");
+        let cx = &mut cx;
+        let compared = Since {
+            files: vec![modified("src/b.rs")],
+            truncated: false,
+            how: SinceHow::Commits(2),
+        };
+        tab.update(cx, |tab, _| {
+            let since = tab.since.as_mut().expect("commits landed after the review");
+            assert_eq!(
+                (since.reviewed.as_str(), since.head.as_str()),
+                ("0ld", "abc")
+            );
+            since.since = Some(compared.clone());
+        });
+        draw(cx);
+        assert!(
+            cx.debug_bounds("files-since-review").is_some(),
+            "the toggle is in the bar"
+        );
+
+        let shown = tab.update_in(cx, |tab, window, cx| {
+            tab.show_since(true, window, cx);
+            tab.since
+                .as_ref()
+                .and_then(|since| since.shown.as_ref())
+                .map(|shown| shown.tab.clone())
+                .expect("the toggle is on")
+        });
+        cx.run_until_parked();
+        shown.update(cx, |since, cx| {
+            assert_eq!(since.scope(), Scope::SinceReview);
+            assert_eq!(
+                since.diff_ends(),
+                ("0ld".to_owned(), "abc".to_owned()),
+                "from the reviewed commit to the head"
+            );
+            let files = vec![modified("src/b.rs")];
+            let signals = classify_all(&files, &Attributes::default());
+            since.finish_load(
+                Ok((
+                    build_files(files, git_patch, |patch| parse_patch(patch).ok()),
+                    signals,
+                )),
+                cx,
+            );
+            if let Some(source) = &mut since.commit {
+                source.since_review = Some(compared);
+            }
+        });
+        for _ in 0..4 {
+            draw(cx);
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("files-since-review").is_some(),
+            "the toggle stays in the bar, on"
+        );
+        let controls = cx
+            .debug_bounds("files-view-controls")
+            .or_else(|| cx.debug_bounds("files-view-menu"))
+            .expect("the diff's view controls, or their menu, are in the bar");
+        assert!(
+            f32::from(controls.right()) <= WINDOW_WIDTH,
+            "the bar fits a 1280 window with the toggle on: {controls:?}"
+        );
+        assert_eq!(shown.read_with(cx, |since, _| since.files.len()), 1);
+
+        shown.update(cx, |_, cx| cx.emit(ShowAllChanges));
+        cx.run_until_parked();
+        assert!(
+            tab.read_with(cx, |tab, _| tab
+                .since
+                .as_ref()
+                .is_some_and(|since| since.shown.is_none())),
+            "All changes or the toggle shows every change again"
+        );
+        assert_eq!(tab.read_with(cx, |tab, _| tab.files.len()), 2);
+    }
+
+    #[test]
+    fn after_a_rebase_the_files_whose_change_moved_show_whole() {
+        let mut moved = modified("src/a.rs");
+        moved.patch = Some("@@ -4 +4 @@\n-old\n+newer".into());
+        let mut shifted = modified("src/b.rs");
+        shifted.patch = Some("@@ -9 +9 @@\n-old\n+new".into());
+        let reviewed = vec![
+            modified("src/a.rs"),
+            modified("src/b.rs"),
+            modified("src/c.rs"),
+        ];
+        let now = vec![moved.clone(), shifted, modified("src/d.rs")];
+        let answer = SinceReview::Rewritten {
+            reviewed_files: reviewed,
+            truncated: false,
+            rebased: true,
+        };
+        assert_eq!(
+            Since::new(&answer, &now),
+            Since {
+                files: vec![moved, modified("src/d.rs")],
+                truncated: false,
+                how: SinceHow::Rewritten {
+                    rebased: true,
+                    dropped: 1,
+                },
+            },
+            "a file the rebase only moved stays out, and a reviewed file gone is counted"
+        );
+    }
+
+    #[test]
+    fn the_bar_folds_one_step_at_a_time_and_unfolds_with_room_to_spare() {
+        let fit = BarFit::default();
+        fit.toggle.set(220.);
+        fit.toggle_compact.set(60.);
+        fit.layout.set(300.);
+        fit.menu.set(110.);
+        fit.omitted.set(100.);
+        assert_eq!(fit.next_level(40.), 0, "room left, nothing folds");
+        assert_eq!(fit.next_level(0.), 1, "no room: the toggle folds first");
+        fit.level.set(1);
+        assert_eq!(fit.next_level(0.), 2, "then the diff's view controls");
+        fit.level.set(2);
+        assert_eq!(fit.next_level(0.), 3, "then the count of diffs not loaded");
+        fit.level.set(3);
+        assert_eq!(fit.next_level(0.), 3, "nothing more folds");
+        assert_eq!(fit.next_level(100.), 3, "the note does not fit back yet");
+        assert_eq!(fit.next_level(130.), 2, "the note fits back with room left");
+        fit.level.set(2);
+        assert_eq!(fit.next_level(190.), 2, "the controls need 190 more");
+        assert_eq!(fit.next_level(210.), 1);
+        fit.level.set(1);
+        assert_eq!(
+            fit.next_level(170.),
+            1,
+            "the full toggle needs 160 and a gap"
+        );
+        assert_eq!(fit.next_level(180.), 0, "the full toggle fits back");
+    }
+
+    #[gpui_kit::test]
+    fn no_toggle_without_commits_after_your_review(cx: &mut TestAppContext) {
+        let (mut cx, tab) = open_reviewed_tab(cx, "abc");
+        let cx = &mut cx;
+        draw(cx);
+        assert!(tab.read_with(cx, |tab, _| tab.since.is_none()));
+        assert!(
+            cx.debug_bounds("files-since-review").is_none(),
+            "a review of the head leaves nothing to show since"
+        );
+    }
+
+    #[test]
+    fn the_toggle_counts_files_and_says_when_github_cut_the_list() {
+        assert_eq!(files_label(1, false), "1 file");
+        assert_eq!(files_label(12, false), "12 files");
+        assert_eq!(files_label(300, true), "300+ files");
     }
 }

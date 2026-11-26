@@ -1,6 +1,7 @@
 //! The box under a diff line where a new inline comment is written. One
 //! composer exists at a time; picking another range moves it and keeps the
-//! draft.
+//! draft. The comment joins the viewer's pending review, which the box
+//! counts and opens in the review composer.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -11,6 +12,7 @@ use loupe_github::{LineAnchor, NewThread, NodeId, Side};
 
 use super::model::composer_label;
 use crate::github::common::{self, Submit};
+use crate::github::pull_request::view::{OpenReviewComposer, PendingComments};
 use crate::theme::scale;
 use crate::ui;
 
@@ -38,6 +40,7 @@ pub struct ComposerView {
     submit: Submit,
     task: Option<Task<()>>,
     _changes: Subscription,
+    _pending: Subscription,
 }
 
 impl EventEmitter<ComposerEvent> for ComposerView {}
@@ -59,6 +62,7 @@ impl ComposerView {
                 cx.notify();
             }
         });
+        let pending = cx.observe_global::<PendingComments>(|_, cx| cx.notify());
         let view = Self {
             pull_request_id,
             target,
@@ -66,6 +70,7 @@ impl ComposerView {
             submit: Submit::Idle,
             task: None,
             _changes: changes,
+            _pending: pending,
         };
         view.focus_text(window, cx);
         view
@@ -179,6 +184,21 @@ impl Render for ComposerView {
             }
         };
         let empty = self.text.read(cx).value().trim().is_empty();
+        let pending = PendingComments::count(&self.pull_request_id, cx);
+        let joins = match pending {
+            0 => "Starts your review".to_owned(),
+            1 => "Joins your review · 1 pending".to_owned(),
+            count => format!("Joins your review · {count} pending"),
+        };
+        let review = Button::new("composer-open-review")
+            .ghost()
+            .xsmall()
+            .icon(IconName::MessageSquareDiff)
+            .label(joins.clone())
+            .text_color(muted)
+            .tooltip("Nothing is posted until you submit the review")
+            .accessibility_label(format!("{joins}. Open the review"))
+            .on_click(|_, window, cx| window.dispatch_action(OpenReviewComposer.boxed_clone(), cx));
         v_flex()
             .w_full()
             .gap_2()
@@ -207,14 +227,15 @@ impl Render for ComposerView {
                     .gap_2()
                     .items_center()
                     .justify_end()
-                    .children(self.submit.error().map(|message| {
+                    .child(review)
+                    .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_size(scale::meta())
                             .text_color(danger)
-                            .child(message.to_owned())
-                    }))
+                            .children(self.submit.error().map(str::to_owned)),
+                    )
                     .child(close)
                     .child(
                         Button::new("add-comment")
