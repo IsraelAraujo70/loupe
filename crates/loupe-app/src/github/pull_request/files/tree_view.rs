@@ -97,6 +97,8 @@ pub fn row(
     let viewed_tab = tab.clone();
     let tooltip = view.tooltip.clone();
     let folder_row = view.folder.is_some();
+    let badge_id = format!("{id_prefix}-threads");
+    let threads = (view.threads > 0).then(|| (badge_id.clone(), ix, view.threads));
     let background = if view.selected {
         tokens::glass_selected()
     } else if sticky {
@@ -179,19 +181,20 @@ pub fn row(
                 .child(if let Some(step) = view.guide_group {
                     guide_group_label(view, step, muted).into_any_element()
                 } else if folder_row {
-                    folder_label(view, muted).into_any_element()
+                    folder_label(view, muted, threads).into_any_element()
                 } else {
                     name_and_size(
                         view.label.clone(),
                         view.name_from,
                         view.additions,
                         view.deletions,
+                        threads,
                     )
                     .text_color(view.label_color)
                     .into_any_element()
                 })
-                .when(view.threads > 0, |item| {
-                    item.child(thread_badge(id_prefix, ix, view.threads).ml(dp(LANE_GAP)))
+                .when(view.guide_group.is_some() && view.threads > 0, |item| {
+                    item.child(thread_badge(&badge_id, ix, view.threads).ml(dp(LANE_GAP)))
                 })
                 .child(status_lane(view.status).ml(dp(LANE_GAP))),
         )
@@ -216,6 +219,9 @@ pub fn row(
 /// status letter, and the viewed box) and after the last one. With the
 /// tree at its opening width, a folded folder name still fits whole.
 const LANE_GAP: f32 = 8.;
+
+/// The space between a file's name and its open threads' badge.
+const BADGE_GAP: f32 = 6.;
 
 /// A folder's label as its first part, what stands between, and its last
 /// part. A folded path of three or more folders shows its first and last
@@ -273,27 +279,44 @@ fn indent(depth: usize) -> f32 {
 /// name with its size `size_width` beside it, then the whole name alone,
 /// and only when the name alone does not fit, the name cut as
 /// `abbreviate_name` cuts it. The size is also in the row's tooltip and
-/// accessible name, so it is what gives way.
+/// accessible name, so it is what gives way. A row with open threads keeps
+/// their badge, `badge` wide, and its size, and cuts the name instead: the
+/// files under discussion are the ones whose size the reader weighs.
 fn fit_file_row(
     name: &str,
     from: usize,
     room: f32,
+    badge: f32,
     size_width: f32,
     width: impl Fn(&str) -> f32,
 ) -> (String, bool) {
     let whole = width(name);
-    if whole + size_width <= room {
-        (name.to_owned(), true)
-    } else if whole <= room {
+    if whole + badge + size_width <= room {
+        return (name.to_owned(), true);
+    }
+    let name_room = room - badge - size_width;
+    if badge > 0. && name_room >= width(ELLIPSIS) {
+        return (abbreviate_name(name, from, name_room, width), true);
+    }
+    let room = room - badge;
+    if whole <= room {
         (name.to_owned(), false)
     } else {
         (abbreviate_name(name, from, room, width), false)
     }
 }
 
-/// A file's name and, at the trailing edge, its size, in the room its row
-/// leaves (`fit_file_row`): the name is cut only when it cannot be whole.
-fn name_and_size(name: SharedString, from: usize, additions: u32, deletions: u32) -> Div {
+/// A file's name, its open threads' badge right after it, and at the
+/// trailing edge its size, in the room its row leaves (`fit_file_row`), so
+/// the size stays in the column of the other rows. `threads` is the badge's
+/// id prefix, the row, and the count.
+fn name_and_size(
+    name: SharedString,
+    from: usize,
+    additions: u32,
+    deletions: u32,
+    threads: Option<(String, usize, usize)>,
+) -> Div {
     div()
         .flex_1()
         .min_w_0()
@@ -305,12 +328,22 @@ fn name_and_size(name: SharedString, from: usize, additions: u32, deletions: u32
                 move |bounds, window, cx| {
                     let mut size = size_label(additions, deletions).into_any_element();
                     let size_box = size.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let mut badge = threads.as_ref().map(|(id, ix, count)| {
+                        let mut badge = thread_badge(id, *ix, *count).into_any_element();
+                        let badge_box =
+                            badge.layout_as_root(AvailableSpace::min_size(), window, cx);
+                        (badge, badge_box)
+                    });
+                    let badge_width = badge
+                        .as_ref()
+                        .map_or(px(0.), |(_, badge_box)| badge_box.width + dp(BADGE_GAP));
                     let (label, with_size) = {
                         let measure = text_width(window, FontWeight::NORMAL);
                         fit_file_row(
                             &name,
                             from,
                             f32::from(bounds.size.width),
+                            f32::from(badge_width),
                             f32::from(size_box.width + dp(LANE_GAP)),
                             measure,
                         )
@@ -319,15 +352,22 @@ fn name_and_size(name: SharedString, from: usize, additions: u32, deletions: u32
                     let text_box = text.layout_as_root(AvailableSpace::min_size(), window, cx);
                     let middle = |height: Pixels| bounds.top() + (bounds.size.height - height) / 2.;
                     text.prepaint_at(point(bounds.left(), middle(text_box.height)), window, cx);
+                    if let Some((badge, badge_box)) = badge.as_mut() {
+                        let left = bounds.left() + text_box.width + dp(BADGE_GAP);
+                        badge.prepaint_at(point(left, middle(badge_box.height)), window, cx);
+                    }
                     let size = with_size.then(|| {
                         let left = bounds.right() - size_box.width;
                         size.prepaint_at(point(left, middle(size_box.height)), window, cx);
                         size
                     });
-                    (text, size)
+                    (text, badge.map(|(badge, _)| badge), size)
                 },
-                |_, (mut text, size), window, cx| {
+                |_, (mut text, badge, size), window, cx| {
                     text.paint(window, cx);
+                    if let Some(mut badge) = badge {
+                        badge.paint(window, cx);
+                    }
                     if let Some(mut size) = size {
                         size.paint(window, cx);
                     }
@@ -350,10 +390,12 @@ fn fit_folder_row(label: f32, count: f32, size: f32, room: f32) -> (bool, bool) 
     }
 }
 
-/// A folder's label, its file count after it, and its size at the trailing
-/// edge, in the room its row leaves (`fit_folder_row`). A label wider than
-/// the whole room is cut at its end.
-fn folder_label(view: &RowView, muted: Hsla) -> Div {
+/// A folder's label, its file count and its open threads' badge after it,
+/// and its size at the trailing edge, in the room its row leaves
+/// (`fit_folder_row`, where the badge stays with the label). A label wider
+/// than the whole room is cut at its end. `threads` is as in
+/// [`name_and_size`].
+fn folder_label(view: &RowView, muted: Hsla, threads: Option<(String, usize, usize)>) -> Div {
     let label = view.label.clone();
     let color = view.label_color;
     let (files, additions, deletions) = (view.files, view.additions, view.deletions);
@@ -382,21 +424,31 @@ fn folder_label(view: &RowView, muted: Hsla) -> Div {
                     let count_box = count.layout_as_root(AvailableSpace::min_size(), window, cx);
                     let mut size = size_label(additions, deletions).into_any_element();
                     let size_box = size.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let mut badge = threads.as_ref().map(|(id, ix, open)| {
+                        let mut badge = thread_badge(id, *ix, *open).into_any_element();
+                        let badge_box =
+                            badge.layout_as_root(AvailableSpace::min_size(), window, cx);
+                        (badge, badge_box)
+                    });
+                    let badge_width = badge.as_ref().map_or(0., |(_, badge_box)| {
+                        f32::from(badge_box.width + dp(BADGE_GAP))
+                    });
                     let name_width = f32::from(name_box.width);
                     let (with_count, with_size) = fit_folder_row(
-                        name_width,
+                        name_width + badge_width,
                         f32::from(count_box.width),
                         f32::from(size_box.width + dp(LANE_GAP)),
                         room,
                     );
-                    if name_width > room {
+                    let mut name_box = name_box;
+                    if name_width + badge_width > room {
                         let text = format!("{head}{between}{tail}");
                         let cut: SharedString = {
                             let measure = text_width(window, FontWeight::NORMAL);
-                            cut_name(&text, room, &measure).into()
+                            cut_name(&text, room - badge_width, &measure).into()
                         };
                         name = div().whitespace_nowrap().child(cut).into_any_element();
-                        name.layout_as_root(AvailableSpace::min_size(), window, cx);
+                        name_box = name.layout_as_root(AvailableSpace::min_size(), window, cx);
                     }
                     let middle = |height: Pixels| bounds.top() + (bounds.size.height - height) / 2.;
                     name.prepaint_at(point(bounds.left(), middle(name_box.height)), window, cx);
@@ -405,16 +457,21 @@ fn folder_label(view: &RowView, muted: Hsla) -> Div {
                         count.prepaint_at(point(left, middle(count_box.height)), window, cx);
                         count
                     });
+                    if let Some((badge, badge_box)) = badge.as_mut() {
+                        let count_width = if with_count { count_box.width } else { px(0.) };
+                        let left = bounds.left() + name_box.width + count_width + dp(BADGE_GAP);
+                        badge.prepaint_at(point(left, middle(badge_box.height)), window, cx);
+                    }
                     let size = with_size.then(|| {
                         let left = bounds.right() - size_box.width;
                         size.prepaint_at(point(left, middle(size_box.height)), window, cx);
                         size
                     });
-                    (name, count, size)
+                    (name, count, badge.map(|(badge, _)| badge), size)
                 },
-                |_, (mut name, count, size), window, cx| {
+                |_, (mut name, count, badge, size), window, cx| {
                     name.paint(window, cx);
-                    for mut part in count.into_iter().chain(size) {
+                    for mut part in count.into_iter().chain(badge).chain(size) {
                         part.paint(window, cx);
                     }
                 },
@@ -453,12 +510,9 @@ fn guide_group_label(view: &RowView, step: Option<usize>, muted: Hsla) -> Div {
 
 /// How many review threads on a row are still open: a speech bubble and the
 /// count in the accent, since an open thread waits on someone.
-fn thread_badge(id_prefix: &str, ix: usize, threads: usize) -> Stateful<Div> {
+fn thread_badge(id: &str, ix: usize, threads: usize) -> Stateful<Div> {
     h_flex()
-        .id(ElementId::NamedInteger(
-            format!("{id_prefix}-threads").into(),
-            ix as u64,
-        ))
+        .id(ElementId::NamedInteger(id.to_owned().into(), ix as u64))
         .role(Role::Status)
         .aria_label(open_threads_label(threads))
         .flex_none()
@@ -1097,20 +1151,39 @@ mod tests {
     fn the_size_gives_way_before_the_name() {
         let name = "repository_context.rs";
         let whole = (name.to_owned(), true);
-        assert_eq!(fit_file_row(name, 0, 30., 9., chars), whole);
+        assert_eq!(fit_file_row(name, 0, 30., 0., 9., chars), whole);
         // Too narrow for both: the name stays whole, the size goes.
         assert_eq!(
-            fit_file_row(name, 0, 25., 9., chars),
+            fit_file_row(name, 0, 25., 0., 9., chars),
             (name.to_owned(), false)
         );
         assert_eq!(
-            fit_file_row(name, 0, 21., 9., chars),
+            fit_file_row(name, 0, 21., 0., 9., chars),
             (name.to_owned(), false)
         );
         // Only a name wider than the whole row is cut.
         assert_eq!(
-            fit_file_row(name, 0, 15., 9., chars),
+            fit_file_row(name, 0, 15., 0., 9., chars),
             ("repository_….rs".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn a_row_with_open_threads_cuts_its_name_before_its_size() {
+        let name = "repository_context.rs";
+        assert_eq!(
+            fit_file_row(name, 0, 34., 4., 9., chars),
+            (name.to_owned(), true)
+        );
+        // The badge and the size stay; the name gives way.
+        assert_eq!(
+            fit_file_row(name, 0, 30., 4., 9., chars),
+            ("repository_co….rs".to_owned(), true)
+        );
+        // Too narrow for even a cut name beside both: the size goes.
+        assert_eq!(
+            fit_file_row(name, 0, 13., 4., 9., chars),
+            ("repos….rs".to_owned(), false)
         );
     }
 

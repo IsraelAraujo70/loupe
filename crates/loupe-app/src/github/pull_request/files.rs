@@ -807,11 +807,20 @@ impl FilesTab {
 
     /// The diffs of the files the filter keeps, in the tree's order.
     fn filtered_docs(&self, cx: &App) -> Vec<DiffFile> {
-        self.docs
+        let place: HashMap<&str, usize> = self
+            .file_order()
+            .into_iter()
+            .enumerate()
+            .map(|(place, ix)| (self.files[ix].path.as_str(), place))
+            .collect();
+        let mut docs: Vec<DiffFile> = self
+            .docs
             .iter()
             .filter(|doc| self.tree_keeps(doc.path(), cx))
             .cloned()
-            .collect()
+            .collect();
+        docs.sort_by_key(|doc| place.get(doc.path().as_ref()).copied());
+        docs
     }
 
     /// The low-signal files the filter keeps, for the divider over them.
@@ -819,7 +828,7 @@ impl FilesTab {
         let files: Vec<&ChangedFile> = self
             .files
             .iter()
-            .filter(|file| self.low.contains_key(&file.path) && self.tree_keeps(&file.path, cx))
+            .filter(|file| self.in_low_group(&file.path) && self.tree_keeps(&file.path, cx))
             .collect();
         if files.is_empty() {
             return None;
@@ -2703,10 +2712,11 @@ impl FilesTab {
         // header while it is folded or has no lines. Without a file before
         // them it heads the diff.
         let before_low = low_group.as_ref().and_then(|_| {
-            self.files
-                .iter()
+            self.file_order()
+                .into_iter()
                 .rev()
-                .find(|file| !self.low.contains_key(&file.path) && self.tree_keeps(&file.path, cx))
+                .map(|ix| &self.files[ix])
+                .find(|file| !self.in_low_group(&file.path) && self.tree_keeps(&file.path, cx))
         });
         let mut divider_at: Option<(SharedString, bool)> = None;
         if let Some(file) = before_low {

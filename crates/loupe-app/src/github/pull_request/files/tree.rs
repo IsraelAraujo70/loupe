@@ -285,6 +285,32 @@ pub fn query_rows(
     emitter.rows
 }
 
+/// The place of each file in `files` as the tree lists them: `files`' own
+/// order, or grouped by the steps of `guide` when given, so the diff and
+/// the next file follow what the tree shows.
+pub fn reading_order(
+    files: &[ChangedFile],
+    signals: &[Signal],
+    guide: Option<&GuideLayout>,
+) -> Vec<usize> {
+    let Some(guide) = guide else {
+        return (0..files.len()).collect();
+    };
+    query_rows(
+        files,
+        signals,
+        &TreeQuery::text(""),
+        Some(guide),
+        &HashSet::new(),
+    )
+    .into_iter()
+    .filter_map(|row| match row.kind {
+        RowKind::File { index } => Some(index),
+        RowKind::Dir(_) => None,
+    })
+    .collect()
+}
+
 struct Emitter<'a> {
     files: &'a [ChangedFile],
     collapsed: &'a HashSet<String>,
@@ -905,15 +931,16 @@ pub struct ThreadStop {
     pub side: Side,
 }
 
-/// The open threads on the files `keeps` keeps, in the diff's order: by
-/// file, then the ones off the diff at the file's header, then by line.
-pub fn thread_stops(
-    files: &[ChangedFile],
+/// The open threads on the files `keeps` keeps, with `files` in the diff's
+/// order: by file, then the ones off the diff at the file's header, then by
+/// line.
+pub fn thread_stops<'a>(
+    files: impl IntoIterator<Item = &'a ChangedFile>,
     threads: &[ReviewThread],
     keeps: impl Fn(&str) -> bool,
 ) -> Vec<ThreadStop> {
     let place: HashMap<&str, usize> = files
-        .iter()
+        .into_iter()
         .enumerate()
         .filter(|(_, file)| keeps(&file.path))
         .map(|(ix, file)| (file.path.as_str(), ix))
@@ -966,6 +993,18 @@ impl FilesTab {
 
     fn guide_layout(&self) -> Option<&GuideLayout> {
         (self.tree.guide_order && !self.tree.guide.is_empty()).then_some(&self.tree.guide)
+    }
+
+    /// The place in `files` of each file in the order the tree lists them.
+    pub(super) fn file_order(&self) -> Vec<usize> {
+        reading_order(&self.files, &self.signals, self.guide_layout())
+    }
+
+    /// Whether `path` sits in the low-signal group, at the end of the tree
+    /// and of the diff: a low-signal file a step cites sits under the step
+    /// in Guide order.
+    pub(super) fn in_low_group(&self, path: &str) -> bool {
+        self.tree_group(path) == Some(LOW_SIGNAL)
     }
 
     /// Whether the filter's text and the facets keep `path` in the tree and
@@ -1075,6 +1114,7 @@ impl FilesTab {
 
     pub(super) fn set_guide_order(&mut self, on: bool, cx: &mut Context<Self>) {
         self.tree.guide_order = on;
+        self.show_filtered(cx);
         cx.notify();
     }
 
@@ -1088,15 +1128,20 @@ impl FilesTab {
         self.tree.guide = guide;
         if self.tree.facets.contains(&Facet::CitedByGuide) {
             self.refilter(cx);
+        } else if self.tree.guide_order {
+            self.show_filtered(cx);
         }
         cx.notify();
     }
 
     /// The open threads of the files shown, in the diff's order.
     pub(super) fn open_thread_stops(&self, cx: &App) -> Vec<ThreadStop> {
-        thread_stops(&self.files, self.tree_threads(), |path| {
-            self.tree_keeps(path, cx)
-        })
+        let order = self.file_order();
+        thread_stops(
+            order.iter().map(|&ix| &self.files[ix]),
+            self.tree_threads(),
+            |path| self.tree_keeps(path, cx),
+        )
     }
 
     /// Shows the open thread after the one shown last, in the tree and the
@@ -1137,8 +1182,8 @@ mod tests {
         DOCS, Facet, FileFacts, GitTint, GuideLayout, LARGE_TREE, LOW_SIGNAL, Move, NOT_COVERED,
         RowKind, Sticky, TESTS, TreeQuery, TreeRow, ViewedMark, active_folder, distinct_starts,
         folder_tint, holds, initial_collapsed, into_tree_order, is_group, kept_by, move_down,
-        move_left, move_right, move_up, next_stop, open_threads, query_rows, shown_row,
-        split_group, step_of, sticky_folders, thread_stops, tree_rows, viewed_mark,
+        move_left, move_right, move_up, next_stop, open_threads, query_rows, reading_order,
+        shown_row, split_group, step_of, sticky_folders, thread_stops, tree_rows, viewed_mark,
     };
 
     /// Every file as code, so a tree sorts by name alone.
@@ -1815,6 +1860,47 @@ mod tests {
             kept: Some(&kept),
         };
         assert!(query_rows(&files, &code(&files), &query, None, &collapsed).is_empty());
+    }
+
+    #[test]
+    fn the_diff_reads_the_files_in_guide_order_while_it_is_on() {
+        let mut files = sample();
+        files.push(file("Cargo.lock", 9, 9));
+        let mut signals = code(&files);
+        *signals.last_mut().unwrap() = Signal::Low(super::super::signal::LowSignal::Lockfile);
+        let paths = |order: Vec<usize>| -> Vec<String> {
+            order.into_iter().map(|ix| files[ix].path.clone()).collect()
+        };
+        assert_eq!(
+            reading_order(&files, &signals, None),
+            (0..files.len()).collect::<Vec<_>>()
+        );
+        let guide = GuideLayout::new(&[
+            step("Retry on errors", &["src/lib/http/retry.rs", "src/main.rs"]),
+            step("Wire it in", &["src/main.rs", "src/App.rs"]),
+        ]);
+        assert_eq!(
+            paths(reading_order(&files, &signals, Some(&guide))),
+            [
+                "src/lib/http/retry.rs",
+                "src/main.rs",
+                "src/App.rs",
+                "docs/guide/intro.md",
+                "src/lib/http/client.rs",
+                "Cargo.toml",
+                "README.md",
+                "Cargo.lock",
+            ]
+        );
+        // Next open thread follows the same order.
+        let threads = [
+            thread("PRRT_a", "README.md", Some(2), false),
+            thread("PRRT_b", "src/App.rs", Some(4), false),
+        ];
+        let order = reading_order(&files, &signals, Some(&guide));
+        let stops = thread_stops(order.iter().map(|&ix| &files[ix]), &threads, |_| true);
+        let ids: Vec<&str> = stops.iter().map(|stop| stop.id.as_str()).collect();
+        assert_eq!(ids, ["PRRT_b", "PRRT_a"]);
     }
 
     #[test]

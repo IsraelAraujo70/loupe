@@ -385,8 +385,12 @@ impl super::FilesTab {
             let selected = self.selected.as_deref()?;
             self.files.iter().position(|file| file.path == selected)
         });
-        let ix = next_unviewed(&self.viewed_marks(), current, include_current)?;
-        Some(self.files[ix].path.clone())
+        let order = self.file_order();
+        let marks = self.viewed_marks();
+        let viewed: Vec<bool> = order.iter().map(|&ix| marks[ix]).collect();
+        let current = current.and_then(|current| order.iter().position(|&ix| ix == current));
+        let at = next_unviewed(&viewed, current, include_current)?;
+        Some(self.files[order[at]].path.clone())
     }
 }
 
